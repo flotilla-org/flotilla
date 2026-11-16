@@ -18,8 +18,8 @@ use chrono::{DateTime, Utc};
 use flotilla_engine_store::plain::{PendingChange, PlainLog};
 use flotilla_resources::{
     checkout_records::{
-        launched, CheckoutChange, CheckoutHolder, CheckoutRecord, CheckoutRecords, Inspection, Integration, Landed, HOLDER_ENDED,
-        HOLDER_NOT_OPEN,
+        launched, CheckoutChange, CheckoutHolder, CheckoutLaunch, CheckoutRecord, CheckoutRecords, Inspection, Integration, Landed,
+        Launches, HOLDER_ENDED, HOLDER_NOT_OPEN,
     },
     host_direct_environment_name, CheckoutSpec, CheckoutWorktreeSpec, FreshCloneCheckoutSpec, ObservedCheckoutSpec, RepositoryKey,
     HOST_DIRECT_NAME_PREFIX,
@@ -290,10 +290,6 @@ impl EngineCheckouts {
 
     /// `view` as a reader sees it, with its launch's facts and its home's inspection.
     fn record(&self, read: &mut Read<'_>, view: View<CheckoutKind>) -> Result<CheckoutRecord, ReadError> {
-        let degraded = match read.resolve(CheckoutFacts::CODE, &view.name, &view.home)? {
-            Some(id) => read.load::<CheckoutFacts>(id)?.and_then(|loaded| loaded.value.degraded),
-            None => None,
-        };
         let integration = match read.resolve(CheckoutIntegration::CODE, &view.name, &view.home)? {
             Some(id) => match read.load::<CheckoutIntegration>(id)? {
                 Some(loaded) => Some(self.integration(read, &view.home, &loaded.value)?),
@@ -301,7 +297,16 @@ impl EngineCheckouts {
             },
             None => None,
         };
-        Ok(CheckoutRecord {
+        Ok(self.launch(read, view)?.with_integration(integration))
+    }
+
+    /// `view` as a reader sees it, with its launch's facts; its inspection is not read.
+    fn launch(&self, read: &mut Read<'_>, view: View<CheckoutKind>) -> Result<CheckoutLaunch, ReadError> {
+        let degraded = match read.resolve(CheckoutFacts::CODE, &view.name, &view.home)? {
+            Some(id) => read.load::<CheckoutFacts>(id)?.and_then(|loaded| loaded.value.degraded),
+            None => None,
+        };
+        Ok(CheckoutLaunch {
             requested_at: view.created,
             reading: view.judgement.reading(),
             spec: spec_of(&view.request),
@@ -309,7 +314,7 @@ impl EngineCheckouts {
             name: view.name,
             home: view.home,
             degraded,
-            integration,
+            integration: (),
         })
     }
 
@@ -336,6 +341,39 @@ impl EngineCheckouts {
         self.reads
             .read(|read| views(read)?.into_iter().map(|view| self.record(read, view)).collect())
             .map_err(|error| format!("engine checkouts {what}: {error}"))
+    }
+
+    /// The launches `which` selects, each read by `each`.
+    fn selected<T>(
+        &self,
+        which: Launches<'_>,
+        each: fn(&Self, &mut Read<'_>, View<CheckoutKind>) -> Result<T, ReadError>,
+    ) -> Result<Vec<T>, String> {
+        let (what, homes) = match which {
+            Launches::Named { name, home } => (format!("engine Checkout/{name}"), vec![home.unwrap_or(self.home()).to_owned()]),
+            Launches::Held(holder) => (format!("engine checkouts held for {}", holder_of(holder).0), Vec::new()),
+            Launches::Here => (format!("engine checkouts at {}", self.home()), vec![self.home().to_owned()]),
+            Launches::Every => ("engine checkouts at every home".to_owned(), (self.homes)()),
+        };
+        self.reads
+            .read(|read| {
+                let views = match which {
+                    Launches::Named { name, .. } if launched(name) != name => {
+                        keyed::<CheckoutKind>(read, name, &homes[0])?.into_iter().collect()
+                    }
+                    Launches::Named { name, .. } => latest::<CheckoutKind>(read, name, &homes[0])?.into_iter().collect(),
+                    Launches::Held(holder) => indexed(read, &CheckoutRequest::by_holder(&holder_of(holder)))?,
+                    Launches::Here | Launches::Every => {
+                        let mut views = Vec::new();
+                        for home in &homes {
+                            views.extend(Self::scan(read, home)?);
+                        }
+                        views
+                    }
+                };
+                views.into_iter().map(|view| each(self, read, view)).collect()
+            })
+            .map_err(|error| format!("{what}: {error}"))
     }
 
     /// One try at the launch that serves `request` for `checkout`; a launch it creates is created
@@ -411,22 +449,11 @@ impl CheckoutRecords for EngineCheckouts {
     }
 
     fn get(&self, name: &str, home: Option<&str>) -> Result<Option<CheckoutRecord>, String> {
-        let home = home.unwrap_or(self.home()).to_owned();
-        self.reads
-            .read(|read| {
-                let view = if launched(name) != name {
-                    keyed::<CheckoutKind>(read, name, &home)?
-                } else {
-                    latest::<CheckoutKind>(read, name, &home)?
-                };
-                view.map(|view| self.record(read, view)).transpose()
-            })
-            .map_err(|error| format!("engine Checkout/{name}: {error}"))
+        Ok(self.selected(Launches::Named { name, home }, Self::record)?.pop())
     }
 
     fn held(&self, holder: &CheckoutHolder) -> Result<Vec<CheckoutRecord>, String> {
-        let stored = holder_of(holder);
-        self.records(&format!("held for {}", stored.0), |read| indexed(read, &CheckoutRequest::by_holder(&stored)))
+        self.selected(Launches::Held(holder), Self::record)
     }
 
     fn of_repository(&self, repository: &RepositoryKey) -> Result<Vec<CheckoutRecord>, String> {
@@ -439,19 +466,15 @@ impl CheckoutRecords for EngineCheckouts {
     }
 
     fn here(&self) -> Result<Vec<CheckoutRecord>, String> {
-        let home = self.home().to_owned();
-        self.records(&format!("at {home}"), |read| Self::scan(read, &home))
+        self.selected(Launches::Here, Self::record)
     }
 
     fn every(&self) -> Result<Vec<CheckoutRecord>, String> {
-        let homes = (self.homes)();
-        self.records("at every home", |read| {
-            let mut views = Vec::new();
-            for home in &homes {
-                views.extend(Self::scan(read, home)?);
-            }
-            Ok(views)
-        })
+        self.selected(Launches::Every, Self::record)
+    }
+
+    fn launches(&self, which: Launches<'_>) -> Result<Vec<CheckoutLaunch>, String> {
+        self.selected(which, Self::launch)
     }
 
     fn request(&self, name: &str, spec: &CheckoutSpec, holder: Option<&CheckoutHolder>) -> Result<String, String> {

@@ -516,7 +516,7 @@ pub fn merge_query_definitions(
         }
         selected
     };
-    Ok(crate::definition::overlay_builtins(kind.paths.kind, namespace, merged, names.as_ref())?
+    Ok(crate::definition::with_builtins(kind.paths.kind, namespace, merged, names.as_ref())?
         .into_iter()
         .map(|object| crate::ReadResourceObject { object, provenance: crate::ResourceProvenance::Local })
         .collect())

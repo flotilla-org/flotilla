@@ -22,7 +22,7 @@ use crate::held_listing::ticks;
 
 use flotilla_protocol::LifecycleReading;
 use flotilla_resources::{
-    checkout_records::CheckoutRecord,
+    checkout_records::{CheckoutLaunch, Launches},
     clone_records::{launched, CloneRecord},
     engine_records::{KindRecords, Record},
     environment_records::EnvironmentRecord,
@@ -211,7 +211,7 @@ impl LifecycleKind for Checkout {
 
     /// A checkout's later launch showing the same spec and status is still a change.
     async fn records(views: &LifecycleViews) -> Result<Vec<(Record<Self>, String)>, String> {
-        let records = views.blocking(|reads| reads.checkouts()?.every()).await?;
+        let records = views.blocking(|reads| reads.checkouts()?.launches(Launches::Every)).await?;
         Ok(newest_checkout_launches(records)
             .into_iter()
             .map(|record| {
@@ -265,9 +265,9 @@ fn newest_launches(records: Vec<CloneRecord>) -> Vec<CloneRecord> {
 }
 
 /// Each checkout's newest launch at each home.
-fn newest_checkout_launches(records: Vec<CheckoutRecord>) -> Vec<CheckoutRecord> {
-    let launch = |record: &CheckoutRecord| record.name.rsplit_once('#').and_then(|(_, n)| n.parse::<u64>().ok()).unwrap_or(0);
-    let mut newest = BTreeMap::<(String, String), CheckoutRecord>::new();
+fn newest_checkout_launches(records: Vec<CheckoutLaunch>) -> Vec<CheckoutLaunch> {
+    let launch = |record: &CheckoutLaunch| record.name.rsplit_once('#').and_then(|(_, n)| n.parse::<u64>().ok()).unwrap_or(0);
+    let mut newest = BTreeMap::<(String, String), CheckoutLaunch>::new();
     for record in records {
         let key = (record.home.clone(), record.checkout_name().to_owned());
         if newest.get(&key).is_none_or(|held| launch(held) < launch(&record)) {
@@ -278,7 +278,7 @@ fn newest_checkout_launches(records: Vec<CheckoutRecord>) -> Vec<CheckoutRecord>
 }
 
 /// `record`'s launch as its read view shows it, under the checkout's name.
-fn checkout_object(record: CheckoutRecord) -> Record<Checkout> {
+fn checkout_object(record: CheckoutLaunch) -> Record<Checkout> {
     let view = record.read_view();
     let mut object = object::<Checkout>(view.metadata.name, record.home, record.requested_at, view.spec, view.status);
     object.labels = view.metadata.labels;

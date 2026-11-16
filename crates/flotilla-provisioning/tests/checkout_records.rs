@@ -4,7 +4,7 @@
 use flotilla_protocol::LifecycleReading;
 use flotilla_provisioning_testkit::{checkouts::CheckoutFixture, Ending};
 use flotilla_resources::{
-    checkout_records::{launched, CheckoutRecords, Inspection, Landed},
+    checkout_records::{launched, CheckoutRecords, Inspection, Landed, Launches},
     CheckoutSpec, CheckoutWorktreeSpec, ObservedCheckoutSpec, RepositoryKey,
 };
 
@@ -93,6 +93,27 @@ fn an_adopted_checkout_is_its_hosts_and_reads_back_observed() {
     assert_eq!(record.spec, spec);
     assert_eq!(record.path(), Some("/src/repo"));
     assert_eq!(fixture.checkouts.in_environment("host-direct-home", None).expect("in").len(), 1);
+}
+
+// Behaviour: a launch read for a view or a join comes without its inspection, which is then not
+// read, through every selector; the full record of the same launch reads it.
+#[test]
+fn a_launch_read_without_its_integration_does_not_read_its_inspection() {
+    let fixture = CheckoutFixture::default();
+    fixture.open_convoy("c1");
+    let holder = fixture.holder("c1");
+    let held = fixture.put_ready("co", &worktree("feature"), Some(&holder));
+    assert!(fixture.checkouts.inspected(&held, Inspection { clean: Some(true), ..Inspection::default() }).expect("written"));
+    let inspections = |counts: &flotilla_schema::reads::ReadCounts| counts.get("CheckoutIntegration").map_or(0, |kind| kind.keyed);
+
+    for which in [Launches::Named { name: "co", home: None }, Launches::Held(&holder), Launches::Here, Launches::Every] {
+        let (launches, counts) = flotilla_schema::reads::measure_now(|| fixture.checkouts.launches(which).expect("launches"));
+        assert_eq!(launches.into_iter().map(|launch| launch.name).collect::<Vec<_>>(), std::slice::from_ref(&held), "{which:?}");
+        assert_eq!(inspections(&counts), 0, "{which:?}: {counts:?}");
+    }
+    let (record, counts) = flotilla_schema::reads::measure_now(|| fixture.record(&held));
+    assert!(record.integration.is_some());
+    assert_eq!(inspections(&counts), 1, "{counts:?}");
 }
 
 #[test]

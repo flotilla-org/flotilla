@@ -86,7 +86,7 @@ impl<T: Resource> DefinitionResolver<T> {
     async fn engine_list(&self, records: &dyn KindRecords<T>) -> Result<Vec<ResourceObject<T>>, ResourceError> {
         let listed = if self.holds_engine_records() { port_reads::list(records).await.map_err(ResourceError::other)? } else { Vec::new() };
         let objects = listed.into_iter().map(|record| self.object(record)).collect();
-        overlay_builtins(T::API_PATHS.kind, &self.namespace, objects, None)
+        with_builtins(T::API_PATHS.kind, &self.namespace, objects, None)
     }
 
     /// The engine's records of this kind as replica reads, every home's copy with its home as
@@ -144,7 +144,7 @@ impl<T: Resource> DefinitionResolver<T> {
             };
             reads.push(ReadResourceObject { object: self.object(record), provenance });
         }
-        let builtins = overlay_builtins(T::API_PATHS.kind, &self.namespace, Vec::new(), None)?;
+        let builtins = builtin_objects::<T>(T::API_PATHS.kind, &self.namespace)?;
         reads.extend(
             builtins
                 .into_iter()
@@ -229,7 +229,7 @@ impl<T: Resource> DefinitionResolver<T> {
             };
             current.insert(record.name.clone(), (Some(stamp), read));
         }
-        for object in overlay_builtins(T::API_PATHS.kind, &self.namespace, Vec::new(), None)? {
+        for object in builtin_objects::<T>(T::API_PATHS.kind, &self.namespace)? {
             current.insert(object.metadata.name.clone(), (None, ReadResourceObject { object, provenance: ResourceProvenance::Local }));
         }
         let mut previous = std::mem::take(&mut seen.reads);
@@ -307,8 +307,7 @@ impl<T: Resource> DefinitionResolver<T> {
         }
         let result = self.backend.store().query_decoded(crate::ResourceKind::of::<T>(), &self.namespace, &hydration).await?;
         let root = result.local_root.clone().ok_or_else(|| ResourceError::invalid("definition query has no authority root"))?;
-        let merged =
-            overlay_builtins(T::API_PATHS.kind, &self.namespace, merge_cached_definitions(result.into_typed::<T>()?, &root)?, None)?;
+        let merged = with_builtins(T::API_PATHS.kind, &self.namespace, merge_cached_definitions(result.into_typed::<T>()?, &root)?, None)?;
         select(merged, query)
     }
 
@@ -319,7 +318,7 @@ impl<T: Resource> DefinitionResolver<T> {
         }
         if self.backend.serves_read_views() {
             let listed = self.backend.using::<T>(&self.namespace).list().await?.items;
-            return overlay_builtins(T::API_PATHS.kind, &self.namespace, listed, None);
+            return with_builtins(T::API_PATHS.kind, &self.namespace, listed, None);
         }
         let mut by_name = BTreeMap::<String, Vec<DefinitionSource<T>>>::new();
         for source in self.sources().await? {
@@ -332,7 +331,7 @@ impl<T: Resource> DefinitionResolver<T> {
                 merged.push(object);
             }
         }
-        overlay_builtins(T::API_PATHS.kind, &self.namespace, merged, None)
+        with_builtins(T::API_PATHS.kind, &self.namespace, merged, None)
     }
 
     /// Read a named inventory once while merging every author for each name.
@@ -704,19 +703,15 @@ pub(crate) fn builtin_objects<T: Resource>(kind: &str, namespace: &str) -> Resul
 /// The version every built-in reads at.
 pub const BUILTIN_VERSION: &str = "builtin";
 
-/// `merged` with `kind`'s built-ins in place of any stored definition of their names (a copy an
-/// earlier generation seeded), restricted to `names` when the read selected names.
-pub(crate) fn overlay_builtins<T: Resource>(
+/// `merged` followed by `kind`'s built-ins, those in `names` when the read selected names. No
+/// store holds a built-in's name: every write of one is refused, and the import drops them.
+pub(crate) fn with_builtins<T: Resource>(
     kind: &str,
     namespace: &str,
     mut merged: Vec<ResourceObject<T>>,
     names: Option<&std::collections::BTreeSet<String>>,
 ) -> Result<Vec<ResourceObject<T>>, ResourceError> {
     let builtins = builtin_objects::<T>(kind, namespace)?;
-    if builtins.is_empty() {
-        return Ok(merged);
-    }
-    merged.retain(|object| !builtins.iter().any(|builtin| builtin.metadata.name == object.metadata.name));
     merged.extend(builtins.into_iter().filter(|builtin| names.is_none_or(|names| names.contains(&builtin.metadata.name))));
     Ok(merged)
 }
@@ -983,6 +978,9 @@ fn covers(seen: &BTreeMap<NodeId, u64>, dot: &CausalDot) -> bool {
     seen.get(&dot.author_root).is_some_and(|counter| *counter >= dot.author_counter)
 }
 
+/// The dot of a field a copy carries no merge entry for: its copy's version at its origin. The
+/// 73aa22b9b store holds this shape (Project, WorkflowTemplate and ImageLayer spec fields added
+/// after their copies were written); goes with the import.
 fn legacy_field<T: Resource>(source: &DefinitionSource<T>) -> FieldMergeMetadata {
     FieldMergeMetadata {
         dot: CausalDot { author_root: source.origin.clone(), author_counter: legacy_counter(&source.object) },

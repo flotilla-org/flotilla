@@ -12,7 +12,7 @@ use flotilla_config::ConfigStore;
 use flotilla_discovery_api::ProviderDescriptor;
 use flotilla_protocol::EnvironmentId;
 use flotilla_resources::checkout_path::checkout_path;
-use flotilla_resources::checkout_records::latest_launches;
+use flotilla_resources::checkout_records::{latest_launches, Launches};
 use flotilla_resources::discovered_checkouts::DiscoveredCheckouts;
 use flotilla_resources::lifecycle_reads::LifecycleReads;
 use flotilla_resources::{
@@ -163,7 +163,7 @@ impl CheckoutProviders {
         };
         // Validate the checkout instance synchronously: change delivery may lag behind its
         // release and a new launch. The engine's checkouts here take precedence.
-        let checkout = match self.lifecycle_reads.checkouts()?.get(&key.name, None)? {
+        let checkout = match self.lifecycle_reads.checkouts()?.launches(Launches::Named { name: &key.name, home: None })?.pop() {
             Some(record) => record.read_view(),
             None => match self.discovered_checkouts.view(namespace, &key.name) {
                 Some(checkout) => checkout,
@@ -204,7 +204,7 @@ impl CheckoutProviders {
             .map(|checkout| (checkout.metadata.name.clone(), checkout))
             .collect::<BTreeMap<_, _>>();
         // The engine's checkouts here override the discovered ones by name (#3108).
-        for (name, record) in latest_launches(self.lifecycle_reads.checkouts()?.here()?) {
+        for (name, record) in latest_launches(self.lifecycle_reads.checkouts()?.launches(Launches::Here)?) {
             checkouts.insert(name, record.read_view());
         }
         Ok(checkouts

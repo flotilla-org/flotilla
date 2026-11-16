@@ -19,7 +19,7 @@ use flotilla_protocol::LifecycleReading;
 
 pub use crate::clone_records::launched;
 use crate::{
-    checkout_records::CheckoutRecord,
+    checkout_records::CheckoutLaunch,
     environment_records::EnvironmentRecord,
     terminal_records::{TerminalHolderView, TerminalRecord},
     Convoy, CrewSource, CrewWorkPhase, ResourceObject, Stance, Vessel, VesselPhase, VesselRequirement, WorkPhase,
@@ -386,7 +386,7 @@ pub struct VesselJoins<'a> {
     /// Every launch of each terminal session held for it.
     pub terminals: &'a [TerminalRecord],
     /// Its convoy's checkouts at its home.
-    pub checkouts: &'a [CheckoutRecord],
+    pub checkouts: &'a [CheckoutLaunch],
 }
 
 impl VesselRecord {

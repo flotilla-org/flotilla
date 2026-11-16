@@ -799,18 +799,6 @@ async fn built_in_definitions_are_read_from_the_code_and_never_written(#[case] a
     assert!(matches!(created, Err(ResourceError::Invalid { .. })), "{created:?}");
     assert!(templates.delete("single-agent").await.is_err());
     assert!(templates.update_metadata(&InputMeta::builder().name("single-agent".to_string()).build()).await.is_err());
-    // A copy an earlier generation seeded under a built-in's name is shadowed by the built-in.
-    let mut stale = flotilla_resources::single_agent_workflow_spec();
-    stale.roles.clear();
-    let stale = serde_json::to_value(&stale).expect("stale spec");
-    let seeded = InputMeta::builder().name("single-agent-shepherd".to_string()).build();
-    backend.store().create_raw(ResourceKind::of::<WorkflowTemplate>(), "flotilla", &seeded, &stale).await.expect("a legacy stored copy");
-    let shadowed = templates.get("single-agent-shepherd").await.expect("read");
-    assert_eq!(shadowed.spec, flotilla_resources::single_agent_shepherd_workflow_spec());
-    assert_eq!(
-        templates.list().await.expect("list").iter().filter(|template| template.metadata.name == "single-agent-shepherd").count(),
-        1
-    );
     // The stdlib image layers read the same way.
     let layers = backend.definitions::<ImageLayer>("flotilla");
     let layer_names = builtin_names("ImageLayer");

@@ -17,7 +17,7 @@ use futures::{stream::BoxStream, StreamExt};
 
 use flotilla_protocol::{LifecycleReading, NodeId};
 use flotilla_resources::{
-    checkout_records::{latest_launches, CheckoutChange, CheckoutHolder, CheckoutRecord},
+    checkout_records::{latest_launches, CheckoutChange, CheckoutHolder, CheckoutLaunch, Launches},
     convoy_records::ConvoyChange,
     engine_records::{KindRecords, Record},
     environment_records::{EnvironmentChange, EnvironmentRecord},
@@ -54,7 +54,7 @@ pub struct VesselViews {
 struct Joined {
     environment: Option<EnvironmentRecord>,
     terminals: Vec<TerminalRecord>,
-    checkouts: Vec<CheckoutRecord>,
+    checkouts: Vec<CheckoutLaunch>,
 }
 
 /// A work at a home: its home, its convoy and the convoy's home, and what its launches are of.
@@ -346,7 +346,8 @@ impl VesselViews {
                 if !checkouts.is_empty() {
                     let records = reads.checkouts()?;
                     for name in &checkouts {
-                        touched.holders.extend(records.get(name, None)?.and_then(|checkout| checkout.holder));
+                        let launch = records.launches(Launches::Named { name, home: None })?.pop();
+                        touched.holders.extend(launch.and_then(|checkout| checkout.holder));
                     }
                 }
                 Ok(touched)
@@ -543,7 +544,7 @@ fn join(reads: &dyn LifecycleReads, record: &VesselRecord, holder: Option<&Check
     });
     let terminals = reads.terminals().and_then(|terminals| terminals.of_vessel(&record.name));
     let checkouts = match holder {
-        Some(holder) => reads.checkouts().and_then(|checkouts| checkouts.held(holder)),
+        Some(holder) => reads.checkouts().and_then(|checkouts| checkouts.launches(Launches::Held(holder))),
         None => Ok(Vec::new()),
     };
     let unknown = |what: &str, error: &String| tracing::debug!(vessel = %record.name, %error, "a vessel's {what} could not be read");

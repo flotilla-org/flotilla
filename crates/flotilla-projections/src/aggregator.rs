@@ -233,7 +233,7 @@ pub struct Aggregator {
     /// The engine's adopted checkouts at every home it follows: each name's latest launch that
     /// has not ended (#3108).
     #[builder(skip)]
-    engine_checkouts: Vec<flotilla_resources::checkout_records::CheckoutRecord>,
+    engine_checkouts: Vec<flotilla_resources::checkout_records::CheckoutLaunch>,
     /// This home, as the engine's checkouts name it.
     #[builder(skip)]
     engine_checkout_home: Option<String>,
@@ -1038,7 +1038,7 @@ impl Aggregator {
     /// checkouts held, and the next change reads again.
     fn read_engine_checkouts(&mut self) {
         let Ok(checkouts) = self.lifecycle_reads.checkouts() else { return };
-        let records = match checkouts.every() {
+        let records = match checkouts.launches(flotilla_resources::checkout_records::Launches::Every) {
             Ok(records) => records,
             Err(error) => {
                 tracing::warn!(%error, "aggregator could not read the engine's checkouts");
@@ -5340,8 +5340,8 @@ mod tests {
     }
 
     /// Launch `#1` of `checkout`, adopted by the engine at `home` and ready.
-    fn adopted_record(home: &str, checkout: &ResourceObject<Checkout>) -> flotilla_resources::checkout_records::CheckoutRecord {
-        flotilla_resources::checkout_records::CheckoutRecord {
+    fn adopted_record(home: &str, checkout: &ResourceObject<Checkout>) -> flotilla_resources::checkout_records::CheckoutLaunch {
+        flotilla_resources::checkout_records::CheckoutLaunch {
             name: format!("{}#1", checkout.metadata.name),
             home: home.to_owned(),
             spec: checkout.spec.clone(),
@@ -5349,7 +5349,7 @@ mod tests {
             requested_at: chrono::DateTime::UNIX_EPOCH,
             reading: flotilla_protocol::LifecycleReading::Ready { identity: String::new() },
             degraded: None,
-            integration: None,
+            integration: (),
         }
     }
 
@@ -5358,7 +5358,7 @@ mod tests {
     async fn hold_engine_checkouts(
         aggregator: &mut Aggregator,
         home: &str,
-        records: Vec<flotilla_resources::checkout_records::CheckoutRecord>,
+        records: Vec<flotilla_resources::checkout_records::CheckoutLaunch>,
     ) {
         aggregator.engine_checkout_home = Some(home.to_owned());
         aggregator.engine_checkouts = records;
@@ -7121,14 +7121,27 @@ mod tests {
         }
         fn held(
             &self,
-            _: &flotilla_resources::checkout_records::CheckoutHolder,
+            holder: &flotilla_resources::checkout_records::CheckoutHolder,
         ) -> Result<Vec<flotilla_resources::checkout_records::CheckoutRecord>, String> {
+            let held = self.launches(flotilla_resources::checkout_records::Launches::Held(holder))?;
+            Ok(held.into_iter().map(|launch| launch.with_integration(None)).collect())
+        }
+        fn launches(
+            &self,
+            which: flotilla_resources::checkout_records::Launches<'_>,
+        ) -> Result<Vec<flotilla_resources::checkout_records::CheckoutLaunch>, String> {
             use crate::ports::{LifecycleReads as _, ProvisioningKind};
+            use flotilla_resources::checkout_records::Launches;
+            match which {
+                Launches::Held(_) | Launches::Every => {}
+                Launches::Here => return Ok(Vec::new()),
+                Launches::Named { .. } => return Err("readiness reads checkouts by holder".into()),
+            }
             let checkouts = self.checkouts.lock().expect("checkouts").clone();
             let mut held = Vec::new();
             for (name, (home, spec)) in checkouts {
                 if let Some(reading) = self.try_reading(ProvisioningKind::Checkout, &name, Some(&home))? {
-                    held.push(flotilla_resources::checkout_records::CheckoutRecord {
+                    held.push(flotilla_resources::checkout_records::CheckoutLaunch {
                         name: format!("{name}#1"),
                         home,
                         spec,
@@ -7136,7 +7149,7 @@ mod tests {
                         requested_at: chrono::DateTime::UNIX_EPOCH,
                         reading,
                         degraded: None,
-                        integration: None,
+                        integration: (),
                     });
                 }
             }

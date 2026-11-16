@@ -6,6 +6,7 @@ use std::{
 };
 
 use flotilla_protocol::{RepoIdentity, RepoSelector};
+use flotilla_resources::checkout_records::Launches;
 use flotilla_resources::discovered_checkouts::DiscoveredCheckouts;
 use flotilla_resources::lifecycle_reads::LifecycleReads;
 use flotilla_resources::{Checkout, CheckoutPhase, CheckoutSpec, Project, Repository, RepositoryKey};
@@ -122,7 +123,7 @@ pub async fn local_checkouts_with_lifecycle_reads(
 ) -> Result<Vec<flotilla_resources::ResourceObject<Checkout>>, String> {
     let mut checkouts =
         discovered.views(namespace).into_iter().map(|checkout| (checkout.metadata.name.clone(), checkout)).collect::<BTreeMap<_, _>>();
-    let held = flotilla_resources::checkout_records::latest_launches(reads.checkouts()?.here()?);
+    let held = flotilla_resources::checkout_records::latest_launches(reads.checkouts()?.launches(Launches::Here)?);
     // The engine's checkout of a name, in any state, wins over the observation of it: an ended
     // checkout's stale observation cannot resurrect it.
     for name in held.keys() {

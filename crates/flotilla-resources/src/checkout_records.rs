@@ -30,9 +30,10 @@ pub enum CheckoutHolder {
     Convoy(String),
 }
 
-/// One launch of a checkout as a reader sees it.
+/// One launch of a checkout as a reader sees it: with its home's inspection, or without it
+/// (`I = ()`) for a reader that never looks at it, which then is not read.
 #[derive(Clone, Debug, PartialEq, Eq)]
-pub struct CheckoutRecord {
+pub struct CheckoutRecord<I = Option<Integration>> {
     /// The launch: `<checkout>#<n>`.
     pub name: String,
     /// The home that holds it: the host of its environment.
@@ -46,11 +47,30 @@ pub struct CheckoutRecord {
     pub reading: LifecycleReading,
     /// How it was made short of what was asked, as its launch found when it was realised.
     pub degraded: Option<String>,
-    /// Its home's inspection, if one has been written.
-    pub integration: Option<Integration>,
+    /// Its home's inspection, if one has been written; `()` where it was not read.
+    pub integration: I,
 }
 
-impl CheckoutRecord {
+/// A launch read without its integration.
+pub type CheckoutLaunch = CheckoutRecord<()>;
+
+impl CheckoutLaunch {
+    /// This launch with its home's inspection, as read.
+    pub fn with_integration(self, integration: Option<Integration>) -> CheckoutRecord {
+        CheckoutRecord {
+            name: self.name,
+            home: self.home,
+            spec: self.spec,
+            holder: self.holder,
+            requested_at: self.requested_at,
+            reading: self.reading,
+            degraded: self.degraded,
+            integration,
+        }
+    }
+}
+
+impl<I> CheckoutRecord<I> {
     /// The checkout this launch is of: its name without the launch number.
     pub fn checkout_name(&self) -> &str {
         launched(&self.name)
@@ -79,9 +99,9 @@ impl CheckoutRecord {
 
 /// Each checkout's latest launch among `records`, by checkout name: later launches of a checkout
 /// replace earlier ones.
-pub fn latest_launches(records: impl IntoIterator<Item = CheckoutRecord>) -> std::collections::BTreeMap<String, CheckoutRecord> {
-    let number = |record: &CheckoutRecord| record.name.rsplit_once('#').and_then(|(_, n)| n.parse::<u32>().ok()).unwrap_or(0);
-    let mut latest = std::collections::BTreeMap::<String, CheckoutRecord>::new();
+pub fn latest_launches<I>(records: impl IntoIterator<Item = CheckoutRecord<I>>) -> std::collections::BTreeMap<String, CheckoutRecord<I>> {
+    let number = |record: &CheckoutRecord<I>| record.name.rsplit_once('#').and_then(|(_, n)| n.parse::<u32>().ok()).unwrap_or(0);
+    let mut latest = std::collections::BTreeMap::<String, CheckoutRecord<I>>::new();
     for record in records {
         match latest.get(record.checkout_name()) {
             Some(held) if number(held) >= number(&record) => {}
@@ -94,6 +114,13 @@ pub fn latest_launches(records: impl IntoIterator<Item = CheckoutRecord>) -> std
 }
 
 impl CheckoutRecord {
+    /// Its home's inspection, if one has been written.
+    pub fn inspection(&self) -> Option<&Inspection> {
+        self.integration.as_ref().map(|integration| &integration.inspection)
+    }
+}
+
+impl<I> CheckoutRecord<I> {
     /// The branch it checks out, without `refs/heads/`.
     pub fn branch(&self) -> &str {
         let reference = match &self.spec {
@@ -102,11 +129,6 @@ impl CheckoutRecord {
             CheckoutSpec::Observed(spec) => spec.r#ref.as_str(),
         };
         reference.strip_prefix("refs/heads/").unwrap_or(reference)
-    }
-
-    /// Its home's inspection, if one has been written.
-    pub fn inspection(&self) -> Option<&Inspection> {
-        self.integration.as_ref().map(|integration| &integration.inspection)
     }
 
     /// The realised path: its reading's identity once ready.
@@ -283,6 +305,19 @@ pub enum CheckoutChange {
     Rescanned,
 }
 
+/// Which launches [`CheckoutRecords::launches`] reads.
+#[derive(Clone, Copy, Debug)]
+pub enum Launches<'a> {
+    /// `name` at `home` (this home when `None`): a launch, or a checkout's latest launch.
+    Named { name: &'a str, home: Option<&'a str> },
+    /// Every launch held for a holder, across homes.
+    Held(&'a CheckoutHolder),
+    /// Every launch at this home.
+    Here,
+    /// Every launch at every home this one follows.
+    Every,
+}
+
 /// The checkout port, served by the engine's [`crate::lifecycle_reads::LifecycleReads`]. Each
 /// read is keyed or indexed. [`CheckoutRecords::request`] and the integration writes are the only
 /// writes, and only for this home: the Checkout controller writes every lifecycle edge after them.
@@ -304,6 +339,10 @@ pub trait CheckoutRecords: Send + Sync {
     fn home(&self) -> &str;
     /// Every launch at every home this one follows, ended or not.
     fn every(&self) -> Result<Vec<CheckoutRecord>, String>;
+    /// The launches `which` selects, as [`CheckoutRecords::get`], [`CheckoutRecords::held`],
+    /// [`CheckoutRecords::here`] and [`CheckoutRecords::every`] read them, without reading their
+    /// integration.
+    fn launches(&self, which: Launches<'_>) -> Result<Vec<CheckoutLaunch>, String>;
     /// The launch that serves a request for checkout `name` with `spec`, held for `holder`, at
     /// this home: the latest launch of `name` when that has not ended, else its next launch,
     /// requested now. A live launch requested otherwise is refused: one name is one checkout.
