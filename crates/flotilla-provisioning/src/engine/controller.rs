@@ -277,8 +277,10 @@ fn act(state: &LifecycleState, judgement: &Judgement, found: &Found, trigger: Tr
                 Action::GiveUp { cause: last.clone(), retryable: last_failure.as_ref().is_some_and(|failure| failure.retryable) }
             }
             Judgement::InProgress if usable => Action::Realise,
+            // Holdings are read only for an event that would try again: their read judges the try.
             Judgement::Retrying { .. }
-                if usable && (matches!(trigger, Trigger::Dependency | Trigger::Retry | Trigger::Recheck) || usable_again) =>
+                if usable
+                    && (matches!(trigger, Trigger::Dependency | Trigger::Retry | Trigger::Recheck | Trigger::Held) || usable_again) =>
             {
                 Action::Realise
             }

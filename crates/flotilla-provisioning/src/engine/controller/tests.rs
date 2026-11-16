@@ -351,6 +351,26 @@ async fn a_retryable_failure_waits_for_an_input_to_change() {
     assert_eq!(world.actuator.script().realised.iter().filter(|key| *key == "a").count(), 2);
 }
 
+// A holding kind whose holdings could not be planned, a retryable failure, is tried again when
+// its input changes, though what it holds is realised already: the holdings read that the change
+// starts judges the try, as the change itself would. A vessel whose convoy had not yet arrived,
+// its environment ready, waited forever.
+#[tokio::test]
+async fn a_retryable_planning_failure_is_tried_again_at_an_input_change() {
+    let mut world = World::open();
+    world.actuator.script().holdings.insert("a".into(), 1);
+    world.actuator.script().unplannable.insert("a".into(), failure("convoy not found", true));
+    world.start();
+    world.request("a");
+    world.until("a failed once", |world| failures(&world.state("a")) == Some(1)).await;
+    world.record("hold-a-0");
+    world.record_step("hold-a-0", Step::Realised { identity: "hold-a-0".into() });
+    world.actuator.script().unplannable.clear();
+    world.record("input-a");
+    world.until("a realised", |world| world.state("a").realised()).await;
+    assert_eq!(world.actuator.script().realised, ["a"], "tried once, when everything it holds is realised");
+}
+
 // A failure that no change can fix gives up at once.
 #[tokio::test]
 async fn a_final_failure_gives_up_at_once() {
