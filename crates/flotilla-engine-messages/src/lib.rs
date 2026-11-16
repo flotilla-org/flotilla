@@ -399,6 +399,9 @@ pub struct MessagePrimitives {
     receipts: StoreLog,
     charter_pass: Arc<tokio::sync::Mutex<()>>,
     charter_admission: Arc<tokio::sync::Mutex<()>>,
+    /// Held while an intent with a subject is admitted: what it supersedes or is suppressed by
+    /// is decided against the inbox as no other such admission is changing it.
+    subject_admission: tokio::sync::Mutex<()>,
     bindings: Arc<dyn ports::RoleBindings>,
     conditions: Arc<dyn ports::ConditionReads>,
     /// The observers' freshness windows the conditions judge by, once installed.
@@ -477,6 +480,7 @@ impl MessagePrimitives {
             receipts,
             charter_pass: Arc::default(),
             charter_admission: Arc::default(),
+            subject_admission: tokio::sync::Mutex::new(()),
             bindings: Arc::new(ports::RoleRouting { keyed: Arc::clone(&keyed) }),
             conditions: Arc::new(ports::RecordConditions {
                 keyed: Arc::clone(&keyed),
@@ -1022,6 +1026,31 @@ impl MessagePrimitives {
             intent,
         )?;
         let roles = self.roles(namespace).await.map_err(ResourceError::invalid)?;
+        // A message about a subject revision replaces an undelivered one from the same sender to the
+        // same receiver about it, and is suppressed while a delivered one awaits its answer
+        // (ADR 0055); one that names what it supersedes supersedes only that.
+        let _subject_admission =
+            if intent.subject.is_some() && intent.supersedes.is_none() { Some(self.subject_admission.lock().await) } else { None };
+        let implied;
+        let intent = match self.same_subject_as(namespace, name, intent).await? {
+            None => intent,
+            Some(SameSubject::Undelivered(older)) => {
+                implied = OldSpec { supersedes: Some(older), ..intent.clone() };
+                &implied
+            }
+            Some(SameSubject::Answering { id, home, record }) => {
+                let mut object = match self.view_at(namespace, &roles, id.clone(), home.clone()).await {
+                    Ok(Some(view)) => view.object,
+                    Ok(None) => admitted_intent(namespace, &record, intent),
+                    Err(error) => {
+                        tracing::warn!(message = %record, %error, "suppressing message has no old-shaped view; answering with the intent");
+                        admitted_intent(namespace, &record, intent)
+                    }
+                };
+                object.metadata.annotations.insert(flotilla_store::replica::ORIGIN_ROOT_ANNOTATION.to_owned(), home);
+                return Ok((id, object));
+            }
+        };
         let mut records = OldStoreRecords::empty(namespace);
         let (sender, receiver) = self
             .spell(&mut records, |records| {
@@ -1696,11 +1725,36 @@ impl MessagePrimitives {
         Ok(Some(flotilla_messaging::AdmittedMessage { home, superseded_by }))
     }
 
-    /// The open message in the inbox `intent` is admitted to that `intent` supersedes and that
-    /// still awaits its answer, if one does: one from the sender `intent` converts to, about the
-    /// subject it converts to, delivered and expecting a reply or an outcome. Each open message
-    /// is compared as the engine holds it; only the intent is converted, as admission converts it.
+    /// What admitting `intent` as `name` meets about its subject: nothing for an intent that
+    /// names what it supersedes, has no subject, or is already admitted under `name`.
+    async fn same_subject_as(&self, namespace: &str, name: &str, intent: &OldSpec) -> Result<Option<SameSubject>, ResourceError> {
+        if intent.subject.is_none() || intent.supersedes.is_some() {
+            return Ok(None);
+        }
+        let inbox = self.inbox_for(namespace, &intent.receiver).await.map_err(ResourceError::invalid)?;
+        if self.locate_in(&inbox, name).map_err(ResourceError::other)?.is_some() {
+            return Ok(None);
+        }
+        self.same_subject(namespace, intent, true).await
+    }
+
+    /// The delivered message in the inbox `intent` is admitted to that suppresses `intent`, if one
+    /// does: one from the sender `intent` converts to, about the subject revision it converts to,
+    /// awaiting a reply or an outcome (ADR 0055). Admission suppresses `intent` by it too; a
+    /// producer that must act before admitting asks first. Its record name.
     pub async fn open_superseded(&self, namespace: &str, intent: &OldSpec) -> Result<Option<String>, ResourceError> {
+        Ok(match self.same_subject(namespace, intent, false).await? {
+            Some(SameSubject::Answering { record, .. }) => Some(record),
+            _ => None,
+        })
+    }
+
+    /// The open message in the inbox `intent` is admitted to from the sender it converts to about
+    /// the subject revision it converts to: delivered and awaiting a reply or an outcome, which
+    /// suppresses it, or, when `undelivered` is asked for, undelivered at this home, which
+    /// `intent` replaces. Each message is compared as the engine holds it; only the intent is
+    /// converted, as admission converts it.
+    async fn same_subject(&self, namespace: &str, intent: &OldSpec, undelivered: bool) -> Result<Option<SameSubject>, ResourceError> {
         let Some(subject) = &intent.subject else { return Ok(None) };
         let roles = self.roles(namespace).await.map_err(ResourceError::invalid)?;
         let converted = self
@@ -1716,16 +1770,33 @@ impl MessagePrimitives {
                 return Ok(None);
             }
         };
-        let open = self.open_in(&inbox).map_err(ResourceError::other)?;
-        Ok(open.into_iter().find_map(|(_, message)| {
+        let same = |message: &Resource<Message>| {
             let spec = message.spec();
             let about = spec.references.iter().rev().find(|reference| reference.subject);
-            let superseded = spec.sender == sender
-                && about.is_some_and(|about| about.address == subject.address && about.revision == subject.revision)
-                && matches!(message.state(), MessageState::Awaiting { .. })
-                && !matches!(spec.expectation, Expectation::Nothing);
-            superseded.then(|| record_name(message.name())).flatten()
-        }))
+            let same =
+                spec.sender == sender && about.is_some_and(|about| about.address == subject.address && about.revision == subject.revision);
+            same.then(|| record_name(message.name())).flatten()
+        };
+        // A suppressing message is delivered, so the undelivered are read only when asked for.
+        for (home, message) in self.in_inbox(&inbox, MessageLabel::Awaiting).map_err(ResourceError::other)? {
+            if matches!(message.spec().expectation, Expectation::Nothing) {
+                continue;
+            }
+            if let Some(record) = same(&message) {
+                return Ok(Some(SameSubject::Answering { id: message.name().to_owned(), home, record }));
+            }
+        }
+        if !undelivered {
+            return Ok(None);
+        }
+        for (home, message) in self.in_inbox(&inbox, MessageLabel::Pending).map_err(ResourceError::other)? {
+            if home == self.home {
+                if let Some(record) = same(&message) {
+                    return Ok(Some(SameSubject::Undelivered(record)));
+                }
+            }
+        }
+        Ok(None)
     }
 
     async fn view_in(
@@ -1974,6 +2045,14 @@ pub struct MessageRead {
 }
 
 /// An admitted intent in the old shape, waiting for its consumer.
+/// An open message about the subject revision an intent is about, from its sender to its receiver.
+enum SameSubject {
+    /// Undelivered at this home, by its old record name: the intent replaces it.
+    Undelivered(String),
+    /// Delivered and awaiting its answer: the intent is suppressed by it.
+    Answering { id: String, home: String, record: String },
+}
+
 fn admitted_intent(namespace: &str, name: &str, intent: &OldSpec) -> ResourceObject<OldMessage> {
     let now = chrono::Utc::now();
     ResourceObject {

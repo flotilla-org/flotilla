@@ -75,9 +75,9 @@ pub trait EngineMessages: Send + Sync {
         intent: &flotilla_resources::MessageSpec,
         record: &str,
     ) -> Result<Option<AdmittedMessage>, flotilla_resources::ResourceError>;
-    /// The open message in the inbox `intent` is admitted to that `intent` supersedes and that
-    /// still awaits its answer, if one does: one from the same sender about the same subject,
-    /// delivered and expecting a reply or an outcome. Its record name.
+    /// The delivered message in the inbox `intent` is admitted to that suppresses `intent`, if one
+    /// does: one from the same sender about the same subject revision, awaiting a reply or an
+    /// outcome (ADR 0055). Its record name.
     async fn open_superseded(
         &self,
         namespace: &str,

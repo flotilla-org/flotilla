@@ -52,8 +52,8 @@ impl CrewService {
         self.message_primitives()?.admitted(namespace, intent, name).await
     }
 
-    /// The open Message in the inbox `intent` is admitted to that `intent` supersedes and that
-    /// still awaits its answer, if one does: its name.
+    /// The delivered Message in the inbox `intent` is admitted to that suppresses `intent`, if
+    /// one does: its name.
     pub(crate) async fn open_superseded(&self, namespace: &str, intent: &MessageSpec) -> Result<Option<String>, ResourceError> {
         self.message_primitives()?.open_superseded(namespace, intent).await
     }

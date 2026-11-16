@@ -2868,7 +2868,7 @@ impl CrewService {
     }
 
     /// The turn's message and its receiver's session; the earlier admission instead when the same
-    /// intent was already sent or an open message supersedes it.
+    /// intent was already sent or an open message suppresses it.
     async fn prepare_crew_turn(&self, request: &CrewTurnIntent) -> Result<PreparedTurn, String> {
         use flotilla_resources::MessageSpec;
         let target = self
@@ -2929,8 +2929,8 @@ impl CrewService {
         Ok((holder, rung))
     }
 
-    /// The admission that already answers a turn: the same intent sent before, or an open
-    /// message that supersedes it.
+    /// The admission that already answers a turn: the same intent sent before, or a delivered
+    /// message about its subject that awaits its answer and so suppresses it (ADR 0055).
     async fn earlier_turn_admission(
         &self,
         request: &CrewTurnIntent,
@@ -2955,8 +2955,9 @@ impl CrewService {
         if intent.supersedes.is_some() {
             return Ok(None);
         }
-        let superseded = self.open_superseded(&request.namespace, intent).await.map_err(|error| error.to_string())?;
-        Ok(superseded.map(|existing| CrewTurnAdmission {
+        // Admission suppresses it too; found first, the turn activates no work for nothing.
+        let suppressing = self.open_superseded(&request.namespace, intent).await.map_err(|error| error.to_string())?;
+        Ok(suppressing.map(|existing| CrewTurnAdmission {
             new_turn: false,
             rung,
             message: ResourceRef::new("flotilla.work/v1", "Message", &request.namespace, &existing),
