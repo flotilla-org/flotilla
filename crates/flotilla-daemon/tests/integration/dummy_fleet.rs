@@ -13,7 +13,7 @@ use flotilla_dummy_fleet::{
 };
 use flotilla_protocol::{
     commands::{CommandValue, CrewSupervisionAction},
-    CommandAction,
+    CommandAction, ConvoyNaming,
 };
 use flotilla_resources::{
     Convoy, ConvoyPhase, ConvoyStatus, CrewWorkPhase, FleetDesignation, FleetDesignationSpec, Host, Resource, ResourceObject, StatusPatch,
@@ -62,17 +62,53 @@ async fn a_lone_coder_keeps_its_change_request_promise_and_lands() {
     let fleet = TestDaemon::builder().start().await;
     let (convoy, snapshot) = deliver(&fleet, CrewMix::Coder).await;
     assert_eq!((snapshot.crews_completed, snapshot.change_requests_opened, snapshot.crews_failed), (1, 1, 0));
-    let promises = promises(&fleet, &convoy.metadata.name, "implement", "coder").await;
+    let promises = promises(&fleet, &convoy.metadata.name, "coder", "coder").await;
     let status = convoy.status.expect("status");
     let promise = promises.iter().find(|p| p.kind == flotilla_resources::promises::PromiseKind::Pr).expect("pr promise");
     assert_eq!(promise.state, flotilla_resources::promises::PromiseState::Kept);
     assert_eq!(promise.id, "template/pr");
     assert_eq!(promise.source, flotilla_resources::promises::PromiseSource::Template);
-    let done = &status.crew_work["implement"]["coder"];
+    let done = &status.crew_work["coder"]["coder"];
     assert_eq!(done.completion_authority, flotilla_resources::WorkCompletionAuthority::Promises);
     // A seat whose promises are kept is Done, finished when they were kept.
     assert_eq!(done.phase, flotilla_resources::CrewWorkPhase::Done);
     assert!(done.finished_at.is_some());
+}
+
+// A convoy dispatched into the Fleet project has its project, so explain scores its dispatch, and
+// both it and one created on a bare repository record that their operator named them.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_named_convoy_records_its_naming_and_has_its_project() {
+    let fleet = TestDaemon::builder().start().await;
+    let dispatched = fleet.dispatch(CrewMix::Coder, DUMMY_FULFILMENT_KIND).await;
+    // `create --repo` does not allocate, so its template authors its vessel.
+    let mut authored = CrewMix::Coder.workflow(LONG_RUNNER_TURNS);
+    let crew = std::mem::take(&mut authored.roles);
+    authored.vessels = vec![flotilla_resources::VesselRequirement::builder().name("implement".into()).crew(crew).build()];
+    fleet.apply::<WorkflowTemplate>("authored-coder", authored).await;
+    let forge = catalog::forge(&catalog_forge_url(&fleet).await);
+    let created = fleet
+        .execute(CommandAction::ConvoyCreate {
+            name: "created-on-a-repository".into(),
+            workflow_ref: "authored-coder".into(),
+            inputs: Vec::new(),
+            repository_url: Some(catalog::repository_url(&forge)),
+            r#ref: Some("main".into()),
+            project_ref: None,
+            placement_policy: Some(DUMMY_FULFILMENT_KIND.into()),
+            adopted_checkout: None,
+        })
+        .await;
+    assert!(matches!(created, CommandValue::ConvoyCreated { .. }), "{created:?}");
+    let created = convoy_named(&fleet, "created-on-a-repository").await;
+    let explain = |name: &str| CommandAction::QueryExplainConvoy { namespace: Some(NAMESPACE.into()), name: name.into() };
+    let CommandValue::ConvoyExplanation(explained) = fleet.execute(explain(&dispatched)).await else { panic!("an explanation") };
+    assert_eq!(explained.naming, Some(ConvoyNaming::Explicit));
+    assert_eq!(explained.dispatch_score_error, None);
+    let found = fleet.get::<Convoy>(&dispatched).await.expect("the dispatched convoy");
+    assert_eq!(found.spec.project_ref.as_deref(), Some(catalog::FLEET_PROJECT));
+    let CommandValue::ConvoyExplanation(explained) = fleet.execute(explain(&created)).await else { panic!("an explanation") };
+    assert_eq!(explained.naming, Some(ConvoyNaming::Explicit));
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
@@ -81,7 +117,7 @@ async fn a_reviewed_coder_lands_after_its_reviewer_answers() {
     let (convoy, snapshot) = deliver(&fleet, CrewMix::CoderReviewer).await;
     assert_eq!(snapshot.crews_completed, 2, "{snapshot:?}");
     assert_eq!(snapshot.turns_received, 2, "the review request and its answer are delivered turns: {snapshot:?}");
-    let promises = promises(&fleet, &convoy.metadata.name, "implement", "coder").await;
+    let promises = promises(&fleet, &convoy.metadata.name, "coder", "coder").await;
     let status = convoy.status.unwrap();
     let pr = promises.iter().find(|p| p.kind == flotilla_resources::promises::PromiseKind::Pr).unwrap();
     assert_eq!(pr.id, "template/pr");
@@ -111,7 +147,7 @@ fn supervise(convoy: &str, operation: CrewSupervisionAction) -> CommandAction {
     CommandAction::CrewSupervise {
         namespace: Some(NAMESPACE.into()),
         convoy: convoy.into(),
-        vessel: "implement".into(),
+        vessel: "coder".into(),
         role: "coder".into(),
         operation,
         message: "Supervisor decision.".into(),
@@ -132,7 +168,7 @@ async fn a_failing_crew_proposes_failure_and_its_supervisor_fails_the_convoy() {
     fleet.wait("a supervisable stall", stalled(&name)).await;
     let failed = fleet.execute(supervise(&name, CrewSupervisionAction::Fail)).await;
     assert!(!matches!(failed, CommandValue::Error { .. }), "{failed:?}");
-    let crew_failed = |status: &ConvoyStatus| status.crew_work["implement"]["coder"].phase == CrewWorkPhase::Failed;
+    let crew_failed = |status: &ConvoyStatus| status.crew_work["coder"]["coder"].phase == CrewWorkPhase::Failed;
     fleet.wait("coder Failed", convoy(&name, crew_failed)).await;
     // A supervisor's failure decision ends the convoy, not just the crew.
     let ended = fleet.wait("Failed", in_phase(&name, ConvoyPhase::Failed)).await;
@@ -160,19 +196,16 @@ async fn a_stalled_crew_resumes_on_supervision_and_lands() {
 async fn a_finished_long_runner_handles_a_late_handoff_and_lands() {
     let fleet = TestDaemon::builder().start().await;
     // Isolate the legacy same-vessel hand-back path. Normal peer tasks retain
-    // their separate responsibilities on distinct vessels in the load catalog.
+    // their separate responsibilities on distinct vessels in the load catalog:
+    // with the aide's needs equal to the governor's, allocation puts both in the
+    // governor's vessel.
     let mut same_vessel = CrewMix::LongRunner.workflow(0);
-    let mut aide = same_vessel.vessels.pop().unwrap();
-    same_vessel.vessels[0].crew.append(&mut aide.crew);
-    for crew in &mut same_vessel.vessels[0].crew {
-        if let flotilla_resources::CrewSource::Agent { prompt: Some(prompt), .. } = &mut crew.source {
-            *prompt = prompt.replace("assist:aide", "aide").replace("govern:governor", "governor");
-        }
-    }
+    let needs = same_vessel.roles[0].needs.clone();
+    same_vessel.roles[1].needs = needs;
     fleet.apply::<WorkflowTemplate>(CrewMix::LongRunner.workflow_name(), same_vessel).await;
     let name = fleet.dispatch(CrewMix::LongRunner, DUMMY_FULFILMENT_KIND).await;
     let ready = |status: &ConvoyStatus| {
-        status.crew_work.get("govern").is_some_and(|crew| {
+        status.crew_work.get("governor").is_some_and(|crew| {
             crew.get("governor").is_some_and(|work| work.phase == CrewWorkPhase::Done)
                 && crew.get("aide").is_some_and(|work| work.phase == CrewWorkPhase::Pending)
         })
@@ -204,7 +237,7 @@ async fn a_finished_long_runner_handles_a_late_handoff_and_lands() {
     let landed = fleet.wait("Landed", in_phase(&name, ConvoyPhase::Landed)).await;
     assert_eq!(fleet.counts().turns_received, before.turns_received + 1, "the reopened governor receives the handoff turn");
     assert_eq!(
-        landed.status.expect("status").crew_work["govern"]["governor"].completion_authority,
+        landed.status.expect("status").crew_work["governor"]["governor"].completion_authority,
         flotilla_resources::WorkCompletionAuthority::Promises
     );
     assert_no_old_messages(&fleet).await;
@@ -429,23 +462,16 @@ fn skip_to_retry(clock: &SkippingClock, retry_at: Option<chrono::DateTime<chrono
 
 // A fixed admitted identity makes the dummy provider's seeded failure draw
 // reproducible while the runtime still bootstraps and reconciles the convoy.
-/// Requests a convoy of `workflow` with the role `role`, as `flotilla convoy create` does, and
-/// returns the record name admission gave it.
+/// Requests a convoy of `workflow` with the role `role` in the Fleet project, as `flotilla
+/// convoy create --project fleet` does, and returns the record name admission gave it.
 async fn create_through_admission(fleet: &TestDaemon, role: &str, workflow: &str) -> String {
-    let forge = catalog::forge(&catalog_forge_url(fleet).await);
-    let created = fleet
-        .execute(CommandAction::ConvoyCreate {
-            name: role.into(),
-            workflow_ref: workflow.into(),
-            inputs: Vec::new(),
-            repository_url: Some(catalog::repository_url(&forge)),
-            r#ref: Some("main".into()),
-            project_ref: None,
-            placement_policy: Some(DUMMY_FULFILMENT_KIND.into()),
-            adopted_checkout: None,
-        })
-        .await;
-    assert!(matches!(created, CommandValue::ConvoyCreated { .. }), "create {role}: {created:?}");
+    let created = fleet.execute(catalog::dispatch(role, workflow, DUMMY_FULFILMENT_KIND)).await;
+    assert!(matches!(created, CommandValue::ConvoyStarted { .. }), "create {role}: {created:?}");
+    convoy_named(fleet, role).await
+}
+
+/// The record name of the convoy whose role is `role`.
+async fn convoy_named(fleet: &TestDaemon, role: &str) -> String {
     fleet
         .list::<Convoy>()
         .await
@@ -500,14 +526,14 @@ async fn supervised_coder_scenario(action: CrewSupervisionAction) {
     let role = (0..128)
         .map(|n| format!("engine-supervised-{n}"))
         .find(|role| {
-            dummy_draw(0, domain, &format!("{role}/implement/coder")) < 0.5
-                && dummy_draw(0, domain, &format!("{role}/supervise/governor")) >= 0.5
+            dummy_draw(0, domain, &format!("{role}/coder/coder")) < 0.5
+                && dummy_draw(0, domain, &format!("{role}/governor/governor")) >= 0.5
         })
         .expect("seeded case");
     let fleet = TestDaemon::builder().agent(agent).start().await;
     let mut workflow = CrewMix::CoderSupervisor.workflow(LONG_RUNNER_TURNS);
     workflow.supervision =
-        Some(vec![SupervisionTarget::ConvoyCrew { vessel: "supervise".into(), role: "governor".into() }, SupervisionTarget::Operator]);
+        Some(vec![SupervisionTarget::ConvoyCrew { vessel: "governor".into(), role: "governor".into() }, SupervisionTarget::Operator]);
     fleet.apply::<WorkflowTemplate>("engine-supervised", workflow).await;
     let name = create_through_admission(&fleet, &role, "engine-supervised").await;
     let supervised = |status: &ConvoyStatus| status.stalled.as_ref().is_some_and(|stall| stall.supervisor.is_some());

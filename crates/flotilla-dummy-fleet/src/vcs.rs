@@ -296,8 +296,8 @@ mod ownership_tests {
         let convoy = format!("load-{number}");
         let other = format!("{convoy}-2");
         let fleet = DummyFleet::new(DummyFleetConfig::default());
-        fleet.checkouts.lock().insert((format!("env-{convoy}-implement"), "/own".into()), "main".into());
-        fleet.checkouts.lock().insert((format!("env-{other}-implement"), "/other".into()), "main".into());
+        fleet.checkouts.lock().insert((format!("env-{convoy}-coder"), "/own".into()), "main".into());
+        fleet.checkouts.lock().insert((format!("env-{other}-coder"), "/other".into()), "main".into());
         let remaining = fleet.remaining_for(&convoy);
         assert_eq!(remaining.len(), 1, "{remaining:?}");
         assert!(remaining[0].ends_with(":/own"));

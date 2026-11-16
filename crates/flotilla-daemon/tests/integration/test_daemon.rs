@@ -125,7 +125,7 @@ async fn the_aides_role_passes_to_its_relaunch(restart: bool) {
             daemon.counts().sessions_launched == 2 && daemon.counts().turns_received >= 2
         })
         .await;
-    let assist = |row: &Row| of_convoy(&convoy, "Realised")(row) && text(row, "holder").contains("-assist#");
+    let assist = |row: &Row| of_convoy(&convoy, "Realised")(row) && text(row, "holder").contains("-aide#");
     let ready = daemon.wait_row("the aide's Realised environment", "environment", "", assist).await;
     let name = text(&ready, "resource.name").to_owned();
     assert!(DummyVendor::vanish(daemon.vendor(), &name), "{ready:?}");
@@ -145,7 +145,7 @@ async fn the_aides_role_passes_to_its_relaunch(restart: bool) {
     let resume = CommandAction::CrewSupervise {
         namespace: Some(NAMESPACE.into()),
         convoy: convoy.clone(),
-        vessel: "govern".into(),
+        vessel: "governor".into(),
         role: "governor".into(),
         operation: CrewSupervisionAction::Resume,
         message: "The aide is back.".into(),

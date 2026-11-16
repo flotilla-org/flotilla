@@ -238,15 +238,16 @@ mod tests {
         use flotilla_daemon_api::daemon::DaemonHandle;
         use flotilla_dummy_fleet::catalog::{self, CrewMix, DUMMY_FULFILMENT_KIND};
         use flotilla_resources::{
-            FleetDesignation, FleetDesignationSpec, FulfilmentKind, Host, InputMeta, Project, ProjectSpec, Repository, WorkflowTemplate,
+            FleetDesignation, FleetDesignationSpec, FulfilmentKind, Host, InputMeta, Project, Repository, WorkflowTemplate,
             FLEET_DESIGNATION_NAME,
         };
         let backend = daemon.resource_backend();
         // The fleet is designated, as the dummy catalog designates it: a checkout's branch is
         // looked up through the fleet's forge observer role.
+        let repository = catalog::repository(&forge).unwrap();
         backend
             .definitions::<Project>("flotilla")
-            .create(&InputMeta::builder().name("fleet".into()).build(), &ProjectSpec::builder().display_name("Fleet".into()).build())
+            .create(&InputMeta::builder().name(catalog::FLEET_PROJECT.into()).build(), &catalog::fleet_project(&repository))
             .await
             .unwrap();
         backend
@@ -258,7 +259,6 @@ mod tests {
             .await
             .unwrap();
         let host = backend.clone().using::<Host>("flotilla").list().await.unwrap().items.remove(0);
-        let repository = catalog::repository(&forge).unwrap();
         let repositories = backend.clone().using::<Repository>("flotilla");
         repositories.create(&InputMeta::builder().name(repository.key().to_string()).build(), &repository).await.unwrap();
         backend
@@ -299,16 +299,7 @@ mod tests {
         daemon
             .execute(
                 flotilla_protocol::Command::builder()
-                    .action(flotilla_protocol::CommandAction::ConvoyCreate {
-                        name: "metrics-load".into(),
-                        workflow_ref: CrewMix::Coder.workflow_name().into(),
-                        inputs: vec![],
-                        repository_url: Some(catalog::repository_url(&forge)),
-                        r#ref: Some("main".into()),
-                        project_ref: None,
-                        placement_policy: Some(DUMMY_FULFILMENT_KIND.into()),
-                        adopted_checkout: None,
-                    })
+                    .action(catalog::dispatch("metrics-load", CrewMix::Coder.workflow_name(), DUMMY_FULFILMENT_KIND))
                     .build(),
             )
             .await

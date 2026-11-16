@@ -68,8 +68,7 @@ use flotilla_protocol::{
 };
 use flotilla_provider_runtime::{CommandRunner, HttpClient};
 use flotilla_resources::{
-    Clock, Convoy, FleetDesignation, FleetDesignationSpec, Forge, FulfilmentKind, Host, K8sResourceObject, Project, ProjectSpec,
-    Repository, RepositoryKey, Resource, ResourceObject, SystemClock, WorkflowTemplate, FLEET_DESIGNATION_NAME,
+    Clock, Convoy, FulfilmentKind, Host, K8sResourceObject, Repository, RepositoryKey, Resource, ResourceObject, SystemClock,
 };
 use flotilla_store::ResourceBackend;
 use flotilla_store_memory::InMemoryBackend;
@@ -349,24 +348,13 @@ impl TestDaemon {
         convoys.into_iter().find(|convoy| convoy.spec.role == role).unwrap_or_else(|| panic!("no convoy {role}")).metadata.name
     }
 
-    /// Request a convoy of `mix` onto the fulfilment kind `kind`, as `flotilla
-    /// convoy create` does, and return its role.
+    /// Request a convoy of `mix` onto the fulfilment kind `kind` in the Fleet
+    /// project, as `flotilla convoy ROLE create --project fleet` does, and
+    /// return its role.
     pub async fn request_convoy(&self, mix: CrewMix, kind: &str) -> String {
         let role = format!("{}-{}", mix.workflow_name(), self.dispatched.fetch_add(1, Ordering::Relaxed));
-        let forge = catalog::forge(&self.fleet.config().forge_service_url);
-        let created = self
-            .execute(CommandAction::ConvoyCreate {
-                name: role.clone(),
-                workflow_ref: mix.workflow_name().into(),
-                inputs: Vec::new(),
-                repository_url: Some(catalog::repository_url(&forge)),
-                r#ref: Some("main".into()),
-                project_ref: None,
-                placement_policy: Some(kind.into()),
-                adopted_checkout: None,
-            })
-            .await;
-        assert!(matches!(created, CommandValue::ConvoyCreated { .. }), "dispatch {role}: {created:?}");
+        let created = self.execute(catalog::dispatch(&role, mix.workflow_name(), kind)).await;
+        assert!(matches!(created, CommandValue::ConvoyStarted { .. }), "dispatch {role}: {created:?}");
         role
     }
 
@@ -676,28 +664,16 @@ impl TestDaemon {
     /// The dummy catalog, applied as an operator applies one: a Fleet project
     /// and its designation, the forge, repository, kinds and workflows.
     async fn seed(&self) {
-        // Fleet identity and charter Project are declared independently.
-        let fleet = ProjectSpec::builder()
-            .display_name("Fleet".to_string())
-            .default_workflow_ref(CrewMix::Coder.workflow_name().to_string())
-            .repositories(Vec::new())
-            .build();
-        self.apply::<Project>("fleet", fleet).await;
-        let designation = FleetDesignationSpec { fleet: Some("lab".into()), project: "fleet".into(), image_cache: None };
-        self.apply::<FleetDesignation>(FLEET_DESIGNATION_NAME, designation).await;
         let host = self.list::<Host>().await.into_iter().next().expect("local host").metadata.name;
-        let forge = catalog::forge(&self.fleet.config().forge_service_url);
-        self.apply::<Forge>(&forge.forge_id.clone(), forge.clone()).await;
-        // A dispatched repository is tracked first; admission reads its resolved default branch.
-        let repository = catalog::repository(&forge).expect("dummy repository");
-        let key = repository.key().to_string();
-        self.apply::<Repository>(&key, repository).await;
-        self.apply::<FulfilmentKind>(DUMMY_FULFILMENT_KIND, catalog::fulfilment_kind(&host)).await;
-        self.apply::<FulfilmentKind>(DUMMY_CLOUD_FULFILMENT_KIND, catalog::cloud_fulfilment_kind(&host)).await;
-        let turns = self.fleet.config().agent.long_runner_turns;
-        for mix in CrewMix::ALL {
-            self.apply::<WorkflowTemplate>(mix.workflow_name(), mix.workflow(turns)).await;
+        let config = self.fleet.config();
+        // The documents an operator applies to a real daemon (`dummy-fleet-catalog`).
+        let documents = catalog::documents(&config.forge_service_url, &host, config.agent.long_runner_turns).expect("dummy catalog");
+        for catalog::CatalogDocument { kind, name, document } in documents {
+            let applied = self.execute(CommandAction::ResourceApply { namespace: NAMESPACE.into(), document }).await;
+            assert!(matches!(applied, CommandValue::ResourceObject(_)), "apply {kind} {name}: {applied:?}");
         }
+        self.apply::<FulfilmentKind>(DUMMY_CLOUD_FULFILMENT_KIND, catalog::cloud_fulfilment_kind(&host)).await;
+        let key = catalog::repository(&catalog::forge(&config.forge_service_url)).expect("dummy repository").key().to_string();
         let resolved = |repository: &ResourceObject<Repository>| {
             repository.metadata.name == key && repository.status.as_ref().is_some_and(|status| status.default_branch.is_some())
         };

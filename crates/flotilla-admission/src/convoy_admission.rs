@@ -1570,7 +1570,8 @@ impl ConvoyAdmission {
                     vessel_placements: (!vessel_placements.is_empty()).then_some(&vessel_placements),
                     image_builds: &image_builds,
                     adopted_checkout: adopted_checkout.as_ref(),
-                    naming: None,
+                    // `convoy NAME create` always names its convoy.
+                    naming: Some(ConvoyNaming::Explicit),
                     ensure: None,
                     provenance: BTreeMap::new(),
                 },

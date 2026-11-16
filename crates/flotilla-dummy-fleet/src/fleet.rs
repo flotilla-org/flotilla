@@ -63,11 +63,9 @@ impl DummyFleet {
 
     fn build(config: DummyFleetConfig, http: Option<Arc<dyn HttpClient>>) -> Arc<Self> {
         let shared_forge = config.shared_forge.clone().zip(http).map(|(shared, http)| Arc::new(SharedForge::new(shared, http)));
-        let vessel_names = CrewMix::ALL
-            .into_iter()
-            .flat_map(|mix| mix.workflow(config.agent.long_runner_turns).vessels)
-            .map(|vessel| vessel.name)
-            .collect();
+        // Allocation names each vessel after a role it holds.
+        let vessel_names =
+            CrewMix::ALL.into_iter().flat_map(|mix| mix.workflow(config.agent.long_runner_turns).roles).map(|crew| crew.role).collect();
         Arc::new(Self {
             vessel_names,
             forge: DummyForge::new(&config),

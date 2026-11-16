@@ -466,6 +466,26 @@ fn crew_handoff_address_error(target: &str, vessel: &str) -> String {
     format!("no such crew target; handoff requires a different crew member (target `{target}`, vessel `{vessel}`)")
 }
 
+/// The vessel a handoff `target` names a role in. A bare role is the caller's own vessel's
+/// role when it has one, else the one vessel in the convoy that holds it: a crew names a peer
+/// by role, wherever allocation placed it. Any other target qualifies against the caller's vessel.
+fn role_vessel(convoy: &ResourceObject<ResourceConvoy>, own: &str, target: &str) -> Result<String, String> {
+    let vessels =
+        convoy.status.as_ref().and_then(|status| status.workflow_snapshot.as_ref()).map_or(&[][..], |snapshot| snapshot.vessels.as_slice());
+    let holding = vessels.iter().filter(|vessel| vessel.crew.iter().any(|crew| crew.role == target)).collect::<Vec<_>>();
+    if target.contains(['/', ':']) || holding.iter().any(|vessel| vessel.name == own) {
+        return Ok(own.to_owned());
+    }
+    match holding.as_slice() {
+        [vessel] => Ok(vessel.name.clone()),
+        [] => Ok(own.to_owned()),
+        several => Err(format!(
+            "crew target `{target}` is a role in more than one vessel ({}); name one as convoy/vessel/role",
+            several.iter().map(|vessel| vessel.name.as_str()).collect::<Vec<_>>().join(", ")
+        )),
+    }
+}
+
 impl CrewService {
     /// The session capability source the runtime installs after construction.
     pub fn capability_source(&self) -> &RwLock<Option<Arc<dyn flotilla_capability_contract::SessionCapabilitySource>>> {
@@ -1806,7 +1826,7 @@ impl CrewService {
             &flotilla_resources::MessageAddressContext {
                 project: project.into(),
                 convoy: context.convoy.clone(),
-                vessel: context.vessel.clone(),
+                vessel: role_vessel(&convoy, &context.vessel, target)?,
             },
         )
         .map_err(|error| error.to_string())?;

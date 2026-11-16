@@ -337,7 +337,8 @@ async fn message_names(daemon: &TestDaemon) -> std::collections::BTreeSet<String
 // moves records on between two reads, so the current state may already be past it.
 async fn delivered_convoy(daemon: &TestDaemon) {
     daemon.stage("admission");
-    daemon.request_convoy(CrewMix::CoderReviewer, DUMMY_FULFILMENT_KIND).await;
+    // A coder and its supervisor: their needs differ, so each has a vessel.
+    daemon.request_convoy(CrewMix::CoderSupervisor, DUMMY_FULFILMENT_KIND).await;
     // Admission: the convoy is Open, holding its crews' promises.
     let open = daemon.wait_reached("Open", "convoy", "Open", |_| true).await;
     // The engine convoy is a launch of the admitted convoy's name: the launch holds the vessels,
@@ -367,7 +368,7 @@ async fn delivered_convoy(daemon: &TestDaemon) {
     }
 
     // Crew turns and messages: each crew's session takes its turns, and the coder's
-    // review request and the reviewer's answer settle in their inboxes.
+    // review request and the supervisor's answer settle in their inboxes.
     daemon.stage("crew turns and messages");
     daemon.wait_row("a live agent session", "agent_session", "", |_| true).await;
     daemon

@@ -66,9 +66,8 @@ use flotilla_load_driver::{ConvoyObservation, ConvoyState, FleetTarget, HomeSamp
 use flotilla_observation::forge_observation::NO_READY_FORGE_OBSERVER;
 use flotilla_protocol::{commands::CommandValue, CommandAction, HostName};
 use flotilla_resources::{
-    Checkout, Convoy, ConvoyPhase, FleetDesignation, FleetDesignationSpec, Forge, Host, InputMeta, Message, Project, ProjectSpec,
-    ReadWatchEvent, Repository, ResourceProvenance, TerminalSession, Vessel, WatchEvent, WatchStart, WorkflowTemplate,
-    FLEET_DESIGNATION_NAME,
+    Checkout, Convoy, ConvoyPhase, Host, Message, ReadWatchEvent, Repository, ResourceProvenance, TerminalSession, Vessel, WatchEvent,
+    WatchStart,
 };
 use flotilla_schema::{Cause, CodeEnum, KindCode, KindSpec};
 use flotilla_schema_sqlite::stream::{Frame, Service};
@@ -217,65 +216,28 @@ async fn start_home(root: &std::path::Path, index: usize, dummy_fleet: &str, opt
     let options = RuntimeOptions { namespace: NAMESPACE.into(), ..options };
     let runtime = DaemonRuntime::start_with_options(Arc::clone(&daemon), config, None, options).await.expect("runtime");
     let backend = daemon.resource_backend();
-    seed(&backend, fleet.config()).await;
+    let port = DaemonCommandPort::new(&(Arc::clone(&daemon) as Arc<dyn DaemonHandle>));
+    seed(&backend, &port, fleet.config()).await;
     let view = Arc::new(HomeView::default());
     watch_convoys(&backend, Arc::clone(&view), admissions).await;
     watch_messages(&backend, Arc::clone(&view)).await;
     let primitives = daemon.message_primitives().expect("the Message path is composed");
     watch_engine_messages(Arc::clone(primitives.service()), Arc::clone(&view));
-    let port = DaemonCommandPort::new(&(Arc::clone(&daemon) as Arc<dyn DaemonHandle>));
     Home { daemon, fleet, runtime, store, database, port, replication: Arc::default(), view }
 }
 
-async fn seed(backend: &ResourceBackend, config: &flotilla_config::dummy_fleet::DummyFleetConfig) {
-    // The engine path resolves fleet roles from the replicated fleet identity.
-    backend
-        .clone()
-        .using::<Project>(NAMESPACE)
-        .create(
-            &InputMeta::builder().name("fleet".to_string()).build(),
-            &ProjectSpec::builder()
-                .display_name("Fleet".to_string())
-                .default_workflow_ref(CrewMix::Coder.workflow_name().to_string())
-                .repositories(Vec::new())
-                .build(),
-        )
-        .await
-        .expect("fleet project");
-    backend
-        .clone()
-        .definitions::<FleetDesignation>(NAMESPACE)
-        .create(
-            &InputMeta::builder().name(FLEET_DESIGNATION_NAME.to_string()).build(),
-            &FleetDesignationSpec { fleet: Some("lab".into()), project: "fleet".into(), image_cache: None },
-        )
-        .await
-        .expect("fleet designation");
+/// Apply the dummy catalog as an operator applies it to a real daemon: the
+/// documents `dummy-fleet-catalog` writes, through the resource-apply command.
+async fn seed(backend: &ResourceBackend, port: &DaemonCommandPort, config: &flotilla_config::dummy_fleet::DummyFleetConfig) {
     let host = backend.clone().using::<Host>(NAMESPACE).list().await.expect("hosts").items.into_iter().next().expect("local host");
-    let forge = catalog::forge(&config.forge_service_url);
-    backend
-        .clone()
-        .using::<Forge>(NAMESPACE)
-        .create(&InputMeta::builder().name(forge.forge_id.clone()).build(), &forge)
-        .await
-        .expect("dummy forge");
-    let repository = catalog::repository(&forge).expect("dummy repository");
-    let repositories = backend.clone().using::<Repository>(NAMESPACE);
-    repositories.create(&InputMeta::builder().name(repository.key().to_string()).build(), &repository).await.expect("repository");
-    backend
-        .clone()
-        .using::<flotilla_resources::FulfilmentKind>(NAMESPACE)
-        .create(&InputMeta::builder().name(DUMMY_FULFILMENT_KIND.to_string()).build(), &catalog::fulfilment_kind(&host.metadata.name))
-        .await
-        .expect("dummy fulfilment kind");
-    for mix in CrewMix::ALL {
-        backend
-            .clone()
-            .using::<WorkflowTemplate>(NAMESPACE)
-            .create(&InputMeta::builder().name(mix.workflow_name().to_string()).build(), &mix.workflow(config.agent.long_runner_turns))
-            .await
-            .expect("dummy workflow");
+    let documents =
+        catalog::documents(&config.forge_service_url, &host.metadata.name, config.agent.long_runner_turns).expect("dummy catalog");
+    for catalog::CatalogDocument { kind, name, document } in documents {
+        let applied = port.execute(CommandAction::ResourceApply { namespace: NAMESPACE.into(), document }).await;
+        assert!(matches!(applied, Ok(CommandValue::ResourceObject(_))), "apply {kind} {name}: {applied:?}");
     }
+    let repository = catalog::repository(&catalog::forge(&config.forge_service_url)).expect("dummy repository");
+    let repositories = backend.clone().using::<Repository>(NAMESPACE);
     tokio::time::timeout(Duration::from_secs(60), async {
         while repositories.get(&repository.key().to_string()).await.ok().and_then(|repository| repository.status?.default_branch).is_none()
         {
@@ -577,20 +539,8 @@ impl FleetTarget for InProcessFleet {
         }
         let _call = self.calls.begin(format!("dispatch {name}"));
         let home = &self.homes[home];
-        let forge = catalog::forge(&catalog_forge_url());
-        let action = CommandAction::ConvoyCreate {
-            name: name.into(),
-            workflow_ref: mix.workflow_name().into(),
-            inputs: Vec::new(),
-            repository_url: Some(catalog::repository_url(&forge)),
-            // Each convoy's worktree on the host reserves its own branch.
-            r#ref: Some(format!("dummy/{name}")),
-            project_ref: None,
-            placement_policy: Some(DUMMY_FULFILMENT_KIND.into()),
-            adopted_checkout: None,
-        };
-        match home.port.execute(action).await? {
-            CommandValue::ConvoyCreated { .. } => Ok(()),
+        match home.port.execute(catalog::dispatch(name, mix.workflow_name(), DUMMY_FULFILMENT_KIND)).await? {
+            CommandValue::ConvoyStarted { .. } => Ok(()),
             CommandValue::Error { message } => Err(message),
             other => Err(format!("unexpected admission result {other:?}")),
         }

@@ -9,6 +9,12 @@ version = "0.1.0"
 edition = "2021"
 license.workspace = true
 
+# Writes the catalog as documents for `flotilla resource apply --file`
+# (scripts/rehearsal/dummy-fleet-seed.sh).
+[[bin]]
+name = "dummy-fleet-catalog"
+path = "src/bin/dummy-fleet-catalog.rs"
+
 [dependencies]
 flotilla-agent = { path = "../flotilla-agent" }
 flotilla-change-request = { path = "../flotilla-change-request" }
