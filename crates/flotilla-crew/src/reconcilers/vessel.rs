@@ -309,7 +309,7 @@ impl VesselPlanning {
                     return Err(ResourceError::not_found(name));
                 };
                 let source = federated.get(name).await?;
-                if is_prepared_snapshot(name, &source.object.metadata.labels, PLACEMENT_SNAPSHOT_KIND) {
+                if is_prepared_snapshot(&source.object.metadata.labels, PLACEMENT_SNAPSHOT_KIND) {
                     Ok(source.object)
                 } else {
                     Err(ResourceError::not_found(name))

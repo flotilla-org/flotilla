@@ -18,6 +18,13 @@ fn prepared_meta(name: &str, kind: &str) -> InputMeta {
     InputMeta::builder().name(name.to_string()).labels(BTreeMap::from([(PREPARED_SNAPSHOT_LABEL.to_string(), kind.to_string())])).build()
 }
 
+/// A placement snapshot as admission writes it: labelled with its convoy.
+fn placement_meta(name: &str, convoy: &str) -> InputMeta {
+    let mut meta = prepared_meta(name, PLACEMENT_SNAPSHOT_KIND);
+    meta.labels.insert(CONVOY_LABEL.to_string(), convoy.to_string());
+    meta
+}
+
 async fn create_convoy(
     backend: &ResourceBackend,
     name: &str,
@@ -55,7 +62,7 @@ async fn shared_snapshots_are_collected_only_after_the_last_convoy_releases_them
     backend
         .clone()
         .using::<FulfilmentKind>("flotilla")
-        .create(&prepared_meta(placement_name, PLACEMENT_SNAPSHOT_KIND), &placement())
+        .create(&placement_meta(placement_name, "second"), &placement())
         .await
         .expect("create prepared placement");
     create_convoy(&backend, "first", workflow_name, placement_name).await.expect("create first convoy");
@@ -88,7 +95,7 @@ async fn replicated_convoy_keeps_an_authored_snapshot_alive() {
         .expect("author workflow snapshot");
     author
         .using::<FulfilmentKind>("flotilla")
-        .create(&prepared_meta(placement_name, PLACEMENT_SNAPSHOT_KIND), &placement())
+        .create(&placement_meta(placement_name, "remote-convoy"), &placement())
         .await
         .expect("author placement snapshot");
     create_convoy(&remote, "remote-convoy", workflow_name, placement_name).await.expect("remote convoy");
@@ -120,7 +127,7 @@ async fn replicated_convoy_keeps_an_authored_snapshot_alive() {
 async fn a_placement_snapshot_written_before_its_convoy_is_released_only_by_that_convoy() {
     let backend = ResourceBackend::new(InMemoryBackend::default());
     let workflow_name = "workflow-snapshot-012345abcdef";
-    let shared_placement = "placement-snapshot-012345abcdef";
+    let ending_placement = "placement-snapshot-012345abcdef";
     let admitting_placement = "placement-snapshot-fedcba543210";
     backend
         .clone()
@@ -131,13 +138,16 @@ async fn a_placement_snapshot_written_before_its_convoy_is_released_only_by_that
     backend
         .clone()
         .using::<FulfilmentKind>("flotilla")
-        .create(&prepared_meta(shared_placement, PLACEMENT_SNAPSHOT_KIND), &placement())
+        .create(&placement_meta(ending_placement, "ending"), &placement())
         .await
         .expect("create ending convoy's placement");
-    let mut owned = prepared_meta(admitting_placement, PLACEMENT_SNAPSHOT_KIND);
-    owned.labels.insert(CONVOY_LABEL.to_string(), "admitting".to_string());
-    backend.clone().using::<FulfilmentKind>("flotilla").create(&owned, &placement()).await.expect("create admitting convoy's placement");
-    create_convoy(&backend, "ending", workflow_name, shared_placement).await.expect("create ending convoy");
+    backend
+        .clone()
+        .using::<FulfilmentKind>("flotilla")
+        .create(&placement_meta(admitting_placement, "admitting"), &placement())
+        .await
+        .expect("create admitting convoy's placement");
+    create_convoy(&backend, "ending", workflow_name, ending_placement).await.expect("create ending convoy");
 
     let collector = PreparedSnapshotGarbageCollector::new(backend.clone(), "flotilla");
     assert_eq!(collector.collect(Some("ending")).await.expect("ending convoy's teardown").placements_deleted, 1);
@@ -146,30 +156,4 @@ async fn a_placement_snapshot_written_before_its_convoy_is_released_only_by_that
 
     assert_eq!(collector.collect(Some("admitting")).await.expect("admitting convoy's release").placements_deleted, 1);
     assert!(matches!(backend.using::<FulfilmentKind>("flotilla").get(admitting_placement).await, Err(ResourceError::NotFound { .. })));
-}
-
-#[tokio::test]
-async fn sweep_removes_unreferenced_legacy_snapshots() {
-    let backend = ResourceBackend::new(InMemoryBackend::default());
-    let legacy_workflow = "old-convoy-remote-workflow-012345abcdef";
-    let legacy_placement = "old-convoy-remote-placement-fedcba543210";
-    backend
-        .clone()
-        .using::<WorkflowTemplate>("flotilla")
-        .create(
-            &InputMeta::builder().name(legacy_workflow.to_string()).build(),
-            &WorkflowTemplateSpec::builder().vessels(Vec::new()).build(),
-        )
-        .await
-        .expect("create legacy workflow");
-    backend
-        .clone()
-        .using::<FulfilmentKind>("flotilla")
-        .create(&InputMeta::builder().name(legacy_placement.to_string()).build(), &placement())
-        .await
-        .expect("create legacy placement");
-
-    let result = PreparedSnapshotGarbageCollector::new(backend, "flotilla").collect(None).await.expect("sweep legacy snapshots");
-    assert_eq!(result.workflows_deleted, 1);
-    assert_eq!(result.placements_deleted, 1);
 }

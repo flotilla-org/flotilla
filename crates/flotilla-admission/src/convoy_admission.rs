@@ -2594,7 +2594,7 @@ impl AdmissionReadContext<'_> {
                 .items,
         )
         .into_iter()
-        .filter(|kind| !is_prepared_snapshot(&kind.metadata.name, &kind.metadata.labels, PLACEMENT_SNAPSHOT_KIND))
+        .filter(|kind| !is_prepared_snapshot(&kind.metadata.labels, PLACEMENT_SNAPSHOT_KIND))
         .collect::<Vec<_>>();
         if purpose == PlacementPurpose::Routing {
             if let Some(pin) = pin {
@@ -5335,9 +5335,7 @@ mod tests {
             .realisation(FulfilmentRealisation::HostDirect)
             .build();
         let labelled = BTreeMap::from([(flotilla_resources::PREPARED_SNAPSHOT_LABEL.to_string(), "placement".to_string())]);
-        for (name, labels) in [("frozen-by-label", labelled), ("placement-snapshot-0123456789ab", BTreeMap::new())] {
-            kinds.create(&InputMeta::builder().name(name.into()).labels(labels).build(), &minimal).await.unwrap();
-        }
+        kinds.create(&InputMeta::builder().name("frozen-by-label".into()).labels(labelled).build(), &minimal).await.unwrap();
         let workflow = WorkflowTemplateSpec::builder()
             .vessels(vec![VesselRequirement::builder()
                 .name("work".into())
@@ -5354,14 +5352,9 @@ mod tests {
             .chain(placement.viable_not_selected.iter().map(|viable| viable.kind.as_str()))
             .chain(placement.allocation.iter().flat_map(|allocation| allocation.candidates.iter().map(|candidate| candidate.kind.as_str())))
             .collect::<Vec<_>>();
-        assert!(
-            !considered.iter().any(|kind| ["frozen-by-label", "placement-snapshot-0123456789ab"].contains(kind)),
-            "snapshots must not be considered: {considered:?}"
-        );
-        for pin in ["frozen-by-label", "placement-snapshot-0123456789ab"] {
-            let error = fixture.owner.resolve_created_convoy_placement("flotilla", None, &[], &workflow, Some(pin)).await.err();
-            assert_eq!(error, Some(format!("fulfilment kind `{pin}` does not exist")));
-        }
+        assert!(!considered.contains(&"frozen-by-label"), "snapshots must not be considered: {considered:?}");
+        let error = fixture.owner.resolve_created_convoy_placement("flotilla", None, &[], &workflow, Some("frozen-by-label")).await.err();
+        assert_eq!(error, Some("fulfilment kind `frozen-by-label` does not exist".to_owned()));
     }
 
     // A host whose Docker provider is not ready names why in the refusal of its Docker kinds.

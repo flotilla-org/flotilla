@@ -6,6 +6,7 @@
 //! | FulfilmentKind | the kind, written as its stamps' writer: admission's snapshot, seeding, or the definition's origin |
 //! | PlacementPolicy with a kind of its name at its home | dropped: the kind is the daemon's migration of it |
 //! | PlacementPolicy without one | the kind its topology describes; its settings are the code constants |
+//! | A placement snapshot no convoy label owns | labelled with the one live convoy referencing it; dropped when none does; refused when several do |
 //! | Deleted | dropped |
 //! | One name in several namespaces at one home | refused: the engine has no namespaces |
 
@@ -18,7 +19,7 @@ use flotilla_engine_store::ImportTarget;
 use flotilla_environment::environment::ENVIRONMENT_PROVIDER_INSTANCE_LABEL;
 use flotilla_resources::{
     definition_provenance::SEEDING_MANAGER, definitions::DefinitionOrigin, is_prepared_snapshot, FulfilmentGrant, FulfilmentKind,
-    FulfilmentKindSpec, FulfilmentRealisation, ResourceObject, MANAGED_BY_LABEL, PLACEMENT_SNAPSHOT_KIND, PREPARED_SNAPSHOT_LABEL,
+    FulfilmentKindSpec, FulfilmentRealisation, ResourceObject, CONVOY_LABEL, MANAGED_BY_LABEL, PLACEMENT_SNAPSHOT_KIND,
 };
 use flotilla_schema::{CreatedAt, Kind, Timestamp};
 
@@ -43,6 +44,8 @@ pub struct PlacementCopy<O> {
 pub struct PlacementCopies {
     pub kinds: Vec<PlacementCopy<ResourceObject<FulfilmentKind>>>,
     pub policies: Vec<PlacementCopy<RetiredPolicy>>,
+    /// The live convoys, by old name, that reference each placement snapshot, by home and name.
+    pub live_references: BTreeMap<(String, String), BTreeSet<String>>,
 }
 
 /// A kind to write at its home, with the stamps its change is made from.
@@ -81,24 +84,48 @@ fn host_ref(spec: &PolicySpec) -> &str {
     }
 }
 
-/// What a copy's stamps say wrote it, as the engine's kinds read it back, with a snapshot named
-/// only by its name stamped as one.
+/// A copy's labels as written, and the writer they read back as.
+type Stamps = (BTreeMap<String, String>, &'static str);
+
+/// What a copy's stamps say wrote it, as the engine's kinds read it back; `None` for a snapshot
+/// with no convoy to release it.
+///
+/// A snapshot is released with the convoy its label names. One written before admission labelled
+/// it takes the one live convoy that references it (`live`), and is dropped when none does.
 fn stamped(
-    name: &str,
     labels: &BTreeMap<String, String>,
     annotations: &BTreeMap<String, String>,
-) -> Result<(BTreeMap<String, String>, &'static str), String> {
+    live: Option<&BTreeSet<String>>,
+) -> Result<Option<Stamps>, String> {
     let mut labels = labels.clone();
-    if is_prepared_snapshot(name, &labels, PLACEMENT_SNAPSHOT_KIND) {
-        labels.insert(PREPARED_SNAPSHOT_LABEL.to_owned(), PLACEMENT_SNAPSHOT_KIND.to_owned());
-        return Ok((labels, label(&DefinitionOrigin::Snapshot)));
+    if is_prepared_snapshot(&labels, PLACEMENT_SNAPSHOT_KIND) {
+        if !labels.contains_key(CONVOY_LABEL) {
+            let live: Vec<_> = live.into_iter().flatten().collect();
+            match live.as_slice() {
+                [] => return Ok(None),
+                [convoy] => {
+                    labels.insert(CONVOY_LABEL.to_owned(), (*convoy).clone());
+                }
+                several => {
+                    let names: Vec<&str> = several.iter().map(|convoy| convoy.as_str()).collect();
+                    return Err(format!(
+                        "a snapshot no convoy owns is shared by live convoys `{}`, and only one can release it",
+                        names.join("`, `")
+                    ));
+                }
+            }
+        }
+        return Ok(Some((labels, label(&DefinitionOrigin::Snapshot))));
     }
     if labels.get(MANAGED_BY_LABEL).is_some_and(|manager| manager == SEEDING_MANAGER) {
-        return Ok((labels, "seeding"));
+        return Ok(Some((labels, "seeding")));
     }
     let writer = label(&flotilla_resources::definitions::origin(&labels, annotations)?);
-    Ok((labels, writer))
+    Ok(Some((labels, writer)))
 }
+
+/// What the report counts a snapshot no convoy can release under.
+const UNOWNED: &str = "a snapshot no live convoy references";
 
 struct KindEntry {
     namespaces: BTreeSet<String>,
@@ -147,7 +174,16 @@ fn import_placement_at(copies: &PlacementCopies, imports: &dyn Fn(&str) -> bool,
         if let Some(instance) = metadata.labels.get(ENVIRONMENT_PROVIDER_INSTANCE_LABEL) {
             unpinned.push((KINDS, metadata.name.clone(), copy.home.clone(), instance.clone()));
         }
-        let record = stamped(&metadata.name, &metadata.labels, &metadata.annotations).and_then(|(labels, writer)| {
+        let live = copies.live_references.get(&(copy.home.clone(), metadata.name.clone()));
+        let stamps = match stamped(&metadata.labels, &metadata.annotations, live) {
+            Ok(None) => {
+                report.drop_rows(KINDS, UNOWNED, 1);
+                continue;
+            }
+            Ok(Some(stamps)) => Ok(stamps),
+            Err(reason) => Err(reason),
+        };
+        let record = stamps.and_then(|(labels, writer)| {
             Ok(Placed {
                 name: metadata.name.clone(),
                 home: copy.home.clone(),
@@ -188,8 +224,9 @@ fn import_placement_at(copies: &PlacementCopies, imports: &dyn Fn(&str) -> bool,
         if spec.docker_per_vessel.as_ref().is_some_and(|docker| !docker.agent_adapters.is_empty()) {
             *report.dropped.entry((POLICIES, "agent adapters, an image fact the host probes")).or_default() += 1;
         }
-        let snapshot = is_prepared_snapshot(name, &metadata.labels, PLACEMENT_SNAPSHOT_KIND);
-        let stamps = stamped(name, &metadata.labels, &metadata.annotations).and_then(|stamps| {
+        let snapshot = is_prepared_snapshot(&metadata.labels, PLACEMENT_SNAPSHOT_KIND);
+        let live = copies.live_references.get(&(copy.home.clone(), name.clone()));
+        let stamps = stamped(&metadata.labels, &metadata.annotations, live).and_then(|stamps| {
             if snapshot {
                 Ok(stamps)
             } else {
@@ -197,7 +234,11 @@ fn import_placement_at(copies: &PlacementCopies, imports: &dyn Fn(&str) -> bool,
             }
         });
         let (labels, writer) = match stamps {
-            Ok(stamps) => stamps,
+            Ok(Some(stamps)) => stamps,
+            Ok(None) => {
+                report.drop_rows(POLICIES, UNOWNED, 1);
+                continue;
+            }
             Err(reason) => {
                 report.refused.push(refuse(reason));
                 continue;

@@ -2,6 +2,8 @@
 //! Artifact, AccessDelivery, FulfilmentKind (with each PlacementPolicy as a kind of its name) and the
 //! account kinds.
 
+use std::collections::{BTreeMap, BTreeSet};
+
 use flotilla_engine_store::Import;
 use flotilla_provisioning::engine::{
     access_delivery_import::{import_access_deliveries, AccessDeliveryCopy},
@@ -13,7 +15,10 @@ use flotilla_provisioning::engine::{
     placement_import::{retired::RetiredPolicy, write_placement, PlacementCopies, PlacementCopy},
     repository_import::{import_repositories, RepositoryCopy},
 };
-use flotilla_resources::{AccessDelivery, AccountBinding, AccountProvision, Artifact, FulfilmentKind, Host, ManifestRoot, Repository};
+use flotilla_resources::{
+    AccessDelivery, AccountBinding, AccountProvision, Artifact, Convoy, FulfilmentKind, Host, ManifestRoot, Repository, VesselPlacementPin,
+    PLACEMENT_SNAPSHOT_ANNOTATION, VESSEL_PLACEMENTS_ANNOTATION,
+};
 
 use super::{Carried, Source};
 
@@ -69,7 +74,36 @@ pub(super) fn placement(source: &Source, target: &mut Import, _: &mut Carried, r
         .into_iter()
         .map(|(namespace, object, home)| PlacementCopy { namespace, object, home })
         .collect();
-    write_placement(&PlacementCopies { kinds, policies }, target, report);
+    let live_references = live_placement_references(source);
+    write_placement(&PlacementCopies { kinds, policies, live_references }, target, report);
+}
+
+/// The placement snapshots each live convoy references, by home and snapshot: a live convoy is
+/// one the convoy import carries, bootstrapped and not ended.
+fn live_placement_references(source: &Source) -> BTreeMap<(String, String), BTreeSet<String>> {
+    let mut references = BTreeMap::<(String, String), BTreeSet<String>>::new();
+    for convoy in source.context::<Convoy>("convoys", None) {
+        let live = convoy.object.status.as_ref().is_some_and(|status| status.workflow_snapshot.is_some() && !status.phase.is_terminal());
+        if !live {
+            continue;
+        }
+        let object = &convoy.object;
+        let annotations = &object.metadata.annotations;
+        let pins = annotations
+            .get(VESSEL_PLACEMENTS_ANNOTATION)
+            .and_then(|pins| serde_json::from_str::<BTreeMap<String, VesselPlacementPin>>(pins).ok())
+            .unwrap_or_default();
+        let named = annotations
+            .get(PLACEMENT_SNAPSHOT_ANNOTATION)
+            .cloned()
+            .into_iter()
+            .chain(object.spec.placement_policy.clone())
+            .chain(pins.into_values().map(|pin| pin.kind_ref));
+        for snapshot in named {
+            references.entry((convoy.home.clone(), snapshot)).or_default().insert(object.metadata.name.clone());
+        }
+    }
+    references
 }
 
 /// Every namespace's at once: the engine has no namespaces.

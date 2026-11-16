@@ -1,4 +1,7 @@
-use std::sync::Arc;
+use std::{
+    collections::{BTreeMap, BTreeSet},
+    sync::Arc,
+};
 
 use chrono::Utc;
 use flotilla_engine_store::Import;
@@ -87,6 +90,16 @@ fn migrated_kind() -> Value {
         "grants": ["platform:linux", "network:scoped", "toolchain:rust"], "realisation": "docker_per_vessel"})
 }
 
+/// The live convoys referencing each snapshot, by home and name.
+fn live(references: &[(&str, &str, &[&str])]) -> BTreeMap<(String, String), BTreeSet<String>> {
+    references
+        .iter()
+        .map(|(home, snapshot, convoys)| {
+            (((*home).to_owned(), (*snapshot).to_owned()), convoys.iter().map(|convoy| (*convoy).to_owned()).collect())
+        })
+        .collect()
+}
+
 fn host_direct_kind() -> Value {
     json!({"host_ref": KIWI, "pool": "local", "grants": ["platform:macos", "account:host", "network:host", "display:gui-session"],
         "realisation": "host_direct"})
@@ -121,6 +134,7 @@ fn policies_become_kinds_and_their_settings_are_constants() {
                 spec
             }),
         ],
+        live_references: live(&[("kiwi", "placement-snapshot-0123456789ab", &["convoy-0002"])]),
     };
     let mut report = ImportReport::default();
     let imported = import_placement(&copies, &mut report);
@@ -143,6 +157,7 @@ fn policies_become_kinds_and_their_settings_are_constants() {
     assert_eq!(placed("placement-snapshot-ba9876543210").writer, "snapshot");
     let snapshot = placed("placement-snapshot-0123456789ab");
     assert_eq!(snapshot.writer, "snapshot");
+    assert_eq!(snapshot.labels.get(CONVOY_LABEL).map(String::as_str), Some("convoy-0002"), "its one live convoy releases it");
     assert_eq!(
         snapshot.record.realisation,
         KindRealisation::DockerBuilt { identity: "sha256:abc".into(), image_build_ref: "image-abc-amd64".into() }
@@ -196,6 +211,7 @@ fn what_the_move_cannot_carry_is_refused() {
             policy("adapters", "udder", &[], &[], adapters),
             deleted,
         ],
+        ..Default::default()
     };
     let report = rehearse_placement(&copies);
     let mut imported = ImportReport::default();
@@ -246,6 +262,10 @@ fn host_direct_snapshots_frozen_away_from_their_host_import() {
     let copies = PlacementCopies {
         kinds: vec![kind("host-direct-kiwi", "kiwi", &[], &[], host_direct_kind())],
         policies: vec![snapshot("placement-snapshot-005c09b60ee0", KIWI), snapshot("placement-snapshot-0123456789ab", "unknown-host")],
+        live_references: live(&[
+            ("udder", "placement-snapshot-005c09b60ee0", &["convoy-0001"]),
+            ("udder", "placement-snapshot-0123456789ab", &["convoy-0002"]),
+        ]),
     };
     let report = rehearse_placement(&copies);
     assert!(report.refused.is_empty(), "{:?}", report.refused);
@@ -259,6 +279,39 @@ fn host_direct_snapshots_frozen_away_from_their_host_import() {
     assert!(platforms("placement-snapshot-0123456789ab").is_empty());
 }
 
+// A placement snapshot is released with the convoy its label names. One stored before admission
+// labelled snapshots takes the one live convoy referencing it; with none it is dropped, as no
+// convoy would release it, and one several live convoys share is refused.
+#[test]
+fn a_snapshot_no_convoy_owns_takes_its_one_live_convoy() {
+    let unowned = &[(PREPARED_SNAPSHOT_LABEL, "placement")];
+    let copies = PlacementCopies {
+        kinds: vec![
+            kind("placement-snapshot-000000000001", "kiwi", unowned, &[], host_direct_kind()),
+            kind("placement-snapshot-000000000002", "kiwi", unowned, &[], host_direct_kind()),
+        ],
+        policies: vec![
+            policy("placement-snapshot-000000000003", "kiwi", unowned, &[], host_direct_policy()),
+            policy("placement-snapshot-000000000004", "kiwi", unowned, &[], host_direct_policy()),
+        ],
+        live_references: live(&[
+            ("kiwi", "placement-snapshot-000000000001", &["convoy-0001"]),
+            ("kiwi", "placement-snapshot-000000000003", &["convoy-0003", "convoy-0004"]),
+        ]),
+    };
+    let mut report = ImportReport::default();
+    let imported = import_placement(&copies, &mut report);
+    let names: Vec<_> = imported.kinds.iter().map(|placed| placed.name.as_str()).collect();
+    assert_eq!(names, ["placement-snapshot-000000000001"]);
+    assert_eq!(imported.kinds[0].labels.get(CONVOY_LABEL).map(String::as_str), Some("convoy-0001"));
+    for kind in ["FulfilmentKind", "PlacementPolicy"] {
+        assert_eq!(report.dropped.get(&(kind, "a snapshot no live convoy references")), Some(&1), "{kind}");
+    }
+    let refused: Vec<_> = report.refused.iter().map(|refusal| refusal.to_string()).collect();
+    assert_eq!(refused.len(), 1, "{refused:#?}");
+    assert!(refused[0].contains("placement-snapshot-000000000003") && refused[0].contains("`convoy-0003`, `convoy-0004`"), "{refused:#?}");
+}
+
 #[test]
 fn settings_other_than_the_constants_and_a_provider_instance_are_named() {
     let mut odd = crew_image();
@@ -267,11 +320,6 @@ fn settings_other_than_the_constants_and_a_provider_instance_are_named() {
     let cloud = json!({"pool": "cloud", "provider_requirements": {"instance": "daytona", "class": "cloud_sandbox"},
         "cloud_sandbox_per_vessel": {"image": "registry.test/crew@sha256:c",
         "size": {"cpus": 4, "memory_bytes": 8, "disk_bytes": 16}, "checkout": "clone_in_vessel", "env": {"A": "b"}}});
-    let constrained_snapshot = {
-        let mut spec = crew_image();
-        spec["provider_requirements"] = json!({"egress_enforcement": "enforced"});
-        spec
-    };
     let copies = PlacementCopies {
         kinds: vec![kind(
             "pinned",
@@ -283,10 +331,10 @@ fn settings_other_than_the_constants_and_a_provider_instance_are_named() {
         policies: vec![
             policy("odd", "kiwi", &[], &[], odd),
             policy("sandbox", "kiwi", &[], &[], cloud),
-            policy("placement-snapshot-0123456789ab", "kiwi", &[], &[], constrained_snapshot),
             policy("docker-on-kiwi", "kiwi", &[], &[], crew_image()),
             policy("docker-on-kiwi", "feta", &[], &[], crew_image()),
         ],
+        ..Default::default()
     };
     let mut report = ImportReport::default();
     let imported = import_placement(&copies, &mut report);
@@ -302,12 +350,6 @@ fn settings_other_than_the_constants_and_a_provider_instance_are_named() {
     assert_eq!(report.dropped.get(&("PlacementPolicy", "a cloud sandbox's settings")), Some(&1));
     let sandbox = imported.kinds.iter().find(|placed| placed.name == "sandbox").expect("sandbox");
     assert_eq!(sandbox.record.host_ref, "");
-    let snapshot = imported.kinds.iter().find(|placed| placed.name == "placement-snapshot-0123456789ab").expect("snapshot");
-    assert_eq!(
-        snapshot.labels.get(PREPARED_SNAPSHOT_LABEL).map(String::as_str),
-        Some(PLACEMENT_SNAPSHOT_KIND),
-        "named only, stamped as one"
-    );
     let homes: Vec<_> = imported.kinds.iter().filter(|placed| placed.name == "docker-on-kiwi").map(|placed| placed.home.as_str()).collect();
     assert_eq!(homes, ["feta", "kiwi"]);
 }
@@ -349,7 +391,7 @@ fn the_stored_corpus_imports_whole() {
         })
         .collect();
     let (kind_count, policy_count) = (kinds.len(), policies.len());
-    let report = rehearse_placement(&PlacementCopies { kinds, policies });
+    let report = rehearse_placement(&PlacementCopies { kinds, policies, ..Default::default() });
     assert!(report.refused.is_empty(), "{:#?}", report.refused);
     assert_eq!(report.imported.values().sum::<usize>(), kind_count + policy_count);
 }
@@ -379,8 +421,9 @@ async fn imported_kinds_read_back_through_the_engine() {
         ],
         policies: vec![
             policy("crew-image", "alpha", &[], &[], crew_image()),
-            policy("convoy-remote-placement-0123456789ab", "alpha", &[], &[], crew_image()),
+            policy("placement-snapshot-0123456789ab", "alpha", &[(PREPARED_SNAPSHOT_LABEL, "placement")], &[], crew_image()),
         ],
+        live_references: live(&[("alpha", "placement-snapshot-0123456789ab", &["convoy-0002"])]),
     };
     let mut report = ImportReport::default();
     {
@@ -405,8 +448,9 @@ async fn imported_kinds_read_back_through_the_engine() {
     assert_eq!(seeded.spec, serde_json::from_value::<FulfilmentKindSpec>(host_direct_kind()).expect("spec"));
     let snapshot = read("placement-snapshot-ba9876543210").await;
     assert_eq!(snapshot.metadata.labels.get(CONVOY_LABEL).map(String::as_str), Some("convoy-0001"));
-    let named = read("convoy-remote-placement-0123456789ab").await;
-    assert_eq!(named.metadata.labels.get(PREPARED_SNAPSHOT_LABEL).map(String::as_str), Some(PLACEMENT_SNAPSHOT_KIND));
+    let unowned = read("placement-snapshot-0123456789ab").await;
+    assert_eq!(unowned.metadata.labels.get(PREPARED_SNAPSHOT_LABEL).map(String::as_str), Some(PLACEMENT_SNAPSHOT_KIND));
+    assert_eq!(unowned.metadata.labels.get(CONVOY_LABEL).map(String::as_str), Some("convoy-0002"), "its live convoy releases it");
     let converted = read("crew-image").await;
     assert!(converted.metadata.labels.is_empty(), "{:?}", converted.metadata.labels);
     assert_eq!(converted.spec.realisation, FulfilmentRealisation::DockerPerVessel { image: None });

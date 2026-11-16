@@ -15,26 +15,22 @@ pub fn content_hash(value: &Value) -> Result<String, ResourceError> {
     Ok(digest[..6].iter().map(|byte| format!("{byte:02x}")).collect())
 }
 
-pub fn is_prepared_snapshot(name: &str, labels: &std::collections::BTreeMap<String, String>, kind: &str) -> bool {
+/// Whether `labels` mark a prepared snapshot of `kind`. Every writer labels its snapshots.
+pub fn is_prepared_snapshot(labels: &std::collections::BTreeMap<String, String>, kind: &str) -> bool {
     labels.get(PREPARED_SNAPSHOT_LABEL).is_some_and(|value| value == kind)
-        || has_content_hash_suffix(name, &format!("{kind}-snapshot-"))
-        || has_content_hash_suffix(name, &format!("-remote-{kind}-"))
-}
-
-fn has_content_hash_suffix(name: &str, marker: &str) -> bool {
-    name.rsplit_once(marker).is_some_and(|(_, suffix)| suffix.len() == 12 && suffix.chars().all(|character| character.is_ascii_hexdigit()))
 }
 
 #[cfg(test)]
 mod tests {
+    use std::collections::BTreeMap;
+
     use super::*;
 
     #[test]
-    fn recognizes_current_and_legacy_snapshot_names_without_matching_human_templates() {
-        let labels = Default::default();
-        assert!(is_prepared_snapshot("workflow-snapshot-012345abcdef", &labels, WORKFLOW_SNAPSHOT_KIND));
-        assert!(is_prepared_snapshot("old-convoy-remote-workflow-012345abcdef", &labels, WORKFLOW_SNAPSHOT_KIND));
-        assert!(!is_prepared_snapshot("workflow-snapshot-custom", &labels, WORKFLOW_SNAPSHOT_KIND));
-        assert!(!is_prepared_snapshot("my-workflow", &labels, WORKFLOW_SNAPSHOT_KIND));
+    fn a_snapshot_is_known_by_its_label_not_its_name() {
+        let labelled = BTreeMap::from([(PREPARED_SNAPSHOT_LABEL.to_owned(), WORKFLOW_SNAPSHOT_KIND.to_owned())]);
+        assert!(is_prepared_snapshot(&labelled, WORKFLOW_SNAPSHOT_KIND));
+        assert!(!is_prepared_snapshot(&labelled, PLACEMENT_SNAPSHOT_KIND));
+        assert!(!is_prepared_snapshot(&BTreeMap::new(), WORKFLOW_SNAPSHOT_KIND));
     }
 }

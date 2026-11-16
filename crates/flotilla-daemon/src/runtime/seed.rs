@@ -254,7 +254,7 @@ pub(super) async fn canonicalize_kind_hosts(backend: &ResourceBackend, namespace
     for kind in kinds.list().await.map_err(|error| error.to_string())?.items {
         if kind.metadata.deletion_timestamp.is_some()
             || kind.spec.host_ref == host_ref
-            || is_prepared_snapshot(&kind.metadata.name, &kind.metadata.labels, PLACEMENT_SNAPSHOT_KIND)
+            || is_prepared_snapshot(&kind.metadata.labels, PLACEMENT_SNAPSHOT_KIND)
         {
             continue;
         }

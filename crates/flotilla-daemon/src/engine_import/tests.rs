@@ -2,7 +2,9 @@ use std::path::Path;
 
 use chrono::Utc;
 use flotilla_core::primitives::demand_import::retired;
-use flotilla_daemon_testkit::import_fixture::{artifact, clone, demand, designation, document, forge, message, own, populated, NS, THERE};
+use flotilla_daemon_testkit::import_fixture::{
+    artifact, clone, demand, designation, document, forge, live_convoy, message, own, populated, NS, THERE,
+};
 use flotilla_engine_store::ImportTarget;
 use flotilla_provisioning::stored::forge_observation::{ChangeRequestRecord, IssueRecord};
 use flotilla_resources::{
@@ -1074,6 +1076,40 @@ async fn placement_rows_import_as_kinds_and_none_stay_on_the_old_store() {
     for name in ["host-direct-feta", "docker-crew-image-feta", "placement-snapshot-0123456789ab"] {
         assert!(holds::<flotilla_provisioning::stored::placement::FulfilmentKindDefinition>(&mut store, name, HERE), "{name}");
     }
+}
+
+// Behaviour (#3108): a placement snapshot written before admission labelled snapshots with their
+// convoy imports as the one live convoy's that references it, so that convoy releases it; one only
+// an ended convoy references is dropped, as nothing on the engine would release it.
+#[test]
+fn an_unowned_placement_snapshot_imports_with_its_live_convoy_or_is_dropped() {
+    let snapshot = |name: &str| {
+        let mut policy = document(
+            "PlacementPolicy",
+            name,
+            json!({"pool": "cleat", "host_direct": {"host_ref": HERE, "checkout": "worktree"}}),
+            Value::Null,
+        );
+        policy["metadata"]["labels"] = json!({ (flotilla_resources::PREPARED_SNAPSHOT_LABEL): "placement" });
+        policy
+    };
+    let referencing = |mut convoy: Value, snapshot: &str| {
+        convoy["metadata"]["annotations"][flotilla_resources::PLACEMENT_SNAPSHOT_ANNOTATION] = json!(snapshot);
+        convoy
+    };
+    let mut ended = live_convoy("ended");
+    ended["status"]["phase"] = json!("Landed");
+    let documents = vec![
+        snapshot("placement-snapshot-live"),
+        snapshot("placement-snapshot-ended"),
+        referencing(live_convoy("live"), "placement-snapshot-live"),
+        referencing(ended, "placement-snapshot-ended"),
+    ];
+    let summary = rehearse(&rows(documents), HERE);
+    assert!(summary.refusals.is_empty(), "{summary:?}");
+    let policies = &summary.rows["PlacementPolicy"];
+    assert_eq!((policies.imported, policies.dropped), (1, 1), "{policies:?}");
+    assert_eq!(policies.drops.get("a snapshot no live convoy references"), Some(&1), "{policies:?}");
 }
 
 // Behaviour (ADR 0047, #3108): a previous-generation manifest stamp named the declaring host, not

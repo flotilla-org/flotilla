@@ -585,9 +585,7 @@ pub(super) async fn observe_fulfilment_facts(
     let all_kinds = backend.clone().using::<FulfilmentKind>(namespace).list().await.map_err(|error| error.to_string())?.items;
     let mut kinds = Vec::new();
     for kind in all_kinds {
-        if kind.metadata.deletion_timestamp.is_some()
-            || is_prepared_snapshot(&kind.metadata.name, &kind.metadata.labels, PLACEMENT_SNAPSHOT_KIND)
-        {
+        if kind.metadata.deletion_timestamp.is_some() || is_prepared_snapshot(&kind.metadata.labels, PLACEMENT_SNAPSHOT_KIND) {
             continue;
         }
         if kind_belongs_to_host(&hosts.items, &kind, host_ref, "fact observation") {
