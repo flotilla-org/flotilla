@@ -80,6 +80,58 @@ async fn follow_up_reference_releases_from_message_evidence() {
     assert_eq!((messages[0].metadata.name.as_str(), messages[0].spec.body.as_str()), (pending.name.as_str(), "continue after this turn"));
 }
 
+/// The Message rows loaded and converted while one turn about the convoy is delivered to a coder
+/// whose inbox holds `count` open messages about nothing.
+async fn read_by_one_turn(count: usize) -> (u64, u64) {
+    use flotilla_resources::{MessageReference, MessageRelation, MessageSpec};
+
+    use crate::leaf_engine::CrewTurnIntent;
+    let (crew, _backend, probe, held) = fixture(CrewWorkPhase::Working).await;
+    probe.fail.store(false, Ordering::SeqCst);
+    let primitives = held.messages().primitives();
+    let coder = flotilla_resources::crew_role_address("flotilla", &held.launch, "work", "coder");
+    for index in 0..count {
+        let intent = MessageSpec::builder()
+            .sender("system:turn-rules".into())
+            .receiver(coder.clone())
+            .relation(MessageRelation::System)
+            .body(format!("open {index}"))
+            .build();
+        primitives.admit("flotilla", &format!("open-{index}"), &intent).await.expect("admit an open message");
+    }
+    let reference = MessageReference::ControlRecord {
+        resource: ResourceRef::new("flotilla.work/v1", "Convoy", "flotilla", held.launch.clone()),
+        revision: "revision".into(),
+    };
+    let request = CrewTurnIntent::builder()
+        .namespace("flotilla".into())
+        .convoy(held.launch.clone())
+        .source("measured".into())
+        .vessel("work".into())
+        .role("coder".into())
+        .brief("about the convoy".into())
+        .subject_revision("revision".into())
+        .sender("system:turn-rules".into())
+        .references(vec![reference.clone()])
+        .message_subject(reference)
+        .build();
+    let before = primitives.rows_read();
+    let admission = crew.deliver_turn(&request).await.expect("deliver the turn");
+    let after = primitives.rows_read();
+    assert!(admission.new_turn, "nothing open supersedes the turn");
+    (after.loaded - before.loaded, after.converted - before.converted)
+}
+
+// Behaviour: delivering a turn reads the coder's open messages as the engine holds them to find
+// one the turn supersedes, converting none to the old shape.
+#[tokio::test]
+async fn a_turn_finds_what_it_supersedes_without_converting_open_messages() {
+    let (small, large) = (read_by_one_turn(5).await, read_by_one_turn(60).await);
+    // Admission reads the admitted turn back in the old shape until intents are in the engine's.
+    assert_eq!((small.1, large.1), (1, 1), "no open message is converted: {small:?} {large:?}");
+    assert_eq!(large.0 - small.0, 55, "each open message is loaded once: {small:?} {large:?}");
+}
+
 /// The Message rows loaded and converted while follow-ups delivered to `count` other convoys'
 /// coders continue their work.
 async fn read_by_follow_ups(count: usize) -> (u64, u64) {

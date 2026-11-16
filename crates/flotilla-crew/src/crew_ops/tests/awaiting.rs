@@ -73,13 +73,23 @@ impl EngineMessages for RecordingMessages {
             .filter(|object| object.spec.receiver == receiver)
             .map(|object| ReadResourceObject { object, provenance: ResourceProvenance::Local }))
     }
-    async fn view_for(
+    async fn admitted(
         &self,
         namespace: &str,
         intent: &MessageSpec,
         record: &str,
-    ) -> Result<Option<ReadResourceObject<Message>>, ResourceError> {
-        self.view_to(namespace, &intent.receiver, record).await
+    ) -> Result<Option<flotilla_messaging::AdmittedMessage>, ResourceError> {
+        let read = self.view_to(namespace, &intent.receiver, record).await?;
+        Ok(read.map(|read| flotilla_messaging::AdmittedMessage {
+            home: self.home(),
+            superseded_by: read.object.status.and_then(|status| status.canonical_predecessor).map(|predecessor| predecessor.name),
+        }))
+    }
+    async fn open_superseded(&self, _namespace: &str, intent: &MessageSpec) -> Result<Option<String>, ResourceError> {
+        Ok(self.admitted_to(std::slice::from_ref(&intent.receiver)).into_iter().find_map(|read| {
+            (flotilla_resources::message_supersedes(intent, &read.object) && flotilla_resources::message_expectation_open(&read.object))
+                .then_some(read.object.metadata.name)
+        }))
     }
     async fn open_to(&self, _namespace: &str, receivers: &[String]) -> Result<Vec<ReadResourceObject<Message>>, ResourceError> {
         Ok(self.admitted_to(receivers))

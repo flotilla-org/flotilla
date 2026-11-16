@@ -5,7 +5,7 @@
 use flotilla_resources::*;
 use flotilla_store::*;
 mod engine_messages;
-pub use engine_messages::{EngineMessages, MessageResolution, SeatMessage, SentMessage};
+pub use engine_messages::{AdmittedMessage, EngineMessages, MessageResolution, SeatMessage, SentMessage};
 mod framing;
 pub use framing::{frame_message, frame_turn, subject_text, Expects, TurnHeader};
 mod message_inbox;

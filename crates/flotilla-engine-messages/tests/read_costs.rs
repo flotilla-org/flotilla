@@ -83,9 +83,9 @@ async fn reads_by_receiver_and_by_name_load_only_their_messages() {
     assert_eq!(cost(before, primitives.rows_read()), (1, 1), "a by-name read loads and converts one message");
 
     let before = primitives.rows_read();
-    let named = primitives.view_for(NAMESPACE, &intent(QUIET, "quiet-1"), "quiet-1").await.expect("by-name read").expect("held");
-    assert_eq!(named.object.spec.receiver, QUIET);
-    assert_eq!(cost(before, primitives.rows_read()), (1, 1), "a by-name read for an intent loads and converts one message");
+    let named = primitives.admitted(NAMESPACE, &intent(QUIET, "quiet-1"), "quiet-1").await.expect("by-name read").expect("held");
+    assert_eq!(named.superseded_by, None);
+    assert_eq!(cost(before, primitives.rows_read()), (1, 0), "a by-name read for an intent loads one message and converts none");
 
     let before = primitives.rows_read();
     assert!(primitives.view_to(NAMESPACE, QUIET, "settled-17").await.expect("by-name read").is_none(), "another inbox holds none");

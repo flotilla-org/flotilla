@@ -46,8 +46,8 @@ use flotilla_state_machines::{
         agent_session::{AgentSession, MemoryAgentSessionWorld, Receive},
         consumer::{ConsumerKind, Receiver},
         message::{
-            Deliver, DropReason, MemoryMessageWorld, Message, MessageBody, MessageLabel, MessageRef, MessageReference, MessageSpec,
-            MessageState, Relation, RequestBody, Supersedes,
+            Deliver, DropReason, Expectation, MemoryMessageWorld, Message, MessageBody, MessageLabel, MessageRef, MessageReference,
+            MessageSpec, MessageState, Relation, RequestBody, Supersedes,
         },
         person::{self, Person},
         service::{self as service_machine, Service as ServiceMachine},
@@ -1706,18 +1706,65 @@ impl MessagePrimitives {
             .ok_or_else(|| format!("message `{record}` is not in this home's replica"))
     }
 
-    /// The message `record` in the inbox `intent` is admitted to, read by its exact identity.
-    pub async fn view_for(
+    /// Where the message `record` in the inbox `intent` is admitted to stands, read by its exact
+    /// identity: the home holding it and what superseded it. Nothing of it is spelled.
+    pub async fn admitted(
         &self,
         namespace: &str,
         intent: &OldSpec,
         record: &str,
-    ) -> Result<Option<ReadResourceObject<OldMessage>>, ResourceError> {
+    ) -> Result<Option<flotilla_messaging::AdmittedMessage>, ResourceError> {
         let roles = self.roles(namespace).await.map_err(ResourceError::invalid)?;
         let inbox = self
             .spell(&mut OldStoreRecords::empty(namespace), |records| Conversion { roles: &roles, forges: &[], records }.receiver(intent))
             .await?;
-        self.view_in(namespace, &roles, inbox, record).await
+        // No message is admitted to a receiver that converts to no inbox.
+        let inbox = match inbox {
+            Ok(inbox) => inbox,
+            Err(error) => {
+                tracing::debug!(%record, %error, "a receiver with no inbox holds no message");
+                return Ok(None);
+            }
+        };
+        let Some((id, home)) = self.locate_in(&inbox, record).map_err(ResourceError::other)? else { return Ok(None) };
+        let Some((home, _, resource)) = self.load_at(id, home)? else { return Ok(None) };
+        let superseded_by = match resource.state() {
+            MessageState::Dropped { reason: DropReason::Superseded { by }, .. } => Some(by.name().to_owned()),
+            _ => None,
+        };
+        Ok(Some(flotilla_messaging::AdmittedMessage { home, superseded_by }))
+    }
+
+    /// The open message in the inbox `intent` is admitted to that `intent` supersedes and that
+    /// still awaits its answer, if one does: one from the sender `intent` converts to, about the
+    /// subject it converts to, delivered and expecting a reply or an outcome. Each open message
+    /// is compared as the engine holds it; only the intent is converted, as admission converts it.
+    pub async fn open_superseded(&self, namespace: &str, intent: &OldSpec) -> Result<Option<String>, ResourceError> {
+        let Some(subject) = &intent.subject else { return Ok(None) };
+        let roles = self.roles(namespace).await.map_err(ResourceError::invalid)?;
+        let converted = self
+            .spell(&mut OldStoreRecords::empty(namespace), |records| -> Result<_, String> {
+                let conversion = Conversion { roles: &roles, forges: records.forges(), records };
+                Ok((conversion.receiver(intent)?, conversion.sender_of(intent)?, conversion.reference(subject, true)?))
+            })
+            .await?;
+        let (inbox, sender, subject) = match converted {
+            Ok(converted) => converted,
+            Err(error) => {
+                tracing::debug!(%error, "an intent that does not convert supersedes nothing");
+                return Ok(None);
+            }
+        };
+        let open = self.open_in(&inbox).map_err(ResourceError::other)?;
+        Ok(open.into_iter().find_map(|(_, message)| {
+            let spec = message.spec();
+            let about = spec.references.iter().rev().find(|reference| reference.subject);
+            let superseded = spec.sender == sender
+                && about.is_some_and(|about| about.address == subject.address && about.revision == subject.revision)
+                && matches!(message.state(), MessageState::Awaiting { .. })
+                && !matches!(spec.expectation, Expectation::Nothing);
+            superseded.then(|| record_name(message.name())).flatten()
+        }))
     }
 
     async fn view_in(
@@ -1986,13 +2033,16 @@ impl flotilla_messaging::EngineMessages for MessagePrimitives {
     ) -> Result<Option<ReadResourceObject<OldMessage>>, ResourceError> {
         MessagePrimitives::view_to(self, namespace, receiver, record).await
     }
-    async fn view_for(
+    async fn admitted(
         &self,
         namespace: &str,
         intent: &OldSpec,
         record: &str,
-    ) -> Result<Option<ReadResourceObject<OldMessage>>, ResourceError> {
-        MessagePrimitives::view_for(self, namespace, intent, record).await
+    ) -> Result<Option<flotilla_messaging::AdmittedMessage>, ResourceError> {
+        MessagePrimitives::admitted(self, namespace, intent, record).await
+    }
+    async fn open_superseded(&self, namespace: &str, intent: &OldSpec) -> Result<Option<String>, ResourceError> {
+        MessagePrimitives::open_superseded(self, namespace, intent).await
     }
     async fn open_to(&self, namespace: &str, receivers: &[String]) -> Result<Vec<ReadResourceObject<OldMessage>>, ResourceError> {
         MessagePrimitives::open_to(self, namespace, receivers).await

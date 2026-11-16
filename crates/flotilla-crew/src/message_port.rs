@@ -36,14 +36,21 @@ impl CrewService {
         self.message_primitives()?.view_to(namespace, receiver, name).await?.ok_or_else(|| ResourceError::not_found(name))
     }
 
-    /// The Message `name` in the inbox `intent` is admitted to, local or replicated.
-    pub(crate) async fn message_for(
+    /// Where the Message `name` in the inbox `intent` is admitted to stands, local or replicated;
+    /// `None` when none is admitted.
+    pub(crate) async fn admitted_message(
         &self,
         namespace: &str,
         intent: &MessageSpec,
         name: &str,
-    ) -> Result<ReadResourceObject<Message>, ResourceError> {
-        self.message_primitives()?.view_for(namespace, intent, name).await?.ok_or_else(|| ResourceError::not_found(name))
+    ) -> Result<Option<flotilla_messaging::AdmittedMessage>, ResourceError> {
+        self.message_primitives()?.admitted(namespace, intent, name).await
+    }
+
+    /// The open Message in the inbox `intent` is admitted to that `intent` supersedes and that
+    /// still awaits its answer, if one does: its name.
+    pub(crate) async fn open_superseded(&self, namespace: &str, intent: &MessageSpec) -> Result<Option<String>, ResourceError> {
+        self.message_primitives()?.open_superseded(namespace, intent).await
     }
 
     /// The open Messages to `receiver`, local or replicated.

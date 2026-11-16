@@ -2734,24 +2734,19 @@ impl CrewService {
             &request.sender,
             &turn_message_producer_key(&request.source, &request.subject_revision),
         );
-        match self.message_for(&request.namespace, &intent, &name).await {
-            Ok(existing) => {
-                // A repeat records what an earlier send could not (record is idempotent).
-                self.record_awaiting(&request.namespace, &name, &intent, self.admitted_home(&existing), request.stall_of.as_deref())
-                    .await?;
-                return Ok(CrewTurnAdmission {
-                    new_turn: false,
-                    rung: TurnDeliveryRung::WarmSession,
-                    message: existing
-                        .object
-                        .status
-                        .as_ref()
-                        .and_then(|status| status.canonical_predecessor.clone())
-                        .unwrap_or_else(|| ResourceRef::new("flotilla.work/v1", "Message", &request.namespace, &name)),
-                });
-            }
-            Err(ResourceError::NotFound { .. }) => {}
-            Err(error) => return Err(error.to_string()),
+        if let Some(existing) = self.admitted_message(&request.namespace, &intent, &name).await.map_err(|error| error.to_string())? {
+            // A repeat records what an earlier send could not (record is idempotent).
+            self.record_awaiting(&request.namespace, &name, &intent, Some(existing.home), request.stall_of.as_deref()).await?;
+            return Ok(CrewTurnAdmission {
+                new_turn: false,
+                rung: TurnDeliveryRung::WarmSession,
+                message: ResourceRef::new(
+                    "flotilla.work/v1",
+                    "Message",
+                    &request.namespace,
+                    existing.superseded_by.as_deref().unwrap_or(&name),
+                ),
+            });
         }
         let holder = flotilla_messaging::resolve_message_receiver(&self.resource_backend, &request.namespace, receiver)
             .await
@@ -2766,7 +2761,7 @@ impl CrewService {
             if holder.as_ref().is_some_and(|holder| matches!(holder.provenance, ResourceProvenance::Replica { .. })) {
                 return Err("receiver-home resource mutation router unavailable".into());
             }
-            let existing = self.message_for(&request.namespace, &intent, &name).await.is_ok();
+            let existing = self.admitted_message(&request.namespace, &intent, &name).await.map_err(|error| error.to_string())?.is_some();
             let admission = self
                 .admit_message(&request.namespace, &InputMeta::builder().name(name).build(), &intent)
                 .await
@@ -2945,37 +2940,29 @@ impl CrewService {
         name: &str,
         rung: TurnDeliveryRung,
     ) -> Result<Option<CrewTurnAdmission>, String> {
-        match self.message_for(&request.namespace, intent, name).await {
-            Ok(existing) => {
-                // A repeat records what an earlier send could not (record is idempotent).
-                self.record_awaiting(&request.namespace, name, intent, self.admitted_home(&existing), request.stall_of.as_deref()).await?;
-                return Ok(Some(CrewTurnAdmission {
-                    new_turn: false,
-                    rung,
-                    message: existing
-                        .object
-                        .status
-                        .as_ref()
-                        .and_then(|status| status.canonical_predecessor.clone())
-                        .unwrap_or_else(|| ResourceRef::new("flotilla.work/v1", "Message", &request.namespace, name)),
-                }));
-            }
-            Err(ResourceError::NotFound { .. }) => {}
-            Err(error) => return Err(error.to_string()),
-        }
-        let records = self.active_message_records(&request.namespace, &intent.receiver).await.map_err(|error| error.to_string())?;
-        if let Some(existing) = records.iter().find(|record| {
-            intent.supersedes.is_none()
-                && flotilla_resources::message_supersedes(intent, &record.object)
-                && flotilla_resources::message_expectation_open(&record.object)
-        }) {
+        if let Some(existing) = self.admitted_message(&request.namespace, intent, name).await.map_err(|error| error.to_string())? {
+            // A repeat records what an earlier send could not (record is idempotent).
+            self.record_awaiting(&request.namespace, name, intent, Some(existing.home), request.stall_of.as_deref()).await?;
             return Ok(Some(CrewTurnAdmission {
                 new_turn: false,
                 rung,
-                message: ResourceRef::new("flotilla.work/v1", "Message", &request.namespace, &existing.object.metadata.name),
+                message: ResourceRef::new(
+                    "flotilla.work/v1",
+                    "Message",
+                    &request.namespace,
+                    existing.superseded_by.as_deref().unwrap_or(name),
+                ),
             }));
         }
-        Ok(None)
+        if intent.supersedes.is_some() {
+            return Ok(None);
+        }
+        let superseded = self.open_superseded(&request.namespace, intent).await.map_err(|error| error.to_string())?;
+        Ok(superseded.map(|existing| CrewTurnAdmission {
+            new_turn: false,
+            rung,
+            message: ResourceRef::new("flotilla.work/v1", "Message", &request.namespace, &existing),
+        }))
     }
 
     /// Activates and publishes a new turn; a failed or suppressed publication restores the
@@ -3356,14 +3343,10 @@ impl CrewService {
         name: &str,
         intent: &flotilla_resources::MessageSpec,
     ) -> Result<ResourceRef, String> {
-        match self.message_for(namespace, intent, name).await {
-            Ok(existing) => {
-                // A repeat records what an earlier send could not (record is idempotent).
-                self.record_awaiting(namespace, name, intent, self.admitted_home(&existing), None).await?;
-                return Ok(ResourceRef::new("flotilla.work/v1", "Message", namespace, &existing.object.metadata.name));
-            }
-            Err(ResourceError::NotFound { .. }) => {}
-            Err(error) => return Err(error.to_string()),
+        if let Some(existing) = self.admitted_message(namespace, intent, name).await.map_err(|error| error.to_string())? {
+            // A repeat records what an earlier send could not (record is idempotent).
+            self.record_awaiting(namespace, name, intent, Some(existing.home), None).await?;
+            return Ok(ResourceRef::new("flotilla.work/v1", "Message", namespace, name));
         }
         let publisher = self.resource_intent_publisher.read().expect("resource intent publisher lock").as_ref().and_then(Weak::upgrade);
         if let Some(publisher) = publisher {
@@ -3389,14 +3372,6 @@ impl CrewService {
         let home = record.metadata.annotations.get(flotilla_store::replica::ORIGIN_ROOT_ANNOTATION).cloned();
         self.record_awaiting(namespace, &record.metadata.name, intent, home, None).await?;
         Ok(ResourceRef::new("flotilla.work/v1", "Message", namespace, record.metadata.name))
-    }
-
-    /// The home that admitted an engine message, from where it was read.
-    fn admitted_home(&self, read: &flotilla_resources::ReadResourceObject<flotilla_resources::Message>) -> Option<String> {
-        match &read.provenance {
-            ResourceProvenance::Replica { origin_root, .. } => Some(origin_root.as_str().to_owned()),
-            ResourceProvenance::Local => self.message_primitives().ok().map(|engine| engine.home()),
-        }
     }
 
     /// Records the sender's half of a send expecting a reply or an outcome,

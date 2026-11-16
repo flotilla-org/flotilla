@@ -1270,12 +1270,19 @@ impl flotilla_messaging::EngineMessages for Turns {
     ) -> Result<Option<flotilla_resources::ReadResourceObject<flotilla_resources::Message>>, flotilla_resources::ResourceError> {
         unreachable!("the convoy reconciler reads no message views")
     }
-    async fn view_for(
+    async fn admitted(
         &self,
         _: &str,
         _: &flotilla_resources::MessageSpec,
         _: &str,
-    ) -> Result<Option<flotilla_resources::ReadResourceObject<flotilla_resources::Message>>, flotilla_resources::ResourceError> {
+    ) -> Result<Option<flotilla_messaging::AdmittedMessage>, flotilla_resources::ResourceError> {
+        unreachable!("the convoy reconciler reads no message views")
+    }
+    async fn open_superseded(
+        &self,
+        _: &str,
+        _: &flotilla_resources::MessageSpec,
+    ) -> Result<Option<String>, flotilla_resources::ResourceError> {
         unreachable!("the convoy reconciler reads no message views")
     }
     async fn open_to(

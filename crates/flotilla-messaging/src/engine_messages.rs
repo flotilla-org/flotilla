@@ -40,6 +40,15 @@ pub struct SentMessage {
     pub body: String,
 }
 
+/// Where a message admitted under a name stands, read by its exact identity (#3108).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AdmittedMessage {
+    /// The home it is held at: its receiver's, which admitted it.
+    pub home: String,
+    /// The message that superseded it, if one did.
+    pub superseded_by: Option<String>,
+}
+
 /// The `[primitives]` switch's Message path, as crew code reads and admits
 /// Messages (#3317). Crew code never reaches the engine: it sees engine
 /// messages in the old shape through this port, which the composition root
@@ -54,13 +63,21 @@ pub trait EngineMessages: Send + Sync {
         receiver: &str,
         record: &str,
     ) -> Result<Option<flotilla_resources::ReadResourceObject<flotilla_resources::Message>>, flotilla_resources::ResourceError>;
-    /// The message `record` in the inbox `intent` is admitted to, local or replicated.
-    async fn view_for(
+    /// Where the message `record` in the inbox `intent` is admitted to stands, local or replicated.
+    async fn admitted(
         &self,
         namespace: &str,
         intent: &flotilla_resources::MessageSpec,
         record: &str,
-    ) -> Result<Option<flotilla_resources::ReadResourceObject<flotilla_resources::Message>>, flotilla_resources::ResourceError>;
+    ) -> Result<Option<AdmittedMessage>, flotilla_resources::ResourceError>;
+    /// The open message in the inbox `intent` is admitted to that `intent` supersedes and that
+    /// still awaits its answer, if one does: one from the same sender about the same subject,
+    /// delivered and expecting a reply or an outcome. Its record name.
+    async fn open_superseded(
+        &self,
+        namespace: &str,
+        intent: &flotilla_resources::MessageSpec,
+    ) -> Result<Option<String>, flotilla_resources::ResourceError>;
     /// The open messages to `receivers` (old addresses), local or replicated.
     async fn open_to(
         &self,
