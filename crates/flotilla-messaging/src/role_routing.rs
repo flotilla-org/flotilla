@@ -366,8 +366,9 @@ pub trait CharterNotices: Send + Sync {
     fn admission(&self) -> std::sync::Arc<tokio::sync::Mutex<()>>;
     /// Whether `name`, sent to `receiver`, exists, repairing one stored without admission.
     async fn existing(&self, receiver: &str, name: &str, now: chrono::DateTime<chrono::Utc>) -> Result<bool, ResourceError>;
-    /// The open Messages to `receiver`.
-    async fn open_to(&self, receiver: &str) -> Result<Vec<ResourceObject<Message>>, ResourceError>;
+    /// The newest open charter notification to `receiver` about `project`, which the next one
+    /// supersedes: its name.
+    async fn open_charter_notice(&self, receiver: &str, project: &str) -> Result<Option<String>, ResourceError>;
     async fn admit(&self, name: &str, spec: &crate::MessageSpec, now: chrono::DateTime<chrono::Utc>) -> Result<(), ResourceError>;
 }
 
@@ -385,8 +386,12 @@ impl CharterNotices for crate::MessageInbox {
     async fn existing(&self, _: &str, name: &str, now: chrono::DateTime<chrono::Utc>) -> Result<bool, ResourceError> {
         repair_existing_charter_notification(self, name, now).await
     }
-    async fn open_to(&self, receiver: &str) -> Result<Vec<ResourceObject<Message>>, ResourceError> {
-        self.messages.query(&crate::MessageQuery::Active { receiver: Some(receiver.to_owned()) }).await
+    async fn open_charter_notice(&self, receiver: &str, project: &str) -> Result<Option<String>, ResourceError> {
+        use crate::MessageReference;
+        let open = self.messages.query(&crate::MessageQuery::Active { receiver: Some(receiver.to_owned()) }).await?;
+        Ok(open.into_iter().filter(|message| message.spec.sender == FLEET_STORE_SENDER && message.spec.subject.as_ref().is_some_and(|subject| {
+                matches!(subject, MessageReference::ControlRecord { resource, .. } if resource.kind == "Project" && resource.namespace == self.namespace && resource.name == project)
+            })).max_by(|a, b| (a.metadata.creation_timestamp, &a.metadata.name).cmp(&(b.metadata.creation_timestamp, &b.metadata.name))).map(|message| message.metadata.name))
     }
     async fn admit(&self, name: &str, spec: &crate::MessageSpec, now: chrono::DateTime<chrono::Utc>) -> Result<(), ResourceError> {
         self.accept_locked(&crate::InputMeta::builder().name(name.to_owned()).build(), spec, now).await.map(|_| ())
@@ -510,10 +515,7 @@ async fn reconcile_charter_notifications_from_receivers(
         if inbox.existing(&receiver, &name, now).await? {
             continue;
         }
-        let predecessor = inbox.open_to(&receiver).await?
-            .into_iter().filter(|message| message.spec.sender == FLEET_STORE_SENDER && message.spec.subject.as_ref().is_some_and(|subject| {
-                matches!(subject, MessageReference::ControlRecord { resource, .. } if resource.kind == "Project" && resource.namespace == namespace && resource.name == project_name)
-            })).max_by(|a, b| (a.metadata.creation_timestamp, &a.metadata.name).cmp(&(b.metadata.creation_timestamp, &b.metadata.name))).map(|message| message.metadata.name);
+        let predecessor = inbox.open_charter_notice(&receiver, &project_name).await?;
         let spec = MessageSpec::builder()
             .sender(FLEET_STORE_SENDER.into())
             .receiver(receiver)

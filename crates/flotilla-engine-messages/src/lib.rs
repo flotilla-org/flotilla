@@ -2138,8 +2138,32 @@ impl flotilla_messaging::CharterNotices for EngineCharterNotices {
             Conversion { roles: &roles, forges: &[], records: &convert::NoRecords }.inbox(receiver).map_err(ResourceError::invalid)?;
         Ok(self.primitives.locate_in(&inbox, name).map_err(ResourceError::other)?.is_some())
     }
-    async fn open_to(&self, receiver: &str) -> Result<Vec<ResourceObject<OldMessage>>, ResourceError> {
-        Ok(self.primitives.open_to(&self.namespace, &[receiver.to_owned()]).await?.into_iter().map(|view| view.object).collect())
+    async fn open_charter_notice(&self, receiver: &str, project: &str) -> Result<Option<String>, ResourceError> {
+        let Ok(roles) = self.primitives.roles_or_wait(&self.namespace).await.map_err(ResourceError::other)? else { return Ok(None) };
+        let conversion = Conversion { roles: &roles, forges: &[], records: &convert::NoRecords };
+        let inbox = conversion.inbox(receiver).map_err(ResourceError::invalid)?;
+        let sender = conversion.sender(flotilla_messaging::FLEET_STORE_SENDER).map_err(ResourceError::invalid)?;
+        // The supersession scan reads the receiver's open messages through its inbox's index.
+        let notices: Vec<_> = self
+            .primitives
+            .open_in(&inbox)
+            .map_err(ResourceError::other)?
+            .into_iter()
+            .filter(|(_, message)| {
+                let spec = message.spec();
+                // The old shape's subject is the last reference marked as one.
+                let subject = spec.references.iter().rev().find(|reference| reference.subject);
+                spec.sender == sender
+                    && subject.is_some_and(|subject| subject.address.kind() == AddressKind::Project && subject.address.name() == project)
+            })
+            .collect();
+        let created = self.primitives.created_of(&notices)?;
+        Ok(created
+            .into_iter()
+            .zip(&notices)
+            .filter_map(|(created, (_, message))| Some((created.to_datetime(), record_name(message.name())?)))
+            .max()
+            .map(|(_, name)| name))
     }
     async fn admit(&self, name: &str, spec: &OldSpec, _: chrono::DateTime<chrono::Utc>) -> Result<(), ResourceError> {
         self.primitives.admit(&self.namespace, name, spec).await.map(|_| ())
