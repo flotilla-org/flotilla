@@ -372,6 +372,8 @@ fn imports_with_its_spec_and_origin(tc: &TestCase, stamp: u8) {
         crew_defaults: vec![copy("defaults", "alpha", labels.clone(), annotations.clone(), defaults.clone())],
         image_layers: vec![copy("layer", "alpha", labels.clone(), annotations.clone(), layer.clone())],
         workflow_templates: vec![copy("template", "alpha", labels.clone(), annotations.clone(), template.clone())],
+        // A live convoy references the template, so a snapshot's stamp imports too.
+        live_workflow_snapshots: BTreeSet::from(["template".to_owned()]),
         convoy_ensures: vec![copy("ensure", "alpha", labels.clone(), annotations.clone(), ensure.clone())],
         projects: vec![copy("project", "alpha", labels.clone(), annotations.clone(), project_spec.clone())],
         manifest_roots: held_roots(),

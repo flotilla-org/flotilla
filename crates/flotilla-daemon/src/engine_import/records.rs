@@ -20,7 +20,7 @@ use flotilla_resources::{
     PLACEMENT_SNAPSHOT_ANNOTATION, VESSEL_PLACEMENTS_ANNOTATION,
 };
 
-use super::{Carried, Source};
+use super::{Carried, Decoded, Source};
 
 pub(super) const ACCOUNT_KINDS: [&str; 2] = ["accountbindings", "accountprovisions"];
 pub(super) const PLACEMENT_KINDS: [&str; 2] = ["fulfilmentkinds", "placementpolicies"];
@@ -78,15 +78,20 @@ pub(super) fn placement(source: &Source, target: &mut Import, _: &mut Carried, r
     write_placement(&PlacementCopies { kinds, policies, live_references }, target, report);
 }
 
-/// The placement snapshots each live convoy references, by home and snapshot: a live convoy is
-/// one the convoy import carries, bootstrapped and not ended.
+/// The convoys, every home's, that the convoy import carries as live: bootstrapped and not ended.
+/// Only these release their prepared snapshots on the engine.
+pub(super) fn live_convoys(source: &Source) -> Vec<Decoded<Convoy>> {
+    let mut convoys = source.context::<Convoy>("convoys", None);
+    convoys.retain(|convoy| {
+        convoy.object.status.as_ref().is_some_and(|status| status.workflow_snapshot.is_some() && !status.phase.is_terminal())
+    });
+    convoys
+}
+
+/// The placement snapshots each live convoy references, by home and snapshot.
 fn live_placement_references(source: &Source) -> BTreeMap<(String, String), BTreeSet<String>> {
     let mut references = BTreeMap::<(String, String), BTreeSet<String>>::new();
-    for convoy in source.context::<Convoy>("convoys", None) {
-        let live = convoy.object.status.as_ref().is_some_and(|status| status.workflow_snapshot.is_some() && !status.phase.is_terminal());
-        if !live {
-            continue;
-        }
+    for convoy in live_convoys(source) {
         let object = &convoy.object;
         let annotations = &object.metadata.annotations;
         let pins = annotations

@@ -1112,6 +1112,53 @@ fn an_unowned_placement_snapshot_imports_with_its_live_convoy_or_is_dropped() {
     assert_eq!(policies.drops.get("a snapshot no live convoy references"), Some(&1), "{policies:?}");
 }
 
+// Behaviour (#3108): an ended convoy never tears down on the engine, so a labelled snapshot,
+// placement or workflow, that only an ended convoy references is dropped and counted, while the
+// live convoy's snapshots import.
+#[test]
+fn snapshots_only_an_ended_convoy_references_are_dropped() {
+    use flotilla_resources::{CONVOY_LABEL, PLACEMENT_SNAPSHOT_ANNOTATION, PREPARED_SNAPSHOT_LABEL, WORKFLOW_SNAPSHOT_ANNOTATION};
+    let placement = |name: &str, convoy: &str| {
+        let mut kind = document(
+            "FulfilmentKind",
+            name,
+            json!({"grants": ["platform:linux"], "host_ref": HERE, "pool": "cleat", "realisation": "host_direct"}),
+            Value::Null,
+        );
+        kind["metadata"]["labels"] = json!({ (PREPARED_SNAPSHOT_LABEL): "placement", (CONVOY_LABEL): convoy });
+        kind
+    };
+    let workflow = |name: &str| {
+        let mut template = document("WorkflowTemplate", name, json!({"vessels": []}), Value::Null);
+        template["metadata"]["labels"] = json!({ (PREPARED_SNAPSHOT_LABEL): "workflow" });
+        template
+    };
+    let referencing = |mut convoy: Value, snapshots: &str| {
+        convoy["metadata"]["annotations"] = json!({
+            (PLACEMENT_SNAPSHOT_ANNOTATION): format!("placement-{snapshots}"),
+            (WORKFLOW_SNAPSHOT_ANNOTATION): format!("workflow-{snapshots}"),
+        });
+        convoy
+    };
+    let mut ended = live_convoy("ended");
+    ended["status"]["phase"] = json!("Landed");
+    let documents = vec![
+        placement("placement-live", "live"),
+        placement("placement-ended", "ended"),
+        workflow("workflow-live"),
+        workflow("workflow-ended"),
+        referencing(live_convoy("live"), "live"),
+        referencing(ended, "ended"),
+    ];
+    let summary = rehearse(&rows(documents), HERE);
+    assert!(summary.refusals.is_empty(), "{summary:?}");
+    for kind in ["FulfilmentKind", "WorkflowTemplate"] {
+        let rows = &summary.rows[kind];
+        assert_eq!((rows.imported, rows.dropped), (1, 1), "{kind}: {rows:?}");
+        assert_eq!(rows.drops.get("a snapshot no live convoy references"), Some(&1), "{kind}: {rows:?}");
+    }
+}
+
 // Behaviour (ADR 0047, #3108): a previous-generation manifest stamp named the declaring host, not
 // its root. Imported at its home with the root in the same import, the record names the root that
 // host and its source declare, and reads back with the root's source and the document's path; a

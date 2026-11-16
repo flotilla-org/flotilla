@@ -134,7 +134,10 @@ fn policies_become_kinds_and_their_settings_are_constants() {
                 spec
             }),
         ],
-        live_references: live(&[("kiwi", "placement-snapshot-0123456789ab", &["convoy-0002"])]),
+        live_references: live(&[
+            ("kiwi", "placement-snapshot-ba9876543210", &["convoy-0001"]),
+            ("kiwi", "placement-snapshot-0123456789ab", &["convoy-0002"]),
+        ]),
     };
     let mut report = ImportReport::default();
     let imported = import_placement(&copies, &mut report);
@@ -423,7 +426,10 @@ async fn imported_kinds_read_back_through_the_engine() {
             policy("crew-image", "alpha", &[], &[], crew_image()),
             policy("placement-snapshot-0123456789ab", "alpha", &[(PREPARED_SNAPSHOT_LABEL, "placement")], &[], crew_image()),
         ],
-        live_references: live(&[("alpha", "placement-snapshot-0123456789ab", &["convoy-0002"])]),
+        live_references: live(&[
+            ("alpha", "placement-snapshot-ba9876543210", &["convoy-0001"]),
+            ("alpha", "placement-snapshot-0123456789ab", &["convoy-0002"]),
+        ]),
     };
     let mut report = ImportReport::default();
     {

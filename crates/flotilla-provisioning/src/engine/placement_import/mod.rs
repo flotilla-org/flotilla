@@ -6,7 +6,8 @@
 //! | FulfilmentKind | the kind, written as its stamps' writer: admission's snapshot, seeding, or the definition's origin |
 //! | PlacementPolicy with a kind of its name at its home | dropped: the kind is the daemon's migration of it |
 //! | PlacementPolicy without one | the kind its topology describes; its settings are the code constants |
-//! | A placement snapshot no convoy label owns | labelled with the one live convoy referencing it; dropped when none does; refused when several do |
+//! | A placement snapshot no live convoy references | dropped: an ended convoy never tears down on the engine |
+//! | A placement snapshot no convoy label owns | labelled with the one live convoy referencing it; refused when several do |
 //! | Deleted | dropped |
 //! | One name in several namespaces at one home | refused: the engine has no namespaces |
 
@@ -88,10 +89,11 @@ fn host_ref(spec: &PolicySpec) -> &str {
 type Stamps = (BTreeMap<String, String>, &'static str);
 
 /// What a copy's stamps say wrote it, as the engine's kinds read it back; `None` for a snapshot
-/// with no convoy to release it.
+/// with no live convoy to release it.
 ///
-/// A snapshot is released with the convoy its label names. One written before admission labelled
-/// it takes the one live convoy that references it (`live`), and is dropped when none does.
+/// A snapshot is released with the convoy its label names, and an ended convoy never tears down
+/// on the engine, so a snapshot no live convoy references (`live`) is dropped. One written before
+/// admission labelled it takes the one live convoy that references it.
 fn stamped(
     labels: &BTreeMap<String, String>,
     annotations: &BTreeMap<String, String>,
@@ -99,10 +101,12 @@ fn stamped(
 ) -> Result<Option<Stamps>, String> {
     let mut labels = labels.clone();
     if is_prepared_snapshot(&labels, PLACEMENT_SNAPSHOT_KIND) {
+        let live: Vec<_> = live.into_iter().flatten().collect();
+        if live.is_empty() {
+            return Ok(None);
+        }
         if !labels.contains_key(CONVOY_LABEL) {
-            let live: Vec<_> = live.into_iter().flatten().collect();
             match live.as_slice() {
-                [] => return Ok(None),
                 [convoy] => {
                     labels.insert(CONVOY_LABEL.to_owned(), (*convoy).clone());
                 }
@@ -124,8 +128,9 @@ fn stamped(
     Ok(Some((labels, writer)))
 }
 
-/// What the report counts a snapshot no convoy can release under.
-const UNOWNED: &str = "a snapshot no live convoy references";
+/// What the report counts a prepared snapshot, placement or workflow, that no convoy on the
+/// engine will release under.
+pub const UNREFERENCED: &str = "a snapshot no live convoy references";
 
 struct KindEntry {
     namespaces: BTreeSet<String>,
@@ -177,7 +182,7 @@ fn import_placement_at(copies: &PlacementCopies, imports: &dyn Fn(&str) -> bool,
         let live = copies.live_references.get(&(copy.home.clone(), metadata.name.clone()));
         let stamps = match stamped(&metadata.labels, &metadata.annotations, live) {
             Ok(None) => {
-                report.drop_rows(KINDS, UNOWNED, 1);
+                report.drop_rows(KINDS, UNREFERENCED, 1);
                 continue;
             }
             Ok(Some(stamps)) => Ok(stamps),
@@ -236,7 +241,7 @@ fn import_placement_at(copies: &PlacementCopies, imports: &dyn Fn(&str) -> bool,
         let (labels, writer) = match stamps {
             Ok(Some(stamps)) => stamps,
             Ok(None) => {
-                report.drop_rows(POLICIES, UNOWNED, 1);
+                report.drop_rows(POLICIES, UNREFERENCED, 1);
                 continue;
             }
             Err(reason) => {

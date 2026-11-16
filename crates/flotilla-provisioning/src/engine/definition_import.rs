@@ -9,6 +9,7 @@
 //! | Under a built-in's name (layer 2a) | dropped: the built-in is served from the code |
 //! | Deleted (the merge reads it as deleted) | dropped |
 //! | A retired ADR 0053 image layer | dropped: inert for resolution |
+//! | A workflow snapshot no live convoy references | dropped: an ended convoy never tears down on the engine |
 //! | With a field still in merge conflict | the merged value readers see, noted with its sibling values |
 //! | Declared by a manifest at one or more homes | one record at each declaring home |
 //! | Materialised by project ops at one or more homes | one record at each materialising home |
@@ -34,14 +35,16 @@ use flotilla_protocol::NodeId;
 use flotilla_resources::{
     builtins::is_builtin,
     definitions::{declares, DefinitionOrigin},
-    ConvoyEnsure, CredentialGrant, CredentialSpec, CrewDefaults, FleetDesignation, Forge, ImageLayer, ImageLayerResourceSpec,
-    ManifestRoot as OldRoot, ObjectMeta, Project, Resource, ResourceObject, WorkflowTemplate, WorkflowTemplateSpec,
+    is_prepared_snapshot, ConvoyEnsure, CredentialGrant, CredentialSpec, CrewDefaults, FleetDesignation, Forge, ImageLayer,
+    ImageLayerResourceSpec, ManifestRoot as OldRoot, ObjectMeta, Project, Resource, ResourceObject, WorkflowTemplate, WorkflowTemplateSpec,
+    WORKFLOW_SNAPSHOT_KIND,
 };
 use flotilla_schema::{CreatedAt, Kind, Timestamp};
 use flotilla_store::{definition_is_live, merge_definition_copies};
 
 use super::{
     import::{ImportRefusal, ImportReport, RowOutcome},
+    placement_import::UNREFERENCED,
     project_import::write_project_ops,
     provenance::{change_of, declared_elsewhere, legacy_root, stamped_root, DeclaringRoot},
 };
@@ -126,6 +129,9 @@ pub struct DefinitionCopies {
     pub crew_defaults: Vec<DefinitionCopy<CrewDefaults>>,
     pub image_layers: Vec<DefinitionCopy<ImageLayer>>,
     pub workflow_templates: Vec<DefinitionCopy<WorkflowTemplate>>,
+    /// The workflow snapshots a live convoy references, by name. Any other snapshot is dropped:
+    /// an ended convoy never tears down on the engine, so nothing would release it.
+    pub live_workflow_snapshots: BTreeSet<String>,
     /// A standing role's declaration (#3108). Its old status is not carried: the role's reading
     /// is derived from its convoy generations and its hold attention.
     pub convoy_ensures: Vec<DefinitionCopy<ConvoyEnsure>>,
@@ -160,10 +166,32 @@ pub fn import_definitions(copies: &DefinitionCopies, target: &mut impl ImportTar
     write_kind::<CredentialGrantDefinition>(&copies.credential_grants, roots, target, report);
     write_kind::<CrewDefaultsDefinition>(&copies.crew_defaults, roots, target, report);
     write_kind::<ImageLayerDefinition>(&copies.image_layers, roots, target, report);
-    write_kind::<WorkflowTemplateDefinition>(&copies.workflow_templates, roots, target, report);
+    let templates = referenced_templates(copies, &|home| target.imports(home), report);
+    write_kind::<WorkflowTemplateDefinition>(&templates, roots, target, report);
     write_kind::<ConvoyEnsureDefinition>(&copies.convoy_ensures, roots, target, report);
     let projects = write_kind::<ProjectDefinition>(&copies.projects, roots, target, report);
     write_project_ops(&copies.projects, &projects, target, report);
+}
+
+/// The workflow template copies to import: each copy of a workflow snapshot no live convoy
+/// references is dropped, and counted where `imports` accepts its home.
+fn referenced_templates(
+    copies: &DefinitionCopies,
+    imports: &dyn Fn(&str) -> bool,
+    report: &mut ImportReport,
+) -> Vec<DefinitionCopy<WorkflowTemplate>> {
+    let mut kept = Vec::new();
+    for copy in &copies.workflow_templates {
+        let metadata = &copy.object.metadata;
+        if is_prepared_snapshot(&metadata.labels, WORKFLOW_SNAPSHOT_KIND) && !copies.live_workflow_snapshots.contains(&metadata.name) {
+            if imports(&copy.home) {
+                report.drop_rows(<WorkflowTemplateDefinition as Kind>::KIND, UNREFERENCED, 1);
+            }
+            continue;
+        }
+        kept.push(DefinitionCopy { namespace: copy.namespace.clone(), object: copy.object.clone(), home: copy.home.clone() });
+    }
+    kept
 }
 
 /// One engine record the import makes: its namespace, name, home and value.
