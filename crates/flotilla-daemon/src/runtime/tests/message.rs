@@ -202,38 +202,37 @@ async fn hookless_submission_waits_for_delayed_working_evidence_with_composer_vi
     assert_eq!(pool.inner.delivered.lock().await.len(), 1);
 }
 
-// #2705: generate isolated redraws and short Working/Idle runs through
-// the real Codex adapter and terminal-pool boundary. No flicker permits a
-// second write; only a full stable second confirms the queued submission.
-#[hegel::test]
-fn flickering_codex_confirmation_never_resends(tc: hegel::TestCase) {
-    use hegel::generators as gs;
-    let run_length = tc.draw(gs::integers::<usize>().min_value(1).max_value(3));
-    let accepted_then_error = tc.draw(gs::booleans());
-    let mut pool = DeliveryProbePool::new(vec![ScreenActivity::Stable]);
-    pool.submission_error = accepted_then_error;
-    pool.screens.push("› Ask Codex to do anything".into());
-    for index in 0..24 {
-        pool.screens.push(if (index / run_length).is_multiple_of(2) {
-            "• Working (10m • esc to interrupt)\n› Ask Codex to do anything".into()
-        } else {
-            "› Ask Codex to do anything".into()
-        });
+// #2705: isolated redraws and short Working/Idle runs, each with and without a
+// submission error, through the real Codex adapter and terminal-pool boundary.
+// No flicker permits a second write; only a full stable second confirms the
+// queued submission.
+#[tokio::test(start_paused = true)]
+async fn flickering_codex_confirmation_never_resends() {
+    for run_length in 1..=3usize {
+        for accepted_then_error in [false, true] {
+            let mut pool = DeliveryProbePool::new(vec![ScreenActivity::Stable]);
+            pool.submission_error = accepted_then_error;
+            pool.screens.push("› Ask Codex to do anything".into());
+            for index in 0..24 {
+                pool.screens.push(if (index / run_length).is_multiple_of(2) {
+                    "• Working (10m • esc to interrupt)\n› Ask Codex to do anything".into()
+                } else {
+                    "› Ask Codex to do anything".into()
+                });
+            }
+            let adapters = AgentAdapterRegistry::discover(
+                &EnvironmentBag::new().with(EnvironmentAssertion::binary("codex", "/tools/codex")),
+                Arc::new(DiscoveryMockRunner::builder().build()),
+            );
+            let outcome =
+                submit_and_confirm(&pool, &ComposerDrafts::default(), adapters.get("codex").map(|adapter| &**adapter), "agent", "wake")
+                    .await
+                    .expect("uncertain submission");
+            assert_eq!(outcome, TerminalDeliveryOutcome::Unconfirmed(TerminalDeliveryFailure::SubmissionUnconfirmed));
+            assert_eq!(pool.deliveries.load(Ordering::SeqCst), 1);
+            assert_eq!(pool.retries.load(Ordering::SeqCst), 0);
+        }
     }
-    let runtime = tokio::runtime::Builder::new_current_thread().enable_all().start_paused(true).build().expect("runtime");
-    runtime.block_on(async {
-        let adapters = AgentAdapterRegistry::discover(
-            &EnvironmentBag::new().with(EnvironmentAssertion::binary("codex", "/tools/codex")),
-            Arc::new(DiscoveryMockRunner::builder().build()),
-        );
-        let outcome =
-            submit_and_confirm(&pool, &ComposerDrafts::default(), adapters.get("codex").map(|adapter| &**adapter), "agent", "wake")
-                .await
-                .expect("uncertain submission");
-        assert_eq!(outcome, TerminalDeliveryOutcome::Unconfirmed(TerminalDeliveryFailure::SubmissionUnconfirmed));
-        assert_eq!(pool.deliveries.load(Ordering::SeqCst), 1);
-        assert_eq!(pool.retries.load(Ordering::SeqCst), 0);
-    });
 }
 
 #[tokio::test(start_paused = true)]
