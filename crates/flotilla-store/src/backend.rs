@@ -831,6 +831,7 @@ impl<T: Resource> TypedResolver<T> {
     }
 
     pub async fn create(&self, meta: &InputMeta, spec: &T::Spec) -> Result<ResourceObject<T>, ResourceError> {
+        self.refuse_engine_write_elsewhere()?;
         if T::REPLICATION_CLASS == crate::ReplicationClass::Definitions {
             return self.backend.definitions::<T>(&self.namespace).create(meta, spec).await;
         }
@@ -850,9 +851,9 @@ impl<T: Resource> TypedResolver<T> {
         (T::REPLICATION_CLASS != crate::ReplicationClass::Definitions).then(|| self.backend.engine_records(T::API_PATHS.kind)).flatten()
     }
 
-    /// The namespace this kind's engine records are in: the engine's, not the one read through.
-    fn engine_namespace(&self) -> String {
-        self.backend.engine_namespace(T::API_PATHS.kind).unwrap_or_else(|| self.namespace.clone())
+    /// Refuses a write through a namespace other than the one the engine serves this kind in.
+    fn refuse_engine_write_elsewhere(&self) -> Result<(), ResourceError> {
+        self.backend.definitions::<T>(&self.namespace).refuse_write_elsewhere()
     }
 
     /// This home's own engine record `name`, if any.
@@ -869,6 +870,7 @@ impl<T: Resource> TypedResolver<T> {
     /// Why `verb` on `name` fails when this home holds no copy: other homes' copies, named,
     /// since only a record's home writes it; otherwise not found.
     pub(crate) async fn not_held_here(&self, name: &str, verb: &str) -> Result<ResourceError, ResourceError> {
+        self.refuse_engine_write_elsewhere()?;
         let Some(records) = self.engine_owned() else {
             return Ok(ResourceError::not_found(name));
         };
@@ -903,10 +905,11 @@ impl<T: Resource> TypedResolver<T> {
         let value = serde_json::to_value(spec).map_err(|error| ResourceError::decode(error.to_string()))?;
         let record =
             records.apply(T::API_PATHS.kind, &meta.name, &meta.labels, &meta.annotations, value).await.map_err(ResourceError::other)?;
-        crate::definition::engine_object(&self.engine_namespace(), record)
+        crate::definition::engine_object(&self.namespace, record)
     }
 
     pub async fn update(&self, meta: &InputMeta, resource_version: &str, spec: &T::Spec) -> Result<ResourceObject<T>, ResourceError> {
+        self.refuse_engine_write_elsewhere()?;
         if let Some(records) = self.engine_owned() {
             self.engine_current(&*records, &meta.name, resource_version).await?;
             let current = self.get(&meta.name).await?;
@@ -930,6 +933,7 @@ impl<T: Resource> TypedResolver<T> {
     /// retried by reconciliation with the newly held lifecycle; it cannot change engine state.
     /// HTTP validates on its server and does not transmit this local validator selection.
     pub async fn update_status(&self, name: &str, resource_version: &str, status: &T::Status) -> Result<ResourceObject<T>, ResourceError> {
+        self.refuse_engine_write_elsewhere()?;
         let engine_owned = match (T::STATUS_LIFECYCLE_KIND, self.lifecycle_status_reads.as_ref()) {
             (Some(lifecycle), Some(reads)) => {
                 let reads = std::sync::Arc::clone(reads);
@@ -947,7 +951,7 @@ impl<T: Resource> TypedResolver<T> {
             self.engine_current(&*records, name, resource_version).await?;
             let value = serde_json::to_value(status).map_err(|error| ResourceError::decode(error.to_string()))?;
             let record = records.set_status(T::API_PATHS.kind, name, value).await.map_err(ResourceError::other)?;
-            return crate::definition::engine_object(&self.engine_namespace(), record);
+            return crate::definition::engine_object(&self.namespace, record);
         }
         if !engine_owned {
             return dispatch_backend!(self, update_status_typed, name, resource_version, status);
@@ -960,6 +964,7 @@ impl<T: Resource> TypedResolver<T> {
     }
 
     pub async fn delete(&self, name: &str) -> Result<(), ResourceError> {
+        self.refuse_engine_write_elsewhere()?;
         if T::REPLICATION_CLASS == crate::ReplicationClass::Definitions {
             return self.backend.definitions::<T>(&self.namespace).delete(name).await;
         }

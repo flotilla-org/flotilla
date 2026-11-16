@@ -65,12 +65,21 @@ impl<T: Resource> DefinitionResolver<T> {
         self.backend.engine_namespace(T::API_PATHS.kind).is_none_or(|namespace| namespace == self.namespace)
     }
 
+    /// Refuses a write through a namespace other than the one the engine serves this kind in: its
+    /// records can be in no other.
+    pub(crate) fn refuse_write_elsewhere(&self) -> Result<(), ResourceError> {
+        match self.backend.engine_namespace(T::API_PATHS.kind) {
+            Some(namespace) if namespace != self.namespace => {
+                Err(ResourceError::invalid(format!("{} is served in namespace {namespace}", T::API_PATHS.kind)))
+            }
+            _ => Ok(()),
+        }
+    }
+
     /// An engine record as the old store's object: the stamps its port rebuilds, and no merge
     /// metadata, owner references or finalizers. The engine keeps no creation time.
-    /// It carries the engine's namespace, which a write through another namespace lands in.
     fn object(&self, record: EngineObject) -> Result<ResourceObject<T>, ResourceError> {
-        let namespace = self.backend.engine_namespace(T::API_PATHS.kind).unwrap_or_else(|| self.namespace.clone());
-        engine_object(&namespace, record)
+        engine_object(&self.namespace, record)
     }
 
     /// Every engine record of this kind read through this namespace, with the built-ins.
@@ -387,6 +396,7 @@ impl<T: Resource> DefinitionResolver<T> {
     pub async fn apply_as(&self, writer: &WriterIdentity, meta: &InputMeta, spec: &T::Spec) -> Result<ResourceObject<T>, ResourceError> {
         ensure_definitions::<T>()?;
         refuse_builtin::<T>(&meta.name)?;
+        self.refuse_write_elsewhere()?;
         let _hierarchy_admission = self.backend.hierarchy_admission(T::API_PATHS.kind).await;
         T::validate_spec(meta, spec)?;
         if crate::project_hierarchy::is_hierarchy_kind(T::API_PATHS.kind) {
@@ -498,6 +508,7 @@ impl<T: Resource> DefinitionResolver<T> {
     pub async fn delete(&self, name: &str) -> Result<(), ResourceError> {
         ensure_definitions::<T>()?;
         refuse_builtin::<T>(name)?;
+        self.refuse_write_elsewhere()?;
         let _hierarchy_admission = self.backend.hierarchy_admission(T::API_PATHS.kind).await;
         if T::API_PATHS.kind == "Project" {
             let hierarchy = crate::ProjectHierarchy::load_for_inspection(&self.backend, &self.namespace).await?;
@@ -558,6 +569,7 @@ impl<T: Resource> DefinitionResolver<T> {
     pub async fn update_metadata(&self, meta: &InputMeta) -> Result<ResourceObject<T>, ResourceError> {
         ensure_definitions::<T>()?;
         refuse_builtin::<T>(&meta.name)?;
+        self.refuse_write_elsewhere()?;
         let _hierarchy_admission = self.backend.hierarchy_admission(T::API_PATHS.kind).await;
         // The backend writes the read spec along with metadata. Serialize this
         // read/write pair with reparenting to avoid restoring a stale parent.

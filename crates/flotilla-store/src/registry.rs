@@ -997,6 +997,7 @@ async fn get_all_typed<T: Resource>(backend: &ResourceBackend, namespace: &str, 
 async fn delete_typed<T: Resource>(backend: &ResourceBackend, namespace: &str, name: &str) -> Result<DynamicResourceDelete, ResourceError> {
     let resolver = backend.using::<T>(namespace);
     if let Some(records) = backend.engine_records(T::API_PATHS.kind) {
+        backend.definitions::<T>(namespace).refuse_write_elsewhere()?;
         // The engine keeps its own deletions: no old-store tombstone or decode quarantine. Its port
         // answers a delete of a name it does not list too, refusing it when the kind takes no writes.
         let object = match resolver.get(name).await {

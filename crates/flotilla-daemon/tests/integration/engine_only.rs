@@ -201,6 +201,47 @@ async fn every_registered_kind_is_served_by_the_engine_or_refused() {
     }
 }
 
+// The engine serves its kinds in the daemon's namespace alone: the resource commands refuse a write
+// through any other, naming the namespace, and nothing is written.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn the_resource_commands_refuse_writes_through_another_namespace() {
+    use flotilla_protocol::{CommandAction, CommandValue};
+    use flotilla_resources::AccessDelivery;
+    let daemon = TestDaemon::builder().old_store(OldStoreMode::Unavailable).start().await;
+    let refused = |value: CommandValue| match value {
+        CommandValue::Error { message } => assert!(message.contains("AccessDelivery is served in namespace flotilla"), "{message}"),
+        other => panic!("not refused: {other:?}"),
+    };
+    let spec = serde_json::json!({
+        "access": flotilla_resources::access_delivery::access_key("flotilla", "demo", "implement", "coder"),
+        "place": "env-a", "harness": "claude-code", "home": "/home/a", "needs": {},
+    });
+    let apply = CommandAction::ResourceApply {
+        namespace: "elsewhere".into(),
+        document: serde_json::json!({
+            "apiVersion": "flotilla.work/v1", "kind": "AccessDelivery", "metadata": {"name": "access-a", "namespace": "elsewhere"}, "spec": spec,
+        }),
+    };
+    refused(daemon.execute(apply).await);
+    let patch = CommandAction::ResourceStatusPatch {
+        expected_resource_version: None,
+        namespace: "elsewhere".into(),
+        kind: "AccessDelivery".into(),
+        name: "access-a".into(),
+        // AccessDelivery's status is unit.
+        status: serde_json::Value::Null,
+    };
+    refused(daemon.execute(patch).await);
+    let delete = CommandAction::ResourceDelete {
+        namespace: "elsewhere".into(),
+        kind: "AccessDelivery".into(),
+        name: "access-a".into(),
+        replica_origin: None,
+    };
+    refused(daemon.execute(delete).await);
+    assert!(daemon.get::<AccessDelivery>("access-a").await.is_none(), "nothing was written in the engine's namespace");
+}
+
 // The resource commands read a crew's messages from the engine. A message's state moves only
 // through its machine, so a delete is refused, naming the command that does change it.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]

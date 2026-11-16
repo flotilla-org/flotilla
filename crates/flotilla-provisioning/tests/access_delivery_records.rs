@@ -100,6 +100,28 @@ async fn contract(backend: &ResourceBackend) {
     assert_eq!(records.list().await.expect("list").items.len(), 1);
 }
 
+/// The engine serves the kind in [`NS`] alone: a create, update or delete through another namespace
+/// is refused, naming it, and leaves the records as they were.
+async fn writes_through_another_namespace_are_refused(backend: &ResourceBackend) {
+    let records = backend.using::<AccessDelivery>(NS);
+    let elsewhere = backend.using::<AccessDelivery>("elsewhere");
+    let held = records.create(&meta("access-held", "demo"), &spec("demo", "/home/held")).await.expect("create");
+    let refused = |result: Result<_, flotilla_resources::ResourceError>, verb: &str| match result {
+        Err(flotilla_resources::ResourceError::Invalid { message }) => {
+            assert_eq!(message, format!("AccessDelivery is served in namespace {NS}"), "{verb}")
+        }
+        other => panic!("{verb} through another namespace was not refused: {other:?}"),
+    };
+    refused(elsewhere.create(&meta("access-new", "demo"), &spec("demo", "/home/new")).await.map(|_| ()), "create");
+    let changed = spec("demo", "/home/changed");
+    refused(elsewhere.update(&meta("access-held", "demo"), &held.metadata.resource_version, &changed).await.map(|_| ()), "update");
+    refused(elsewhere.delete("access-held").await, "delete");
+    assert!(records.get("access-new").await.is_err(), "nothing was created");
+    let still = records.get("access-held").await.expect("not deleted");
+    assert_eq!((still.metadata.resource_version, still.spec), (held.metadata.resource_version, held.spec), "not changed");
+    records.delete("access-held").await.expect("delete");
+}
+
 #[tokio::test]
 async fn the_old_store_keeps_the_access_delivery_contract() {
     contract(&ResourceBackend::new(InMemoryBackend::default())).await;
@@ -117,5 +139,6 @@ async fn the_engine_keeps_the_access_delivery_contract() {
     backend.serve_engine_in(NS);
     backend.install_engine_records(Arc::new(records));
     contract(&backend).await;
+    writes_through_another_namespace_are_refused(&backend).await;
     assert!(backend.store().list_raw(flotilla_store::ResourceKind::of::<AccessDelivery>(), NS).await.expect("old rows").items.is_empty());
 }
