@@ -333,12 +333,20 @@ pub trait CharterNotices: Send + Sync {
     fn namespace(&self) -> &str;
     fn pass(&self) -> std::sync::Arc<tokio::sync::Mutex<()>>;
     fn admission(&self) -> std::sync::Arc<tokio::sync::Mutex<()>>;
-    /// Whether `name`, sent to `receiver`, exists.
-    async fn existing(&self, receiver: &str, name: &str, now: chrono::DateTime<chrono::Utc>) -> Result<bool, ResourceError>;
-    /// The newest open charter notification to `receiver` about `project`, which the next one
-    /// supersedes: its name.
-    async fn open_charter_notice(&self, receiver: &str, project: &str) -> Result<Option<String>, ResourceError>;
-    async fn admit(&self, name: &str, spec: &crate::MessageSpec, now: chrono::DateTime<chrono::Utc>) -> Result<(), ResourceError>;
+    /// The fleet-store role's inbox, which sends the notices; `None` until the fleet is designated,
+    /// when nothing is admitted.
+    async fn sender(&self) -> Result<Option<flotilla_address::Address>, ResourceError>;
+    /// Whether `inbox` holds `name`.
+    async fn existing(&self, inbox: &flotilla_address::Address, name: &str) -> Result<bool, ResourceError>;
+    /// The newest open notification from `sender` in `inbox` about `project`'s charter, which the
+    /// next one supersedes: its name.
+    async fn open_charter_notice(
+        &self,
+        inbox: &flotilla_address::Address,
+        sender: &flotilla_address::Address,
+        project: &str,
+    ) -> Result<Option<String>, ResourceError>;
+    async fn admit(&self, name: &str, intent: &crate::Intent) -> Result<(), ResourceError>;
 }
 
 /// Applied revisions generate receiver-homed notifications. Deterministic IDs make a restart
@@ -347,7 +355,6 @@ pub trait CharterNotices: Send + Sync {
 pub async fn reconcile_charter_notifications_with_receivers(
     inbox: &dyn CharterNotices,
     renderer: &dyn CharterBriefRenderer,
-    now: chrono::DateTime<chrono::Utc>,
     backend: &ResourceBackend,
     receivers: &MessageReceiverSnapshot,
     projects: &crate::ReadResourceList<Project>,
@@ -357,7 +364,6 @@ pub async fn reconcile_charter_notifications_with_receivers(
     reconcile_charter_notifications_from_receivers(
         inbox,
         renderer,
-        now,
         backend,
         receivers,
         projects.items.iter().map(|item| &item.object).collect(),
@@ -368,14 +374,15 @@ pub async fn reconcile_charter_notifications_with_receivers(
 async fn reconcile_charter_notifications_from_receivers(
     inbox: &dyn CharterNotices,
     renderer: &dyn CharterBriefRenderer,
-    now: chrono::DateTime<chrono::Utc>,
     backend: &ResourceBackend,
     receivers: &MessageReceiverSnapshot,
     projects: Vec<&ResourceObject<Project>>,
 ) -> Result<(), ResourceError> {
-    use crate::{MessageExpectation, MessageReference, MessageRelation, MessageSpec, ResourceProvenance, TerminalSessionSource};
+    use crate::{Intent, IntentExpectation, IntentReference, MessageRelation, ResourceProvenance, TerminalSessionSource};
     use sha2::{Digest, Sha256};
     let namespace = inbox.namespace();
+    // Nothing is admitted before the fleet is designated.
+    let Some(sender) = inbox.sender().await? else { return Ok(()) };
     let convoys = receivers.convoys();
     let mut cascades = BTreeMap::new();
     for holder in receivers.terminals() {
@@ -426,10 +433,11 @@ async fn reconcile_charter_notifications_from_receivers(
             continue;
         }
         let name = format!("charter-{:x}", Sha256::digest(format!("{receiver}\0{revision}").as_bytes()));
+        let receiver_inbox = flotilla_resources::convoy::engine::role_inbox(&receiver).map_err(ResourceError::invalid)?;
         {
             let admission = inbox.admission();
             let _admission = admission.lock().await;
-            if inbox.existing(&receiver, &name, now).await? {
+            if inbox.existing(&receiver_inbox, &name).await? {
                 continue;
             }
         }
@@ -438,10 +446,10 @@ async fn reconcile_charter_notifications_from_receivers(
             cascades.insert(project_name.clone(), cascade);
         }
         let cascade = cascades.get(&project_name).expect("loaded Project cascade");
-        let subject = MessageReference::ControlRecord {
-            resource: flotilla_protocol::ResourceRef::new("flotilla.work/v1", "Project", namespace, &project_name),
-            revision: revision.clone(),
-        };
+        let subject = IntentReference::subject(
+            flotilla_address::Address::project(&project_name).map_err(|error| ResourceError::invalid(error.to_string()))?,
+            flotilla_address::Revision::new(revision.clone()).map_err(|error| ResourceError::invalid(error.to_string()))?,
+        );
         let rendered = renderer
             .render(
                 CharterBriefInput::builder()
@@ -458,21 +466,16 @@ async fn reconcile_charter_notifications_from_receivers(
         // snapshot reads never block ordinary inbox producers.
         let admission = inbox.admission();
         let _admission = admission.lock().await;
-        if inbox.existing(&receiver, &name, now).await? {
+        if inbox.existing(&receiver_inbox, &name).await? {
             continue;
         }
-        let predecessor = inbox.open_charter_notice(&receiver, &project_name).await?;
-        let spec = MessageSpec::builder()
-            .sender(FLEET_STORE_SENDER.into())
-            .receiver(receiver)
-            .relation(MessageRelation::System)
-            .body(format!("Project charter updated: charter@{revision}\n\n{rendered}"))
-            .references(vec![subject.clone()])
-            .subject(subject)
-            .expectation(MessageExpectation::None)
-            .maybe_supersedes(predecessor)
-            .build();
-        inbox.admit(&name, &spec, now).await?;
+        let predecessor = inbox.open_charter_notice(&receiver_inbox, &sender, &project_name).await?;
+        let body = format!("Project charter updated: charter@{revision}\n\n{rendered}");
+        let mut intent = Intent::new(sender.clone(), receiver_inbox, MessageRelation::System, body);
+        intent.references = vec![subject];
+        intent.expectation = IntentExpectation::Nothing;
+        intent.supersedes = predecessor;
+        inbox.admit(&name, &intent).await?;
     }
     Ok(())
 }

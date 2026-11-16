@@ -1409,18 +1409,21 @@ impl flotilla_messaging::CharterNotices for NoCharterNotices {
     fn admission(&self) -> Arc<tokio::sync::Mutex<()>> {
         Arc::default()
     }
-    async fn existing(&self, _: &str, _: &str, _: chrono::DateTime<chrono::Utc>) -> Result<bool, flotilla_resources::ResourceError> {
+    async fn sender(&self) -> Result<Option<flotilla_address::Address>, flotilla_resources::ResourceError> {
+        Ok(Some("fleet:lab/role:fleet-store".parse().expect("the fleet-store role")))
+    }
+    async fn existing(&self, _: &flotilla_address::Address, _: &str) -> Result<bool, flotilla_resources::ResourceError> {
         Err(flotilla_resources::ResourceError::invalid("these tests admit no charter notice"))
     }
-    async fn open_charter_notice(&self, _: &str, _: &str) -> Result<Option<String>, flotilla_resources::ResourceError> {
-        Err(flotilla_resources::ResourceError::invalid("these tests admit no charter notice"))
-    }
-    async fn admit(
+    async fn open_charter_notice(
         &self,
+        _: &flotilla_address::Address,
+        _: &flotilla_address::Address,
         _: &str,
-        _: &flotilla_resources::MessageSpec,
-        _: chrono::DateTime<chrono::Utc>,
-    ) -> Result<(), flotilla_resources::ResourceError> {
+    ) -> Result<Option<String>, flotilla_resources::ResourceError> {
+        Err(flotilla_resources::ResourceError::invalid("these tests admit no charter notice"))
+    }
+    async fn admit(&self, _: &str, _: &flotilla_messaging::Intent) -> Result<(), flotilla_resources::ResourceError> {
         Err(flotilla_resources::ResourceError::invalid("these tests admit no charter notice"))
     }
 }

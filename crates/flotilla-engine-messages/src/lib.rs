@@ -30,7 +30,7 @@ use std::{
 
 use self::{
     convert::{Conversion, ReferenceAddresses},
-    roles::{designated_fleet_roles, FleetRoles},
+    roles::{designated_fleet_roles, FleetRoles, FLEET_STORE},
     view::{old_view, record_name, ViewLookups},
 };
 use flotilla_address::{Address, Kind as AddressKind};
@@ -1018,6 +1018,23 @@ impl MessagePrimitives {
     pub async fn person_role(&self, namespace: &str, principal: &str, project: Option<&str>) -> Result<Address, ResourceError> {
         let roles = self.roles(namespace).await.map_err(ResourceError::invalid)?;
         self.person_inbox(namespace, &roles, &format!("principal:{principal}"), project).await.map_err(ResourceError::invalid)
+    }
+
+    /// The person who holds person role `inbox`, when it is one: the principal its project's
+    /// charter declares for the role, else the role's own name. Read on the project's declaration
+    /// by its name.
+    pub async fn person_holding(&self, namespace: &str, inbox: &Address) -> Result<Option<String>, String> {
+        if inbox.kind() != AddressKind::Role || inbox.get(AddressKind::Convoy).is_some() {
+            return Ok(None);
+        }
+        if let Some(project) = inbox.get(AddressKind::Project) {
+            let declared = self.keyed_reads().declared::<Project>(namespace, project).await.map_err(|error| error.to_string())?;
+            let principal = declared.as_ref().and_then(|project| project.spec.role_definitions.get(inbox.name())?.principal.as_deref());
+            if let Some(principal) = principal {
+                return Ok(Some(principal.strip_prefix("principal:").unwrap_or(principal).to_owned()));
+            }
+        }
+        Ok(self.roles(namespace).await?.person_role_of(inbox).map(str::to_owned))
     }
 
     /// An old-shaped intent in the engine's terms, as admission takes it.
@@ -2125,30 +2142,27 @@ impl flotilla_messaging::CharterNotices for EngineCharterNotices {
     fn admission(&self) -> Arc<tokio::sync::Mutex<()>> {
         Arc::clone(&self.primitives.charter_admission)
     }
-    async fn existing(&self, receiver: &str, name: &str, _: chrono::DateTime<chrono::Utc>) -> Result<bool, ResourceError> {
-        // The engine admits in the create: a stored message is admitted. Nothing is admitted
-        // before the fleet is designated.
-        let Ok(roles) = self.primitives.roles_or_wait(&self.namespace).await.map_err(ResourceError::other)? else { return Ok(false) };
-        let inbox =
-            Conversion { roles: &roles, forges: &[], records: &convert::NoRecords }.inbox(receiver).map_err(ResourceError::invalid)?;
-        Ok(self.primitives.locate_in(&inbox, name).map_err(ResourceError::other)?.is_some())
-    }
-    async fn open_charter_notice(&self, receiver: &str, project: &str) -> Result<Option<String>, ResourceError> {
+    async fn sender(&self) -> Result<Option<Address>, ResourceError> {
         let Ok(roles) = self.primitives.roles_or_wait(&self.namespace).await.map_err(ResourceError::other)? else { return Ok(None) };
-        let conversion = Conversion { roles: &roles, forges: &[], records: &convert::NoRecords };
-        let inbox = conversion.inbox(receiver).map_err(ResourceError::invalid)?;
-        let sender = conversion.sender(flotilla_messaging::FLEET_STORE_SENDER).map_err(ResourceError::invalid)?;
+        let sender = roles.address(FLEET_STORE.name).ok_or_else(|| ResourceError::invalid("the fleet-store role is not declared"))?;
+        Ok(Some(sender))
+    }
+    async fn existing(&self, inbox: &Address, name: &str) -> Result<bool, ResourceError> {
+        // The engine admits in the create: a stored message is admitted.
+        Ok(self.primitives.locate_in(inbox, name).map_err(ResourceError::other)?.is_some())
+    }
+    async fn open_charter_notice(&self, inbox: &Address, sender: &Address, project: &str) -> Result<Option<String>, ResourceError> {
         // The supersession scan reads the receiver's open messages through its inbox's index.
         let notices: Vec<_> = self
             .primitives
-            .open_in(&inbox)
+            .open_in(inbox)
             .map_err(ResourceError::other)?
             .into_iter()
             .filter(|(_, message)| {
                 let spec = message.spec();
                 // The old shape's subject is the last reference marked as one.
                 let subject = spec.references.iter().rev().find(|reference| reference.subject);
-                spec.sender == sender
+                spec.sender == *sender
                     && subject.is_some_and(|subject| subject.address.kind() == AddressKind::Project && subject.address.name() == project)
             })
             .collect();
@@ -2160,8 +2174,8 @@ impl flotilla_messaging::CharterNotices for EngineCharterNotices {
             .max()
             .map(|(_, name)| name))
     }
-    async fn admit(&self, name: &str, spec: &OldSpec, _: chrono::DateTime<chrono::Utc>) -> Result<(), ResourceError> {
-        self.primitives.admit_old(&self.namespace, name, spec).await.map(|_| ())
+    async fn admit(&self, name: &str, intent: &flotilla_messaging::Intent) -> Result<(), ResourceError> {
+        self.primitives.admit(name, intent).await.map(|_| ())
     }
 }
 

@@ -101,7 +101,7 @@ async fn notify(backend: &ResourceBackend, primitives: &Arc<MessagePrimitives>) 
     let notices = EngineCharterNotices { primitives: Arc::clone(primitives), namespace: NAMESPACE.into() };
     let receivers = MessageReceiverSnapshot::load(backend, NAMESPACE).await.expect("receivers");
     let projects = backend.including_replicas::<Project>(NAMESPACE).list().await.expect("projects");
-    reconcile_charter_notifications_with_receivers(&notices, &CharterProseRenderer, chrono::Utc::now(), backend, &receivers, &projects)
+    reconcile_charter_notifications_with_receivers(&notices, &CharterProseRenderer, backend, &receivers, &projects)
         .await
         .expect("charter pass");
 }
@@ -257,7 +257,7 @@ async fn custom_charter_renderer_uses_structured_revision_and_does_not_lock_admi
         let listed = backend.including_replicas::<Project>(NAMESPACE).list().await.expect("projects");
         tokio::time::timeout(
             std::time::Duration::from_secs(2),
-            reconcile_charter_notifications_with_receivers(&notices, &renderer, chrono::Utc::now(), &backend, &receivers, &listed),
+            reconcile_charter_notifications_with_receivers(&notices, &renderer, &backend, &receivers, &listed),
         )
         .await
         .expect("render does not hold admission lock")

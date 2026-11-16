@@ -4976,13 +4976,8 @@ impl InProcessDaemon {
 
     /// Sends a Message intent as producers do: deduplicated by its name and
     /// handed to the receiver's home through the receiver-home router.
-    pub async fn publish_message(
-        &self,
-        namespace: &str,
-        name: &str,
-        intent: &flotilla_resources::MessageSpec,
-    ) -> Result<ResourceRef, String> {
-        self.crew.publish_message_spec(namespace, name, intent).await
+    pub async fn publish_message(&self, namespace: &str, name: &str, intent: &flotilla_messaging::Intent) -> Result<ResourceRef, String> {
+        self.crew.publish_message_intent(namespace, name, intent).await
     }
 
     pub async fn deliver_standing_turn(&self, request: &flotilla_crew::leaf_engine::CrewTurnIntent) -> Result<TurnDeliveryRung, String> {

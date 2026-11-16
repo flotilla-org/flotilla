@@ -240,13 +240,16 @@ impl flotilla_messaging::CharterNotices for NoCharterNotices {
     fn admission(&self) -> Arc<tokio::sync::Mutex<()>> {
         Arc::default()
     }
-    async fn existing(&self, _: &str, _: &str, _: chrono::DateTime<chrono::Utc>) -> Result<bool, ResourceError> {
+    async fn sender(&self) -> Result<Option<Address>, ResourceError> {
+        Ok(Some("fleet:fleet/role:fleet-store".parse().expect("the fleet-store role")))
+    }
+    async fn existing(&self, _: &Address, _: &str) -> Result<bool, ResourceError> {
         Err(ResourceError::invalid("these tests admit no charter notice"))
     }
-    async fn open_charter_notice(&self, _: &str, _: &str) -> Result<Option<String>, ResourceError> {
+    async fn open_charter_notice(&self, _: &Address, _: &Address, _: &str) -> Result<Option<String>, ResourceError> {
         Err(ResourceError::invalid("these tests admit no charter notice"))
     }
-    async fn admit(&self, _: &str, _: &flotilla_resources::MessageSpec, _: chrono::DateTime<chrono::Utc>) -> Result<(), ResourceError> {
+    async fn admit(&self, _: &str, _: &Intent) -> Result<(), ResourceError> {
         Err(ResourceError::invalid("these tests admit no charter notice"))
     }
 }

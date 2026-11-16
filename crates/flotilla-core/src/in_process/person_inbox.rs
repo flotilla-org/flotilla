@@ -3,8 +3,9 @@
 //! person's receipt. Listing a message writes nothing.
 
 use flotilla_daemon_api::action_events::ActionEvents;
+use flotilla_messaging::{Intent, IntentReference};
 use flotilla_protocol::{Command, CommandAction, CommandValue, PersonInboxItem, PersonInboxResponse};
-use flotilla_resources::{MessageRelation, MessageSpec};
+use flotilla_resources::MessageRelation;
 use flotilla_state_machines::machines::message::{Expectation, MessageBody};
 
 use super::InProcessDaemon;
@@ -62,22 +63,28 @@ impl InProcessDaemon {
                 Ok(CommandValue::Ok)
             }
             CommandAction::PersonAnswer { message, body, .. } => {
-                let original = primitives.view_for_person(&namespace, message).await?.object;
-                primitives.acknowledge(&namespace, message).await?;
+                let original = primitives.acknowledge(&namespace, message).await?;
+                let original = original.spec();
                 // The person answers as the role the message was addressed to, back to its sender.
-                let reply = MessageSpec::builder()
-                    .sender(original.spec.receiver.clone())
-                    .receiver(original.spec.sender.clone())
-                    .relation(MessageRelation::Supervisor)
-                    .body(body.clone())
-                    .references(original.spec.references.clone())
-                    .in_reply_to(message.clone())
-                    .build();
-                let name = flotilla_address::message_record_name(&reply.receiver, &reply.sender, &format!("answer:{message}"));
+                let references = original
+                    .references
+                    .iter()
+                    .map(|reference| {
+                        let revision = flotilla_address::Revision::new(reference.revision.clone()).map_err(|error| error.to_string())?;
+                        let mut answered = IntentReference::new(reference.address.clone(), revision);
+                        answered.subject = reference.subject;
+                        Ok(answered)
+                    })
+                    .collect::<Result<Vec<_>, String>>()?;
+                let mut reply = Intent::new(original.inbox.clone(), original.sender.clone(), MessageRelation::Supervisor, body.clone());
+                reply.references = references;
+                reply.in_reply_to = Some(message.clone());
+                reply.principal = primitives.person_holding(&namespace, &original.inbox).await?;
+                let name = flotilla_address::message_record_name(reply.inbox.as_str(), reply.sender.as_str(), &format!("answer:{message}"));
                 // One answer per message: repeating it is a no-op, and a different one is refused
                 // rather than dropped by the engine's keyed admission.
-                if let Some(sent) = primitives.view_to(&namespace, &reply.receiver, &name).await.map_err(|error| error.to_string())? {
-                    if sent.object.spec.body != reply.body {
+                if let Some(sent) = primitives.find_stored(&name, &reply.inbox).await.map_err(|error| error.to_string())? {
+                    if !matches!(sent.resource.spec().body.value(), MessageBody::Text(text) if *text == reply.body) {
                         return Err(format!("message `{message}` was already answered as `{name}`; one answer per message"));
                     }
                     return Ok(CommandValue::Ok);

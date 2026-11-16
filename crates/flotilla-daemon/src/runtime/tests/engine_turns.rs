@@ -7,7 +7,7 @@
 //! passes run on events, never on a timer.
 
 use flotilla_engine_messages::MessagePrimitives;
-use flotilla_resources::{MessagePhase, MessageRelation, MessageSpec};
+use flotilla_resources::{MessagePhase, MessageRelation};
 use flotilla_schema::Timestamp;
 use flotilla_state_machines::machines::agent_session::Activity;
 use flotilla_store::load_metrics::ControllerLoadMetrics;
@@ -106,8 +106,21 @@ impl EngineCrew {
         flotilla_resources::crew_role_address(NAMESPACE, &self.convoy, "work", "coder")
     }
 
+    /// Sends `body` to the crew from `sender`: a fleet role (`system:<role>`) or a person
+    /// (`principal:<name>`), who sends as the role they hold in the convoy's project.
     async fn send(&self, name: &str, sender: &str, relation: MessageRelation, body: &str) {
-        let intent = MessageSpec::builder().sender(sender.into()).receiver(self.receiver()).relation(relation).body(body.into()).build();
+        use flotilla_crew::leaf_engine::Party;
+        let messages: &dyn flotilla_messaging::EngineMessages = self.primitives.as_ref();
+        let party = match (sender.strip_prefix("system:"), sender.strip_prefix("principal:")) {
+            (Some(role), _) => Party::fleet(role),
+            (_, Some(principal)) => Party::Person(principal.to_owned()),
+            _ => panic!("`{sender}` is no fleet role or person"),
+        };
+        let crew = Party::Seat { project: NAMESPACE.into(), convoy: self.convoy.clone(), role: "coder".into() };
+        let sender = party.inbox(messages, NAMESPACE, NAMESPACE).await.expect("the sender's inbox");
+        let inbox = crew.inbox(messages, NAMESPACE, NAMESPACE).await.expect("the crew's inbox");
+        let mut intent = flotilla_messaging::Intent::new(sender, inbox, relation, body);
+        intent.principal = party.principal();
         self.daemon.publish_message(NAMESPACE, name, &intent).await.expect("send the turn");
     }
 

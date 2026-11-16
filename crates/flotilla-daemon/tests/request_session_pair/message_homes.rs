@@ -199,7 +199,8 @@ pub(super) async fn messages_are_homed_at_the_receiver_and_replies_route_by_subj
         .subject(convoy_ref(&subject_x))
         .expectation(MessageExpectation::Reply)
         .build();
-    a.publish_message(NS, &request, &intent).await.expect("routed send");
+    let routed = engine_a.intent_of(NS, &intent).await.expect("the send in the engine's terms");
+    a.publish_message(NS, &request, &routed).await.expect("routed send");
     let (home, sent) = homed(&engine_b, &receiver, &request).await.expect("the message is created at the receiver's home");
     assert_eq!(home, home_b);
     assert_eq!(sent.spec().sender.as_str(), "fleet:lab/role:turn-rules");
@@ -229,7 +230,8 @@ pub(super) async fn messages_are_homed_at_the_receiver_and_replies_route_by_subj
         .body("reviewed".into())
         .in_reply_to(request.clone())
         .build();
-    b.publish_message(NS, &reply, &answer).await.expect("routed reply");
+    let routed = engine_b.intent_of(NS, &answer).await.expect("the reply in the engine's terms");
+    b.publish_message(NS, &reply, &routed).await.expect("routed reply");
     // Routing by subject and the admission each read the original at B.
     let served = reads.served.lock().expect("served").clone();
     assert!(!served.is_empty() && served.iter().all(|name| name == sent.name()), "the misses were read at B: {served:?}");
@@ -317,7 +319,8 @@ pub(super) async fn messages_are_homed_at_the_receiver_and_replies_route_by_subj
                 let mut successor = cancel.clone();
                 successor.expectation = MessageExpectation::None;
                 successor.supersedes = Some(name.clone());
-                a.publish_message(NS, &next, &successor).await.expect("routed supersession");
+                let routed = engine_a.intent_of(NS, &successor).await.expect("the successor in the engine's terms");
+                a.publish_message(NS, &next, &routed).await.expect("routed supersession");
             }
             DropAction::Withdraw => engine_b.withdraw(NS, &cancel.receiver, &name, &crew).await.expect("receiver withdrawal"),
             DropAction::Expire => {

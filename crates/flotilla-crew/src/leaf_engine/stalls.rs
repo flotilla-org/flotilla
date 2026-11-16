@@ -564,7 +564,7 @@ impl ReconcilerWake {
             tracing::debug!(namespace, %wait, "stall judging waits");
             return Ok(());
         }
-        let inputs = off_frame(|| self.read_stall_inputs(namespace, now)).await?;
+        let inputs = off_frame(|| self.read_stall_inputs(namespace)).await?;
         let available_convoys = &inputs.available_convoys;
         let rows = self.subscriptions.rows().await;
         self.subscriptions.inner.supervisor_context.lock().await.retain(|(ns, name), _| ns != namespace || convoys.contains_key(name));
@@ -629,7 +629,7 @@ impl ReconcilerWake {
 
     /// One tick's request snapshot of the watched kinds, after reconciling charter notifications
     /// against it.
-    async fn read_stall_inputs(&self, namespace: &str, now: DateTime<Utc>) -> Result<StallInputs, String> {
+    async fn read_stall_inputs(&self, namespace: &str) -> Result<StallInputs, String> {
         let backend = &self.subscriptions.inner.backend;
         let cell = self.views(namespace).await?;
         let views = cell.get().expect("initialized views");
@@ -673,7 +673,6 @@ impl ReconcilerWake {
         flotilla_messaging::reconcile_charter_notifications_with_receivers(
             notices.as_ref(),
             self.subscriptions.inner.charter_brief_renderer.as_ref(),
-            now,
             &read_backend,
             &receivers,
             &projects,

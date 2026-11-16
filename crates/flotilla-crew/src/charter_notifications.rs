@@ -91,7 +91,6 @@ impl CharterBriefRenderer for LiveCharterBriefRenderer {
 mod tests {
     use std::collections::BTreeMap;
 
-    use chrono::Utc;
     use flotilla_engine_messages::{view::body_text, EngineCharterNotices};
     use flotilla_engine_messages_testkit::{designate_fleet, EngineMessagesHome};
     use flotilla_messaging::{reconcile_charter_notifications_with_receivers, MessageReceiverSnapshot};
@@ -205,7 +204,7 @@ mod tests {
             projects.apply(&meta, &spec).await.expect("applied revision");
             let receivers = MessageReceiverSnapshot::load(&backend, "flotilla").await.expect("receivers");
             let listed = backend.including_replicas::<Project>("flotilla").list().await.expect("projects");
-            reconcile_charter_notifications_with_receivers(&notices, &renderer, Utc::now(), &backend, &receivers, &listed)
+            reconcile_charter_notifications_with_receivers(&notices, &renderer, &backend, &receivers, &listed)
                 .await
                 .expect("render notification");
         }
