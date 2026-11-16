@@ -28,7 +28,7 @@ use std::{
 use self::{
     convert::{Conversion, ReferenceAddresses},
     roles::{designated_fleet_roles, FleetRoles},
-    view::{old_spec, old_view, record_name, ViewLookups},
+    view::{old_view, record_name, ViewLookups},
 };
 use flotilla_address::{Address, Kind as AddressKind};
 use flotilla_engine_store::StoreLog;
@@ -610,20 +610,13 @@ impl MessagePrimitives {
             .map_err(|error| ResourceError::other(error.to_string()))
     }
 
-    /// The records the messages `ids` held here name, read by key, for spelling them later.
-    pub async fn records_for(&self, namespace: &str, roles: &FleetRoles, ids: &[String]) -> Result<Arc<OldStoreRecords>, ResourceError> {
-        let mut resources = Vec::new();
-        for id in ids {
-            resources.extend(self.inbox.get_async(id).await.map_err(|error| ResourceError::other(error.to_string()))?);
+    /// The message `id` held here, counted as a row loaded.
+    pub async fn message(&self, id: &str) -> Result<Option<Resource<Message>>, ResourceError> {
+        let message = self.inbox.get_async(id).await.map_err(|error| ResourceError::other(error.to_string()))?;
+        if message.is_some() {
+            self.count_loaded();
         }
-        let mut records = OldStoreRecords::empty(namespace);
-        self.spell(&mut records, |records| {
-            resources.iter().for_each(|resource| {
-                let _ = old_spec(resource, namespace, roles, records);
-            })
-        })
-        .await?;
-        Ok(Arc::new(records))
+        Ok(message)
     }
 
     /// Reads what `asked` names into `records`, each record by its key. A convoy role's session

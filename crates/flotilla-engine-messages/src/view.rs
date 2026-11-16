@@ -8,6 +8,7 @@
 
 use chrono::{DateTime, Utc};
 use flotilla_address::{Address, Condition, Kind};
+use flotilla_messaging::{subject_text, Expects, TurnHeader};
 use flotilla_protocol::{Leaf, LeafAddress, LeafOperator, ResourceRef};
 use flotilla_resources::{
     address::{leaf_for, stored_service_scope},
@@ -207,10 +208,41 @@ pub fn old_view(
     view_spelled(resource, created, namespace, &|address| old_address(address, roles, lookups), lookups)
 }
 
-/// The old spec of an engine message, as [`old_view`] spells it.
-pub fn old_spec(resource: &Resource<Message>, namespace: &str, roles: &FleetRoles, lookups: &dyn ViewLookups) -> Result<OldSpec, String> {
-    // Only the spec is read, so the view is made at no particular creation time.
-    Ok(old_view(resource, CreatedAt(0), namespace, roles, lookups)?.spec)
+/// What an engine message's turn says of it (#3108): its parties in today's spelling through
+/// [`old_address`] and its subject through [`old_reference`]; nothing else of it is spelled.
+pub fn turn_header(resource: &Resource<Message>, roles: &FleetRoles, lookups: &dyn ViewLookups) -> Result<TurnHeader, String> {
+    let spec = resource.spec();
+    // The old shape's subject is the last reference marked as one.
+    let subject = spec.references.iter().rev().find(|reference| reference.subject);
+    Ok(TurnHeader {
+        sender: old_address(&spec.sender, roles, lookups)?,
+        receiver: old_address(&spec.inbox, roles, lookups)?,
+        relation: old_relation(spec.relation),
+        subject: subject.map(|subject| old_reference(subject, lookups)).transpose()?.as_ref().map(subject_text),
+        expects: match spec.expectation {
+            Expectation::Nothing => Expects::Nothing,
+            Expectation::Reply => Expects::Reply,
+            Expectation::Outcome { .. } => Expects::Outcome,
+        },
+        body: body_text(spec.body.value()),
+    })
+}
+
+fn old_relation(relation: Relation) -> MessageRelation {
+    match relation {
+        Relation::Supervisor => MessageRelation::Supervisor,
+        Relation::Peer => MessageRelation::Peer,
+        Relation::Dependency => MessageRelation::Dependency,
+        Relation::Dependee => MessageRelation::Dependee,
+        Relation::System => MessageRelation::System,
+    }
+}
+
+fn body_text(body: &MessageBody) -> String {
+    match body {
+        MessageBody::Text(text) => text.clone(),
+        MessageBody::Request(request) => format!("{request:?}"),
+    }
 }
 
 /// An engine message, created at `created`, as the generic resource verbs show it: the old shape
@@ -260,10 +292,7 @@ fn view_spelled(
         }
         Err(error) => Err(error),
     };
-    let body = match spec.body.value() {
-        MessageBody::Text(text) => text.clone(),
-        MessageBody::Request(request) => format!("{request:?}"),
-    };
+    let body = body_text(spec.body.value());
     let expectation = match &spec.expectation {
         Expectation::Nothing => MessageExpectation::None,
         Expectation::Reply => MessageExpectation::Reply,
@@ -278,13 +307,7 @@ fn view_spelled(
     let old_spec = OldSpec {
         sender,
         receiver: receiver.clone(),
-        relation: match spec.relation {
-            Relation::Supervisor => MessageRelation::Supervisor,
-            Relation::Peer => MessageRelation::Peer,
-            Relation::Dependency => MessageRelation::Dependency,
-            Relation::Dependee => MessageRelation::Dependee,
-            Relation::System => MessageRelation::System,
-        },
+        relation: old_relation(spec.relation),
         body,
         body_digest: None,
         references,

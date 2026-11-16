@@ -35,15 +35,20 @@ use chrono::Utc;
 use flotilla_address::Address;
 use flotilla_engine_messages::{
     sweep::{held_turns_superseded, OpenMessages, TurnHolds},
-    view::old_spec,
+    view::turn_header,
     MessagePrimitives,
 };
 use flotilla_inbox::{InboxBackend, Rules};
+use flotilla_messaging::TurnHeader;
 use flotilla_resources::TerminalSession;
 use flotilla_schema::Timestamp;
 use flotilla_state_machines::{
-    machines::{agent_session::EndReason, consumer::Receiver, message::Deliver},
-    Transport,
+    machines::{
+        agent_session::EndReason,
+        consumer::Receiver,
+        message::{Deliver, Message},
+    },
+    Resource, Transport,
 };
 use futures::TryStreamExt;
 use tracing::{debug, warn, Instrument};
@@ -517,22 +522,22 @@ impl MessageDelivery {
     /// the engine's audit, rather than typed again once their hold runs out.
     async fn supersede_held_system_turns(
         &mut self,
-        due: &[(String, flotilla_resources::MessageSpec)],
+        due: &[(String, TurnHeader)],
         held: Vec<String>,
         roles: &flotilla_engine_messages::roles::FleetRoles,
-        records: &flotilla_engine_messages::OldStoreRecords,
+        records: &mut flotilla_engine_messages::OldStoreRecords,
     ) -> Result<(), String> {
-        if held.is_empty() || !due.iter().any(|(_, spec)| spec.is_operator_or_supervisor()) {
+        if held.is_empty() || !due.iter().any(|(_, turn)| turn.is_operator_or_supervisor()) {
             return Ok(());
         }
-        let inbox = self.primitives.inbox();
-        let mut views = Vec::new();
+        let mut loaded = Vec::new();
         for message in held {
-            let Some(resource) = inbox.get_async(&message).await.map_err(|error| error.to_string())? else { continue };
-            if let Ok(spec) = old_spec(&resource, &self.namespace, roles, records) {
-                views.push((message, spec));
+            if let Some(resource) = self.primitives.message(&message).await.map_err(|error| error.to_string())? {
+                loaded.push((message, resource));
             }
         }
+        let headers = self.headers(&loaded, roles, records).await?;
+        let views: Vec<_> = loaded.into_iter().zip(headers).filter_map(|((message, _), header)| Some((message, header.ok()?))).collect();
         let Some((successor, older)) = held_turns_superseded(due, &views) else { return Ok(()) };
         for message in older {
             tracing::info!(%message, %successor, "operator turn supersedes a held system turn");
@@ -540,6 +545,19 @@ impl MessageDelivery {
             self.held.release(message);
         }
         Ok(())
+    }
+
+    /// Each of `messages`' turn headers, spelled on the records they name, read into `records`.
+    async fn headers(
+        &self,
+        messages: &[(String, Resource<Message>)],
+        roles: &flotilla_engine_messages::roles::FleetRoles,
+        records: &mut flotilla_engine_messages::OldStoreRecords,
+    ) -> Result<Vec<Result<TurnHeader, String>>, String> {
+        self.primitives
+            .spell(records, |records| messages.iter().map(|(_, resource)| turn_header(resource, roles, records)).collect())
+            .await
+            .map_err(|error| error.to_string())
     }
 
     /// Types one session's pending turns as one turn, through the same
@@ -575,22 +593,24 @@ impl MessageDelivery {
         if turns.is_empty() {
             return Ok(());
         }
-        // Framing reads old-store records: only once a turn is due.
+        // Framing reads the records the turns' headers name: only once a turn is due.
         let roles = self.primitives.roles(&self.namespace).await?;
-        let records = self
-            .primitives
-            .records_for(&self.namespace, &roles, &[&turns[..], &held[..]].concat())
-            .await
-            .map_err(|error| error.to_string())?;
+        let mut loaded = Vec::new();
+        for message in turns {
+            if let Some(resource) = self.primitives.message(&message).await.map_err(|error| error.to_string())? {
+                loaded.push((message, resource));
+            }
+        }
+        let mut records = flotilla_engine_messages::OldStoreRecords::empty(&self.namespace);
+        let headers = self.headers(&loaded, &roles, &mut records).await?;
         let mut members = Vec::new();
         let mut texts = Vec::new();
         let mut due = Vec::new();
-        for message in turns {
-            let Some(resource) = inbox.get_async(&message).await.map_err(|error| error.to_string())? else { continue };
-            match old_spec(&resource, &self.namespace, &roles, &*records) {
-                Ok(spec) => {
-                    texts.push(flotilla_messaging::frame_message(&spec));
-                    due.push((message.clone(), spec));
+        for ((message, resource), header) in loaded.into_iter().zip(headers) {
+            match header {
+                Ok(header) => {
+                    texts.push(flotilla_messaging::frame_turn(&header));
+                    due.push((message.clone(), header));
                 }
                 Err(error) => {
                     debug!(%message, %error, "framing an engine turn without its old spelling");
@@ -599,7 +619,7 @@ impl MessageDelivery {
             }
             members.push(message);
         }
-        self.supersede_held_system_turns(&due, held, &roles, &records).await?;
+        self.supersede_held_system_turns(&due, held, &roles, &mut records).await?;
         let runtime = TerminalControllerRuntime { state: Arc::clone(&self.state) };
         let pool = runtime.pool_for_spec((&holder.terminal).into()).await?;
         let adapter = runtime.adapter_for_spec((&holder.terminal).into()).await?;

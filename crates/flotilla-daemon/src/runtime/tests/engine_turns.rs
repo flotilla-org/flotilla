@@ -256,6 +256,34 @@ async fn a_sessions_pending_messages_are_typed_as_one_turn() {
     assert_eq!(pool.deliveries.load(Ordering::SeqCst), 1);
 }
 
+/// The Message rows loaded and converted while `count` turns due to one session are typed as one.
+async fn read_typing_turns(count: usize) -> (u64, u64) {
+    let pool = lossy_pool();
+    let crew = engine_crew("claude-code", pool.clone()).await;
+    crew.primitives.sessions().observe_screen(&crew.launch, Activity::Idle, EngineCrew::at(Utc::now())).expect("idle before the turn");
+    let mut delivery = crew.delivery();
+    for index in 0..count {
+        let (sender, relation) = match index % 2 {
+            0 => ("system:turn-rules", MessageRelation::System),
+            _ => ("principal:alice", MessageRelation::Supervisor),
+        };
+        crew.send(&format!("turn-{index}"), sender, relation, "Continue the work.").await;
+    }
+    let before = crew.primitives.rows_read();
+    passes(&mut delivery, 20).await;
+    let after = crew.primitives.rows_read();
+    assert_eq!(pool.inputs.lock().expect("typed inputs").len(), 1, "the due turns are typed as one turn");
+    (after.loaded - before.loaded, after.converted - before.converted)
+}
+
+// Behaviour: typing a session's due turns loads each once and frames it as the engine holds it,
+// converting none to the old shape.
+#[tokio::test(start_paused = true)]
+async fn typing_a_turn_loads_each_due_message_once_and_converts_none() {
+    assert_eq!(read_typing_turns(5).await, (5, 0), "five due turns");
+    assert_eq!(read_typing_turns(60).await, (60, 0), "sixty due turns");
+}
+
 // A confirmed turn whose receipt is refused stays held: later passes retry the receipt and never
 // type the turn again while the hold lasts. The refusal here is the agent's record ending between
 // the turn's confirmation and its receipt.

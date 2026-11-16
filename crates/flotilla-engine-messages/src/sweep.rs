@@ -451,8 +451,8 @@ impl TurnHolds {
 /// engine hold ends by retyping, not by an operator closing it. Dropping the
 /// system members leaves the others to be retyped exactly as before.
 pub fn held_turns_superseded<'a>(
-    due: &'a [(String, flotilla_resources::MessageSpec)],
-    held: &'a [(String, flotilla_resources::MessageSpec)],
+    due: &'a [(String, flotilla_messaging::TurnHeader)],
+    held: &'a [(String, flotilla_messaging::TurnHeader)],
 ) -> Option<(&'a str, Vec<&'a str>)> {
     let (successor, _) = due.iter().find(|(_, spec)| spec.is_operator_or_supervisor())?;
     let older: Vec<_> = held.iter().filter(|(_, spec)| spec.is_system_turn()).map(|(name, _)| name.as_str()).collect();
@@ -484,7 +484,7 @@ mod tests {
                         .relation(relation)
                         .body("turn".into())
                         .build();
-                    (format!("{prefix}-{index}"), spec)
+                    (format!("{prefix}-{index}"), flotilla_messaging::TurnHeader::of(&spec))
                 })
                 .collect::<Vec<_>>()
         };

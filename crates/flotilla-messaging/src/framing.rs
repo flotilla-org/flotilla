@@ -14,9 +14,75 @@ fn header_value(value: &str) -> String {
         .collect()
 }
 
+/// What a crew turn's text says of one Message: its parties in today's spelling, its relation,
+/// its subject as the header names it, what it expects, and its body.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TurnHeader {
+    pub sender: String,
+    pub receiver: String,
+    pub relation: MessageRelation,
+    pub subject: Option<String>,
+    pub expects: Expects,
+    pub body: String,
+}
+
+/// What a Message expects of its receiver, as its turn's header says it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Expects {
+    Nothing,
+    Reply,
+    Outcome,
+}
+
+impl TurnHeader {
+    /// What `spec`'s turn says of it.
+    pub fn of(spec: &MessageSpec) -> Self {
+        Self {
+            sender: spec.sender.clone(),
+            receiver: spec.receiver.clone(),
+            relation: spec.relation,
+            subject: spec.subject.as_ref().map(subject_text),
+            expects: match spec.expectation {
+                MessageExpectation::None => Expects::Nothing,
+                MessageExpectation::Reply => Expects::Reply,
+                MessageExpectation::Outcome { .. } => Expects::Outcome,
+            },
+            body: spec.body.clone(),
+        }
+    }
+
+    /// Flotilla's own turn rules speaking.
+    pub fn is_system_turn(&self) -> bool {
+        self.sender.starts_with("system:")
+    }
+
+    /// A person or supervising role speaking, never flotilla's own turn rules.
+    pub fn is_operator_or_supervisor(&self) -> bool {
+        !self.is_system_turn() && (self.relation == MessageRelation::Supervisor || self.sender.starts_with("principal:"))
+    }
+}
+
+/// A Message's subject as its turn's header names it.
+pub fn subject_text(subject: &MessageReference) -> String {
+    match subject {
+        MessageReference::ChangeRequest { number, .. } => format!("PR #{number}"),
+        MessageReference::Issue { number, .. } => format!("issue #{number}"),
+        MessageReference::Commit { revision, .. } => format!("commit {revision}"),
+        MessageReference::Ref { name, .. } => format!("ref {name}"),
+        MessageReference::Artifact { resource, .. } => format!("artifact {}", resource.name),
+        MessageReference::Comment { id, .. } => format!("comment {id}"),
+        MessageReference::ControlRecord { resource, .. } => format!("{} {}", resource.kind, resource.name),
+    }
+}
+
+/// One Message as its turn text, as [`frame_turn`] frames it.
+pub fn frame_message(spec: &MessageSpec) -> String {
+    frame_turn(&TurnHeader::of(spec))
+}
+
 /// One Message as its turn text: a header naming sender, relation, subject
 /// and expectation, then the body. A crew turn joins its messages this way.
-pub fn frame_message(spec: &MessageSpec) -> String {
+pub fn frame_turn(spec: &TurnHeader) -> String {
     let relation = match spec.relation {
         MessageRelation::Supervisor => "supervisor",
         MessageRelation::Peer => "peer",
@@ -41,21 +107,12 @@ pub fn frame_message(spec: &MessageSpec) -> String {
         header_value(sender)
     };
     if let Some(subject) = &spec.subject {
-        let subject = match subject {
-            MessageReference::ChangeRequest { number, .. } => format!("PR #{number}"),
-            MessageReference::Issue { number, .. } => format!("issue #{number}"),
-            MessageReference::Commit { revision, .. } => format!("commit {revision}"),
-            MessageReference::Ref { name, .. } => format!("ref {name}"),
-            MessageReference::Artifact { resource, .. } => format!("artifact {}", resource.name),
-            MessageReference::Comment { id, .. } => format!("comment {id}"),
-            MessageReference::ControlRecord { resource, .. } => format!("{} {}", resource.kind, resource.name),
-        };
-        facts.push(format!("re {}", header_value(&subject)));
+        facts.push(format!("re {}", header_value(subject)));
     }
-    match spec.expectation {
-        MessageExpectation::None => {}
-        MessageExpectation::Reply => facts.push("reply expected".into()),
-        MessageExpectation::Outcome { .. } => facts.push("outcome expected".into()),
+    match spec.expects {
+        Expects::Nothing => {}
+        Expects::Reply => facts.push("reply expected".into()),
+        Expects::Outcome => facts.push("outcome expected".into()),
     }
     let suffix = if facts.is_empty() { String::new() } else { format!(" · {}", facts.join(" · ")) };
     format!("[from {sender} ({relation}){suffix}]\n\n{}", spec.body)
