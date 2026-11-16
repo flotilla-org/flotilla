@@ -397,7 +397,9 @@ pub fn admission(convoy: &ResourceObject<OldConvoy>) -> Result<(String, Frozen<A
         workflow_snapshot,
         placement_decision: status.placement_decision.clone(),
         placement_policy: spec.placement_policy.clone(),
-        role: spec.role.clone(),
+        // An old convoy admitted with no role was known by its name; admission now names every
+        // convoy's role.
+        role: if spec.role.is_empty() { name.clone() } else { spec.role.clone() },
         ensure_admission: status.ensure_admission.clone(),
         naming: status.naming.clone(),
         dispatching_principal_ref: spec.dispatching_principal_ref.clone(),

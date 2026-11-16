@@ -189,6 +189,19 @@ fn a_convoy_with_history_imports_one_to_one() {
     assert_eq!(document.dispatching_principal_ref, old.spec.dispatching_principal_ref);
 }
 
+// Behaviour: an old convoy admitted with no role imports with its name as its role, as admission
+// names a convoy's role now; one with a role keeps it.
+#[test]
+fn a_convoy_with_no_role_imports_known_by_its_name() {
+    for (role, expected) in [("", "c"), ("reviewers", "reviewers")] {
+        let mut old = convoy("c", ConvoyPhase::Active, vec![agent("coder", true)]);
+        old.spec.role = role.into();
+        let convoy = imported(import_convoy(&old, HOME, &[], &WORLD));
+        let document = AdmissionDocument::decode("c", convoy.resource.spec().admission.value().bytes()).expect("admission document");
+        assert_eq!(document.role, expected, "role {role:?}");
+    }
+}
+
 // Behaviour: a finite, unfinished convoy with no promise is the named refusal NoObligations (its
 // only agent is done, so admission owes it no default ledger); an ended or unbootstrapped convoy
 // stays on the old path.

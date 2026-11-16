@@ -328,14 +328,9 @@ fn crew_change_request_query(
     })
 }
 
-/// Legacy convoys may have no role; retain their resource identity instead of
-/// rendering an empty address or a bare project suffix.
+/// The convoy's `role@project` address, as a message names it.
 pub fn convoy_message_address(convoy: &ResourceObject<ResourceConvoy>) -> String {
-    if convoy.spec.role.is_empty() {
-        convoy.metadata.name.clone()
-    } else {
-        convoy_address(&convoy.spec.role, convoy.spec.project_ref.as_deref())
-    }
+    convoy_address(&convoy.spec.role, convoy.spec.project_ref.as_deref())
 }
 
 fn ensure_crew_work_is_defined(

@@ -45,15 +45,13 @@ async fn actuator_refuses_delivery_and_hold_after_service_stops() {
 // #1986: each orientation query follows live Project membership and roles while
 // the crew, convoy, and admission snapshot remain intact.
 
-// #2592: attribution uses role/project addresses and preserves legacy resource names.
-// Formatting glue: these rows exhaust empty/nonempty role and absent/present project.
+// #2592: attribution uses role/project addresses.
+// Formatting glue: these rows exhaust absent/present project.
 #[tokio::test]
-async fn convoy_message_addresses_preserve_legacy_identity() {
+async fn convoy_message_addresses_are_role_and_project() {
     let backend = ResourceBackend::new(InMemoryBackend::default());
     let convoys = backend.using::<ResourceConvoy>("flotilla");
     for (name, role, project, expected) in [
-        ("legacy", "", None, "legacy"),
-        ("legacy-project", "", Some("project"), "legacy-project"),
         ("named", "graphql-budget", None, "graphql-budget"),
         ("named-project", "graphql-budget", Some("project"), "graphql-budget@project"),
     ] {
