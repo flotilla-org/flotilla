@@ -63,6 +63,9 @@ pub trait EngineMessages: Send + Sync {
         receiver: &str,
         record: &str,
     ) -> Result<Option<flotilla_resources::ReadResourceObject<flotilla_resources::Message>>, flotilla_resources::ResourceError>;
+    /// Whether `receiver`'s inbox (an old address) holds the message `record`, local or
+    /// replicated, read by its exact identity without loading it.
+    async fn holds(&self, namespace: &str, receiver: &str, record: &str) -> Result<bool, flotilla_resources::ResourceError>;
     /// Where the message `record` in the inbox `intent` is admitted to stands, local or replicated.
     async fn admitted(
         &self,

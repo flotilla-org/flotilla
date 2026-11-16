@@ -73,6 +73,9 @@ impl EngineMessages for RecordingMessages {
             .filter(|object| object.spec.receiver == receiver)
             .map(|object| ReadResourceObject { object, provenance: ResourceProvenance::Local }))
     }
+    async fn holds(&self, _namespace: &str, receiver: &str, record: &str) -> Result<bool, ResourceError> {
+        Ok(self.admitted.lock().expect("admitted").get(record).is_some_and(|object| object.spec.receiver == receiver))
+    }
     async fn admitted(
         &self,
         namespace: &str,

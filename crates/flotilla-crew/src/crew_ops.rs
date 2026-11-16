@@ -3475,11 +3475,7 @@ impl CrewService {
         // retry after a lost acceptance completes both.
         let crew = crew_role_address(project, &request.convoy, &request.vessel, &request.role);
         let notice = flotilla_resources::message_record_name("system:hold", sender, &format!("hold-notice:{hold_key}"));
-        let notified = match self.message_to(&request.namespace, &crew, &notice).await {
-            Ok(_) => true,
-            Err(ResourceError::NotFound { .. }) => false,
-            Err(error) => return Err(error.to_string()),
-        };
+        let notified = self.holds_message(&request.namespace, &crew, &notice).await.map_err(|error| error.to_string())?;
         if crew != receiver && !notified {
             let intent = flotilla_resources::MessageSpec::builder()
                 .sender(sender.into())
@@ -3500,10 +3496,8 @@ impl CrewService {
         // Producer identity follows the persisted hold, independent of receiver changes
         // or new observations racing a lost acceptance response.
         let name = flotilla_resources::message_record_name("system:hold", sender, &format!("hold:{hold_key}"));
-        match self.message_to(&request.namespace, &receiver, &name).await {
-            Ok(_) => return Ok(()),
-            Err(ResourceError::NotFound { .. }) => {}
-            Err(error) => return Err(error.to_string()),
+        if self.holds_message(&request.namespace, &receiver, &name).await.map_err(|error| error.to_string())? {
+            return Ok(());
         }
         let intent = flotilla_resources::MessageSpec::builder()
             .sender(sender.into())

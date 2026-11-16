@@ -1695,6 +1695,21 @@ impl MessagePrimitives {
         self.view_in(namespace, &roles, inbox, record).await
     }
 
+    /// Whether `receiver`'s inbox (an old address) holds the message `record`, read by its exact
+    /// identity at every followed home without loading it.
+    pub async fn holds(&self, namespace: &str, receiver: &str, record: &str) -> Result<bool, ResourceError> {
+        let roles = self.roles(namespace).await.map_err(ResourceError::invalid)?;
+        // No message is admitted to a receiver that converts to no inbox.
+        let inbox = match (Conversion { roles: &roles, forges: &[], records: &convert::NoRecords }).inbox(receiver) {
+            Ok(inbox) => inbox,
+            Err(error) => {
+                tracing::debug!(%record, %error, "a receiver with no inbox holds no message");
+                return Ok(false);
+            }
+        };
+        Ok(self.locate_in(&inbox, record).map_err(ResourceError::other)?.is_some())
+    }
+
     /// The message a person names by its old record name, in the old shape: read by its exact
     /// identity in each person role's inbox, refused when more than one holds the name.
     pub async fn view_for_person(&self, namespace: &str, record: &str) -> Result<ReadResourceObject<OldMessage>, String> {
@@ -2032,6 +2047,9 @@ impl flotilla_messaging::EngineMessages for MessagePrimitives {
         record: &str,
     ) -> Result<Option<ReadResourceObject<OldMessage>>, ResourceError> {
         MessagePrimitives::view_to(self, namespace, receiver, record).await
+    }
+    async fn holds(&self, namespace: &str, receiver: &str, record: &str) -> Result<bool, ResourceError> {
+        MessagePrimitives::holds(self, namespace, receiver, record).await
     }
     async fn admitted(
         &self,

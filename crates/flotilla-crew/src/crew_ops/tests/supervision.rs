@@ -442,6 +442,45 @@ fn hold_state_and_single_supervisor_message(tc: hegel::TestCase) {
     });
 }
 
+/// The Message rows loaded and converted by a repeated hold, both its messages already sent,
+/// with `count` other messages open to the held coder.
+async fn read_by_a_repeated_hold(count: usize) -> (u64, u64) {
+    let (crew, _backend, _, held) = fixture(CrewWorkPhase::Done).await;
+    let primitives = held.messages().primitives();
+    for index in 0..count {
+        let intent = flotilla_resources::MessageSpec::builder()
+            .sender("system:turn-rules".into())
+            .receiver(held.receiver("work", "coder"))
+            .relation(flotilla_resources::MessageRelation::System)
+            .body(format!("open {index}"))
+            .build();
+        primitives.admit("flotilla", &format!("open-{index}"), &intent).await.expect("admit an open message");
+    }
+    let request = crate::leaf_engine::CrewTurnIntent::builder()
+        .namespace("flotilla".into())
+        .convoy(held.launch.clone())
+        .source("checks-settled".into())
+        .vessel("work".into())
+        .role("coder".into())
+        .brief("continue".into())
+        .subject_revision("head".into())
+        .sender("system:turn-rules".into())
+        .build();
+    crew.execute_turn_delivery_hold(&request, &HoldAct::State, "episode limit").await.expect("hold");
+    let before = primitives.rows_read();
+    crew.execute_turn_delivery_hold(&request, &HoldAct::State, "episode limit").await.expect("repeated hold");
+    let after = primitives.rows_read();
+    (after.loaded - before.loaded, after.converted - before.converted)
+}
+
+// Behaviour: a repeated hold finds its crew notice and supervisor signal by their identities,
+// loading and converting neither, whatever else the crew holds.
+#[tokio::test]
+async fn a_repeated_hold_finds_its_messages_without_converting_them() {
+    assert_eq!(read_by_a_repeated_hold(5).await, (0, 0), "five other messages");
+    assert_eq!(read_by_a_repeated_hold(60).await, (0, 0), "sixty other messages");
+}
+
 // All terminal convoy outcomes refuse resume and turn admission with an explicit
 // continuation path. Refusal leaves the convoy and Message inbox unchanged.
 #[tokio::test]

@@ -36,6 +36,11 @@ impl CrewService {
         self.message_primitives()?.view_to(namespace, receiver, name).await?.ok_or_else(|| ResourceError::not_found(name))
     }
 
+    /// Whether `receiver`'s inbox holds the Message `name`, local or replicated.
+    pub(crate) async fn holds_message(&self, namespace: &str, receiver: &str, name: &str) -> Result<bool, ResourceError> {
+        self.message_primitives()?.holds(namespace, receiver, name).await
+    }
+
     /// Where the Message `name` in the inbox `intent` is admitted to stands, local or replicated;
     /// `None` when none is admitted.
     pub(crate) async fn admitted_message(
