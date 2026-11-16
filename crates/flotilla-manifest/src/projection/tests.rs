@@ -2354,7 +2354,7 @@ fn builtin_github_forge_resolves_subjects(tc: hegel::TestCase) {
     let count = tc.draw(gs::integers::<usize>().min_value(0).max_value(3));
     let number = tc.draw(gs::integers::<u32>().min_value(1).max_value(u32::MAX));
     // Forge resource IDs are DNS labels, so github.com cannot be an exact ID.
-    // Exercise every valid covering mode on every generated input.
+    // Every valid covering mode is drawn.
     #[derive(Clone, Copy, Debug)]
     enum Coverage {
         Absent,
@@ -2362,142 +2362,142 @@ fn builtin_github_forge_resolves_subjects(tc: hegel::TestCase) {
         InstallationUrl,
         HostAlias,
     }
-    for mode in [Coverage::Absent, Coverage::Unrelated, Coverage::InstallationUrl, Coverage::HostAlias] {
-        let runtime = tokio::runtime::Builder::new_current_thread().build().expect("runtime");
-        let backend = ResourceBackend::new(InMemoryBackend::default());
-        let mut observations = runtime.block_on(async {
-            SubjectCatalogInput {
-                change_requests: vec![backend
-                    .using::<ChangeRequest>("dev")
-                    .create(
-                        &InputMeta::builder().name("cr".into()).build(),
-                        &ChangeRequestSpec::builder()
-                            .service("github.com".into())
-                            .scope("org/repo".into())
-                            .number(number.into())
-                            .observing_authority("kiwi".into())
-                            .build(),
-                    )
-                    .await
-                    .expect("change request")],
-                issues: vec![backend
-                    .using::<Issue>("dev")
-                    .create(
-                        &InputMeta::builder().name("issue".into()).build(),
-                        &IssueSpec::builder()
-                            .service("github.com".into())
-                            .scope("org/repo".into())
-                            .number(number.into())
-                            .observing_authority("kiwi".into())
-                            .build(),
-                    )
-                    .await
-                    .expect("issue")],
-                ..Default::default()
-            }
-        });
-        let source = IssueSource { service: "github.com".into(), scope: "org/repo".into() };
-        let subjects = [
-            Subject { kind: SubjectKind::ChangeRequest, source: source.clone(), id: number.to_string() },
-            Subject { kind: SubjectKind::Issue, source, id: number.to_string() },
-        ];
-        let mut convoy =
-            ConvoyRow::builder().resource(convoy_ref("dev", "work")).name("work").workflow_ref("dev").phase(ConvoyPhase::Active).build();
-        convoy.subjects = (0..count)
-            .flat_map(|_| {
-                subjects.iter().map(|subject| ConvoySubjectRow {
-                    subject: subject.clone(),
-                    relationship: Relationship::Produces,
-                    declared: false,
-                    short: subject.id.clone(),
-                    url: None,
-                    repository_key: None,
-                })
+    let mode = [Coverage::Absent, Coverage::Unrelated, Coverage::InstallationUrl, Coverage::HostAlias]
+        [tc.draw(gs::integers::<usize>().min_value(0).max_value(3))];
+    let runtime = tokio::runtime::Builder::new_current_thread().build().expect("runtime");
+    let backend = ResourceBackend::new(InMemoryBackend::default());
+    let mut observations = runtime.block_on(async {
+        SubjectCatalogInput {
+            change_requests: vec![backend
+                .using::<ChangeRequest>("dev")
+                .create(
+                    &InputMeta::builder().name("cr".into()).build(),
+                    &ChangeRequestSpec::builder()
+                        .service("github.com".into())
+                        .scope("org/repo".into())
+                        .number(number.into())
+                        .observing_authority("kiwi".into())
+                        .build(),
+                )
+                .await
+                .expect("change request")],
+            issues: vec![backend
+                .using::<Issue>("dev")
+                .create(
+                    &InputMeta::builder().name("issue".into()).build(),
+                    &IssueSpec::builder()
+                        .service("github.com".into())
+                        .scope("org/repo".into())
+                        .number(number.into())
+                        .observing_authority("kiwi".into())
+                        .build(),
+                )
+                .await
+                .expect("issue")],
+            ..Default::default()
+        }
+    });
+    let source = IssueSource { service: "github.com".into(), scope: "org/repo".into() };
+    let subjects = [
+        Subject { kind: SubjectKind::ChangeRequest, source: source.clone(), id: number.to_string() },
+        Subject { kind: SubjectKind::Issue, source, id: number.to_string() },
+    ];
+    let mut convoy =
+        ConvoyRow::builder().resource(convoy_ref("dev", "work")).name("work").workflow_ref("dev").phase(ConvoyPhase::Active).build();
+    convoy.subjects = (0..count)
+        .flat_map(|_| {
+            subjects.iter().map(|subject| ConvoySubjectRow {
+                subject: subject.clone(),
+                relationship: Relationship::Produces,
+                declared: false,
+                short: subject.id.clone(),
+                url: None,
+                repository_key: None,
             })
-            .collect();
-        let convoys = [convoy];
-        let build = |observations: &SubjectCatalogInput| {
-            let mut input = catalog_input(&convoys);
-            input.subjects = Some(observations);
-            if awareness {
-                input.awareness = Some(&[]);
-            }
-            project_catalog(&input, &mint())
-        };
-        let implicit = build(&observations);
-        let declaration = match mode {
-            Coverage::Absent => None,
-            Coverage::Unrelated => Some(("lab", "https://lab.example", "lab.example", ForgeKind::Github)),
-            Coverage::InstallationUrl => Some(("declared", "https://github.com/", "declared.example", ForgeKind::Github)),
-            Coverage::HostAlias => Some(("declared", "https://declared.example", "github.com", ForgeKind::Forgejo)),
-        };
-        if let Some((id, url, host, kind)) = declaration {
-            observations.forges.push(runtime.block_on(async {
-                backend
-                    .using::<Forge>("dev")
-                    .create(
-                        &InputMeta::builder().name(id.into()).build(),
-                        &ForgeSpec::builder()
-                            .forge_id(id.into())
-                            .kind(kind)
-                            .hosts([host.into()].into_iter().collect())
-                            .https_url(url.into())
-                            .git_ssh_host(host.into())
-                            .build(),
-                    )
-                    .await
-                    .expect("forge")
-            }));
+        })
+        .collect();
+    let convoys = [convoy];
+    let build = |observations: &SubjectCatalogInput| {
+        let mut input = catalog_input(&convoys);
+        input.subjects = Some(observations);
+        if awareness {
+            input.awareness = Some(&[]);
         }
-        let catalog = build(&observations);
-        let patches = catalog.reassert_patches();
-        let expected_id = if matches!(mode, Coverage::Absent | Coverage::Unrelated) { "github.com" } else { "declared" };
-        let forge = entity::forge(expected_id);
-        let facts = find_entity(&patches, &forge);
-        assert_eq!(text(facts, "flotilla.forge.kind"), if matches!(mode, Coverage::HostAlias) { "forgejo" } else { "github" }, "{mode:?}");
-        assert_eq!(
-            text(facts, "flotilla.forge.web_url"),
-            if matches!(mode, Coverage::HostAlias) { "https://declared.example" } else { "https://github.com" },
-            "{mode:?}"
-        );
-        assert_eq!(
-            text(facts, "flotilla.forge.change_request_url_template"),
-            if matches!(mode, Coverage::HostAlias) { "{web_url}/{scope}/pulls/{number}" } else { "{web_url}/{scope}/pull/{number}" },
-            "{mode:?}"
-        );
-        assert_eq!(text(facts, "flotilla.forge.issue_url_template"), "{web_url}/{scope}/issues/{number}", "{mode:?}");
-        for subject in &subjects {
-            let target = match subject.kind {
-                SubjectKind::ChangeRequest => entity::change_request("github.com", "org/repo", &subject.id),
-                SubjectKind::Issue => entity::issue(&IssueRef { source: subject.source.clone(), id: subject.id.clone() }),
-            };
-            if count == 0 {
-                assert!(!patches.iter().any(|patch| patch.target == MetadataTarget::Entity(target.clone())));
-                continue;
-            }
-            let patch = find_entity(&patches, &target);
-            assert_eq!(text(patch, "flotilla.subject.service"), "github.com", "{mode:?}");
-            assert_eq!(text(patch, "flotilla.subject.scope"), "org/repo", "{mode:?}");
-            assert_eq!(text(patch, "flotilla.subject.number"), subject.id, "{mode:?}");
-            // The serialized PM connector payload is the consumer's contract.
-            let wire = serde_json::to_value(patch).expect("wire patch");
-            assert_eq!(
-                wire["set"]["flotilla.forge"]["value"],
-                serde_json::json!({
-                    "type": "entity-refs", "value": [{"provider": "", "kind": "forge", "id": expected_id}]
-                }),
-                "{mode:?}"
-            );
-        }
-        if matches!(mode, Coverage::InstallationUrl | Coverage::HostAlias) {
-            assert!(!patches.iter().any(|patch| patch.target == MetadataTarget::Entity(entity::forge("github.com"))));
-            let diff = catalog.diff_patches(&implicit);
-            assert!(find_entity(&diff, &entity::forge("github.com")).unset.contains(&"flotilla.forge.kind".into()));
-        }
-        // Projection never creates a Forge resource for the fallback.
-        let stored = runtime.block_on(backend.using::<Forge>("dev").list()).expect("stored forges");
-        assert_eq!(stored.items.len(), usize::from(!matches!(mode, Coverage::Absent)), "{mode:?}");
+        project_catalog(&input, &mint())
+    };
+    let implicit = build(&observations);
+    let declaration = match mode {
+        Coverage::Absent => None,
+        Coverage::Unrelated => Some(("lab", "https://lab.example", "lab.example", ForgeKind::Github)),
+        Coverage::InstallationUrl => Some(("declared", "https://github.com/", "declared.example", ForgeKind::Github)),
+        Coverage::HostAlias => Some(("declared", "https://declared.example", "github.com", ForgeKind::Forgejo)),
+    };
+    if let Some((id, url, host, kind)) = declaration {
+        observations.forges.push(runtime.block_on(async {
+            backend
+                .using::<Forge>("dev")
+                .create(
+                    &InputMeta::builder().name(id.into()).build(),
+                    &ForgeSpec::builder()
+                        .forge_id(id.into())
+                        .kind(kind)
+                        .hosts([host.into()].into_iter().collect())
+                        .https_url(url.into())
+                        .git_ssh_host(host.into())
+                        .build(),
+                )
+                .await
+                .expect("forge")
+        }));
     }
+    let catalog = build(&observations);
+    let patches = catalog.reassert_patches();
+    let expected_id = if matches!(mode, Coverage::Absent | Coverage::Unrelated) { "github.com" } else { "declared" };
+    let forge = entity::forge(expected_id);
+    let facts = find_entity(&patches, &forge);
+    assert_eq!(text(facts, "flotilla.forge.kind"), if matches!(mode, Coverage::HostAlias) { "forgejo" } else { "github" }, "{mode:?}");
+    assert_eq!(
+        text(facts, "flotilla.forge.web_url"),
+        if matches!(mode, Coverage::HostAlias) { "https://declared.example" } else { "https://github.com" },
+        "{mode:?}"
+    );
+    assert_eq!(
+        text(facts, "flotilla.forge.change_request_url_template"),
+        if matches!(mode, Coverage::HostAlias) { "{web_url}/{scope}/pulls/{number}" } else { "{web_url}/{scope}/pull/{number}" },
+        "{mode:?}"
+    );
+    assert_eq!(text(facts, "flotilla.forge.issue_url_template"), "{web_url}/{scope}/issues/{number}", "{mode:?}");
+    for subject in &subjects {
+        let target = match subject.kind {
+            SubjectKind::ChangeRequest => entity::change_request("github.com", "org/repo", &subject.id),
+            SubjectKind::Issue => entity::issue(&IssueRef { source: subject.source.clone(), id: subject.id.clone() }),
+        };
+        if count == 0 {
+            assert!(!patches.iter().any(|patch| patch.target == MetadataTarget::Entity(target.clone())));
+            continue;
+        }
+        let patch = find_entity(&patches, &target);
+        assert_eq!(text(patch, "flotilla.subject.service"), "github.com", "{mode:?}");
+        assert_eq!(text(patch, "flotilla.subject.scope"), "org/repo", "{mode:?}");
+        assert_eq!(text(patch, "flotilla.subject.number"), subject.id, "{mode:?}");
+        // The serialized PM connector payload is the consumer's contract.
+        let wire = serde_json::to_value(patch).expect("wire patch");
+        assert_eq!(
+            wire["set"]["flotilla.forge"]["value"],
+            serde_json::json!({
+                "type": "entity-refs", "value": [{"provider": "", "kind": "forge", "id": expected_id}]
+            }),
+            "{mode:?}"
+        );
+    }
+    if matches!(mode, Coverage::InstallationUrl | Coverage::HostAlias) {
+        assert!(!patches.iter().any(|patch| patch.target == MetadataTarget::Entity(entity::forge("github.com"))));
+        let diff = catalog.diff_patches(&implicit);
+        assert!(find_entity(&diff, &entity::forge("github.com")).unset.contains(&"flotilla.forge.kind".into()));
+    }
+    // Projection never creates a Forge resource for the fallback.
+    let stored = runtime.block_on(backend.using::<Forge>("dev").list()).expect("stored forges");
+    assert_eq!(stored.items.len(), usize::from(!matches!(mode, Coverage::Absent)), "{mode:?}");
 }
 
 // #1961: PM facts keep Active lifecycle, structured blockers and attachment
@@ -3026,20 +3026,17 @@ fn structured_recipe_mint_refuses_ambiguous_hosts() {
 }
 
 // #2758: the catalog exposes raw holds, latest ledger and pending/stuck messages;
-// empty input retracts the facts. Generate absent/present hold and ledger, every
-// message phase, duplicate observation order and unrelated convoy/namespace records.
-#[hegel::test]
-fn convoy_inbox_facts_are_raw_and_retractable(tc: hegel::TestCase) {
+// empty input retracts the facts. Every combination of absent/present hold and
+// ledger, waiting reason and message phase, with duplicate observation order and
+// unrelated convoy/namespace records.
+#[tokio::test]
+async fn convoy_inbox_facts_are_raw_and_retractable() {
     use crate::keys::{KEY_CONVOY_HELD, KEY_CONVOY_HOLDS, KEY_CONVOY_LEDGER, KEY_CONVOY_PENDING_MESSAGES, KEY_CONVOY_STUCK_MESSAGES};
     use flotilla_resources::{
         Artifact, ArtifactSpec, Convoy, ConvoyAttention, ConvoySpec, ConvoyStatus, InputMeta, Message, MessagePhase, MessageRelation,
         MessageSpec, MessageStatus,
     };
     use flotilla_store::ResourceBackend;
-    use hegel::generators as gs;
-    let held = tc.draw(gs::booleans());
-    let ledger = tc.draw(gs::booleans());
-    let waiting_reason = tc.draw(gs::booleans());
     let phases = [
         MessagePhase::Accepted,
         MessagePhase::WaitingOnReferences,
@@ -3052,9 +3049,17 @@ fn convoy_inbox_facts_are_raw_and_retractable(tc: hegel::TestCase) {
         MessagePhase::Superseded,
         MessagePhase::DeadLettered,
     ];
-    let phase = phases[tc.draw(gs::integers::<usize>().min_value(0).max_value(phases.len() - 1))];
-    let runtime = tokio::runtime::Builder::new_current_thread().enable_all().build().expect("runtime");
-    runtime.block_on(async {
+    let mut cases = Vec::new();
+    for held in [false, true] {
+        for ledger in [false, true] {
+            for waiting_reason in [false, true] {
+                for phase in phases {
+                    cases.push((held, ledger, waiting_reason, phase));
+                }
+            }
+        }
+    }
+    for (held, ledger, waiting_reason, phase) in cases {
         let backend = ResourceBackend::new(InMemoryBackend::default());
         let mut convoy = backend
             .using::<Convoy>("dev")
@@ -3163,5 +3168,5 @@ fn convoy_inbox_facts_are_raw_and_retractable(tc: hegel::TestCase) {
         }
         let cleared_patches = cleared.reassert_patches();
         assert_eq!(find_entity(&cleared_patches, &target).set[KEY_CONVOY_HELD].value, MetadataValue::Bool(false));
-    });
+    }
 }

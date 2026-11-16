@@ -1963,16 +1963,10 @@ mod tests {
     // Selection is a host-local fact: foreign-host and unrelated-repository
     // checkouts do not participate. A sole checkout is usable; among multiple
     // candidates only a unique main is selectable, otherwise refuse ambiguity.
-    #[hegel::test]
-    fn checkout_selection_uses_local_facts_and_refuses_ambiguity(tc: hegel::TestCase) {
-        use flotilla_resources::ObservedCheckoutSpec;
-        use hegel::generators as gs;
-
-        // Generate 0–8 facts spanning both hosts, repository membership and main/
-        // worktree state; pinned equivalence classes guarantee boundary coverage.
-        let count = tc.draw(gs::integers::<usize>().min_value(0).max_value(8));
-        let generated = (0..count).map(|_| (tc.draw(gs::booleans()), tc.draw(gs::booleans()), tc.draw(gs::booleans()))).collect();
-        let cases = [
+    // Pinned equivalence classes guarantee boundary coverage.
+    #[tokio::test]
+    async fn checkout_selection_boundary_classes() {
+        for facts in [
             vec![],
             vec![(true, true, true)],
             vec![(true, false, true)],
@@ -1981,63 +1975,76 @@ mod tests {
             vec![(true, false, true), (true, false, true)],
             vec![(false, true, true), (true, false, true)],
             vec![(true, true, false), (true, false, true)],
-            generated,
-        ];
+        ] {
+            checkout_selection_case(facts).await;
+        }
+    }
+
+    #[hegel::test]
+    fn checkout_selection_uses_local_facts_and_refuses_ambiguity(tc: hegel::TestCase) {
+        use hegel::generators as gs;
+
+        // Generate 0–8 facts spanning both hosts, repository membership and main/
+        // worktree state.
+        let count = tc.draw(gs::integers::<usize>().min_value(0).max_value(8));
+        let generated = (0..count).map(|_| (tc.draw(gs::booleans()), tc.draw(gs::booleans()), tc.draw(gs::booleans()))).collect();
         let runtime = tokio::runtime::Builder::new_current_thread().enable_all().build().expect("runtime");
-        runtime.block_on(async {
-            let temp = tempfile::tempdir().expect("checkout paths");
-            let root = temp.path().canonicalize().expect("physical checkout paths");
-            for facts in cases {
-                let backend = ResourceBackend::new(InMemoryBackend::default());
-                let discovered = DiscoveredCheckouts::default();
-                let namespace = std::sync::RwLock::new("flotilla".to_string());
-                let key = RepositorySpec::remote("https://github.com/example/ops").expect("repository").key();
-                let mut found = BTreeMap::<RepositoryKey, Vec<_>>::new();
-                for (index, (local, main, member)) in facts.iter().enumerate() {
-                    let repo_ref = if *member { key.clone() } else { RepositoryKey("other-repository".into()) };
-                    found.entry(repo_ref.clone()).or_default().push(DiscoveredCheckout {
-                        name: format!("checkout-{index}"),
-                        repo_slug: repo_ref.0.clone(),
-                        spec: ObservedCheckoutSpec::builder()
-                            .path(root.join(index.to_string()).to_string_lossy().into_owned())
-                            .host_ref(if *local { "local-host" } else { "foreign-host" }.to_string())
-                            .repo_ref(repo_ref)
-                            .r#ref(if *main { "main" } else { "convoy/work" }.to_string())
-                            .is_main(*main)
-                            .build(),
-                    });
-                }
-                for (repository, checkouts) in found {
-                    discovered.replace(&repository, checkouts);
-                }
-                let local = facts.iter().enumerate().filter(|(_, (local, _, member))| *local && *member).collect::<Vec<_>>();
-                let mains = local.iter().filter(|(_, (_, main, _))| *main).collect::<Vec<_>>();
-                let selected = if local.len() == 1 {
-                    Some(local[0].0)
-                } else if mains.len() == 1 {
-                    Some(mains[0].0)
-                } else {
-                    None
-                };
-                let index = RepositoryIndex {
-                    lifecycle_reads: crate::test_support::no_held_checkouts().as_ref(),
-                    backend: &backend,
-                    discovered: &discovered,
-                    namespace: &namespace,
-                    host: "local-host",
-                };
-                match index.select_checkout(&key).await.expect("selection") {
-                    CheckoutSelection::Unavailable => assert!(local.is_empty(), "available local facts must not be lost"),
-                    CheckoutSelection::Ambiguous => assert!(!local.is_empty() && selected.is_none(), "a unique checkout must be usable"),
-                    CheckoutSelection::Selected(checkout) => {
-                        let expected = selected.expect("ambiguous facts must never select an arbitrary checkout");
-                        assert_eq!(checkout.path, root.join(expected.to_string()));
-                        assert_eq!(checkout.is_main, facts[expected].1);
-                        assert_eq!(checkout.git_ref, if facts[expected].1 { "main" } else { "convoy/work" });
-                    }
-                }
+        runtime.block_on(checkout_selection_case(generated));
+    }
+
+    /// Checks selection over checkout facts, each (local host, main, repository member).
+    async fn checkout_selection_case(facts: Vec<(bool, bool, bool)>) {
+        use flotilla_resources::ObservedCheckoutSpec;
+        let temp = tempfile::tempdir().expect("checkout paths");
+        let root = temp.path().canonicalize().expect("physical checkout paths");
+        let backend = ResourceBackend::new(InMemoryBackend::default());
+        let discovered = DiscoveredCheckouts::default();
+        let namespace = std::sync::RwLock::new("flotilla".to_string());
+        let key = RepositorySpec::remote("https://github.com/example/ops").expect("repository").key();
+        let mut found = BTreeMap::<RepositoryKey, Vec<_>>::new();
+        for (index, (local, main, member)) in facts.iter().enumerate() {
+            let repo_ref = if *member { key.clone() } else { RepositoryKey("other-repository".into()) };
+            found.entry(repo_ref.clone()).or_default().push(DiscoveredCheckout {
+                name: format!("checkout-{index}"),
+                repo_slug: repo_ref.0.clone(),
+                spec: ObservedCheckoutSpec::builder()
+                    .path(root.join(index.to_string()).to_string_lossy().into_owned())
+                    .host_ref(if *local { "local-host" } else { "foreign-host" }.to_string())
+                    .repo_ref(repo_ref)
+                    .r#ref(if *main { "main" } else { "convoy/work" }.to_string())
+                    .is_main(*main)
+                    .build(),
+            });
+        }
+        for (repository, checkouts) in found {
+            discovered.replace(&repository, checkouts);
+        }
+        let local = facts.iter().enumerate().filter(|(_, (local, _, member))| *local && *member).collect::<Vec<_>>();
+        let mains = local.iter().filter(|(_, (_, main, _))| *main).collect::<Vec<_>>();
+        let selected = if local.len() == 1 {
+            Some(local[0].0)
+        } else if mains.len() == 1 {
+            Some(mains[0].0)
+        } else {
+            None
+        };
+        let index = RepositoryIndex {
+            lifecycle_reads: crate::test_support::no_held_checkouts().as_ref(),
+            backend: &backend,
+            discovered: &discovered,
+            namespace: &namespace,
+            host: "local-host",
+        };
+        match index.select_checkout(&key).await.expect("selection") {
+            CheckoutSelection::Unavailable => assert!(local.is_empty(), "available local facts must not be lost"),
+            CheckoutSelection::Ambiguous => assert!(!local.is_empty() && selected.is_none(), "a unique checkout must be usable"),
+            CheckoutSelection::Selected(checkout) => {
+                let expected = selected.expect("ambiguous facts must never select an arbitrary checkout");
+                assert_eq!(checkout.path, root.join(expected.to_string()));
+                assert_eq!(checkout.is_main, facts[expected].1);
+                assert_eq!(checkout.git_ref, if facts[expected].1 { "main" } else { "convoy/work" });
             }
-        });
+        }
     }
 
     #[test]

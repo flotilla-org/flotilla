@@ -5958,15 +5958,14 @@ mod tests {
 
     // Placement matches every vessel's crew needs and policy independently.
     // Reversing vessel order cannot lend one vessel's provider to another.
-    #[hegel::test]
-    fn distinct_vessel_needs_freeze_distinct_provider_instances(tc: hegel::TestCase) {
+    #[tokio::test]
+    async fn distinct_vessel_needs_freeze_distinct_provider_instances() {
         use flotilla_protocol::provider::{
             CheckoutStrategy, EgressEnforcement, EnvironmentClass, MaterialMode, ProviderAdvertisement, ProviderCapabilities, ProviderKind,
             ProviderReadiness,
         };
         use flotilla_resources::{HostSpec, HostStatus};
-        let reverse = tc.draw(hegel::generators::booleans());
-        tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap().block_on(async {
+        for reverse in [false, true] {
             let fixture = handler_contract_fixture().await;
             for platform in ["linux", "macos"] {
                 let host = fixture
@@ -6055,7 +6054,7 @@ mod tests {
                 assert_eq!(placements[platform].1.provider_instance.as_deref(), Some(format!("{platform}-instance").as_str()));
                 assert_eq!(placements[platform].1.target_host.reference.as_str(), platform);
             }
-        });
+        }
     }
 
     // ADR 0062: a workflow template leg's `needs` survive role expansion and
