@@ -199,7 +199,6 @@ mod tests {
     use flotilla_provisioning_testkit::Ending;
     use flotilla_resources::discovered_checkouts::DiscoveredCheckout;
     use flotilla_resources::{InputMeta, ObservedCheckoutSpec, ProjectRepositoryRole, ProjectRepositorySpec, ProjectSpec, RepositorySpec};
-    use flotilla_store_memory::InMemoryBackend;
     use hegel::generators as gs;
 
     use super::*;
@@ -244,8 +243,8 @@ mod tests {
         }
     }
 
-    fn backend() -> ResourceBackend {
-        ResourceBackend::new(InMemoryBackend::default())
+    fn backend() -> flotilla_provisioning_testkit::EngineBackend {
+        flotilla_provisioning_testkit::EngineBackend::open_in("local", "test")
     }
 
     /// Resolves `selector` with no checkout held on the engine.
@@ -286,10 +285,12 @@ mod tests {
             .serving(Arc::clone(&environments.environments) as _, Arc::clone(&clones.clones) as _)
     }
 
-    async fn repository(backend: &ResourceBackend, name: &str, slug: &str) -> RepositoryKey {
+    /// Records the repository at `slug`, named by its identity's key as every Repository is.
+    async fn repository(backend: &ResourceBackend, slug: &str) -> RepositoryKey {
         let spec = RepositorySpec::remote(format!("https://github.com/{slug}")).expect("repository spec");
-        backend.using::<Repository>("test").create(&InputMeta::builder().name(name.to_string()).build(), &spec).await.expect("repository");
-        RepositoryKey(name.into())
+        let key = spec.key();
+        backend.using::<Repository>("test").create(&InputMeta::builder().name(key.to_string()).build(), &spec).await.expect("repository");
+        key
     }
 
     async fn project(backend: &ResourceBackend, name: &str, key: RepositoryKey, alias: &str) {
@@ -334,12 +335,12 @@ mod tests {
         runtime.block_on(async {
             let durable = backend();
             let observed = DiscoveredCheckouts::default();
-            let key = repository(&durable, "widgets", "acme/widgets").await;
+            let key = repository(&durable, "acme/widgets").await;
             for i in 0..duplicates {
                 project(&durable, &format!("project-{i}"), key.clone(), "primary").await;
             }
             if extra {
-                repository(&durable, "other", "acme/other").await;
+                repository(&durable, "acme/other").await;
             }
             let selector = match selector_kind {
                 0 => RepoSelector::Query("primary".into()),
@@ -362,8 +363,8 @@ mod tests {
         runtime.block_on(async {
             let durable = backend();
             let observed = DiscoveredCheckouts::default();
-            let parent = repository(&durable, "widgets", "acme/widgets").await;
-            let child = repository(&durable, "other", "acme/other").await;
+            let parent = repository(&durable, "acme/widgets").await;
+            let child = repository(&durable, "acme/other").await;
             checkout().discovered(&observed).name("parent").path("/work/widgets").key(parent.clone()).call();
             checkout().discovered(&observed).name("remote").path("/work/widgets/nested").key(child.clone()).host("remote").call();
             if nested {
@@ -409,7 +410,7 @@ mod tests {
         runtime.block_on(async {
             let durable = backend();
             let observed = DiscoveredCheckouts::default();
-            let key = repository(&durable, "widgets", "acme/widgets").await;
+            let key = repository(&durable, "acme/widgets").await;
             let stored = if stored_alias { &alias } else { &physical };
             checkout().discovered(&observed).name("checkout").path(stored.to_str().expect("path")).key(key.clone()).call();
             let mut cwd = alias.clone();
@@ -431,8 +432,8 @@ mod tests {
     async fn invalid_selectors_are_read_only_refusals() {
         let durable = backend();
         let observed = DiscoveredCheckouts::default();
-        let first = repository(&durable, "widgets", "acme/widgets").await;
-        let second = repository(&durable, "other", "acme/other").await;
+        let first = repository(&durable, "acme/widgets").await;
+        let second = repository(&durable, "acme/other").await;
         project(&durable, "a", first, "primary").await;
         project(&durable, "b", second, "primary").await;
         project(&durable, "dangling", RepositoryKey("absent".into()), "missing").await;
@@ -459,7 +460,7 @@ mod tests {
 
         let durable = backend();
         let observed = DiscoveredCheckouts::default();
-        let key = repository(&durable, "widgets", "acme/widgets").await;
+        let key = repository(&durable, "acme/widgets").await;
         let engine = engine_on("local");
         let spec = CheckoutSpec::FreshClone(
             FreshCloneCheckoutSpec::builder()
@@ -496,7 +497,7 @@ mod tests {
         use flotilla_resources::CheckoutWorktreeSpec;
         let durable = backend();
         let observed = DiscoveredCheckouts::default();
-        let key = repository(&durable, "widgets", "acme/widgets").await;
+        let key = repository(&durable, "acme/widgets").await;
         let temp = tempfile::tempdir().expect("paths");
         let live = temp.path().join("live");
         let stale = temp.path().join("stale");

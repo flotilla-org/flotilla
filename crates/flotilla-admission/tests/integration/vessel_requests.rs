@@ -1,20 +1,18 @@
-use flotilla_store_memory::InMemoryBackend;
 use std::{collections::BTreeMap, sync::Arc};
 
 use chrono::Utc;
 use flotilla_admission::reconcilers::vessel_requests::{
     ConvoyStanding, ConvoyTouched, ConvoyWorks, ConvoyWorksRead, VesselReleaseGate, VesselRequests, WorkNeedingVessel,
 };
-use flotilla_protocol::{CanonicalHostId, LifecycleReading, NodeId, PlacementDecision, PlacementTargetHost};
+use flotilla_engine_convoys_testkit::EngineHome;
+use flotilla_protocol::{CanonicalHostId, LifecycleReading, PlacementDecision, PlacementTargetHost};
 use flotilla_provisioning_testkit::{FollowedVessels, VesselsFixture};
 use flotilla_resources::{
     checkout_records::CheckoutHolder,
     vessel_records::{VesselChange, VesselLaunchRequest, VesselRecords},
-    CheckoutSpec, Convoy, ConvoyPhase, ConvoySpec, ConvoyStatus, InputMeta, ObservedCheckoutSpec, RepositoryKey, WorkPhase, WorkState,
-    WorkflowSnapshot,
+    CheckoutSpec, ConvoyPhase, ConvoySpec, ConvoyStatus, ObservedCheckoutSpec, RepositoryKey, WorkPhase, WorkState, WorkflowSnapshot,
 };
 use flotilla_store::load_metrics::{measure, KindReadCounts};
-use flotilla_store::ResourceBackend;
 use futures::StreamExt;
 use std::collections::BTreeSet;
 
@@ -52,60 +50,40 @@ fn decision(host: &str) -> PlacementDecision {
     }
 }
 
-/// Convoy `name` admitted on `backend`, its one work in `work`, placed on `host` when given.
-async fn admit(backend: &ResourceBackend, name: &str, host: Option<&str>, work: WorkPhase) {
-    let convoys = backend.using::<Convoy>(NAMESPACE);
-    let convoy = convoys
-        .create(
-            &InputMeta::builder().name(name.to_owned()).build(),
-            &ConvoySpec::builder().workflow_ref("workflow".to_owned()).placement_policy("host-direct".to_owned()).build(),
-        )
-        .await
-        .expect("admit convoy");
+/// Convoy `name` admitted at `home`, its one work in `work`, placed on `host` when given; returns
+/// the launch.
+async fn admit(home: &EngineHome, name: &str, host: Option<&str>, work: WorkPhase) -> String {
     let workflow = flotilla_resources::single_agent_workflow_spec();
-    convoys
-        .update_status(
-            name,
-            &convoy.metadata.resource_version,
-            &ConvoyStatus {
-                phase: ConvoyPhase::Active,
-                placement_decision: host.map(decision),
-                workflow_snapshot: Some(WorkflowSnapshot {
-                    cascade: None,
-                    stall_nudges: Default::default(),
-                    supervision: None,
-                    exit: workflow.exit,
-                    turn_delivery: workflow.turn_delivery,
-                    vessels: workflow.vessels,
-                }),
-                work: BTreeMap::from([("work".to_owned(), WorkState::builder().phase(work).build())]),
-                ..ConvoyStatus::default()
-            },
-        )
-        .await
-        .expect("convoy status");
-}
-
-async fn replicate(from: &ResourceBackend, root: &NodeId, to: &ResourceBackend) {
-    to.replica_writer::<Convoy>(root.clone(), NAMESPACE)
-        .replace(&from.using::<Convoy>(NAMESPACE).list().await.expect("convoys"), Utc::now())
-        .await
-        .expect("replicate convoys");
+    let status = ConvoyStatus {
+        phase: ConvoyPhase::Active,
+        placement_decision: host.map(decision),
+        workflow_snapshot: Some(WorkflowSnapshot {
+            cascade: None,
+            stall_nudges: Default::default(),
+            supervision: None,
+            exit: workflow.exit,
+            turn_delivery: workflow.turn_delivery,
+            vessels: workflow.vessels,
+        }),
+        work: BTreeMap::from([("work".to_owned(), WorkState::builder().phase(work).build())]),
+        ..ConvoyStatus::default()
+    };
+    let spec = ConvoySpec::builder().workflow_ref("workflow".to_owned()).placement_policy("host-direct".to_owned()).build();
+    home.admit(name, spec, status).await
 }
 
 // A convoy admitted at kiwi and placed on feta's host is launched at feta, as a launch of its work
 // in the convoy homed at kiwi; kiwi requests nothing for it.
 #[tokio::test]
 async fn a_placed_work_is_launched_at_the_home_that_serves_its_host() {
-    let kiwi_root = NodeId::new("kiwi");
-    let kiwi = ResourceBackend::new(InMemoryBackend::default()).with_local_root(kiwi_root.clone());
-    let feta = ResourceBackend::new(InMemoryBackend::default()).with_local_root(NodeId::new("feta"));
-    admit(&kiwi, "remote", Some("feta-host"), WorkPhase::Ready).await;
-    replicate(&kiwi, &kiwi_root, &feta).await;
+    let kiwi = EngineHome::open("kiwi");
+    let feta = EngineHome::open("feta");
+    let convoy = admit(&kiwi, "remote", Some("feta-host"), WorkPhase::Ready).await;
+    kiwi.replicate_to(&feta);
 
     let kiwi_vessels = VesselsFixture::at("kiwi");
     let kiwi_requests = VesselRequests::new(
-        std::sync::Arc::new(flotilla_admission::reconcilers::vessel_requests::OldConvoyWorks::new(kiwi.clone(), NAMESPACE)),
+        std::sync::Arc::new(flotilla_admission::reconcilers::vessel_requests::OldConvoyWorks::new(kiwi.backend().clone(), NAMESPACE)),
         kiwi_vessels.reads.clone(),
         sanctioned(),
         CanonicalHostId::resolved("kiwi-host"),
@@ -115,7 +93,7 @@ async fn a_placed_work_is_launched_at_the_home_that_serves_its_host() {
 
     let feta_vessels = VesselsFixture::at("feta");
     let feta_requests = VesselRequests::new(
-        std::sync::Arc::new(flotilla_admission::reconcilers::vessel_requests::OldConvoyWorks::new(feta.clone(), NAMESPACE)),
+        std::sync::Arc::new(flotilla_admission::reconcilers::vessel_requests::OldConvoyWorks::new(feta.backend().clone(), NAMESPACE)),
         feta_vessels.reads.clone(),
         sanctioned(),
         CanonicalHostId::resolved("feta-host"),
@@ -124,7 +102,7 @@ async fn a_placed_work_is_launched_at_the_home_that_serves_its_host() {
     let pass = feta_requests.sync_once(Utc::now()).await.expect("feta pass");
     assert_eq!(pass.requested.len(), 1);
     let launch = feta_vessels.vessels.get(&pass.requested[0], None).expect("read").expect("launch");
-    assert_eq!((launch.convoy.as_str(), launch.convoy_home.as_str(), launch.launch_of.as_str()), ("remote", "kiwi", "remote-work"));
+    assert_eq!((launch.convoy.as_str(), launch.convoy_home.as_str(), launch.launch_of.as_str()), (convoy.as_str(), "kiwi", "remote-work"));
     assert_eq!(launch.host, "feta-host");
     assert_eq!(launch.reading, LifecycleReading::InProgress);
 
@@ -135,15 +113,14 @@ async fn a_placed_work_is_launched_at_the_home_that_serves_its_host() {
 // A daemon requests the launches placed on the SSH hosts it actuates for, on those hosts.
 #[tokio::test]
 async fn a_daemon_launches_the_works_placed_on_its_ssh_hosts() {
-    let root = NodeId::new("admitting");
-    let admitting = ResourceBackend::new(InMemoryBackend::default()).with_local_root(root.clone());
-    let owner = ResourceBackend::new(InMemoryBackend::default()).with_local_root(NodeId::new("owner"));
+    let admitting = EngineHome::open("admitting");
+    let owner = EngineHome::open("owner");
     admit(&admitting, "ssh", Some("ssh-host"), WorkPhase::Ready).await;
-    replicate(&admitting, &root, &owner).await;
+    admitting.replicate_to(&owner);
 
     let vessels = VesselsFixture::at("owner");
     let requests = VesselRequests::new(
-        std::sync::Arc::new(flotilla_admission::reconcilers::vessel_requests::OldConvoyWorks::new(owner.clone(), NAMESPACE)),
+        std::sync::Arc::new(flotilla_admission::reconcilers::vessel_requests::OldConvoyWorks::new(owner.backend().clone(), NAMESPACE)),
         vessels.reads.clone(),
         sanctioned(),
         CanonicalHostId::resolved("owner-host"),
@@ -159,12 +136,12 @@ async fn a_daemon_launches_the_works_placed_on_its_ssh_hosts() {
 // sanctions it.
 #[tokio::test]
 async fn an_unplaced_local_work_runs_here_until_its_convoy_is_reclaimed() {
-    let backend = ResourceBackend::new(InMemoryBackend::default()).with_local_root(NodeId::new("home"));
-    admit(&backend, "local", None, WorkPhase::Ready).await;
+    let home = EngineHome::open("home");
+    let convoy = admit(&home, "local", None, WorkPhase::Ready).await;
     let vessels = VesselsFixture::at("home");
     let requests = |gate: bool| {
         VesselRequests::new(
-            std::sync::Arc::new(flotilla_admission::reconcilers::vessel_requests::OldConvoyWorks::new(backend.clone(), NAMESPACE)),
+            std::sync::Arc::new(flotilla_admission::reconcilers::vessel_requests::OldConvoyWorks::new(home.backend().clone(), NAMESPACE)),
             Arc::clone(&vessels.reads),
             Arc::new(Gate(gate)),
             CanonicalHostId::resolved("home-host"),
@@ -174,11 +151,7 @@ async fn an_unplaced_local_work_runs_here_until_its_convoy_is_reclaimed() {
     let launch = requests(true).sync_once(Utc::now()).await.expect("pass").requested.pop().expect("requested");
     assert_eq!(vessels.vessels.get(&launch, None).expect("read").expect("launch").host, "home-host");
 
-    let convoys = backend.using::<Convoy>(NAMESPACE);
-    let convoy = convoys.get("local").await.expect("convoy");
-    let mut status = convoy.status.clone().expect("status");
-    status.phase = ConvoyPhase::Landed;
-    convoys.update_status("local", &convoy.metadata.resource_version, &status).await.expect("land");
+    flotilla_engine_convoys_testkit::land(&home.convoys.path(), &home.convoy(&convoy).await).await;
 
     let refused = requests(false).sync_once(Utc::now()).await.expect("refused pass");
     assert!(refused.released.is_empty());

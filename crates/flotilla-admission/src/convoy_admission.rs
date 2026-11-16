@@ -48,8 +48,6 @@ use flotilla_resources::{
 #[cfg(test)]
 use flotilla_resources::{HoldAct, InputMeta, RepositorySpec, SystemClock};
 use flotilla_store::{resolve_project_issue_sources, PlacementImageSourceStoreExt, ResolvedCascadeStoreExt, ResourceBackend, StoreQuery};
-#[cfg(test)]
-use flotilla_store_memory::InMemoryBackend;
 use sha2::{Digest, Sha256};
 use tokio::sync::{Mutex, RwLock};
 use tracing::warn;
@@ -4841,7 +4839,9 @@ pub async fn handler_contract_fixture() -> HandlerContractFixture {
         runner: discovery.runner.clone(),
         bag: flotilla_discovery::run_host_detectors(&discovery.host_detectors, &*discovery.runner, &*discovery.env).await,
     });
-    let resource_backend = ResourceBackend::new(flotilla_store_memory::InMemoryBackend::default());
+    // Every kind is the engine's, its Convoy path over the same decided store.
+    let engine = flotilla_engine_convoys_testkit::EngineHome::open("host");
+    let resource_backend = engine.backend().clone();
     let provisioning_namespace = Arc::new(std::sync::RwLock::new("flotilla".into()));
     let query_port: Arc<dyn ChangeRequestQueryPort> = Arc::new(FixtureQueries);
     let issue_query_port: Arc<dyn IssueQueryPort> = Arc::new(FixtureQueries);
@@ -4851,22 +4851,10 @@ pub async fn handler_contract_fixture() -> HandlerContractFixture {
     let admission_free_space_path = Arc::new(std::sync::RwLock::new(temp.path().to_path_buf()));
     let clock: Arc<dyn Clock> = Arc::new(SystemClock);
     let host_name = HostName::new("host");
-    // The engine's Convoy path, over a decided store in the fixture's directory, which the path
-    // keeps open.
-    let reads = Arc::clone(crate::test_support::no_held_checkouts());
-    let convoys = flotilla_engine_convoys_testkit::EngineConvoysHome::open_in(
-        temp.path(),
-        "host",
-        "flotilla",
-        &resource_backend,
-        Arc::clone(&clock),
-        reads,
-    )
-    .path();
     let admission = ConvoyAdmission::builder()
         .backend(resource_backend.clone())
-        .convoys(convoys)
-        .accounts(Arc::new(flotilla_store_testkit::OldStoreAccounts::new(resource_backend.clone())))
+        .convoys(engine.convoys.path())
+        .accounts(Arc::clone(&engine.engine.ports.accounts))
         .discovered_checkouts(DiscoveredCheckouts::default())
         .config(Arc::clone(&config))
         .discovery(Arc::clone(&discovery))
@@ -4885,7 +4873,7 @@ pub async fn handler_contract_fixture() -> HandlerContractFixture {
         // The engine's readings, as composition installs them; none is held here.
         .lifecycle_reads(Arc::clone(crate::test_support::no_held_checkouts()))
         .build();
-    HandlerContractFixture { owner: admission, backend: resource_backend, namespace: provisioning_namespace, temp }
+    HandlerContractFixture { owner: admission, backend: resource_backend, namespace: provisioning_namespace, temp, engine }
 }
 
 /// Registers a ready host advertising one host-direct provider and the
@@ -4942,6 +4930,8 @@ pub struct HandlerContractFixture {
     pub backend: ResourceBackend,
     pub namespace: Arc<std::sync::RwLock<String>>,
     pub temp: tempfile::TempDir,
+    /// The engine serving `backend`, which keeps its decided store open.
+    pub engine: flotilla_engine_convoys_testkit::EngineHome,
 }
 
 struct ProbedNamingUtility {
@@ -5069,17 +5059,43 @@ mod tests {
         }
     }
 
+    /// `work`'s output, its reads through the backend per kind (keyed, index and whole-kind reads
+    /// together) and the records those reads returned per kind, as the engine's ports count them.
+    async fn engine_reads<T>(work: impl std::future::Future<Output = T>) -> (T, BTreeMap<String, u64>, BTreeMap<String, u64>) {
+        let (output, counts) = flotilla_store::load_metrics::measure(work).await;
+        let (reads, returned) = port_reads(&counts);
+        (output, reads, returned)
+    }
+
+    /// The reads through the backend per kind and the records they returned, from the engine's
+    /// counts: a port's counts are under its kind's name with " port" after it.
+    fn port_reads(counts: &flotilla_store::load_metrics::ReadCounts) -> (BTreeMap<String, u64>, BTreeMap<String, u64>) {
+        let ports = || counts.iter().filter_map(|(kind, c)| kind.strip_suffix(" port").map(|kind| (kind.to_owned(), c)));
+        let reads = ports().map(|(kind, c)| (kind, c.keyed + c.index + c.whole_kind)).filter(|(_, n)| *n > 0).collect();
+        let returned = ports().map(|(kind, c)| (kind, c.rows)).filter(|(_, n)| *n > 0).collect();
+        (reads, returned)
+    }
+
+    /// Admits an unrelated system message on the fixture's engine, as the system sends one.
+    async fn unrelated_message(fixture: &HandlerContractFixture, name: &str, receiver: String) {
+        let intent = flotilla_engine_messages_testkit::intent(
+            "system:turn-rules",
+            &receiver,
+            flotilla_resources::MessageRelation::System,
+            "unrelated",
+        );
+        fixture.engine.messages.primitives().admit(name, &intent).await.expect("admit the message");
+    }
+
     // Repository and cached request joins are one inventory read each; a missing
     // observation on the first repository must not cause point reads per member.
     #[tokio::test]
     async fn observed_request_reads_are_bounded_across_repositories() {
-        use flotilla_resources::{ChangeRequestSpec, Message, MessageRelation, MessageSpec, RepositorySpec};
-        use flotilla_store_testkit::ReadCountsBackendExt;
+        use flotilla_resources::{ChangeRequestSpec, RepositorySpec};
         let mut outcomes = Vec::new();
         for n in [0, 200] {
-            let mut fixture = handler_contract_fixture().await;
-            let observed = fixture.backend.clone().with_read_counts();
-            fixture.owner.backend = observed.clone();
+            let fixture = handler_contract_fixture().await;
+            flotilla_engine_messages_testkit::designate_fleet(&fixture.backend, "flotilla").await;
             let mut keys = Vec::new();
             for name in ["first", "second"] {
                 let spec = RepositorySpec::remote(format!("https://github.com/acme/{name}")).unwrap();
@@ -5115,25 +5131,10 @@ mod tests {
                     ),
                 )
                 .await;
-                fixture
-                    .backend
-                    .using::<Message>("flotilla")
-                    .create(
-                        &InputMeta::builder().name(format!("message-{index}")).build(),
-                        &MessageSpec::builder()
-                            .sender("system:test".into())
-                            .receiver("other/unrelated/work/coder".into())
-                            .relation(MessageRelation::System)
-                            .body("unrelated".into())
-                            .build(),
-                    )
-                    .await
-                    .unwrap();
+                unrelated_message(&fixture, &format!("message-{index}"), "other/unrelated/work/coder".into()).await;
             }
-            let before = observed.read_snapshot();
-            assert!(fixture.owner.resolve_observed_convoy_change_request(&keys, Some("42")).await.unwrap().is_none());
-            let delta = observed.read_snapshot().since(&before);
-            let (reads, decoded) = (delta.calls_by_kind(), delta.objects_by_kind());
+            let (resolved, reads, decoded) = engine_reads(fixture.owner.resolve_observed_convoy_change_request(&keys, Some("42"))).await;
+            assert!(resolved.unwrap().is_none());
             for (kind, count) in &reads {
                 assert!(*count <= 1, "{kind}: {count} reads");
             }
@@ -5148,13 +5149,10 @@ mod tests {
 
     #[tokio::test]
     async fn admission_brief_reads_are_bounded_across_vessels() {
-        use flotilla_resources::{Message, MessageRelation, MessageSpec};
-        use flotilla_store_testkit::ReadCountsBackendExt;
         let mut outcomes = Vec::new();
         for (reuse, n) in [(false, 2), (false, 200), (true, 2), (true, 200)] {
-            let mut fixture = handler_contract_fixture().await;
-            let observed = fixture.backend.clone().with_read_counts();
-            fixture.owner.backend = observed.clone();
+            let fixture = handler_contract_fixture().await;
+            flotilla_engine_messages_testkit::designate_fleet(&fixture.backend, "flotilla").await;
             let writer = Arc::new(CapturedBriefs::default());
             *fixture.owner.brief_artifact_writer.write().await = Some(writer.clone());
             fixture
@@ -5178,20 +5176,7 @@ mod tests {
                     ),
                 )
                 .await;
-                fixture
-                    .backend
-                    .using::<Message>("flotilla")
-                    .create(
-                        &InputMeta::builder().name(format!("message-{index}")).build(),
-                        &MessageSpec::builder()
-                            .sender("system:test".into())
-                            .receiver(format!("other/convoy-{index}/work/coder"))
-                            .relation(MessageRelation::System)
-                            .body("unrelated".into())
-                            .build(),
-                    )
-                    .await
-                    .unwrap();
+                unrelated_message(&fixture, &format!("message-{index}"), format!("other/convoy-{index}/work/coder")).await;
             }
             let workflow = WorkflowTemplateSpec::builder()
                 .vessels(
@@ -5214,12 +5199,11 @@ mod tests {
                 )
                 .build();
             let spec = ConvoySpec::builder().workflow_ref("scratch".into()).project_ref("project".into()).build();
-            let before = observed.read_snapshot();
-            let ((), port) = flotilla_store::load_metrics::measure(async {
+            let ((), counts) = flotilla_store::load_metrics::measure(async {
                 if reuse {
                     let snapshot = fixture.owner.load_brief_definitions("flotilla", &spec, &workflow).await.unwrap();
                     let query = fixture.owner.brief_query("flotilla", "target", &spec, &workflow, &snapshot).await.unwrap().unwrap();
-                    let inventory = observed.query_declared::<ResourceConvoy>("flotilla", &query).await.unwrap().items;
+                    let inventory = fixture.backend.query_declared::<ResourceConvoy>("flotilla", &query).await.unwrap().items;
                     // Incomplete prepared evidence must refuse, never fall back to native reads.
                     let missing = ResourceBackend::new(flotilla_store::ViewSnapshot::default());
                     let error = fixture
@@ -5253,14 +5237,16 @@ mod tests {
             })
             .await;
             // The brief reads the convoys it may show: none of the project's other launches.
-            assert_eq!(port.get("Convoy").map_or(0, |counts| counts.converted), 0, "{n} launches held");
+            assert_eq!(counts.get("Convoy").map_or(0, |counts| counts.converted), 0, "{n} launches held");
             assert_eq!(writer.0.read().await.len(), 2);
-            let delta = observed.read_snapshot().since(&before);
-            let (reads, decoded) = (delta.calls_by_kind(), delta.objects_by_kind());
+            let (reads, _) = port_reads(&counts);
             for (kind, count) in &reads {
                 assert!(*count <= 1, "{kind}: {count} reads");
             }
-            // The engine serves convoys through its views: no stored Convoy is decoded.
+            // The engine serves convoys through its views: no stored Convoy is decoded. The
+            // launches the brief lists are the project's, so their count follows n.
+            let decoded: BTreeMap<String, u64> =
+                counts.iter().map(|(kind, c)| (kind.clone(), c.decoded)).filter(|(kind, n)| *n > 0 && !kind.ends_with(" port")).collect();
             assert_eq!(decoded.get("Convoy").copied().unwrap_or(0), 0);
             outcomes.push((reads, decoded));
         }
@@ -5273,16 +5259,13 @@ mod tests {
     #[tokio::test]
     async fn prepared_capacity_uses_captured_evidence() {
         use flotilla_resources::{HostSpec, HostStatus};
-        use flotilla_store_testkit::ReadCountsBackendExt;
         for (captured, current) in [(100, 0), (0, 100)] {
-            let mut fixture = handler_contract_fixture().await;
-            let counted = fixture.backend.clone().with_read_counts();
-            fixture.owner.backend = counted.clone();
-            let hosts = fixture.backend.using::<ResourceHost>("flotilla");
-            let host = hosts.create(&InputMeta::builder().name("remote".into()).build(), &HostSpec::default()).await.unwrap();
+            let fixture = handler_contract_fixture().await;
+            let counted = &fixture.backend;
             let capacity =
                 |bytes| HostStatus { disk_free_bytes: Some(bytes), admission_free_space_floor_bytes: Some(20), ..Default::default() };
-            let host = hosts.update_status("remote", &host.metadata.resource_version, &capacity(captured)).await.unwrap();
+            // The host is written at its own home, as its daemon publishes it.
+            fixture.engine.put_host_at_its_home("remote", &HostSpec::default(), Some(&capacity(captured))).await;
             fixture
                 .backend
                 .using::<FulfilmentKind>("flotilla")
@@ -5296,9 +5279,9 @@ mod tests {
                 )
                 .await
                 .unwrap();
-            let mut evidence = flotilla_store::RequestSnapshot::new(&counted, "flotilla").unwrap();
-            evidence.copy::<ResourceHost>(&counted).await.unwrap();
-            evidence.copy::<FulfilmentKind>(&counted).await.unwrap();
+            let mut evidence = flotilla_store::RequestSnapshot::new(counted, "flotilla").unwrap();
+            evidence.copy::<ResourceHost>(counted).await.unwrap();
+            evidence.copy::<FulfilmentKind>(counted).await.unwrap();
             let admission = PreparedConvoyAdmission::builder()
                 .evidence(evidence.finish())
                 .name("prepared".into())
@@ -5316,12 +5299,10 @@ mod tests {
                     allocation: None,
                 })
                 .build();
-            hosts.update_status("remote", &host.metadata.resource_version, &capacity(current)).await.unwrap();
-            let before = counted.read_snapshot();
-            let result = fixture.owner.check_prepared_placement_floors("flotilla", &admission).await;
+            fixture.engine.put_host_at_its_home("remote", &HostSpec::default(), Some(&capacity(current))).await;
+            let (result, reads, _) = engine_reads(fixture.owner.check_prepared_placement_floors("flotilla", &admission)).await;
             assert_eq!(result.is_ok(), captured >= 20, "captured={captured}, current={current}: {result:?}");
-            let reads = counted.read_snapshot().since(&before);
-            assert!(reads.is_empty(), "capacity validation must not reread the native store\n{reads}");
+            assert!(reads.is_empty(), "capacity validation must not reread the native store\n{reads:?}");
         }
     }
 
@@ -5491,13 +5472,11 @@ mod tests {
     // unrelated convoys/messages cannot add reads or decoded objects.
     #[tokio::test]
     async fn admission_reads_and_decodes_stay_bounded() {
-        use flotilla_resources::{Message, MessageRelation, MessageSpec, ProjectRepositoryRole, ProjectRepositorySpec, RepositorySpec};
-        use flotilla_store_testkit::ReadCountsBackendExt;
+        use flotilla_resources::{ProjectRepositoryRole, ProjectRepositorySpec, RepositorySpec};
         let mut outcomes = Vec::new();
         for n in [0, 200] {
-            let mut fixture = handler_contract_fixture().await;
-            let observed = fixture.backend.clone().with_read_counts();
-            fixture.owner.backend = observed.clone();
+            let fixture = handler_contract_fixture().await;
+            flotilla_engine_messages_testkit::designate_fleet(&fixture.backend, "flotilla").await;
             register_host_direct_kind(&fixture.backend, "host").await;
             let repository = RepositorySpec::remote("https://example.com/owner/repo").expect("remote identity");
             let key = repository.key();
@@ -5557,35 +5536,21 @@ mod tests {
                     ),
                 )
                 .await;
-                fixture
-                    .backend
-                    .using::<Message>("flotilla")
-                    .create(
-                        &InputMeta::builder().name(format!("message-{index}")).build(),
-                        &MessageSpec::builder()
-                            .sender("system:test".into())
-                            .receiver(format!("other/convoy-{index}/work/tool"))
-                            .relation(MessageRelation::System)
-                            .body("unrelated".into())
-                            .build(),
-                    )
-                    .await
-                    .unwrap();
+                unrelated_message(&fixture, &format!("message-{index}"), format!("other/convoy-{index}/work/tool")).await;
             }
             let intent = flotilla_protocol::ConvoyStartIntent::builder()
                 .project_ref("project".into())
                 .name("bounded".into())
                 .branch("bounded".into())
                 .build();
-            let before = observed.read_snapshot();
-            let prepared = fixture
-                .owner
-                .prepare_convoy_admission("flotilla", &intent, &PrincipalRef::implicit_for_namespace("flotilla"))
-                .await
-                .expect("prepare");
+            let (prepared, reads, decoded) = engine_reads(fixture.owner.prepare_convoy_admission(
+                "flotilla",
+                &intent,
+                &PrincipalRef::implicit_for_namespace("flotilla"),
+            ))
+            .await;
+            let prepared = prepared.expect("prepare");
             assert_eq!(prepared.workflow.vessels.len(), 2);
-            let delta = observed.read_snapshot().since(&before);
-            let (reads, decoded) = (delta.calls_by_kind(), delta.objects_by_kind());
             for (kind, count) in &reads {
                 assert!(*count <= 1, "{kind}: {count} admission reads");
             }
@@ -5640,7 +5605,8 @@ mod tests {
 
     #[tokio::test]
     async fn observed_change_request_uses_injected_repository_query() {
-        let backend = ResourceBackend::new(InMemoryBackend::default());
+        let engine = flotilla_engine_convoys_testkit::EngineHome::open("host");
+        let backend = engine.backend().clone();
         let repository = RepositorySpec::remote("https://github.com/acme/repo").expect("repository");
         let key = repository.key();
         backend
@@ -5683,7 +5649,7 @@ mod tests {
         let legacy = tc.draw(hegel::generators::booleans());
         let other_instance = tc.draw(hegel::generators::booleans());
         tokio::runtime::Builder::new_current_thread().enable_all().build().expect("runtime").block_on(async {
-            let backend = ResourceBackend::new(InMemoryBackend::default());
+            let backend = flotilla_provisioning_testkit::EngineBackend::open_in("host", "test");
             let hosts = backend.using::<ResourceHost>("test");
             let host = hosts
                 .create(&InputMeta::builder().name("host".into()).build(), &flotilla_resources::HostSpec::default())
@@ -5728,7 +5694,7 @@ mod tests {
     async fn composed_image_cost_follows_the_identity_build() {
         use flotilla_provisioning_testkit::{image_build::ImageBuildFixture, Ending};
         use flotilla_resources::{ImageAcquisitionCost, ImageDelivery, ImageLayerSource, ImageLayerSpec, ImageLayerTier};
-        let backend = ResourceBackend::new(InMemoryBackend::default());
+        let backend = flotilla_provisioning_testkit::EngineBackend::open_in("host", "test");
         let hosts = backend.using::<ResourceHost>("test");
         let host =
             hosts.create(&InputMeta::builder().name("host".into()).build(), &flotilla_resources::HostSpec::default()).await.expect("host");
@@ -5980,15 +5946,6 @@ mod tests {
         for reverse in [false, true] {
             let fixture = handler_contract_fixture().await;
             for platform in ["linux", "macos"] {
-                let host = fixture
-                    .backend
-                    .using::<ResourceHost>("flotilla")
-                    .create(
-                        &InputMeta::builder().name(platform.into()).build(),
-                        &HostSpec { display_name: platform.into(), ..Default::default() },
-                    )
-                    .await
-                    .unwrap();
                 let providers = vec![ProviderAdvertisement {
                     instance: format!("{platform}-instance"),
                     kind: Some(ProviderKind::new(EnvironmentClass::HostDirect, "fixture")),
@@ -6000,23 +5957,22 @@ mod tests {
                         ..Default::default()
                     },
                 }];
+                // Each host is written at its own home, as its daemon publishes it.
                 fixture
-                    .backend
-                    .using::<ResourceHost>("flotilla")
-                    .update_status(
+                    .engine
+                    .put_host_at_its_home(
                         platform,
-                        &host.metadata.resource_version,
-                        &HostStatus {
+                        &HostSpec { display_name: platform.into(), ..Default::default() },
+                        Some(&HostStatus {
                             capabilities: [(flotilla_resources::ENVIRONMENT_PROVIDERS_CAPABILITY.into(), serde_json::json!(providers))]
                                 .into_iter()
                                 .collect(),
                             heartbeat_at: Some(Utc::now()),
                             ready: true,
                             ..Default::default()
-                        },
+                        }),
                     )
-                    .await
-                    .unwrap();
+                    .await;
                 fixture
                     .backend
                     .using::<FulfilmentKind>("flotilla")

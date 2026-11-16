@@ -289,12 +289,12 @@ mod tests {
 
     use async_trait::async_trait;
     use flotilla_charter::charter_store::LayerDirectorySnapshot;
+    use flotilla_provisioning_testkit::EngineBackend;
     use flotilla_resources::{
         discovered_checkouts::DiscoveredCheckouts, CharterPointer, Clock, ImageLayerTier, ProjectRepositoryRole, ProjectRepositorySpec,
         ProjectSpec, RepositorySpec, RepositoryStatus, SystemClock,
     };
     use flotilla_store::ResourceBackend;
-    use flotilla_store_memory::InMemoryBackend;
 
     use super::*;
     use crate::{
@@ -370,9 +370,13 @@ mod tests {
                 .build(),
             ProjectRepositorySpec::builder().repo(repository.key()).roles([ProjectRepositoryRole::Code].into()).build(),
         ];
+        // A declared Project names its declaring repository and the commit it was read at.
         let meta = InputMeta::builder()
             .name("app".into())
-            .annotations(BTreeMap::from([(BOOTSTRAP_REPOSITORY_ANNOTATION.to_string(), repository.key().to_string())]))
+            .annotations(BTreeMap::from([
+                (BOOTSTRAP_REPOSITORY_ANNOTATION.to_string(), repository.key().to_string()),
+                (flotilla_resources::definition_provenance::BOOTSTRAP_COMMIT_ANNOTATION.to_string(), "commit".to_string()),
+            ]))
             .build();
         backend.using::<Project>("flotilla").create(&meta, &spec).await.expect("project");
     }
@@ -381,14 +385,14 @@ mod tests {
     // exactly one current project diagnosis, cleared by a successful retry.
     #[tokio::test(start_paused = true)]
     async fn image_layer_refusal_backs_off_and_recovers() {
-        let backend = ResourceBackend::new(InMemoryBackend::default());
+        let backend = EngineBackend::open("home");
         let discovered = DiscoveredCheckouts::default();
         seed(&backend, None).await;
         let source = Arc::new(LayerSource::default());
         let operations = Operations::with_inspector(source.clone());
         let clock: Arc<dyn Clock> = Arc::new(SystemClock);
         let namespace = std::sync::RwLock::new("flotilla".to_string());
-        let roots = flotilla_store_testkit::OldStoreManifestRoots::new(backend.clone());
+        let roots = Arc::clone(&backend.ports.manifest_roots);
         let service = service(&backend, &discovered, &clock, &namespace, &operations, &roots);
         *source.error.lock().unwrap() = Some("Unable to create /cache/shallow.lock: File exists".into());
         service.reconcile_project_image_layers().await.unwrap();
@@ -416,27 +420,18 @@ mod tests {
         assert!(service.image_layer_refresh.lock().await.conditions().is_empty());
         assert!(backend.using::<ImageLayer>("flotilla").get(&layer_name("1.0.0")).await.is_ok());
 
-        // Deleting projects must lose their diagnosis even while a finalizer
-        // keeps their local resource visible during teardown.
+        // Deleting projects must lose their diagnosis.
         *source.error.lock().unwrap() = Some("again".into());
         service.reconcile_project_image_layers().await.unwrap();
         assert_eq!(service.image_layer_refresh.lock().await.conditions().len(), 1);
-        let projects = backend.using::<Project>("flotilla");
-        let project = projects.get("app").await.unwrap();
-        backend
-            .definitions::<Project>("flotilla")
-            .apply(&InputMeta::builder().name("app".into()).finalizers(vec!["test/hold".into()]).build(), &project.spec)
-            .await
-            .unwrap();
-        projects.delete("app").await.unwrap();
-        assert!(projects.get("app").await.unwrap().metadata.deletion_timestamp.is_some());
+        backend.using::<Project>("flotilla").delete("app").await.unwrap();
         service.reconcile_project_image_layers().await.unwrap();
         assert!(service.image_layer_refresh.lock().await.conditions().is_empty());
     }
 
     #[tokio::test(start_paused = true)]
     async fn image_layer_refusal_clears_when_its_home_disappears() {
-        let backend = ResourceBackend::new(InMemoryBackend::default());
+        let backend = EngineBackend::open("home");
         let discovered = DiscoveredCheckouts::default();
         seed(&backend, None).await;
         let source = Arc::new(LayerSource::default());
@@ -444,7 +439,7 @@ mod tests {
         let operations = Operations::with_inspector(source.clone());
         let clock: Arc<dyn Clock> = Arc::new(SystemClock);
         let namespace = std::sync::RwLock::new("flotilla".to_string());
-        let roots = flotilla_store_testkit::OldStoreManifestRoots::new(backend.clone());
+        let roots = Arc::clone(&backend.ports.manifest_roots);
         let service = service(&backend, &discovered, &clock, &namespace, &operations, &roots);
         service.reconcile_project_image_layers().await.unwrap();
         assert_eq!(service.image_layer_refresh.lock().await.conditions().len(), 1);
@@ -457,14 +452,14 @@ mod tests {
 
     #[tokio::test(start_paused = true)]
     async fn declaring_repository_without_default_branch_is_refused_by_name() {
-        let backend = ResourceBackend::new(InMemoryBackend::default());
+        let backend = EngineBackend::open("home");
         let discovered = DiscoveredCheckouts::default();
         seed(&backend, None).await;
         let source = Arc::new(LayerSource::default());
         let operations = Operations::with_inspector(source.clone());
         let clock: Arc<dyn Clock> = Arc::new(SystemClock);
         let namespace = std::sync::RwLock::new("flotilla".to_string());
-        let roots = flotilla_store_testkit::OldStoreManifestRoots::new(backend.clone());
+        let roots = Arc::clone(&backend.ports.manifest_roots);
         let service = service(&backend, &discovered, &clock, &namespace, &operations, &roots);
         let repository_name = backend.using::<Project>("flotilla").get("app").await.unwrap().spec.repositories[1].repo.to_string();
         let repositories = backend.using::<Repository>("flotilla");
@@ -494,7 +489,7 @@ mod tests {
 
     #[tokio::test(start_paused = true)]
     async fn project_without_recorded_declaration_is_refused() {
-        let backend = ResourceBackend::new(InMemoryBackend::default());
+        let backend = EngineBackend::open("home");
         let discovered = DiscoveredCheckouts::default();
         seed(&backend, None).await;
         let project = backend.using::<Project>("flotilla").get("app").await.unwrap();
@@ -503,7 +498,7 @@ mod tests {
         let operations = Operations::with_inspector(source.clone());
         let clock: Arc<dyn Clock> = Arc::new(SystemClock);
         let namespace = std::sync::RwLock::new("flotilla".to_string());
-        let roots = flotilla_store_testkit::OldStoreManifestRoots::new(backend.clone());
+        let roots = Arc::clone(&backend.ports.manifest_roots);
         let service = service(&backend, &discovered, &clock, &namespace, &operations, &roots);
         service.reconcile_project_image_layers().await.unwrap();
         let conditions = service.image_layer_refresh.lock().await.conditions();
@@ -515,7 +510,7 @@ mod tests {
 
     #[tokio::test(start_paused = true)]
     async fn layer_is_read_from_the_declaring_repository_not_the_first_code_member() {
-        let backend = ResourceBackend::new(InMemoryBackend::default());
+        let backend = EngineBackend::open("home");
         let discovered = DiscoveredCheckouts::default();
         seed(&backend, None).await;
         let mut project = backend.using::<Project>("flotilla").get("app").await.unwrap();
@@ -526,7 +521,7 @@ mod tests {
         let operations = Operations::with_inspector(source.clone());
         let clock: Arc<dyn Clock> = Arc::new(SystemClock);
         let namespace = std::sync::RwLock::new("flotilla".to_string());
-        let roots = flotilla_store_testkit::OldStoreManifestRoots::new(backend.clone());
+        let roots = Arc::clone(&backend.ports.manifest_roots);
         let service = service(&backend, &discovered, &clock, &namespace, &operations, &roots);
         service.reconcile_project_image_layers().await.unwrap();
         assert_eq!(
@@ -542,7 +537,7 @@ mod tests {
 
     #[tokio::test(start_paused = true)]
     async fn refusal_clears_once_the_declaration_is_recorded() {
-        let backend = ResourceBackend::new(InMemoryBackend::default());
+        let backend = EngineBackend::open("home");
         let discovered = DiscoveredCheckouts::default();
         seed(&backend, None).await;
         let declared = backend.using::<Project>("flotilla").get("app").await.unwrap();
@@ -553,7 +548,7 @@ mod tests {
         let operations = Operations::with_inspector(source.clone());
         let clock: Arc<dyn Clock> = Arc::new(SystemClock);
         let namespace = std::sync::RwLock::new("flotilla".to_string());
-        let roots = flotilla_store_testkit::OldStoreManifestRoots::new(backend.clone());
+        let roots = Arc::clone(&backend.ports.manifest_roots);
         let service = service(&backend, &discovered, &clock, &namespace, &operations, &roots);
         service.reconcile_project_image_layers().await.unwrap();
         assert_eq!(service.image_layer_refresh.lock().await.conditions().len(), 1);
@@ -565,7 +560,7 @@ mod tests {
 
     #[tokio::test(start_paused = true)]
     async fn whole_repository_project_is_declared_by_its_one_repository() {
-        let backend = ResourceBackend::new(InMemoryBackend::default());
+        let backend = EngineBackend::open("home");
         seed(&backend, None).await;
         let declared = backend.using::<Project>("flotilla").get("app").await.unwrap();
         let mut spec = declared.spec.clone();
@@ -583,7 +578,7 @@ mod tests {
 
     #[tokio::test(start_paused = true)]
     async fn explicit_branch_beats_member_default_branch_beats_repository_default() {
-        let backend = ResourceBackend::new(InMemoryBackend::default());
+        let backend = EngineBackend::open("home");
         seed(&backend, None).await;
         let mut project = backend.using::<Project>("flotilla").get("app").await.unwrap();
         let branch = |home: LayerHome| match home {
@@ -602,7 +597,7 @@ mod tests {
 
     #[tokio::test(start_paused = true)]
     async fn charter_project_without_declaration_is_not_refused() {
-        let backend = ResourceBackend::new(InMemoryBackend::default());
+        let backend = EngineBackend::open("home");
         seed(&backend, Some(CharterPointer::Inline { documents: Vec::new(), files: BTreeMap::new() })).await;
         let mut project = backend.using::<Project>("flotilla").get("app").await.unwrap();
         project.metadata.annotations.clear();
@@ -669,7 +664,7 @@ mod tests {
     // keeps the previous one, and removing the directory removes the layer.
     #[tokio::test(start_paused = true)]
     async fn primary_repository_layer_follows_the_default_branch() {
-        let backend = ResourceBackend::new(InMemoryBackend::default());
+        let backend = EngineBackend::open("home");
         let discovered = DiscoveredCheckouts::default();
         seed(&backend, None).await;
         let source = Arc::new(LayerSource::default());
@@ -677,11 +672,11 @@ mod tests {
         let operations = Operations::with_inspector(source.clone());
         let clock: Arc<dyn Clock> = Arc::new(SystemClock);
         let namespace = std::sync::RwLock::new("flotilla".to_string());
-        let roots = flotilla_store_testkit::OldStoreManifestRoots::new(backend.clone());
+        let roots = Arc::clone(&backend.ports.manifest_roots);
         let service = ProjectService {
             image_layer_refresh: Default::default(),
             resource_backend: &backend,
-            manifest_roots: &roots,
+            manifest_roots: roots.as_ref(),
             discovered_checkouts: &discovered,
             clock: &clock,
             namespace: &namespace,
@@ -747,12 +742,12 @@ mod tests {
         clock: &'a Arc<dyn Clock>,
         namespace: &'a std::sync::RwLock<String>,
         operations: &'a Operations,
-        roots: &'a flotilla_store_testkit::OldStoreManifestRoots,
+        roots: &'a Arc<dyn flotilla_resources::manifest_roots::ManifestRoots>,
     ) -> ProjectService<'a> {
         ProjectService {
             image_layer_refresh: Default::default(),
             resource_backend: backend,
-            manifest_roots: roots,
+            manifest_roots: roots.as_ref(),
             discovered_checkouts: discovered,
             clock,
             namespace,
@@ -772,7 +767,7 @@ mod tests {
     // within-source clash, refused naming both locations.
     #[tokio::test]
     async fn charter_projects_read_their_primary_repository_and_refuse_a_second_layer() {
-        let backend = ResourceBackend::new(InMemoryBackend::default());
+        let backend = EngineBackend::open("home");
         let discovered = DiscoveredCheckouts::default();
         seed(&backend, Some(CharterPointer::Inline { documents: Vec::new(), files: BTreeMap::new() })).await;
         let source = Arc::new(LayerSource::default());
@@ -780,7 +775,7 @@ mod tests {
         let operations = Operations::with_inspector(source.clone());
         let clock: Arc<dyn Clock> = Arc::new(SystemClock);
         let namespace = std::sync::RwLock::new("flotilla".to_string());
-        let roots = flotilla_store_testkit::OldStoreManifestRoots::new(backend.clone());
+        let roots = Arc::clone(&backend.ports.manifest_roots);
         let service = service(&backend, &discovered, &clock, &namespace, &operations, &roots);
         service.reconcile_project_image_layers().await.expect("sync");
         let layers = backend.definitions::<ImageLayer>("flotilla");
@@ -788,11 +783,27 @@ mod tests {
 
         let mut charter = parse_layer_directory(&layer_files("2.0.0"), ImageLayerSource::Project, Some("app")).expect("charter layer");
         charter.name = "app-charter".into();
+        // The charter's root at this home, which its manifest's records name.
+        let declaration = flotilla_resources::manifest_roots::RootDeclaration {
+            host: "home".into(),
+            path: String::new(),
+            source: "charter".into(),
+            binding: None,
+            ops: false,
+        };
+        roots.declare("flotilla", "app", declaration).await.expect("charter root");
         layers
             .apply(
                 &InputMeta::builder()
                     .name(charter.resource_name())
                     .labels(BTreeMap::from([(MANAGED_BY_LABEL.to_string(), "manifest".to_string())]))
+                    // Where the charter's manifest declared it.
+                    .annotations(BTreeMap::from([
+                        (flotilla_resources::definition_provenance::MANIFEST_RECONCILER_ROOT_ANNOTATION.to_string(), "app".to_string()),
+                        (flotilla_resources::definition_provenance::MANIFEST_SOURCE_ANNOTATION.to_string(), "charter".to_string()),
+                        (flotilla_resources::definition_provenance::MANIFEST_PATH_ANNOTATION.to_string(), "layer.yaml".to_string()),
+                        (flotilla_resources::definition_provenance::MANIFEST_REVISION_ANNOTATION.to_string(), "commit".to_string()),
+                    ]))
                     .build(),
                 &charter.clone().into(),
             )

@@ -1,5 +1,5 @@
-// Storage boundary: interleave the startup Repository controller before registration commits a
-// Repository spec edit.
+// Engine boundary: interleave the startup Repository controller with registration's Repository
+// spec edit, at the Repository port the engine serves the kind from.
 use std::{
     collections::BTreeMap,
     sync::{
@@ -9,192 +9,130 @@ use std::{
 };
 
 use async_trait::async_trait;
-use flotilla_protocol::NodeId;
-use flotilla_resources::*;
-use flotilla_store::*;
-use serde_json::Value;
+use flotilla_resources::{
+    discovered_checkouts::DiscoveredCheckouts,
+    engine_records::{KindCode, KindRecords, LogPosition, Record, Since},
+    Repository, RepositorySpec, RepositoryStatus,
+};
+use flotilla_store::{apply_status_patch, controller::Reconciler, WeakResourceBackend};
+use futures::stream::BoxStream;
 
 #[derive(Debug, Clone, Copy)]
 pub(crate) enum Contention {
+    /// The controller's status write lands once, between registration's version check and its
+    /// spec write.
     Once,
+    /// A writer moves the record on before every version check registration makes.
     Persistent,
 }
 
+/// The engine's Repository port, with the startup Repository controller racing registration.
 #[derive(Debug)]
-pub(crate) struct RacingStore {
-    pub inner: Arc<dyn Store>,
+pub(crate) struct RacingRepositories {
+    pub inner: Arc<dyn KindRecords<Repository>>,
+    pub backend: WeakResourceBackend,
+    pub namespace: String,
     pub armed: Arc<AtomicBool>,
-    pub discovered: discovered_checkouts::DiscoveredCheckouts,
+    pub discovered: DiscoveredCheckouts,
     pub contention: Contention,
+    /// Set while the controller's own pass reads and writes, which never races itself.
+    pub racing: AtomicBool,
 }
-#[async_trait]
-impl Store for RacingStore {
-    fn with_local_root(&self, root: NodeId) -> Arc<dyn Store> {
-        Arc::new(Self {
-            inner: self.inner.with_local_root(root),
-            armed: Arc::clone(&self.armed),
-            discovered: self.discovered.clone(),
-            contention: self.contention,
-        })
+
+impl flotilla_store::EnginePort for RacingRepositories {
+    fn install(self: Arc<Self>, backend: &flotilla_store::ResourceBackend) {
+        backend.install_engine_kind::<Repository>(self);
     }
-    fn local_root(&self) -> Result<NodeId, ResourceError> {
-        self.inner.local_root()
-    }
-    fn with_read_observer(&self, observer: Arc<dyn ReadObserver>) -> Arc<dyn Store> {
-        Arc::new(Self {
-            inner: self.inner.with_read_observer(observer),
-            armed: Arc::clone(&self.armed),
-            discovered: self.discovered.clone(),
-            contention: self.contention,
-        })
-    }
-    fn read_observer(&self) -> Option<&dyn ReadObserver> {
-        self.inner.read_observer()
-    }
-    async fn diagnostics(&self) -> Result<Option<ResourceStoreDiagnostics>, ResourceError> {
-        self.inner.diagnostics().await
-    }
-    async fn record_field_ownership_violation(&self, violation: FieldOwnershipViolation) -> Result<(), ResourceError> {
-        self.inner.record_field_ownership_violation(violation).await
-    }
-    async fn query_raw(
-        &self,
-        _resource_kind: ResourceKind,
-        _namespace: &str,
-        _query: &flotilla_store::StoreQuery,
-    ) -> Result<flotilla_store::QueryResult, ResourceError> {
-        self.inner.query_raw(_resource_kind, _namespace, _query).await
-    }
-    async fn query_messages_raw(
-        &self,
-        namespace: &str,
-        query: &flotilla_store::MessageQuery,
-        include_replicas: bool,
-    ) -> Result<Vec<ReadResourceObject<SerializedResource>>, ResourceError> {
-        self.inner.query_messages_raw(namespace, query, include_replicas).await
-    }
-    async fn list_replicas_raw(
-        &self,
-        _resource_kind: ResourceKind,
-        _namespace: &str,
-    ) -> Result<Vec<ReadResourceObject<SerializedResource>>, ResourceError> {
-        self.inner.list_replicas_raw(_resource_kind, _namespace).await
-    }
-    async fn get_replicas_raw(
-        &self,
-        _resource_kind: ResourceKind,
-        _namespace: &str,
-        _name: &str,
-    ) -> Result<Vec<ReadResourceObject<SerializedResource>>, ResourceError> {
-        self.inner.get_replicas_raw(_resource_kind, _namespace, _name).await
-    }
-    async fn get_raw(
-        &self,
-        resource_kind: ResourceKind,
-        namespace: &str,
-        name: &str,
-    ) -> Result<ResourceObject<SerializedResource>, ResourceError> {
-        self.inner.get_raw(resource_kind, namespace, name).await
-    }
-    async fn current_position_raw(&self, resource_kind: ResourceKind, namespace: &str) -> Result<ResourcePosition, ResourceError> {
-        self.inner.current_position_raw(resource_kind, namespace).await
-    }
-    async fn list_raw(&self, resource_kind: ResourceKind, namespace: &str) -> Result<ResourceList<SerializedResource>, ResourceError> {
-        self.inner.list_raw(resource_kind, namespace).await
-    }
-    async fn list_raw_matching_labels(
-        &self,
-        resource_kind: ResourceKind,
-        namespace: &str,
-        required: &BTreeMap<String, String>,
-    ) -> Result<ResourceList<SerializedResource>, ResourceError> {
-        self.inner.list_raw_matching_labels(resource_kind, namespace, required).await
-    }
-    async fn create_raw(
-        &self,
-        resource_kind: ResourceKind,
-        namespace: &str,
-        meta: &InputMeta,
-        spec: &Value,
-    ) -> Result<ResourceObject<SerializedResource>, ResourceError> {
-        self.inner.create_raw(resource_kind, namespace, meta, spec).await
-    }
-    async fn create_definition_raw(
-        &self,
-        _resource_kind: ResourceKind,
-        _namespace: &str,
-        _meta: &InputMeta,
-        _spec: &Value,
-        _merge: MergeMetadata,
-    ) -> Result<ResourceObject<SerializedResource>, ResourceError> {
-        self.inner.create_definition_raw(_resource_kind, _namespace, _meta, _spec, _merge).await
-    }
-    async fn update_raw(
-        &self,
-        resource_kind: ResourceKind,
-        namespace: &str,
-        meta: &InputMeta,
-        resource_version: &str,
-        spec: &Value,
-    ) -> Result<ResourceObject<SerializedResource>, ResourceError> {
-        if resource_kind.paths.kind == "Repository" && self.armed.swap(false, Ordering::SeqCst) {
-            use flotilla_store::controller::Reconciler;
-            let backend = ResourceBackend::from_arc(Arc::clone(&self.inner));
-            let repositories = backend.using::<Repository>(namespace);
-            let repository = repositories.get(&meta.name).await?;
+}
+
+impl RacingRepositories {
+    /// One pass of the startup Repository controller over `name`, written through the backend.
+    async fn controller_pass(&self, name: &str) -> Result<(), String> {
+        self.racing.store(true, Ordering::SeqCst);
+        let pass = async {
+            let backend = self.backend.upgrade().ok_or("the backend is gone")?;
+            let repositories = backend.using::<Repository>(&self.namespace);
+            let repository = repositories.get(name).await.map_err(|error| error.to_string())?;
             let reconciler = flotilla_provisioning::reconcilers::RepositoryReconciler::new(
                 self.discovered.clone(),
                 Arc::clone(crate::test_support::no_held_checkouts()),
             );
-            let prepared = reconciler.prepare(&repository).await?;
+            let prepared = reconciler.prepare(&repository).await.map_err(|error| error.to_string())?;
             let outcome = reconciler.reconcile(&repository, &prepared, chrono::Utc::now());
-            apply_status_patch(&repositories, &meta.name, &outcome.patch.expect("repository status patch")).await?;
+            let patch = outcome.patch.expect("repository status patch");
+            apply_status_patch(&repositories, name, &patch).await.map(drop).map_err(|error| error.to_string())
         }
-        // Persistent refusal models a storage writer winning every spec CAS.
-        if resource_kind.paths.kind == "Repository" && matches!(self.contention, Contention::Persistent) {
-            return Err(ResourceError::conflict(&meta.name, "stale resourceVersion"));
+        .await;
+        self.racing.store(false, Ordering::SeqCst);
+        pass
+    }
+}
+
+#[async_trait]
+impl KindRecords<Repository> for RacingRepositories {
+    fn codes(&self) -> Vec<KindCode> {
+        self.inner.codes()
+    }
+    fn ticks(&self) -> flotilla_resources::engine_records::Ticks {
+        self.inner.ticks()
+    }
+    fn home(&self) -> String {
+        self.inner.home()
+    }
+    async fn get(&self, name: &str) -> Result<Option<Record<Repository>>, String> {
+        self.inner.get(name).await
+    }
+    async fn list(&self) -> Result<Vec<Record<Repository>>, String> {
+        self.inner.list().await
+    }
+    async fn sources(&self) -> Result<Vec<Record<Repository>>, String> {
+        self.inner.sources().await
+    }
+    async fn positioned(&self) -> Result<(Vec<Record<Repository>>, LogPosition), String> {
+        self.inner.positioned().await
+    }
+    async fn position(&self) -> Result<LogPosition, String> {
+        self.inner.position().await
+    }
+    async fn changed_since(&self, position: &LogPosition) -> Result<Since, String> {
+        self.inner.changed_since(position).await
+    }
+    async fn copies(&self, name: &str) -> Result<Vec<Record<Repository>>, String> {
+        // Persistent contention: a storage writer moves the record on before each read, so every
+        // version registration checks is stale.
+        if matches!(self.contention, Contention::Persistent) && !self.racing.load(Ordering::SeqCst) {
+            if self.armed.swap(false, Ordering::SeqCst) {
+                self.controller_pass(name).await?;
+            } else if let Some(held) = self.inner.copies(name).await?.into_iter().find(|record| record.home == self.inner.home()) {
+                // Only a spec edit moves an engine record's version: the writer counts its
+                // writes in a verification command registration leaves alone.
+                let mut commands = held.spec.verification_commands().clone();
+                let writes = commands.get("storage-writes").and_then(|count| count.parse::<u64>().ok()).unwrap_or(0);
+                commands.insert("storage-writes".to_owned(), (writes + 1).to_string());
+                self.inner.apply(name, &held.labels, &held.annotations, &held.spec.clone().with_verification_commands(commands)).await?;
+            }
         }
-        self.inner.update_raw(resource_kind, namespace, meta, resource_version, spec).await
+        self.inner.copies(name).await
     }
-    async fn update_definition_raw(
+    async fn apply(
         &self,
-        _resource_kind: ResourceKind,
-        _namespace: &str,
-        _meta: &InputMeta,
-        _resource_version: &str,
-        _spec: &Value,
-        _merge: MergeMetadata,
-    ) -> Result<ResourceObject<SerializedResource>, ResourceError> {
-        self.inner.update_definition_raw(_resource_kind, _namespace, _meta, _resource_version, _spec, _merge).await
-    }
-    async fn update_status_raw(
-        &self,
-        resource_kind: ResourceKind,
-        namespace: &str,
         name: &str,
-        resource_version: &str,
-        status: &Value,
-    ) -> Result<ResourceObject<SerializedResource>, ResourceError> {
-        self.inner.update_status_raw(resource_kind, namespace, name, resource_version, status).await
+        labels: &BTreeMap<String, String>,
+        annotations: &BTreeMap<String, String>,
+        spec: &RepositorySpec,
+    ) -> Result<Record<Repository>, String> {
+        if matches!(self.contention, Contention::Once) && !self.racing.load(Ordering::SeqCst) && self.armed.swap(false, Ordering::SeqCst) {
+            self.controller_pass(name).await?;
+        }
+        self.inner.apply(name, labels, annotations, spec).await
     }
-    async fn delete_raw(&self, resource_kind: ResourceKind, namespace: &str, name: &str) -> Result<(), ResourceError> {
-        self.inner.delete_raw(resource_kind, namespace, name).await
+    async fn set_status(&self, name: &str, status: &RepositoryStatus) -> Result<Record<Repository>, String> {
+        self.inner.set_status(name, status).await
     }
-    async fn tombstone_raw(
-        &self,
-        resource_kind: ResourceKind,
-        namespace: &str,
-        name: &str,
-        minimum_resource_version: Option<&str>,
-    ) -> Result<flotilla_store::watch::TombstoneWrite, ResourceError> {
-        self.inner.tombstone_raw(resource_kind, namespace, name, minimum_resource_version).await
+    async fn delete(&self, name: &str) -> Result<(), String> {
+        self.inner.delete(name).await
     }
-    async fn watch_raw(
-        &self,
-        resource_kind: ResourceKind,
-        namespace: &str,
-        start: WatchStart,
-    ) -> Result<flotilla_store::SerializedWatchStream, ResourceError> {
-        self.inner.watch_raw(resource_kind, namespace, start).await
+    async fn changes(&self) -> Result<BoxStream<'static, ()>, String> {
+        self.inner.changes().await
     }
 }

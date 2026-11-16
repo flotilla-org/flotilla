@@ -1132,16 +1132,16 @@ mod tests {
     use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 
     use chrono::{Duration as ChronoDuration, TimeZone};
+    use flotilla_engine_convoys_testkit::EngineHome;
     use flotilla_protocol::CanonicalHostId;
     use flotilla_resources::ConvoySpec;
     use flotilla_resources::ConvoyStatus;
     use flotilla_resources::ProjectSpec;
     use flotilla_resources::WorkflowTemplateSpec;
-    use flotilla_store_memory::InMemoryBackend;
     use flotilla_store_testkit::VirtualClock;
 
     use super::*;
-    use flotilla_engine_messages_testkit::{designate_fleet, EngineMessagesHome};
+    use flotilla_engine_messages_testkit::designate_fleet;
     use flotilla_resources::InputMeta;
 
     // Stands in for provider-backed admission and lifecycle operations. Resource
@@ -1159,9 +1159,11 @@ mod tests {
         commits: Arc<AtomicU32>,
         #[builder(skip)]
         reaps: Arc<AtomicU32>,
-        /// The engine Message path its attentions are raised on, kept open for the test.
+        /// The engine its generations are admitted on and its attentions raised on.
+        home: Option<Arc<EngineHome>>,
+        /// The launches admitted, oldest first.
         #[builder(skip)]
-        _messages: Option<Arc<EngineMessagesHome>>,
+        launches: Arc<std::sync::Mutex<Vec<String>>>,
     }
 
     #[async_trait]
@@ -1196,32 +1198,31 @@ mod tests {
             annotations: BTreeMap<String, String>,
         ) -> Result<String, String> {
             let generation = self.commits.fetch_add(1, Ordering::SeqCst) + 1;
-            let name = format!("generation-{generation}");
-            let convoys = self.backend.using::<ResourceConvoy>(namespace);
-            let convoy = convoys
-                .create(
-                    &InputMeta::builder().name(name.clone()).annotations(annotations).build(),
-                    &ConvoySpec::builder()
-                        .workflow_ref("standing".into())
-                        .project_ref(ensure.spec.project_ref.clone())
-                        .role(ensure.spec.role.clone())
-                        .generation(u64::from(generation))
-                        .build(),
-                )
-                .await
-                .map_err(|e| e.to_string())?;
-            convoys
-                .update_status(
-                    &name,
-                    &convoy.metadata.resource_version,
-                    &ConvoyStatus { ensure_admission: Some(ensure.spec.clone()), ..Default::default() },
-                )
-                .await
-                .map_err(|e| e.to_string())?;
+            // The generation is admitted on the engine, as the next launch of its role.
+            let spec = ConvoySpec::builder()
+                .workflow_ref("standing".into())
+                .project_ref(ensure.spec.project_ref.clone())
+                .role(ensure.spec.role.clone())
+                .generation(u64::from(generation))
+                .build();
+            let status = ConvoyStatus {
+                ensure_admission: Some(ensure.spec.clone()),
+                ..flotilla_engine_convoys_testkit::single_agent(&ensure.spec.role)
+            };
+            let mut convoy = flotilla_engine_convoys_testkit::convoy(namespace, &ensure.metadata.name, spec, status);
+            convoy.metadata.annotations = annotations;
+            let launch = self.home().convoys.launch(convoy).await;
+            self.launches.lock().expect("launches").push(launch.clone());
             if self.fails_after_create.load(Ordering::SeqCst) {
                 return Err("status patch retry budget exhausted".into());
             }
-            Ok(name)
+            Ok(launch)
+        }
+    }
+
+    impl Admission {
+        fn home(&self) -> &EngineHome {
+            self.home.as_deref().expect("the engine home")
         }
     }
 
@@ -1232,7 +1233,10 @@ mod tests {
         }
         async fn reap(&self, namespace: &str, name: &str, _: bool) -> Result<(), String> {
             self.reaps.fetch_add(1, Ordering::SeqCst);
-            self.backend.using::<ResourceConvoy>(namespace).delete(name).await.map_err(|e| e.to_string())
+            // The engine ends the launch; it stays readable, ended.
+            let convoy = self.backend.using::<ResourceConvoy>(namespace).get(name).await.map_err(|e| e.to_string())?;
+            let path = self.home().convoys.path();
+            path.get().expect("the Convoy path").abandon(&convoy, "operator", "reaped").await
         }
     }
 
@@ -1254,70 +1258,63 @@ mod tests {
     // Both live scopes and local generation history decode only their indexed matches.
     #[tokio::test]
     async fn ensured_convoys_read_only_matching_rows() {
-        use flotilla_store_testkit::{measure_reads, ReadCountsBackendExt};
-        let backend = ResourceBackend::new(InMemoryBackend::default()).with_read_counts();
-        let convoys = backend.using::<ResourceConvoy>("test");
-        for index in 0..312 {
-            let name = format!("c-{index}");
-            let created = convoys
-                .create(
-                    &InputMeta::builder()
-                        .name(name.clone())
-                        .annotations(BTreeMap::from([(
-                            ENSURED_FROM_ANNOTATION.into(),
-                            if index == 0 || index >= 310 { "wanted" } else { "other" }.into(),
-                        )]))
-                        .build(),
-                    &ConvoySpec::builder().workflow_ref("workflow".into()).build(),
-                )
-                .await
-                .expect("convoy");
-            if index != 311 {
-                convoys
-                    .update_status(
-                        &name,
-                        &created.metadata.resource_version,
-                        &ConvoyStatus { phase: if index < 300 { ConvoyPhase::Landed } else { ConvoyPhase::Active }, ..Default::default() },
-                    )
-                    .await
-                    .expect("status");
+        use flotilla_store::load_metrics::{measure, ReadCounts};
+        /// The Convoys the backend's reads returned, as the engine's port counts them.
+        fn convoys_read(reads: &ReadCounts) -> u64 {
+            reads.get("Convoy port").map_or(0, |counts| counts.rows)
+        }
+        /// Admits the same 312 generations at `home`: three of ensure `wanted` (one ended), the
+        /// rest of `other`, ended but ten. A standing generation never lands: it ends failed.
+        async fn admit_generations(home: &EngineHome) {
+            for index in 0..312 {
+                let ensure = if index == 0 || index >= 310 { "wanted" } else { "other" };
+                let mut convoy = flotilla_engine_convoys_testkit::convoy(
+                    "test",
+                    ensure,
+                    ConvoySpec::builder().workflow_ref("workflow".into()).role(ensure.into()).build(),
+                    flotilla_engine_convoys_testkit::single_agent(ensure),
+                );
+                convoy.metadata.annotations = BTreeMap::from([(ENSURED_FROM_ANNOTATION.into(), ensure.into())]);
+                if index < 300 {
+                    convoy.status.as_mut().expect("status").phase = ConvoyPhase::Failed;
+                }
+                home.convoys.launch(convoy).await;
             }
         }
-        let mut replica = convoys.list().await.expect("local fixture");
-        for object in &mut replica.items {
-            object.metadata.name = format!("replica-{}", object.metadata.name);
-        }
-        backend
-            .replica_writer::<ResourceConvoy>(flotilla_protocol::NodeId::new("remote"), "test")
-            .replace(&replica, Utc::now())
-            .await
-            .expect("replicas");
+        let home = Arc::new(EngineHome::open_in("home", "test"));
+        admit_generations(&home).await;
+        // Another home's generations, replicated here as its log arrives.
+        let remote = EngineHome::open_in("remote", "test");
+        admit_generations(&remote).await;
+        remote.replicate_to(&home);
+        let backend = home.backend().clone();
         let clock = Arc::new(VirtualClock::new(Utc::now()));
+        let admission = Admission::builder().backend(backend.clone()).home(Arc::clone(&home)).build();
         let controller = EnsureReconciler::builder()
-            .teardown(Arc::new(Admission::builder().backend(backend.clone()).build()))
+            .teardown(Arc::new(admission.clone()))
             .resource_backend(backend.clone())
             .clock(clock)
-            .manifest_roots(Arc::new(flotilla_store_testkit::OldStoreManifestRoots::new(backend.clone())))
+            .manifest_roots(Arc::clone(&home.engine.ports.manifest_roots))
             .build();
-        let admission = Admission::builder().backend(backend.clone()).build();
         for scope in [EnsureConvoyScope::Local, EnsureConvoyScope::IncludingReplicas] {
-            let (rows, reads) = measure_reads(controller.pass(&admission).active_ensured_convoys("test", "wanted", scope)).await;
+            let (rows, reads) = measure(controller.pass(&admission).active_ensured_convoys("test", "wanted", scope)).await;
             let expected = if matches!(scope, EnsureConvoyScope::Local) { 2 } else { 4 };
             assert_eq!(rows.expect("query").len(), expected);
-            assert_eq!(reads.of(&backend).objects_by_kind().get("Convoy"), Some(&expected));
+            assert_eq!(convoys_read(&reads), expected as u64);
         }
         let (rows, reads) =
-            measure_reads(controller.pass(&admission).active_ensured_convoys("test", "absent", EnsureConvoyScope::IncludingReplicas)).await;
+            measure(controller.pass(&admission).active_ensured_convoys("test", "absent", EnsureConvoyScope::IncludingReplicas)).await;
         assert!(rows.expect("empty query").is_empty());
-        assert_eq!(reads.of(&backend).objects_by_kind().get("Convoy"), Some(&0));
-        let (rows, reads) = measure_reads(controller.pass(&admission).ensured_convoy_generations("test", "wanted")).await;
+        assert_eq!(convoys_read(&reads), 0);
+        let (rows, reads) = measure(controller.pass(&admission).ensured_convoy_generations("test", "wanted")).await;
         assert_eq!(rows.expect("local generations").len(), 3);
-        assert_eq!(reads.of(&backend).objects_by_kind().get("Convoy"), Some(&3));
+        assert_eq!(convoys_read(&reads), 3);
     }
 
     async fn fixture() -> (EnsureReconciler, Admission, Arc<VirtualClock>) {
-        let backend = ResourceBackend::new(InMemoryBackend::default());
         let clock = Arc::new(VirtualClock::new(Utc.with_ymd_and_hms(2026, 8, 15, 12, 0, 0).single().expect("fixture timestamp")));
+        let home = Arc::new(EngineHome::open_with("home", "test", clock.clone()));
+        let backend = home.backend().clone();
         backend
             .using::<Project>("test")
             .create(
@@ -1331,7 +1328,13 @@ mod tests {
             .create(
                 &InputMeta::builder()
                     .name("standing".into())
-                    .annotations(BTreeMap::from([(SOURCE_COMMIT_ANNOTATION.into(), "commit".into())]))
+                    // As project operations materialise it: the engine keeps provenance whole.
+                    .annotations(BTreeMap::from([
+                        (MATERIALIZED_PROJECT_ANNOTATION.into(), "project".into()),
+                        (SOURCE_REPOSITORY_ANNOTATION.into(), "repository".into()),
+                        (SOURCE_COMMIT_ANNOTATION.into(), "commit".into()),
+                        (SOURCE_ENTRY_PATH_ANNOTATION.into(), "ops/standing.md".into()),
+                    ]))
                     .build(),
                 &ConvoyEnsureSpec::builder()
                     .project_ref("project".into())
@@ -1343,15 +1346,20 @@ mod tests {
             .await
             .expect("fixture operation succeeds");
         designate_fleet(&backend, "test").await;
-        let messages = EngineMessagesHome::open_with_clock("home", "test", &backend, clock.clone());
-        let admission = Admission { _messages: Some(Arc::new(messages)), ..Admission::builder().backend(backend.clone()).build() };
-        let controller = EnsureReconciler::builder()
-            .teardown(Arc::new(admission.clone()))
-            .resource_backend(backend.clone())
-            .clock(clock.clone())
-            .manifest_roots(Arc::new(flotilla_store_testkit::OldStoreManifestRoots::new(backend.clone())))
-            .build();
+        let admission = Admission::builder().backend(backend.clone()).home(home).build();
+        let controller = new_controller(&admission, &clock);
         (controller, admission, clock)
+    }
+
+    /// A controller over `admission`'s engine, as the daemon composes one: a restarted one keeps
+    /// nothing but what the store holds.
+    fn new_controller(admission: &Admission, clock: &Arc<VirtualClock>) -> EnsureReconciler {
+        EnsureReconciler::builder()
+            .teardown(Arc::new(admission.clone()))
+            .resource_backend(admission.backend.clone())
+            .clock(clock.clone())
+            .manifest_roots(Arc::clone(&admission.home().engine.ports.manifest_roots))
+            .build()
     }
 
     /// Whether the standing role's hold on its convoy is open.
@@ -1361,19 +1369,21 @@ mod tests {
     }
     /// The role's newest generation.
     fn current(admission: &Admission) -> String {
-        format!("generation-{}", admission.commits.load(Ordering::SeqCst))
+        admission.launches.lock().expect("launches").last().expect("a generation was admitted").clone()
+    }
+    /// The role's first generation.
+    fn first(admission: &Admission) -> String {
+        admission.launches.lock().expect("launches").first().expect("a generation was admitted").clone()
     }
     async fn standing(controller: &EnsureReconciler) -> StandingRole {
         controller.standing_role("test", "project", "standing").await.expect("role reads").expect("role declared")
     }
-    async fn fail_current(admission: &Admission, clock: &VirtualClock) {
-        let name = current(admission);
-        let convoys = admission.backend.using::<ResourceConvoy>("test");
-        let convoy = convoys.get(&name).await.expect("admitted convoy");
-        let mut status = convoy.status.expect("resource status");
-        status.phase = ConvoyPhase::Failed;
-        status.finished_at = Some(clock.now());
-        convoys.update_status(&name, &convoy.metadata.resource_version, &status).await.expect("fixture operation succeeds");
+    /// Fails the newest generation now, as the engine ends it: its failure is stamped by the
+    /// home's clock.
+    async fn fail_current(admission: &Admission) {
+        let convoy = admission.home().convoy(&current(admission)).await;
+        let path = admission.home().convoys.path();
+        path.get().expect("the Convoy path").fail(&convoy, "operator", "failed").await.expect("fixture operation succeeds");
     }
 
     // #2875: a long-lived driver's generation must back off from its failure,
@@ -1382,22 +1392,13 @@ mod tests {
     async fn driver_readmission_backs_off_from_failure_time() {
         let (controller, admission, clock) = fixture().await;
         controller.reconcile_convoy_ensures_once_with_backing_inspector(&admission, "test", &Backing::Dead).await.expect("admit");
-        fail_current(&admission, &clock).await;
         let ensures = admission.backend.using::<ConvoyEnsure>("test");
-        let convoys = admission.backend.using::<ResourceConvoy>("test");
-        let name = &current(&admission);
-        let failed = convoys.get(name).await.expect("failed convoy");
-        clock.advance(failed.metadata.creation_timestamp + ChronoDuration::hours(24) - clock.now());
-        let mut status = failed.status.expect("status");
-        status.finished_at = Some(clock.now());
-        convoys.update_status(name, &failed.metadata.resource_version, &status).await.expect("failure time");
+        // The generation fails a day after it was admitted.
+        let admitted = admission.home().convoy(&current(&admission)).await;
+        clock.advance(admitted.metadata.creation_timestamp + ChronoDuration::hours(24) - clock.now());
+        fail_current(&admission).await;
         for _ in 0..3 {
-            let controller = EnsureReconciler::builder()
-                .teardown(Arc::new(admission.clone()))
-                .resource_backend(admission.backend.clone())
-                .clock(clock.clone())
-                .manifest_roots(Arc::new(flotilla_store_testkit::OldStoreManifestRoots::new(admission.backend.clone())))
-                .build();
+            let controller = new_controller(&admission, &clock);
             let ensure = ensures.get("standing").await.expect("ensure");
             controller.pass(&admission).reconcile_driver_convoy_ensure("test", &ensure, &Backing::Dead, false).await.expect("backoff");
             assert_eq!(admission.commits.load(Ordering::SeqCst), 1);
@@ -1429,12 +1430,7 @@ mod tests {
             .expect("fixture operation succeeds")
             .is_empty());
         assert_eq!(admission.prepares.load(Ordering::SeqCst), 1);
-        let controller = EnsureReconciler::builder()
-            .teardown(Arc::new(admission.clone()))
-            .resource_backend(admission.backend.clone())
-            .clock(clock.clone())
-            .manifest_roots(Arc::new(flotilla_store_testkit::OldStoreManifestRoots::new(admission.backend.clone())))
-            .build();
+        let controller = new_controller(&admission, &clock);
         assert!(controller.reconcile_convoy_ensures_once_with_backing_inspector(&admission, "test", &Backing::Dead).await.is_err());
         assert_eq!(admission.prepares.load(Ordering::SeqCst), 2, "the note is in memory: a restarted controller retries");
         admission.refused.store(false, Ordering::SeqCst);
@@ -1450,7 +1446,7 @@ mod tests {
         let role = standing(&controller).await;
         assert_eq!(role.strikes, 0);
         assert_eq!(role.next_attempt, None);
-        assert_eq!(role.convoy.as_deref(), Some("generation-1"));
+        assert_eq!(role.convoy, Some(first(&admission)));
         assert_eq!(admission.commits.load(Ordering::SeqCst), 1);
     }
 
@@ -1460,7 +1456,7 @@ mod tests {
     #[tokio::test]
     async fn refusals_past_the_limit_wait_for_events_with_one_attention() {
         let (controller, admission, clock) = fixture().await;
-        let messages = admission._messages.clone().expect("engine messages");
+        let messages = &admission.home().messages;
         let refusal_messages = || async {
             let primitives = messages.primitives();
             let mut count = 0;
@@ -1532,7 +1528,7 @@ mod tests {
         admission.refused.store(false, Ordering::SeqCst);
         clock.advance(ChronoDuration::minutes(1));
         assert_eq!(pass().await.expect("admits").len(), 1);
-        assert_eq!(standing(&controller).await.convoy.as_deref(), Some("generation-1"));
+        assert_eq!(standing(&controller).await.convoy, Some(first(&admission)));
     }
 
     // #2220: live backing raises attention and holds admission; verified death
@@ -1544,7 +1540,7 @@ mod tests {
             .reconcile_convoy_ensures_once_with_backing_inspector(&admission, "test", &Backing::Dead)
             .await
             .expect("fixture operation succeeds");
-        fail_current(&admission, &clock).await;
+        fail_current(&admission).await;
         controller
             .reconcile_convoy_ensures_once_with_backing_inspector(&admission, "test", &Backing::Live)
             .await
@@ -1563,7 +1559,7 @@ mod tests {
                 .await
                 .expect("fixture operation succeeds");
             assert_eq!(admission.commits.load(Ordering::SeqCst), expected_commits);
-            fail_current(&admission, &clock).await;
+            fail_current(&admission).await;
         }
         controller
             .reconcile_convoy_ensures_once_with_backing_inspector(&admission, "test", &Backing::Dead)
@@ -1587,7 +1583,7 @@ mod tests {
         admission.fails_after_create.store(true, Ordering::SeqCst);
         controller.reconcile_convoy_ensures_once_with_backing_inspector(&admission, "test", &Backing::Dead).await.expect("admitted");
         admission.fails_after_create.store(false, Ordering::SeqCst);
-        fail_current(&admission, &clock).await;
+        fail_current(&admission).await;
         controller.reconcile_convoy_ensures_once_with_backing_inspector(&admission, "test", &Backing::Dead).await.expect("failure counted");
         assert_eq!(standing(&controller).await.strikes, 1, "the generation's failure is a strike");
         clock.advance(ChronoDuration::minutes(3));
@@ -1602,10 +1598,14 @@ mod tests {
         let (controller, admission, _) = fixture().await;
         let ensure = admission.backend.using::<ConvoyEnsure>("test").get("standing").await.expect("ensure fixture");
         controller.start_ensured_convoy(&admission, "test", &ensure).await.expect("fixture operation succeeds");
-        assert!(controller.reap_ensured_convoy(&admission, "test", "foreign", "generation-1", false).await.is_err());
+        let generation = first(&admission);
+        assert!(controller.reap_ensured_convoy(&admission, "test", "foreign", &generation, false).await.is_err());
         assert_eq!(admission.reaps.load(Ordering::SeqCst), 0);
-        controller.reap_ensured_convoy(&admission, "test", "standing", "generation-1", false).await.expect("fixture operation succeeds");
-        controller.reap_ensured_convoy(&admission, "test", "standing", "generation-1", false).await.expect("fixture operation succeeds");
+        controller.reap_ensured_convoy(&admission, "test", "standing", &generation, false).await.expect("fixture operation succeeds");
+        assert_eq!(admission.reaps.load(Ordering::SeqCst), 1);
+        // An ended launch stays readable on the engine; a generation that is absent is reaped
+        // without crossing the lifecycle port.
+        controller.reap_ensured_convoy(&admission, "test", "standing", "absent#9", false).await.expect("fixture operation succeeds");
         assert_eq!(admission.reaps.load(Ordering::SeqCst), 1);
     }
     // #2220: a named admission dependency arriving invalidates a refusal's

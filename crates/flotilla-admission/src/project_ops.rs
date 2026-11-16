@@ -1620,7 +1620,6 @@ mod tests {
     use std::sync::atomic::Ordering;
 
     use flotilla_resources::{discovered_checkouts::DiscoveredCheckout, SystemClock};
-    use flotilla_store_memory::InMemoryBackend;
 
     use super::*;
     use flotilla_charter::ops_entry::OperationalEntryFile;
@@ -1696,15 +1695,14 @@ mod tests {
             let runner: Arc<dyn flotilla_provider_runtime::CommandRunner> = Arc::new(ProcessCommandRunner);
             let inspector = Arc::new(CharterSourceInspector { runner, cache: cache.path().to_path_buf() });
             let operations = FakeProjectOperations::with_inspector(inspector.clone());
-            let backend = ResourceBackend::new(InMemoryBackend::default());
+            let backend = flotilla_provisioning_testkit::EngineBackend::open("local-host");
             let discovered = DiscoveredCheckouts::default();
             let clock: Arc<dyn Clock> = Arc::new(SystemClock);
             let namespace = std::sync::RwLock::new("flotilla".to_string());
-            let roots = flotilla_store_testkit::OldStoreManifestRoots::new(backend.clone());
             let service = ProjectService {
                 image_layer_refresh: Default::default(),
                 resource_backend: &backend,
-                manifest_roots: &roots,
+                manifest_roots: backend.ports.manifest_roots.as_ref(),
                 discovered_checkouts: &discovered,
                 clock: &clock,
                 namespace: &namespace,
@@ -1726,22 +1724,28 @@ mod tests {
             let mut spec = whole_repository_project_spec(repository.key(), "app".into()).expect("project spec");
             spec.repositories[0].roles.extend([ProjectRepositoryRole::Ops, ProjectRepositoryRole::Code]);
             spec.repositories[0].charter_store = Some(CharterStoreBinding { host: "local-host".into(), source });
-            let project_author = if local { ResourceBackend::new(InMemoryBackend::default()) } else { backend.clone() };
-            project_author
-                .using::<Project>("flotilla")
-                .create(&InputMeta::builder().name("app".into()).build(), &spec)
-                .await
-                .expect("project");
-            if local {
-                // The source home can receive its Project from the fleet store;
-                // it owns the source status, not that Project's status.
-                let snapshot = project_author.using::<Project>("flotilla").list().await.expect("fleet project");
-                backend
-                    .replica_writer::<Project>(flotilla_protocol::NodeId::new("fleet-store"), "flotilla")
-                    .replace(&snapshot, chrono::Utc::now())
-                    .await
-                    .expect("federate project");
-            }
+            // The source home can receive its Project from the fleet store, which authors every
+            // edit of it; the source home owns the source status, not that Project's status.
+            let fleet = local.then(|| backend.other_home("fleet-store"));
+            let author = |spec: ProjectSpec| {
+                let (fleet, backend) = (fleet.clone(), &backend);
+                async move {
+                    match fleet {
+                        Some(fleet) => {
+                            fleet.project("app", &BTreeMap::new(), &BTreeMap::new(), &spec).await;
+                            backend.receive(&fleet);
+                        }
+                        None => {
+                            backend
+                                .definitions::<Project>("flotilla")
+                                .apply(&InputMeta::builder().name("app".into()).build(), &spec)
+                                .await
+                                .expect("project");
+                        }
+                    }
+                }
+            };
+            author(spec.clone()).await;
             service.reconcile_bound_charters().await.expect("first pass");
             let root_name = flotilla_charter::charter_store::ops_root_name("app", &spec.repositories[0], "local-host");
             let roots = backend.using::<ManifestRoot>("flotilla");
@@ -1795,7 +1799,7 @@ mod tests {
             unavailable.repo = RepositoryKey("missing-ops".into());
             unavailable.charter_store = None;
             spec.repositories.push(unavailable);
-            projects.apply(&InputMeta::from(&project.metadata), &spec).await.expect("unavailable ops member");
+            author(spec.clone()).await;
             service.reconcile_bound_charters().await.expect("partial-source refusal");
             let refused = roots.get(&root_name).await.expect("root").status.expect("status");
             assert_eq!(refused.applied_revision, status.applied_revision);
@@ -1805,12 +1809,17 @@ mod tests {
             // and stops its reads/pruning while preserving materialized records.
             spec.repositories.pop();
             spec.charter = Some(flotilla_resources::CharterPointer::Inline { documents: Vec::new(), files: BTreeMap::new() });
-            projects.apply(&InputMeta::from(&project.metadata), &spec).await.expect("declare pointer");
+            author(spec.clone()).await;
             service.reconcile_bound_charters().await.expect("registered charter supersedes legacy ops");
             assert!(matches!(roots.get(&root_name).await, Err(ResourceError::NotFound { .. })));
             let registered = projects.get("app").await.expect("registered Project");
             if local {
-                assert!(registered.status.is_none(), "replicated Project status remains owned by the fleet home");
+                // The engine reads a Project with no status written as an empty one.
+                assert_eq!(
+                    registered.status.unwrap_or_default(),
+                    flotilla_resources::ProjectStatus::default(),
+                    "replicated Project status remains owned by the fleet home"
+                );
             } else {
                 let status = registered.status.expect("Project status");
                 assert!(status.declaration_refused.is_none());
@@ -1867,13 +1876,8 @@ mod tests {
             ..Default::default()
         };
         let discovered = DiscoveredCheckouts::default();
-        let armed = Arc::new(std::sync::atomic::AtomicBool::new(true));
-        let backend = ResourceBackend::new(super::registration_race::RacingStore {
-            inner: Arc::new(InMemoryBackend::default()),
-            armed: Arc::clone(&armed),
-            discovered: discovered.clone(),
-            contention,
-        });
+        let engine = flotilla_provisioning_testkit::EngineBackend::open_in("local-host", test_namespace);
+        let backend = engine.backend.clone();
         // The Repository was first seen through a transport alias, so registering its declared
         // remote is a real spec edit: the declared remote goes first.
         backend
@@ -1884,13 +1888,24 @@ mod tests {
             )
             .await
             .expect("repository seen through its alias");
+        // From here the startup Repository controller races registration.
+        let armed = Arc::new(std::sync::atomic::AtomicBool::new(true));
+        let repositories = engine.repository_port();
+        backend.install_engine_records(Arc::new(super::registration_race::RacingRepositories {
+            inner: Arc::new(repositories),
+            backend: backend.downgrade(),
+            namespace: test_namespace.to_owned(),
+            armed: Arc::clone(&armed),
+            discovered: discovered.clone(),
+            contention,
+            racing: Default::default(),
+        }));
         let clock: Arc<dyn Clock> = Arc::new(SystemClock);
         let namespace = std::sync::RwLock::new(test_namespace.to_string());
-        let roots = flotilla_store_testkit::OldStoreManifestRoots::new(backend.clone());
         let service = ProjectService {
             image_layer_refresh: Default::default(),
             resource_backend: &backend,
-            manifest_roots: &roots,
+            manifest_roots: engine.ports.manifest_roots.as_ref(),
             discovered_checkouts: &discovered,
             clock: &clock,
             namespace: &namespace,
@@ -1997,7 +2012,7 @@ mod tests {
         use flotilla_resources::ObservedCheckoutSpec;
         let temp = tempfile::tempdir().expect("checkout paths");
         let root = temp.path().canonicalize().expect("physical checkout paths");
-        let backend = ResourceBackend::new(InMemoryBackend::default());
+        let backend = flotilla_provisioning_testkit::EngineBackend::open("local-host");
         let discovered = DiscoveredCheckouts::default();
         let namespace = std::sync::RwLock::new("flotilla".to_string());
         let key = RepositorySpec::remote("https://github.com/example/ops").expect("repository").key();

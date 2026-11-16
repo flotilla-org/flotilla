@@ -145,22 +145,14 @@ impl StandingConvoyBackingInspector for ResourceStandingConvoyBackingInspector {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use flotilla_provisioning_testkit::{Ending, EngineFixture};
-    use flotilla_resources::{
-        ConvoySpec, ConvoyStatus, EnvironmentSpec, HostDirectEnvironmentSpec, InputMeta, VesselRequirement, WorkflowSnapshot,
-    };
-    use flotilla_store::ResourceBackend;
+    use flotilla_provisioning_testkit::{Ending, EngineBackend};
+    use flotilla_resources::{ConvoySpec, ConvoyStatus, EnvironmentSpec, HostDirectEnvironmentSpec, VesselRequirement, WorkflowSnapshot};
 
     // Teardown accepts any ended environment: a release, a give-up, or one observed gone.
     #[tokio::test]
     async fn backing_inspection_reads_the_engine_without_a_status_copy() {
         for ending in [Ending::Lost("/work"), Ending::Failed("container is not running"), Ending::Released, Ending::GaveUp("失敗")] {
-            let backend = ResourceBackend::new(flotilla_store_memory::InMemoryBackend::default());
-            let convoys = backend.using::<ResourceConvoy>("flotilla");
-            let created = convoys
-                .create(&InputMeta::builder().name("convoy".into()).build(), &ConvoySpec::builder().workflow_ref("workflow".into()).build())
-                .await
-                .expect("convoy");
+            let home = EngineBackend::open("home");
             let snapshot = WorkflowSnapshot {
                 cascade: None,
                 exit: None,
@@ -170,10 +162,16 @@ mod tests {
                 vessels: vec![VesselRequirement::builder().name("work".into()).crew(Vec::new()).build()],
             };
             let status = ConvoyStatus { workflow_snapshot: Some(snapshot), ..Default::default() };
-            let convoy = convoys.update_status("convoy", &created.metadata.resource_version, &status).await.expect("snapshot");
-            let engine = EngineFixture::default();
+            // The convoy as the engine hands it to teardown; the inspector reads only its launches.
+            let convoy = flotilla_engine_convoys_testkit::convoy(
+                "flotilla",
+                "convoy",
+                ConvoySpec::builder().workflow_ref("workflow".into()).build(),
+                status,
+            );
+            let engine = &home.engine;
             let fixture = &engine.environments;
-            let inspector = ResourceStandingConvoyBackingInspector::new(backend, engine.reads());
+            let inspector = ResourceStandingConvoyBackingInspector::new(home.backend.clone(), engine.reads());
             assert!(inspector.verify_backing_dead(&convoy).await.is_ok(), "a convoy that launched no vessel never provisioned");
             let spec = EnvironmentSpec {
                 host_direct: Some(HostDirectEnvironmentSpec { host_ref: "host".into(), repo_default_dir: "/work".into() }),
