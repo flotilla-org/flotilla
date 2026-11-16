@@ -26,8 +26,18 @@ pub struct SeatMessage {
     /// Its place in its inbox's admission order.
     pub accepted_sequence: u64,
     pub created: chrono::DateTime<chrono::Utc>,
+    /// When it entered its phase.
+    pub since: chrono::DateTime<chrono::Utc>,
     /// When it was delivered, once it was.
     pub delivered_at: Option<chrono::DateTime<chrono::Utc>>,
+}
+
+/// A message read by its exact identity, where it stands with what it says: what a crew member
+/// was sent (#3108).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SentMessage {
+    pub standing: SeatMessage,
+    pub body: String,
 }
 
 /// The `[primitives]` switch's Message path, as crew code reads and admits
@@ -67,6 +77,13 @@ pub trait EngineMessages: Send + Sync {
         receivers: &[String],
         named: &[(String, String)],
     ) -> Result<Vec<SeatMessage>, flotilla_resources::ResourceError>;
+    /// Each `named` (receiver, record) message by its exact identity, local or replicated, read
+    /// as in the receiver (an old crew address) it was asked for; one not held is left out.
+    async fn sent_messages(
+        &self,
+        namespace: &str,
+        named: &[(String, String)],
+    ) -> Result<Vec<SentMessage>, flotilla_resources::ResourceError>;
     /// The messages to `receivers` (old addresses) still waiting for delivery, local or replicated.
     async fn pending_to(
         &self,

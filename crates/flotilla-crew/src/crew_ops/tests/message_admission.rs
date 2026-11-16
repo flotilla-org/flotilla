@@ -80,6 +80,53 @@ async fn follow_up_reference_releases_from_message_evidence() {
     assert_eq!((messages[0].metadata.name.as_str(), messages[0].spec.body.as_str()), (pending.name.as_str(), "continue after this turn"));
 }
 
+/// The Message rows loaded and converted while follow-ups delivered to `count` other convoys'
+/// coders continue their work.
+async fn read_by_follow_ups(count: usize) -> (u64, u64) {
+    use flotilla_resources::{MessageRelation, MessageSpec};
+    let (crew, backend, _probe, held) = fixture(CrewWorkPhase::Working).await;
+    let primitives = held.messages().primitives();
+    let mut followed = Vec::new();
+    for index in 0..count {
+        let launch =
+            held.engine.admit(&format!("other-{index}"), super::crew_spec(), flotilla_engine_convoys_testkit::single_agent("coder")).await;
+        let receiver = flotilla_resources::crew_role_address("flotilla", &launch, "work", "coder");
+        let name = format!("follow-up-{index}");
+        let intent = MessageSpec::builder()
+            .sender("principal:operator".into())
+            .receiver(receiver.clone())
+            .relation(MessageRelation::Supervisor)
+            .body(format!("continue {index}"))
+            .build();
+        primitives.admit("flotilla", &name, &intent).await.expect("admit the follow-up");
+        held.messages().deliver_turn(&receiver, &name, "session").await;
+        let mut status = held.engine.view(&backend, &launch).await.status.unwrap_or_default();
+        let coder = flotilla_resources::CrewWorkState::builder()
+            .phase(CrewWorkPhase::Working)
+            .pending_follow_up(ResourceRef::new("flotilla.work/v1", "Message", "flotilla", &name))
+            .build();
+        status.crew_work.entry("work".into()).or_default().insert("coder".into(), coder);
+        flotilla_resources::convoy::engine::set_notes(&held.engine.path(), &launch, &status).expect("queue the follow-up");
+        followed.push((launch, name));
+    }
+    let before = primitives.rows_read();
+    crew.reconcile_pending_supervisor_turns_once("flotilla").await.expect("reconcile");
+    let after = primitives.rows_read();
+    for (launch, name) in &followed {
+        let coder = held.engine.view(&backend, launch).await.status.expect("status").crew_work["work"]["coder"].clone();
+        assert!(coder.pending_follow_up.is_none(), "{launch}'s follow-up is consumed");
+        assert_eq!(coder.resume_brief_id.as_deref(), Some(name.as_str()), "{launch}'s work continues from its follow-up");
+    }
+    (after.loaded - before.loaded, after.converted - before.converted)
+}
+
+// Behaviour: continuing delivered follow-ups loads each once, converting none to the old shape.
+#[tokio::test]
+async fn follow_ups_are_read_once_each_without_converting_them() {
+    assert_eq!(read_by_follow_ups(5).await, (5, 0), "five follow-ups");
+    assert_eq!(read_by_follow_ups(60).await, (60, 0), "sixty follow-ups");
+}
+
 // Receiver admission can suppress a turn before its Message has replicated to
 // the producer. The acknowledgement must restore speculative workflow activation.
 #[tokio::test]

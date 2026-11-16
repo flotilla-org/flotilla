@@ -3289,9 +3289,9 @@ impl CrewService {
         }
         let mut messages = BTreeMap::new();
         for (message_namespace, names) in references {
-            let records = self.named_message_records(&message_namespace, &names).await.map_err(|error| error.to_string())?;
-            for source in records {
-                messages.entry((message_namespace.clone(), source.object.metadata.name.clone())).or_insert(source.object);
+            let sent = self.sent_messages(&message_namespace, &names).await.map_err(|error| error.to_string())?;
+            for message in sent {
+                messages.entry((message_namespace.clone(), message.standing.name.clone())).or_insert(message);
             }
         }
         // Reconciliation owns every queued continuation; interactive callers select one convoy.
@@ -3310,18 +3310,11 @@ impl CrewService {
                 for (role, state) in crew {
                     let Some(reference) = &state.pending_follow_up else { continue };
                     let Some(message) = messages.get(&(reference.namespace.clone(), reference.name.clone())) else { continue };
-                    if let Some(status) = &message.status {
-                        if status.phase.has_delivery_evidence() {
-                            continuations.push((
-                                vessel.clone(),
-                                role.clone(),
-                                reference.name.clone(),
-                                message.spec.body.clone(),
-                                status.since,
-                            ));
-                        } else if status.phase.is_terminal() {
-                            state.pending_follow_up = None;
-                        }
+                    let standing = &message.standing;
+                    if standing.phase.has_delivery_evidence() {
+                        continuations.push((vessel.clone(), role.clone(), reference.name.clone(), message.body.clone(), standing.since));
+                    } else if standing.phase.is_terminal() {
+                        state.pending_follow_up = None;
                     }
                 }
             }

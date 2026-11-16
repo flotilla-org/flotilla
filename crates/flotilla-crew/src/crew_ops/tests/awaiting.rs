@@ -50,6 +50,21 @@ impl RecordingMessages {
     }
 }
 
+/// Where an admitted message stands, as the engine path reads it.
+fn standing(object: &ResourceObject<Message>) -> flotilla_messaging::SeatMessage {
+    let status = object.status.as_ref();
+    flotilla_messaging::SeatMessage {
+        seat: object.spec.receiver.clone(),
+        name: object.metadata.name.clone(),
+        phase: status.map(|status| status.phase).unwrap_or_default(),
+        reason: status.and_then(|status| status.reason.clone()),
+        accepted_sequence: status.and_then(|status| status.accepted_sequence).unwrap_or_default(),
+        created: object.metadata.creation_timestamp,
+        since: status.map_or(object.metadata.creation_timestamp, |status| status.since),
+        delivered_at: status.and_then(|status| status.resolved_receiver.as_ref()).map(|receiver| receiver.delivered_at),
+    }
+}
+
 #[async_trait]
 impl EngineMessages for RecordingMessages {
     async fn view_to(&self, _namespace: &str, receiver: &str, record: &str) -> Result<Option<ReadResourceObject<Message>>, ResourceError> {
@@ -75,21 +90,18 @@ impl EngineMessages for RecordingMessages {
         receivers: &[String],
         _named: &[(String, String)],
     ) -> Result<Vec<flotilla_messaging::SeatMessage>, ResourceError> {
-        Ok(self
-            .admitted_to(receivers)
-            .into_iter()
-            .map(|read| {
-                let status = read.object.status.as_ref();
-                flotilla_messaging::SeatMessage {
-                    seat: read.object.spec.receiver.clone(),
-                    name: read.object.metadata.name.clone(),
-                    phase: status.map(|status| status.phase).unwrap_or_default(),
-                    reason: status.and_then(|status| status.reason.clone()),
-                    accepted_sequence: status.and_then(|status| status.accepted_sequence).unwrap_or_default(),
-                    created: read.object.metadata.creation_timestamp,
-                    delivered_at: status.and_then(|status| status.resolved_receiver.as_ref()).map(|receiver| receiver.delivered_at),
-                }
-            })
+        Ok(self.admitted_to(receivers).iter().map(|read| standing(&read.object)).collect())
+    }
+    async fn sent_messages(
+        &self,
+        _namespace: &str,
+        named: &[(String, String)],
+    ) -> Result<Vec<flotilla_messaging::SentMessage>, ResourceError> {
+        let admitted = self.admitted.lock().expect("admitted");
+        Ok(named
+            .iter()
+            .filter_map(|(receiver, name)| admitted.get(name).filter(|object| object.spec.receiver == *receiver))
+            .map(|object| flotilla_messaging::SentMessage { standing: standing(object), body: object.spec.body.clone() })
             .collect())
     }
     async fn pending_to(&self, _namespace: &str, receivers: &[String]) -> Result<Vec<ReadResourceObject<Message>>, ResourceError> {

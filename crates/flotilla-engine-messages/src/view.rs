@@ -238,7 +238,8 @@ fn old_relation(relation: Relation) -> MessageRelation {
     }
 }
 
-fn body_text(body: &MessageBody) -> String {
+/// A message's body as text.
+pub fn body_text(body: &MessageBody) -> String {
     match body {
         MessageBody::Text(text) => text.clone(),
         MessageBody::Request(request) => format!("{request:?}"),
@@ -378,7 +379,7 @@ fn view_spelled(
 }
 
 /// When a message entered its state.
-fn since(resource: &Resource<Message>) -> DateTime<Utc> {
+pub fn since(resource: &Resource<Message>) -> DateTime<Utc> {
     resource.since().to_datetime().unwrap_or(DateTime::<Utc>::UNIX_EPOCH)
 }
 

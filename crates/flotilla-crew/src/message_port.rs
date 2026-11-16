@@ -65,23 +65,13 @@ impl CrewService {
     }
 
     /// The Messages with these names, each a (receiver, name) pair read in its receiver's inbox,
-    /// local or replicated; one with no view is left out.
-    pub(crate) async fn named_message_records(
+    /// local or replicated, where each stands with its body; one not held is left out.
+    pub(crate) async fn sent_messages(
         &self,
         namespace: &str,
         named: &[(String, String)],
-    ) -> Result<Vec<ReadResourceObject<Message>>, ResourceError> {
-        let primitives = self.message_primitives()?;
-        let mut records = Vec::new();
-        for (receiver, name) in named {
-            match primitives.view_to(namespace, receiver, name).await {
-                Ok(Some(record)) => records.push(record),
-                Ok(None) => {}
-                Err(ResourceError::Invalid { message }) => tracing::debug!(%name, %message, "engine message has no old-shaped view"),
-                Err(error) => return Err(error),
-            }
-        }
-        Ok(records)
+    ) -> Result<Vec<flotilla_messaging::SentMessage>, ResourceError> {
+        self.message_primitives()?.sent_messages(namespace, named).await
     }
 
     /// Admits a Message at this home, the receiver's. A message's name is

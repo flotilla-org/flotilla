@@ -1800,23 +1800,29 @@ impl MessagePrimitives {
         Ok(rows
             .into_iter()
             .zip(created)
-            .filter_map(|((_, resource), created)| {
-                let seat = seats.get(&resource.spec().inbox)?.clone();
-                let Some(name) = record_name(resource.name()) else {
-                    tracing::debug!(message = resource.name(), "an engine message with no record name is not read at a seat");
-                    return None;
-                };
-                Some(flotilla_messaging::SeatMessage {
-                    seat,
-                    name,
-                    phase: view::old_phase(&resource),
-                    reason: view::old_reason(&resource),
-                    accepted_sequence: resource.spec().admitted_seq,
-                    created: created.to_datetime(),
-                    delivered_at: view::delivered_at(&resource),
-                })
-            })
+            .filter_map(|((_, resource), created)| standing(seats.get(&resource.spec().inbox)?.clone(), &resource, created))
             .collect())
+    }
+
+    /// Each `named` (receiver, record) message by its exact identity, where it stands with its
+    /// body, read as in the receiver (an old crew address) it was asked for. Nothing of it is
+    /// spelled.
+    pub async fn sent_messages(
+        &self,
+        namespace: &str,
+        named: &[(String, String)],
+    ) -> Result<Vec<flotilla_messaging::SentMessage>, ResourceError> {
+        let roles = self.roles(namespace).await.map_err(ResourceError::invalid)?;
+        let conversion = Conversion { roles: &roles, forges: &[], records: &convert::NoRecords };
+        let mut sent = Vec::new();
+        for (inbox, receiver, record) in named_inboxes(&conversion, named) {
+            let Some((id, home)) = self.locate_in(&inbox, record).map_err(ResourceError::other)? else { continue };
+            let Some((_, created, resource)) = self.load_at(id, home)? else { continue };
+            if let Some(standing) = standing(receiver.to_owned(), &resource, created) {
+                sent.push(flotilla_messaging::SentMessage { standing, body: view::body_text(resource.spec().body.value()) });
+            }
+        }
+        Ok(sent)
     }
 
     /// Each of `inboxes`' open messages, the last one admitted among those settled and the one
@@ -1999,6 +2005,13 @@ impl flotilla_messaging::EngineMessages for MessagePrimitives {
     ) -> Result<Vec<flotilla_messaging::SeatMessage>, ResourceError> {
         MessagePrimitives::seat_standings(self, namespace, receivers, named).await
     }
+    async fn sent_messages(
+        &self,
+        namespace: &str,
+        named: &[(String, String)],
+    ) -> Result<Vec<flotilla_messaging::SentMessage>, ResourceError> {
+        MessagePrimitives::sent_messages(self, namespace, named).await
+    }
     async fn pending_to(&self, namespace: &str, receivers: &[String]) -> Result<Vec<ReadResourceObject<OldMessage>>, ResourceError> {
         MessagePrimitives::pending_to(self, namespace, receivers).await
     }
@@ -2123,6 +2136,24 @@ fn found<T>(read: Result<T, ResourceError>) -> Result<Option<T>, ResourceError> 
 }
 
 /// The work holding `role` in `convoy`'s workflow snapshot.
+/// Where a message created at `created` stands, read as in `seat`'s inbox.
+fn standing(seat: String, resource: &Resource<Message>, created: CreatedAt) -> Option<flotilla_messaging::SeatMessage> {
+    let Some(name) = record_name(resource.name()) else {
+        tracing::debug!(message = resource.name(), "an engine message with no record name is not read at a seat");
+        return None;
+    };
+    Some(flotilla_messaging::SeatMessage {
+        seat,
+        name,
+        phase: view::old_phase(resource),
+        reason: view::old_reason(resource),
+        accepted_sequence: resource.spec().admitted_seq,
+        created: created.to_datetime(),
+        since: view::since(resource),
+        delivered_at: view::delivered_at(resource),
+    })
+}
+
 /// Each `named` (receiver, record) message's inbox, with its receiver and record; a receiver with
 /// no inbox names none.
 fn named_inboxes<'a>(conversion: &Conversion<'_>, named: &'a [(String, String)]) -> Vec<(Address, &'a str, &'a str)> {
