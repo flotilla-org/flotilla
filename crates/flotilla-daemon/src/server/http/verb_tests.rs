@@ -379,14 +379,9 @@ fn attribute(span: &opentelemetry_sdk::trace::SpanData, key: &str) -> Option<Str
 async fn the_invocation_span_records_the_intent_and_the_outcomes() {
     let exporter = InMemorySpanExporter::default();
     let provider = SdkTracerProvider::builder().with_simple_exporter(exporter.clone()).build();
-    // While one dispatcher is registered, tracing-core caches a new callsite's interest from the
-    // registering thread's default; a test thread without a subscriber would then cache the
-    // invocation span as never enabled. A second registered dispatcher makes interest the union of
-    // all of them.
-    let _second = tracing::Dispatch::new(tracing_subscriber::registry());
-    let _subscriber = tracing::subscriber::set_default(
+    let _subscriber = tracing::dispatcher::set_default(&flotilla_log_testkit::dispatch(
         tracing_subscriber::registry().with(flotilla_tracing::layer().with_tracer(provider.tracer("verbs"))),
-    );
+    ));
     let Fixture { router, daemon, callers, .. } = fixture().await;
     let missing = "project:flotilla/convoy:missing";
     let request = json!({"invocation": "rec", "subjects": [RUNNING, missing], "params": {"note": "why"}});

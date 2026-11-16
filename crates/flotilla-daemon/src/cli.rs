@@ -267,7 +267,9 @@ mod tests {
         let file_layer = tracing_subscriber::fmt::layer().json().with_ansi(false).with_writer(writer);
         let subscriber = Registry::default().with(file_layer);
 
-        tracing::subscriber::with_default(subscriber, || tracing::info!(repo_count = 0, "starting daemon"));
+        tracing::dispatcher::with_default(&flotilla_log_testkit::dispatch(subscriber), || {
+            tracing::info!(repo_count = 0, "starting daemon")
+        });
 
         let contents = fs::read_to_string(log_dir.path().join(DAEMON_LOG_FILE)).expect("structured daemon log");
         let record: serde_json::Value = serde_json::from_str(contents.trim()).expect("JSON log record");
@@ -290,7 +292,7 @@ mod tests {
         let provider = super::trace_provider(Some(&config), "test-host").expect("valid exporter inside Tokio");
         use flotilla_tracing::TracerProvider as _;
         let subscriber = tracing_subscriber::registry().with(flotilla_tracing::layer().with_tracer(provider.tracer("startup")));
-        tracing::subscriber::with_default(subscriber, || {
+        tracing::dispatcher::with_default(&flotilla_log_testkit::dispatch(subscriber), || {
             drop(tracing::info_span!("startup.failure"));
         });
         let result = tokio::time::timeout(

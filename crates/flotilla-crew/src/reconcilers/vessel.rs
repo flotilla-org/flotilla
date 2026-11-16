@@ -1663,7 +1663,7 @@ impl PlacementStrategy {
 mod tests {
     use std::{
         collections::{BTreeMap, BTreeSet},
-        sync::{Arc, Mutex},
+        sync::Arc,
     };
 
     use flotilla_protocol::{NodeId, PlacementDecision, PlacementTargetHost};
@@ -1791,20 +1791,6 @@ mod tests {
         for count in ["", "-1", "invalid", &usize::MAX.to_string()] {
             let mut env = BTreeMap::from([("GIT_CONFIG_COUNT".into(), count.into())]);
             assert!(configure_contained_tracking(&mut env, &BTreeSet::from(["main".into()])).is_err());
-        }
-    }
-
-    #[derive(Clone)]
-    struct LogCaptureWriter(Arc<Mutex<Vec<u8>>>);
-
-    impl std::io::Write for LogCaptureWriter {
-        fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
-            self.0.lock().expect("log output lock should be healthy").extend_from_slice(buf);
-            Ok(buf.len())
-        }
-
-        fn flush(&mut self) -> std::io::Result<()> {
-            Ok(())
         }
     }
 
@@ -2264,23 +2250,11 @@ mod tests {
         let backend = ResourceBackend::new(flotilla_store_memory::InMemoryBackend::default());
         let reconciler = VesselPlanning::new(backend.clone(), "flotilla", accounts(&backend))
             .with_federated_dependencies(&backend, flotilla_protocol::CanonicalHostId::resolved("feta-host"));
-        let log_output = Arc::new(Mutex::new(Vec::new()));
-        let message;
-        {
-            let writer = LogCaptureWriter(Arc::clone(&log_output));
-            let subscriber = tracing_subscriber::fmt()
-                .without_time()
-                .with_ansi(false)
-                .with_target(false)
-                .with_max_level(tracing::Level::WARN)
-                .with_writer(move || writer.clone())
-                .finish();
-            let _guard = tracing::subscriber::set_default(subscriber);
-            message = reconciler.missing_host_local_environment("host-direct-kiwi", "kiwi-host");
-        }
+        let (logging, logs) = flotilla_log_testkit::capture(tracing::Level::WARN);
+        let message =
+            tracing::dispatcher::with_default(&logging, || reconciler.missing_host_local_environment("host-direct-kiwi", "kiwi-host"));
 
-        let logs =
-            String::from_utf8(log_output.lock().expect("log output lock should be healthy").clone()).expect("logs should be valid UTF-8");
+        let logs = logs.text();
         assert!(logs.contains(" WARN "), "missing warning level: {logs}");
         assert!(logs.contains("environment_ref=host-direct-kiwi"), "missing Environment context: {logs}");
         assert!(logs.contains("placement_host_ref=kiwi-host"), "missing placement-host context: {logs}");

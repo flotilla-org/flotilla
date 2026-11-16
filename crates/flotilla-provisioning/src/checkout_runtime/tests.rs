@@ -237,7 +237,7 @@ async fn convoy_parent_cleanup_contract() {
         let log = tempfile::NamedTempFile::new().expect("test fixture operation succeeds");
         let subscriber =
             tracing_subscriber::fmt().with_ansi(false).with_writer(log.reopen().expect("test fixture operation succeeds")).finish();
-        let _logging = tracing::subscriber::set_default(subscriber);
+        let _logging = tracing::dispatcher::set_default(&flotilla_log_testkit::dispatch(subscriber));
         let outcome = runtime
             .remove_checkout(&CheckoutRemoval::ForcedWorktree {
                 clone_path: clone.path().to_str().expect("test fixture operation succeeds").into(),

@@ -55,23 +55,6 @@ use flotilla_replay_testkit::Masks;
 use flotilla_replay_testkit::Session;
 use flotilla_store_testkit::cr_name;
 
-#[derive(Clone)]
-struct Writer(Arc<std::sync::Mutex<Vec<u8>>>);
-impl std::io::Write for Writer {
-    fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
-        self.0.lock().expect("tracing scenario").extend_from_slice(bytes);
-        Ok(bytes.len())
-    }
-    fn flush(&mut self) -> std::io::Result<()> {
-        Ok(())
-    }
-}
-
-fn captured_subscriber(logs: Arc<std::sync::Mutex<Vec<u8>>>, level: tracing::Level) -> impl tracing::Subscriber + Send + Sync {
-    let writer = Writer(logs);
-    tracing_subscriber::fmt().without_time().with_ansi(false).with_max_level(level).with_writer(move || writer.clone()).finish()
-}
-
 struct UnavailableChangeRequests;
 
 #[async_trait]

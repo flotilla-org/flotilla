@@ -389,21 +389,8 @@ mod lifecycle_contract {
     // the follower starts with the readings.
     #[tokio::test]
     async fn checkouts_discovered_before_the_engine_readings_fail_no_retirement() {
-        #[derive(Clone, Default)]
-        struct Lines(Arc<std::sync::Mutex<Vec<u8>>>);
-        impl std::io::Write for Lines {
-            fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
-                self.0.lock().expect("lines").extend_from_slice(bytes);
-                Ok(bytes.len())
-            }
-            fn flush(&mut self) -> std::io::Result<()> {
-                Ok(())
-            }
-        }
-        let lines = Lines::default();
-        let writer = lines.clone();
-        let _subscriber =
-            tracing::subscriber::set_default(tracing_subscriber::fmt().with_ansi(false).with_writer(move || writer.clone()).finish());
+        let (logging, lines) = flotilla_log_testkit::capture(tracing::Level::INFO);
+        let _subscriber = tracing::dispatcher::set_default(&logging);
         let temp = tempfile::tempdir().expect("config");
         std::fs::write(temp.path().join("daemon.toml"), "machine_id = \"provider-startup\"\n").expect("config");
         let daemon = InProcessDaemon::new_with_resource_backend(
@@ -434,7 +421,7 @@ mod lifecycle_contract {
         for _ in 0..64 {
             tokio::task::yield_now().await;
         }
-        let logged = String::from_utf8(lines.0.lock().expect("lines").clone()).expect("utf8");
+        let logged = lines.text();
         assert!(!logged.contains("retire checkout providers failed"), "{logged}");
     }
 }

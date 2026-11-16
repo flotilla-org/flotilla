@@ -32,6 +32,7 @@ uuid = { workspace = true, features = ["v4"] }
 flotilla-provisioning-testkit = { path = "../flotilla-provisioning-testkit" }
 rusqlite = { version = "0.37", features = ["bundled"] }
 flotilla-quint-testkit = { path = "../flotilla-quint-testkit" }
+flotilla-log-testkit = { path = "../flotilla-log-testkit" }
 futures = { workspace = true }
 tracing-subscriber = { version = "0.3", features = ["fmt"] }
 rstest = { workspace = true }

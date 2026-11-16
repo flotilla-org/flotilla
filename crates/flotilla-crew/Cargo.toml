@@ -55,7 +55,7 @@ rstest = { workspace = true }
 indexmap = { workspace = true }
 tempfile = { workspace = true }
 insta = "1"
-tracing-subscriber = { version = "0.3", features = ["fmt"] }
+flotilla-log-testkit = { path = "../flotilla-log-testkit" }
 flotilla-build-features-http-server = { path = "../flotilla-build-features-http-server" }
 flotilla-build-features-logging = { path = "../flotilla-build-features-logging" }
 

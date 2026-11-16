@@ -99,6 +99,7 @@ flotilla-drydock = { path = "../flotilla-drydock" }
 libc = { workspace = true }
 
 [dev-dependencies]
+flotilla-log-testkit = { path = "../flotilla-log-testkit" }
 flotilla-engine-convoys-testkit = { path = "../flotilla-engine-convoys-testkit" }
 flotilla-engine-messages-testkit = { path = "../flotilla-engine-messages-testkit" }
 flotilla-provisioning-testkit = { path = "../flotilla-provisioning-testkit" }

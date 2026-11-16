@@ -97,20 +97,6 @@ pub(super) async fn declare_mapping_forge_at_home(daemon: &InProcessDaemon, home
     other.replicate_to(&target);
 }
 
-#[derive(Clone)]
-pub(super) struct LogCaptureWriter(pub(super) Arc<std::sync::Mutex<Vec<u8>>>);
-
-impl std::io::Write for LogCaptureWriter {
-    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
-        self.0.lock().expect("log output lock should be healthy").extend_from_slice(buf);
-        Ok(buf.len())
-    }
-
-    fn flush(&mut self) -> std::io::Result<()> {
-        Ok(())
-    }
-}
-
 /// A live crew session `name`, held by vessel `vessel_ref` in environment `env_ref` at
 /// `terminals`: requested and realised under pool session `name`. Returns its launch.
 pub(super) fn create_credential_test_session(

@@ -357,9 +357,8 @@ async fn diagnostics_retain_the_last_firing_for_an_armed_reconciler_row() {
 // then works.
 #[test]
 fn unchanged_subscription_decisions_log_once() {
-    let logs = Arc::new(std::sync::Mutex::new(Vec::new()));
-    let subscriber = captured_subscriber(logs.clone(), tracing::Level::DEBUG);
-    tracing::subscriber::with_default(subscriber, || {
+    let (logging, logs) = flotilla_log_testkit::capture(tracing::Level::DEBUG);
+    tracing::dispatcher::with_default(&logging, || {
         tokio::runtime::Builder::new_current_thread().enable_all().build().expect("tracing scenario").block_on(async {
             let (backend, home) = engine_backend().await;
             let wake = supervision_wake(&backend, &home);
@@ -379,7 +378,7 @@ fn unchanged_subscription_decisions_log_once() {
             sync().await;
         });
     });
-    let output = String::from_utf8(logs.lock().expect("tracing scenario").clone()).expect("tracing scenario");
+    let output = logs.text();
     let decisions = output
         .lines()
         .filter(|line| line.contains("turn delivery subscription decision") && line.contains("source=checks-settled"))

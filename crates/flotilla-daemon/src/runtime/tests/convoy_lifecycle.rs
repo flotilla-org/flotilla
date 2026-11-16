@@ -401,17 +401,9 @@ async fn daemon_restart_publishes_and_logs_agent_adapter_regression() {
     let runtime_health = RuntimeHealth::default();
     let second_health =
         DaemonHealthIdentity { generation: Some("generation-2".to_string()), version: "1.0.0".to_string(), started_at: Utc::now() };
-    let log_output = Arc::new(std::sync::Mutex::new(Vec::new()));
+    let (logging, logs) = flotilla_log_testkit::capture(tracing::Level::WARN);
     {
-        let writer = LogCaptureWriter(Arc::clone(&log_output));
-        let subscriber = tracing_subscriber::fmt()
-            .without_time()
-            .with_ansi(false)
-            .with_target(false)
-            .with_max_level(tracing::Level::WARN)
-            .with_writer(move || writer.clone())
-            .finish();
-        let _guard = tracing::subscriber::set_default(subscriber);
+        let _guard = tracing::dispatcher::set_default(&logging);
         apply_host_heartbeat_with_credentials(&daemon, NAMESPACE, &restarted_profile, None, &second_health, &runtime_health)
             .await
             .expect("restarted generation heartbeat");
@@ -432,44 +424,27 @@ async fn daemon_restart_publishes_and_logs_agent_adapter_regression() {
     assert!(status.conditions[0].message.contains("claude-code"));
     assert_eq!(status.agent_adapter_baseline, Some(first_profile.available_agent_adapters.clone()));
 
-    let logs = String::from_utf8(log_output.lock().expect("log output lock should be healthy").clone()).expect("logs should be utf-8");
+    let logs = logs.text();
     assert!(logs.contains("host capabilities regressed across daemon restart"), "missing capability regression warning: {logs}");
     assert!(logs.contains("claude-code"), "warning should name the missing adapter: {logs}");
 
-    log_output.lock().expect("log output lock should be healthy").clear();
+    let (logging, logs) = flotilla_log_testkit::capture(tracing::Level::WARN);
     {
-        let writer = LogCaptureWriter(Arc::clone(&log_output));
-        let subscriber = tracing_subscriber::fmt()
-            .without_time()
-            .with_ansi(false)
-            .with_target(false)
-            .with_max_level(tracing::Level::WARN)
-            .with_writer(move || writer.clone())
-            .finish();
-        let _guard = tracing::subscriber::set_default(subscriber);
+        let _guard = tracing::dispatcher::set_default(&logging);
         apply_host_heartbeat_with_credentials(&daemon, NAMESPACE, &restarted_profile, None, &second_health, &runtime_health)
             .await
             .expect("same generation heartbeat");
     }
-    let same_generation_logs =
-        String::from_utf8(log_output.lock().expect("log output lock should be healthy").clone()).expect("logs should be utf-8");
+    let same_generation_logs = logs.text();
     assert!(
         !same_generation_logs.contains("host capabilities regressed across daemon restart"),
         "same generation heartbeat should not repeat the warning: {same_generation_logs}"
     );
 
     let third_runtime_health = RuntimeHealth::default();
-    log_output.lock().expect("log output lock should be healthy").clear();
+    let (logging, logs) = flotilla_log_testkit::capture(tracing::Level::WARN);
     {
-        let writer = LogCaptureWriter(Arc::clone(&log_output));
-        let subscriber = tracing_subscriber::fmt()
-            .without_time()
-            .with_ansi(false)
-            .with_target(false)
-            .with_max_level(tracing::Level::WARN)
-            .with_writer(move || writer.clone())
-            .finish();
-        let _guard = tracing::subscriber::set_default(subscriber);
+        let _guard = tracing::dispatcher::set_default(&logging);
         apply_host_heartbeat_with_credentials(
             &daemon,
             NAMESPACE,
@@ -498,8 +473,7 @@ async fn daemon_restart_publishes_and_logs_agent_adapter_regression() {
     assert_eq!(third_status.conditions[0].reason, "AgentAdaptersMissing");
     assert!(third_status.conditions[0].message.contains("claude-code"));
     assert_eq!(third_status.agent_adapter_baseline, Some(first_profile.available_agent_adapters));
-    let third_logs =
-        String::from_utf8(log_output.lock().expect("log output lock should be healthy").clone()).expect("logs should be utf-8");
+    let third_logs = logs.text();
     assert!(
         third_logs.contains("host capabilities regressed across daemon restart"),
         "each regressed daemon generation should warn: {third_logs}"

@@ -271,9 +271,8 @@ fn delivery_failures_are_durable_and_log_once() {
     for kind in 1..5 {
         // Missing observation, unsupported leaf, timed retry (of a missing crew), and missing crew.
         let permanent = kind == 2;
-        let logs = Arc::new(std::sync::Mutex::new(Vec::new()));
-        let subscriber = captured_subscriber(logs.clone(), tracing::Level::WARN);
-        tracing::subscriber::with_default(subscriber, || {
+        let (logging, logs) = flotilla_log_testkit::capture(tracing::Level::WARN);
+        tracing::dispatcher::with_default(&logging, || {
             tokio::runtime::Builder::new_current_thread().enable_all().build().expect("tracing scenario").block_on(async {
                 let (backend, home) = engine_backend().await;
                 let limit = if kind == 2 || kind == 3 { 0 } else { 3 };
@@ -433,7 +432,7 @@ fn delivery_failures_are_durable_and_log_once() {
                 }
             });
         });
-        let text = String::from_utf8(logs.lock().expect("tracing scenario").clone()).expect("tracing scenario");
+        let text = logs.text();
         assert_eq!(text.matches("turn delivery failed").count(), if kind == 4 { 2 } else { 1 }, "{text}");
         assert!(text.contains("source=checks"));
     }
@@ -1421,8 +1420,7 @@ async fn publish_review_round(
 async fn concurrent_delivery_failures_for_one_convoy_share_one_status_write() {
     // Scope this test's failure warnings, as the log-counting tests do, so the
     // shared callsite never registers without a subscriber.
-    let logs = Arc::new(std::sync::Mutex::new(Vec::new()));
-    concurrent_failures_share_one_write().with_subscriber(captured_subscriber(logs, tracing::Level::WARN)).await;
+    concurrent_failures_share_one_write().with_subscriber(flotilla_log_testkit::capture(tracing::Level::WARN).0).await;
 }
 
 async fn concurrent_failures_share_one_write() {
@@ -1467,14 +1465,13 @@ async fn concurrent_delivery_failure_burst_records_every_source() {
             let table = table.clone();
             let barrier = barrier.clone();
             let work = case.work.clone();
-            let logs = Arc::new(std::sync::Mutex::new(Vec::new()));
             tokio::spawn(
                 async move {
                     barrier.wait().await;
                     let error = DeliveryError::from("terminal was not ready".to_string());
                     table.record_delivery_failure("flotilla", &work, &format!("turn-{index}"), &error).await
                 }
-                .with_subscriber(captured_subscriber(logs, tracing::Level::WARN)),
+                .with_subscriber(flotilla_log_testkit::capture(tracing::Level::WARN).0),
             )
         })
         .collect::<Vec<_>>();
@@ -1495,7 +1492,6 @@ async fn concurrent_delivery_failure_burst_records_every_source() {
 // write does (covered below).
 #[tokio::test]
 async fn failure_write_for_a_missing_convoy_prunes_its_batch() {
-    let logs = Arc::new(std::sync::Mutex::new(Vec::new()));
     async {
         let case = project_supervision_case(&[]).await;
         let table = &case.wake.subscriptions;
@@ -1512,7 +1508,7 @@ async fn failure_write_for_a_missing_convoy_prunes_its_batch() {
         assert!(!status.turn_deliveries.contains_key("merged-unclaimed"), "the pruned failure is not resurrected");
         assert!(table.inner.pending_failures.lock().expect("pending").is_empty());
     }
-    .with_subscriber(captured_subscriber(logs, tracing::Level::WARN))
+    .with_subscriber(flotilla_log_testkit::capture(tracing::Level::WARN).0)
     .await;
 }
 

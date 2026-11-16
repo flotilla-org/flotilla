@@ -954,7 +954,7 @@ async fn slow_work_credential_phase_keeps_heartbeat_available_and_completes() {
     let subscriber = tracing_subscriber::fmt().json().with_ansi(false).with_writer(log.reopen().expect("writer")).finish();
     // The test uses Tokio's current-thread runtime, so the scoped dispatcher
     // covers both the spawned phase and its cancellation/drop path.
-    let _logging = tracing::subscriber::set_default(subscriber);
+    let _logging = tracing::dispatcher::set_default(&flotilla_log_testkit::dispatch(subscriber));
     let phase_started = tokio::time::Instant::now();
     let task = tokio::spawn(async move { phase("reconcile_work_credentials", delivery.start()).await });
     tokio::time::timeout(Duration::from_secs(1), runner.entered.notified()).await.expect("work credential preflight starts");

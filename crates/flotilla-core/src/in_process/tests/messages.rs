@@ -303,26 +303,8 @@ async fn message_send_reads_ignore_unrelated_history() {
 // and the admission trace names the principal as given, or that none was named.
 #[tokio::test]
 async fn a_persons_message_traces_its_principal_and_records_its_role() {
-    #[derive(Clone, Default)]
-    struct Lines(Arc<std::sync::Mutex<Vec<u8>>>);
-    impl std::io::Write for Lines {
-        fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
-            self.0.lock().expect("lines").extend_from_slice(bytes);
-            Ok(bytes.len())
-        }
-        fn flush(&mut self) -> std::io::Result<()> {
-            Ok(())
-        }
-    }
-    let lines = Lines::default();
-    let writer = lines.clone();
-    let _subscriber =
-        tracing::subscriber::set_default(tracing_subscriber::fmt().with_ansi(false).with_writer(move || writer.clone()).finish());
-    // While one dispatcher is registered, tracing-core caches a callsite's interest from the
-    // default of whichever thread reaches it first, so a concurrent test without a subscriber
-    // would turn the admission trace off for the whole binary. A second registered dispatcher
-    // makes the cache ask every registered subscriber.
-    let _registered = tracing::Dispatch::new(tracing_subscriber::registry());
+    let (logging, lines) = flotilla_log_testkit::capture(tracing::Level::INFO);
+    let _subscriber = tracing::dispatcher::set_default(&logging);
     let temp = tempfile::tempdir().expect("tempdir");
     std::fs::write(temp.path().join("daemon.toml"), "machine_id = \"principal-trace-test\"\n").expect("daemon config");
     let backend = ResourceBackend::new(InMemoryBackend::default());
@@ -348,7 +330,7 @@ async fn a_persons_message_traces_its_principal_and_records_its_role() {
         intent.principal = Some(principal.into());
         primitives.admit(name, &intent).await.expect("admitted");
         assert_eq!(stored_sender(&primitives, "system:turn-rules", name).await, "fleet:lab/role:operator", "the record names the role");
-        let logged = String::from_utf8(lines.0.lock().expect("lines").clone()).expect("UTF-8");
+        let logged = lines.text();
         assert!(logged.contains(&format!("message.principal=\"{traced}\"")), "{logged}");
     }
 }

@@ -72,6 +72,7 @@ members = [
     "crates/flotilla-engine-messages-testkit",
     "crates/flotilla-inbox-testkit",
     "crates/flotilla-quint-testkit",
+    "crates/flotilla-log-testkit",
     "crates/flotilla-state-machines",
     "crates/flotilla-verbs",
     "crates/flotilla-store",

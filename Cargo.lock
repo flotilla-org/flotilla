@@ -2275,6 +2275,7 @@ dependencies = [
  "flotilla-github-providers",
  "flotilla-inbox",
  "flotilla-issue-tracker",
+ "flotilla-log-testkit",
  "flotilla-manifest",
  "flotilla-messaging",
  "flotilla-observation",
@@ -2318,7 +2319,6 @@ dependencies = [
  "tokio",
  "tokio-util",
  "tracing",
- "tracing-subscriber",
  "url",
  "uuid",
 ]
@@ -2419,6 +2419,7 @@ dependencies = [
  "flotilla-engine-messages-testkit",
  "flotilla-environment",
  "flotilla-forge-github",
+ "flotilla-log-testkit",
  "flotilla-messaging",
  "flotilla-observation",
  "flotilla-paths",
@@ -2450,7 +2451,6 @@ dependencies = [
  "tempfile",
  "tokio",
  "tracing",
- "tracing-subscriber",
  "uuid",
 ]
 
@@ -2518,6 +2518,7 @@ dependencies = [
  "flotilla-inbox",
  "flotilla-issue-tracker",
  "flotilla-load-driver",
+ "flotilla-log-testkit",
  "flotilla-messaging",
  "flotilla-observation",
  "flotilla-orchestration-testkit",
@@ -2746,6 +2747,7 @@ dependencies = [
  "drydock-protocol",
  "drydock-transport",
  "flotilla-environment",
+ "flotilla-log-testkit",
  "flotilla-protocol",
  "flotilla-provider-runtime",
  "flotilla-resources",
@@ -2760,7 +2762,6 @@ dependencies = [
  "tempfile",
  "tokio",
  "tracing",
- "tracing-subscriber",
  "uuid",
 ]
 
@@ -3275,6 +3276,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "flotilla-log-testkit"
+version = "0.1.0"
+dependencies = [
+ "flotilla-build-features-logging",
+ "tracing",
+ "tracing-subscriber",
+]
+
+[[package]]
 name = "flotilla-manifest"
 version = "0.1.0"
 dependencies = [
@@ -3585,6 +3595,7 @@ dependencies = [
  "flotilla-discovery-testkit",
  "flotilla-engine-store",
  "flotilla-environment",
+ "flotilla-log-testkit",
  "flotilla-paths",
  "flotilla-protocol",
  "flotilla-provider-runtime",
