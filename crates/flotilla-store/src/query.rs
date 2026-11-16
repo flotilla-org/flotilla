@@ -209,11 +209,10 @@ impl StoreQuery {
             crate::ReadOperation::List
         }
     }
-    /// The rows the query may select, by index keys as [`QueryIndex`] names them: each equality
-    /// on a label or field, each field's values, each missing or present field and its
-    /// alternatives, all of which a row must meet. `None` when the query selects by nothing else,
-    /// and only a read of every row answers it.
-    pub(crate) fn index_cover(&self) -> Option<IndexCover> {
+    /// What the query's own keys select, by index keys as [`QueryIndex`] names them: each
+    /// equality on a label or field, each field's values, and each missing or present field, all
+    /// of which a row must meet. Its alternatives and relations are the reader's to cover.
+    pub(crate) fn index_parts(&self) -> Vec<IndexCover> {
         let key = |key: String, value: String| IndexCover::AnyKey(BTreeSet::from([(key, value)]));
         let mut parts: Vec<IndexCover> = self.labels.iter().map(|(label, value)| key(format!("label:{label}"), value.clone())).collect();
         parts.extend(self.fields.iter().map(|(path, value)| key(format!("field:{path}"), value.clone())));
@@ -224,16 +223,7 @@ impl StoreQuery {
         );
         parts.extend(self.missing_fields.iter().map(|path| key(format!("missing:{path}"), String::new())));
         parts.extend(self.present.iter().map(|path| key(format!("present:{path}"), String::new())));
-        // Alternatives cover only when each of them does.
-        if let Some(alternatives) = self.any_of.as_ref().and_then(|alternatives| alternatives.iter().map(StoreQuery::index_cover).collect())
-        {
-            parts.push(IndexCover::Any(alternatives));
-        }
-        match parts.len() {
-            0 => None,
-            1 => parts.pop(),
-            _ => Some(IndexCover::All(parts)),
-        }
+        parts
     }
     fn validate_at(&self, kind: ResourceKind, depth: usize) -> Result<(), ResourceError> {
         if self.all_sources_for_matches

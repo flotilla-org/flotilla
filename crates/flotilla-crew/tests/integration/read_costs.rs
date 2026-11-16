@@ -567,3 +567,97 @@ async fn a_controller_pass_counts_its_reads_by_kind_and_shape() {
     }
     assert_eq!(listings[0], listings[1], "the watch lists the kind as often whatever the convoys held");
 }
+
+/// What each of a scoped fleet listing's selecting queries read, by kind, with `others` convoys
+/// of another project each running a coder.
+async fn scoped_query_reads(others: usize) -> Vec<flotilla_store::load_metrics::ReadCounts> {
+    use flotilla_resources::{terminal_records::AgentLaunch, TerminalSession, CONVOY_LABEL};
+    use flotilla_store::{load_metrics::measure, StoreQuery, TerminalViews};
+
+    let store = OtherHome::open("home");
+    let engine = EngineFixture::over_service(store.service());
+    let backend = ResourceBackend::new(InMemoryBackend::default());
+    let convoys = EngineConvoysHome::over(store.service(), NAMESPACE, &backend, Arc::new(SystemClock), engine.reads());
+    backend.install_engine_records(Arc::new(TerminalViews::new(NAMESPACE, Arc::clone(convoys.reads()))));
+    let mut target = None;
+    for n in 0..=others {
+        let project = if n == 0 { "app" } else { "other" };
+        let spec = ConvoySpec::builder().workflow_ref("workflow".into()).project_ref(project.into()).build();
+        let launch = convoys.launch(convoy(NAMESPACE, &format!("convoy-{n}"), spec, single_agent("coder"))).await;
+        let vessel = engine.vessels.request(&launch, "work", store.home());
+        engine.vessels.ready(&vessel, "env");
+        let session = engine.terminals.request(&TerminalsFixture::agent(&vessel, "coder", "env"));
+        let facts = TerminalLaunchFacts {
+            agent: Some(AgentLaunch { adapter: "codex".into(), model: None, stance: "test".into() }),
+            ..TerminalLaunchFacts::default()
+        };
+        engine.terminals.ready(&session, &format!("pool-{n}"), &facts);
+        if n == 0 {
+            target = Some((launch, engine.terminals.record(&session).session_name().to_owned()));
+        }
+    }
+    let (launch, session) = target.expect("the target convoy");
+    // The views are filled once, at their first read, as a running daemon's already are.
+    convoys.settled().await;
+    let sessions = backend.clone().using::<TerminalSession>(NAMESPACE);
+    sessions.list().await.expect("the session views");
+    let crew = sessions.get(&session).await.expect("the target's session").status.and_then(|status| status.crew).expect("its crew").id;
+
+    let mut costs = Vec::new();
+    let by_name = StoreQuery::names([launch.clone()], true);
+    let convoy_queries = [
+        // The project scope.
+        StoreQuery { fields: [("spec.project_ref".to_owned(), "app".to_owned())].into(), include_replicas: true, ..StoreQuery::default() },
+        // The convoy scope: the convoy and its project's convoys.
+        StoreQuery {
+            any_of: Some(vec![
+                by_name.clone(),
+                StoreQuery { include_replicas: true, ..StoreQuery::related("spec.project_ref", "spec.project_ref", by_name) },
+            ]),
+            include_replicas: true,
+            ..StoreQuery::default()
+        },
+    ];
+    for query in convoy_queries {
+        let (read, reads) = measure(backend.query_declared::<Convoy>(NAMESPACE, &query)).await;
+        assert_eq!(
+            read.expect("convoys").items.iter().map(|read| read.object.metadata.name.as_str()).collect::<Vec<_>>(),
+            [launch.as_str()]
+        );
+        costs.push(reads);
+    }
+    let session_queries = [
+        // A crew's session, by its crew identity.
+        StoreQuery { fields: [("status.crew.id".to_owned(), crew)].into(), include_replicas: true, ..StoreQuery::default() },
+        // Its convoy's sessions.
+        StoreQuery {
+            field_values: [(format!("metadata.labels.\"{CONVOY_LABEL}\""), vec![launch.clone()])].into(),
+            include_replicas: true,
+            ..StoreQuery::default()
+        },
+    ];
+    for query in session_queries {
+        let (read, reads) = measure(backend.query_declared::<TerminalSession>(NAMESPACE, &query)).await;
+        assert_eq!(
+            read.expect("sessions").items.iter().map(|read| read.object.metadata.name.as_str()).collect::<Vec<_>>(),
+            [session.as_str()]
+        );
+        costs.push(reads);
+    }
+    costs
+}
+
+// Behaviour: a scoped fleet listing's queries of convoys by project, by a convoy and its project's
+// convoys, and of sessions by crew and by convoy, read through the views' indexes: the rows read
+// are the scope's, whatever other convoys and sessions are held.
+#[tokio::test]
+async fn scoped_queries_read_the_scopes_rows() {
+    let small = scoped_query_reads(0).await;
+    for reads in &small {
+        for kind in ["Convoy port", "TerminalSession port"] {
+            let port = reads.get(kind).copied().unwrap_or_default();
+            assert_eq!(port.whole_kind, 0, "no query reads every {kind} row: {reads:#?}");
+        }
+    }
+    assert_eq!(scoped_query_reads(200).await, small, "the reads do not grow with other convoys and sessions");
+}

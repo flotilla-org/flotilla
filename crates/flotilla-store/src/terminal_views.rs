@@ -17,7 +17,7 @@ use futures::{stream::BoxStream, StreamExt};
 
 use flotilla_protocol::{LifecycleReading, NodeId};
 use flotilla_resources::{
-    engine_records::{KindRecords, LogPosition, Record, Since, UnloggedJournal},
+    engine_records::{IndexCover, KindRecords, LogPosition, Record, Since, UnloggedJournal},
     environment_records::{EnvironmentChange, EnvironmentRecord},
     lifecycle_reads::{ChangeCursor, LifecycleReads},
     terminal_records::{newest_launches, TerminalChange, TerminalHolderView, TerminalRecord, TerminalRecords},
@@ -26,7 +26,7 @@ use flotilla_resources::{
     ReadResourceObject, ResourceError, ResourceObject, ResourceProvenance, TerminalSession, TerminalSessionSpec, TerminalSessionStatus,
 };
 
-use crate::held_listing::{drained, ticks};
+use crate::held_listing::{drained, ticks, ViewIndex};
 
 /// Read views of the terminal sessions in one namespace.
 ///
@@ -51,6 +51,8 @@ struct Listing {
     sessions: BTreeMap<Session, Entry>,
     /// The sessions whose view changed, in this run: what a reading resumes from.
     changed: UnloggedJournal,
+    /// The listed views, under each of their index keys.
+    index: ViewIndex<Session>,
 }
 
 impl Listing {
@@ -59,6 +61,7 @@ impl Listing {
         let entries: BTreeMap<Session, Entry> = entries.into_iter().collect();
         let gone: Vec<Session> = self.sessions.keys().filter(|session| !entries.contains_key(*session)).cloned().collect();
         for session in gone {
+            self.index.remove(&session);
             if self.sessions.remove(&session).is_some_and(|entry| entry.view.is_some()) {
                 self.changed.record([session.1]);
             }
@@ -68,10 +71,14 @@ impl Listing {
 
     /// Holds each of `entries`, counting each whose view changed.
     fn extend(&mut self, entries: impl IntoIterator<Item = (Session, Entry)>) {
-        for (session, entry) in entries {
+        for (session, mut entry) in entries {
             let shown = |entry: &Entry| entry.view.as_ref().map(|view| view.version);
             if self.sessions.get(&session).map(shown) != Some(shown(&entry)) {
                 self.changed.record([session.1.clone()]);
+            }
+            match entry.view {
+                Some(_) => self.index.set(&session, std::mem::take(&mut entry.keys)),
+                None => self.index.remove(&session),
             }
             self.sessions.insert(session, entry);
         }
@@ -118,6 +125,8 @@ struct Entry {
     /// Whether its holder vessel could not be read when it was composed: its holder is unknown,
     /// not absent, so each pass composes it again until it is read.
     unresolved: bool,
+    /// Its view's index keys, until the listing indexes it.
+    keys: Vec<(String, String)>,
 }
 
 /// What changed since the last pass.
@@ -240,6 +249,27 @@ impl TerminalViews {
         keep: impl Fn(&Record<TerminalSession>) -> bool,
         at: impl FnOnce(&Listing) -> T,
     ) -> Result<(Vec<Record<TerminalSession>>, T), ResourceError> {
+        let listing = self.passed().await?;
+        let listed = listing.sessions.values().filter_map(|entry| entry.view.as_ref().filter(|view| keep(view)).cloned()).collect();
+        Ok((listed, at(&listing)))
+    }
+
+    /// The views `cover` selects, from the listing's index, this home's alone when `local`: only
+    /// those are copied out of the listing.
+    async fn covered_views(&self, cover: &IndexCover, local: bool) -> Result<Vec<Record<TerminalSession>>, ResourceError> {
+        let here = self.terminals().map_err(ResourceError::other)?.home().to_owned();
+        let listing = self.passed().await?;
+        Ok(listing
+            .index
+            .covered(cover)
+            .into_iter()
+            .filter(|(home, _)| !local || *home == here)
+            .filter_map(|session| listing.sessions.get(&session)?.view.clone())
+            .collect())
+    }
+
+    /// The listing, once it has taken in what changed since the last pass.
+    async fn passed(&self) -> Result<tokio::sync::MutexGuard<'_, Listing>, ResourceError> {
         let mut listing = self.listing.lock().await;
         let held = listing.cursors.take();
         let (cursors, dirt) = self
@@ -278,8 +308,7 @@ impl TerminalViews {
                 return Err(error);
             }
         }
-        let listed = listing.sessions.values().filter_map(|entry| entry.view.as_ref().filter(|view| keep(view)).cloned()).collect();
-        Ok((listed, at(&listing)))
+        Ok(listing)
     }
 
     /// Composes again the sessions `dirt` touched in `listing`, and takes in their new launches.
@@ -335,16 +364,15 @@ impl TerminalViews {
                 ResourceProvenance::Local => here.clone(),
                 ResourceProvenance::Replica { origin_root, .. } => origin_root.as_str().to_owned(),
             };
+            let keys = crate::object_index_keys(&view.object)?;
             // Its version is the listing's to give.
             let view = crate::held_listing::view_record(view.object, home, 0);
             let unresolved = record.vessel.is_some() && !view.labels.contains_key(flotilla_resources::VESSEL_LABEL);
-            entries.push(((record.home.clone(), record.session_name().to_owned()), Entry { record, view: Some(view), unresolved }));
+            entries.push(((record.home.clone(), record.session_name().to_owned()), Entry { record, view: Some(view), unresolved, keys }));
         }
-        entries.extend(
-            released
-                .into_iter()
-                .map(|record| ((record.home.clone(), record.session_name().to_owned()), Entry { record, view: None, unresolved: false })),
-        );
+        entries.extend(released.into_iter().map(|record| {
+            ((record.home.clone(), record.session_name().to_owned()), Entry { record, view: None, unresolved: false, keys: Vec::new() })
+        }));
         Ok(entries)
     }
 
@@ -605,6 +633,10 @@ impl KindRecords<TerminalSession> for TerminalViews {
     /// Every home's listed copy of `name`: a released launch is listed no more.
     async fn sources_named(&self, name: &str) -> Result<Vec<Record<TerminalSession>>, String> {
         self.listed_where(|object| object.name == name).await.map_err(|error| error.to_string())
+    }
+
+    async fn covered(&self, cover: &IndexCover, local: bool) -> Option<Result<Vec<Record<TerminalSession>>, String>> {
+        Some(self.covered_views(cover, local).await.map_err(|error| error.to_string()))
     }
 
     async fn apply(

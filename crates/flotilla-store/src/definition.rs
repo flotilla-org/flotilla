@@ -8,10 +8,10 @@ use std::{
 use chrono::{DateTime, Utc};
 use flotilla_protocol::NodeId;
 use flotilla_resources::{
-    engine_records::{KindRecords, LogPosition, Record, Since},
+    engine_records::{IndexCover, KindRecords, LogPosition, Record, Since},
     ObjectMeta, ReadResourceObject, ReadWatchEvent,
 };
-use futures::{stream::BoxStream, StreamExt};
+use futures::{stream::BoxStream, FutureExt, StreamExt};
 use serde_json::{Map, Value};
 
 use crate::engine_feed::Copies;
@@ -116,13 +116,84 @@ impl<T: Resource> DefinitionResolver<T> {
                 return Some(open.map_err(ResourceError::other).and_then(|open| self.reads(&records.home(), open, None)));
             }
         }
-        if let Some(cover) = query.index_cover() {
-            // A query of this home's rows reads none of another home's.
-            if let Some(held) = port_reads::covered(&*records, &cover, !query.include_replicas).await {
-                return Some(held.map_err(ResourceError::other).and_then(|held| self.reads(&records.home(), held, None)));
+        match self.engine_cover(&*records, query).await {
+            Ok(Some(cover)) => {
+                // A query of this home's rows reads none of another home's.
+                if let Some(held) = port_reads::covered(&*records, &cover, !query.include_replicas).await {
+                    return Some(held.map_err(ResourceError::other).and_then(|held| self.reads(&records.home(), held, None)));
+                }
             }
+            Ok(None) => {}
+            Err(error) => return Some(Err(error)),
         }
         Some(self.read_all(&*records).await)
+    }
+
+    /// The rows `query` may select, through the port's index: its own keys, its alternatives when
+    /// each of them is covered, and each relation to rows of this kind. `None` when the query
+    /// selects by nothing covered, or the port keeps no index, and only a read of every row
+    /// answers it.
+    fn engine_cover<'a>(
+        &'a self,
+        records: &'a dyn KindRecords<T>,
+        query: &'a crate::StoreQuery,
+    ) -> futures::future::BoxFuture<'a, Result<Option<IndexCover>, ResourceError>> {
+        async move {
+            let mut parts = query.index_parts();
+            if let Some(alternatives) = &query.any_of {
+                let mut covers = Vec::with_capacity(alternatives.len());
+                for alternative in alternatives {
+                    match self.engine_cover(records, alternative).await? {
+                        Some(cover) => covers.push(cover),
+                        None => {
+                            covers.clear();
+                            break;
+                        }
+                    }
+                }
+                if !covers.is_empty() {
+                    parts.push(IndexCover::Any(covers));
+                }
+            }
+            for (field, selection) in &query.field_matches_query {
+                if selection.source_kind.as_deref().is_none_or(|kind| kind == T::API_PATHS.kind) {
+                    parts.extend(self.related_cover(records, field, &selection.field, &selection.query).await?);
+                }
+            }
+            Ok(match parts.len() {
+                0 => None,
+                1 => parts.pop(),
+                _ => Some(IndexCover::All(parts)),
+            })
+        }
+        .boxed()
+    }
+
+    /// The rows a relation of `field` to `source` of this kind's rows that `query` selects may
+    /// select: those rows, which the reader reads the relation from, and the rows holding one of
+    /// their values at `field`. The related rows are read through the port's index; `None` when
+    /// they are not covered.
+    async fn related_cover(
+        &self,
+        records: &dyn KindRecords<T>,
+        field: &str,
+        source: &str,
+        query: &crate::StoreQuery,
+    ) -> Result<Option<IndexCover>, ResourceError> {
+        let Some(cover) = self.engine_cover(records, query).await? else { return Ok(None) };
+        let Some(related) = port_reads::covered(records, &cover, !query.include_replicas).await else { return Ok(None) };
+        let related = select_reads(self.reads(&records.home(), related.map_err(ResourceError::other)?, None)?, query)?;
+        let source = format!("field:{source}");
+        let mut keys = BTreeSet::new();
+        for read in &related {
+            keys.extend(
+                crate::object_index_keys(&read.object)?
+                    .into_iter()
+                    .filter(|(key, _)| *key == source)
+                    .map(|(_, value)| (format!("field:{field}"), value)),
+            );
+        }
+        Ok(Some(IndexCover::Any(vec![cover, IndexCover::AnyKey(keys)])))
     }
 
     async fn read_all(&self, records: &dyn KindRecords<T>) -> Result<Vec<ReadResourceObject<T>>, ResourceError> {

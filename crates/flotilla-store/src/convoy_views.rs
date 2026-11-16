@@ -35,7 +35,7 @@ use flotilla_resources::{
     Convoy, ConvoySpec, ConvoyStatus, ReadResourceObject, ResourceError, ResourceObject, ResourceProvenance,
 };
 
-use crate::held_listing::ticks;
+use crate::held_listing::{ticks, ViewIndex};
 
 /// Read views of the convoys in one namespace.
 #[derive(Clone)]
@@ -77,46 +77,10 @@ struct HeldViews {
     changed: UnloggedJournal,
     /// The views held by each index key their labels and declared fields give, as the store's
     /// query index names them: a selecting query reads only the views it may select.
-    index: ViewIndex,
+    index: ViewIndex<(String, String)>,
     /// The launches held, by `(home, launch)`, that have not ended. One that cannot be read
     /// counts: nothing says it ended.
     open: BTreeSet<(String, String)>,
-}
-
-/// The views held, by `(home, launch)`, under each of their index keys.
-#[derive(Default)]
-struct ViewIndex {
-    entries: BTreeMap<(String, String), BTreeSet<(String, String)>>,
-    keys: BTreeMap<(String, String), Vec<(String, String)>>,
-}
-
-impl ViewIndex {
-    /// Indexes `view` as `launch`, in place of what `launch` showed before.
-    fn set(&mut self, launch: &(String, String), view: &ResourceObject<Convoy>) -> Result<(), String> {
-        self.remove(launch);
-        let keys = crate::object_index_keys(view).map_err(|error| error.to_string())?;
-        for key in &keys {
-            self.entries.entry(key.clone()).or_default().insert(launch.clone());
-        }
-        self.keys.insert(launch.clone(), keys);
-        Ok(())
-    }
-
-    fn remove(&mut self, launch: &(String, String)) {
-        for key in self.keys.remove(launch).into_iter().flatten() {
-            if let Some(launches) = self.entries.get_mut(&key) {
-                launches.remove(launch);
-                if launches.is_empty() {
-                    self.entries.remove(&key);
-                }
-            }
-        }
-    }
-
-    /// The launches `cover` selects.
-    fn covered(&self, cover: &IndexCover) -> BTreeSet<(String, String)> {
-        cover.select(&self.entries)
-    }
 }
 
 /// A launch's view and the version it is handed out at.
@@ -760,7 +724,7 @@ impl HeldViews {
             let version = crate::held_listing::version(held.map(|held| held.version), same, position)?;
             if !same {
                 self.changed.record([key.1.clone()]);
-                self.index.set(&key, &view.object)?;
+                self.index.set(&key, crate::object_index_keys(&view.object).map_err(|error| error.to_string())?);
             }
             self.views.insert(key, HeldView { view, version });
         }

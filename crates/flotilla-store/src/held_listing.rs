@@ -1,10 +1,54 @@
 //! What the engine kinds' incrementally held listings share (#3108): ticks for watchers, the
-//! changes a pass drains, and the end of a watch.
+//! changes a pass drains, the index of the views held, and the end of a watch.
 
-use std::sync::{Arc, Mutex, PoisonError};
+use std::{
+    collections::{BTreeMap, BTreeSet},
+    sync::{Arc, Mutex, PoisonError},
+};
 
-use flotilla_resources::engine_records::Record;
+use flotilla_resources::engine_records::{IndexCover, Record};
 use futures::{stream::BoxStream, StreamExt};
+
+/// The views a listing holds, by its own id for each, under each of their index keys as the
+/// store's query index names them: a selecting query reads only the views it may select.
+pub(crate) struct ViewIndex<Id> {
+    entries: BTreeMap<(String, String), BTreeSet<Id>>,
+    keys: BTreeMap<Id, Vec<(String, String)>>,
+}
+
+impl<Id> Default for ViewIndex<Id> {
+    fn default() -> Self {
+        Self { entries: BTreeMap::new(), keys: BTreeMap::new() }
+    }
+}
+
+impl<Id: Ord + Clone> ViewIndex<Id> {
+    /// Indexes view `id` under `keys` ([`crate::object_index_keys`]), in place of what it showed
+    /// before.
+    pub(crate) fn set(&mut self, id: &Id, keys: Vec<(String, String)>) {
+        self.remove(id);
+        for key in &keys {
+            self.entries.entry(key.clone()).or_default().insert(id.clone());
+        }
+        self.keys.insert(id.clone(), keys);
+    }
+
+    pub(crate) fn remove(&mut self, id: &Id) {
+        for key in self.keys.remove(id).into_iter().flatten() {
+            if let Some(ids) = self.entries.get_mut(&key) {
+                ids.remove(id);
+                if ids.is_empty() {
+                    self.entries.remove(&key);
+                }
+            }
+        }
+    }
+
+    /// The views `cover` selects.
+    pub(crate) fn covered(&self, cover: &IndexCover) -> BTreeSet<Id> {
+        cover.select(&self.entries)
+    }
+}
 
 /// The version a held view is handed out at (#3108): `held`, the version it was last handed out
 /// at under its key, while it shows the `same`; otherwise `position`, how far the reads it was
