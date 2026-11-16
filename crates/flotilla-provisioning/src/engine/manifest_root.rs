@@ -23,6 +23,7 @@ use flotilla_engine_store::{
     open_home, StoreLog,
 };
 use flotilla_resources::{
+    engine_records::{LogPosition, Since, UnloggedJournal},
     manifest_roots::{refusal_evidence, refusals, removals, root_stall, ManifestRoots, PassReport, RootDeclaration, RootView},
     DocumentKey, DocumentPhase, DocumentState, ManifestRootSpec, ManifestRootStatus, Resolution, ResolutionAction, ResolutionOutcome,
 };
@@ -34,6 +35,7 @@ use chrono::{DateTime, Utc};
 
 use super::manifest_root_import::document_name;
 use super::reads::created_at;
+use super::resume::followed_since;
 use super::watch::CommitsSeen;
 use crate::stored::manifest_root::{
     Act, Applied, DocumentName, ManifestRoot, Outcome, Rebind, RequestResolution, Resolve, Retire, RootEdge, RootRefusal, RootRequest,
@@ -87,6 +89,8 @@ pub struct EngineManifestRoots {
     judged: Mutex<BTreeMap<String, BTreeMap<DocumentKey, DocumentState>>>,
     /// How many times a judgement changed since this home started; each change ticks watchers.
     judged_changes: tokio::sync::watch::Sender<u64>,
+    /// The root each change of a judgement touched. Taken under `judged`.
+    unlogged: Mutex<UnloggedJournal>,
     clock: Arc<dyn flotilla_resources::Clock>,
 }
 
@@ -106,6 +110,7 @@ impl EngineManifestRoots {
             resident: Mutex::new(resident),
             judged: Mutex::new(BTreeMap::new()),
             judged_changes: tokio::sync::watch::Sender::new(0),
+            unlogged: Mutex::default(),
             clock,
         };
         let homes = opened.service.homes();
@@ -480,9 +485,13 @@ impl ManifestRoots for EngineManifestRoots {
         // The judgement follows the records just written; the settlements below are each their own
         // write, and a pass that fails among them is repeated whole by the next, which the claimed
         // check and `Unchanged` absorb.
-        let before = locked(&self.judged).insert(engine.clone(), pass.documents.clone());
-        if before.as_ref() != Some(&pass.documents) {
-            self.judged_changes.send_modify(|tick| *tick += 1);
+        {
+            let mut judged = locked(&self.judged);
+            let before = judged.insert(engine.clone(), pass.documents.clone());
+            if before.as_ref() != Some(&pass.documents) {
+                let count = locked(&self.unlogged).record([base(&engine).to_owned()]);
+                self.judged_changes.send_replace(count);
+            }
         }
         // Settle each resolution the pass claimed and finished.
         let resolutions = locked(&self.roots).get(&engine).map(|root| root.spec().resolutions.clone()).unwrap_or_default();
@@ -622,7 +631,7 @@ impl flotilla_resources::engine_records::KindRecords<flotilla_resources::Manifes
 
     /// This home's judgements of its roots' documents.
     fn unlogged_changes(&self) -> Option<u64> {
-        Some(*self.judged_changes.borrow())
+        Some(locked(&self.unlogged).count())
     }
 
     fn home(&self) -> String {
@@ -647,6 +656,31 @@ impl flotilla_resources::engine_records::KindRecords<flotilla_resources::Manifes
 
     async fn sources(&self) -> Result<Vec<RootRecord>, String> {
         self.objects(None)
+    }
+
+    /// Positioned before the roots are read, so a change among them is named again, never missed.
+    async fn positioned(&self) -> Result<(Vec<RootRecord>, LogPosition), String> {
+        let position = self.position().await?;
+        Ok((self.objects(None)?, position))
+    }
+
+    async fn position(&self) -> Result<LogPosition, String> {
+        let homes = self.refresh()?.follower.cursors().clone();
+        Ok(LogPosition { homes, unlogged: Some(locked(&self.unlogged).read()) })
+    }
+
+    async fn changed_since(&self, position: &LogPosition) -> Result<Since, String> {
+        let (changed, homes) = match followed_since(&self.service, [ROOT], position)? {
+            Ok(followed) => followed,
+            Err(reason) => return Ok(Since::Expired(reason)),
+        };
+        let unlogged = locked(&self.unlogged);
+        let mut names = match unlogged.since(position.unlogged.as_ref()) {
+            Ok(names) => names,
+            Err(reason) => return Ok(Since::Expired(reason)),
+        };
+        names.extend(changed.iter().map(|identity| base(&identity.name).to_owned()));
+        Ok(Since::Changed { names, through: LogPosition { homes, unlogged: Some(unlogged.read()) } })
     }
 
     async fn copies(&self, name: &str) -> Result<Vec<RootRecord>, String> {

@@ -14,7 +14,7 @@ use flotilla_resources::{
     address::{artifact_address, record_name, stored_change_request_address},
     artifact::blob_digest_of,
     convoy::engine::{Actor, EngineConvoyPath, EngineConvoys, OldPromises, VerdictScope},
-    engine_records::{KindRecords, Record},
+    engine_records::{KindRecords, LogPosition, Record, Since},
     promises::{self, PromiseKind, PromiseOperation, PromiseSource, PromiseState, Submission},
     Artifact, ArtifactSpec, ChangeRequest, ChangeRequestReviewObservation, ChangeRequestSpec, ChangeRequestStatus, Convoy, ConvoyPhase,
     ConvoySpec, ConvoyStatus, CrewSource, CrewSpec, CrewWorkPhase, CrewWorkState, Forge, InputMeta, Observation,
@@ -1190,6 +1190,19 @@ impl KindRecords<Forge> for Forges {
             return Err("the forges are unreadable".into());
         }
         Ok(Vec::new())
+    }
+    async fn positioned(&self) -> Result<(Vec<Record<Forge>>, LogPosition), String> {
+        Ok((self.sources().await?, LogPosition::default()))
+    }
+    async fn position(&self) -> Result<LogPosition, String> {
+        Ok(LogPosition::default())
+    }
+    async fn changed_since(&self, _: &LogPosition) -> Result<Since, String> {
+        self.sources().await?;
+        Ok(Since::Changed { names: Default::default(), through: LogPosition::default() })
+    }
+    async fn copies(&self, _: &str) -> Result<Vec<Record<Forge>>, String> {
+        self.sources().await
     }
     async fn apply(
         &self,

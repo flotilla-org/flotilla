@@ -1183,13 +1183,7 @@ async fn reconnect_loop_bounds_real_unsupported_watch_errors() {
             },
             |daemon| async move {
                 let mut watch = ResourceClient::new(daemon)
-                    .watch(
-                        ResourceWatchRequest::builder()
-                            .kind("issues".into())
-                            .include_replicas(true)
-                            .cursor(flotilla_protocol::ResourceCursor::from_position("overlay", None))
-                            .build(),
-                    )
+                    .watch(ResourceWatchRequest::builder().kind("nope".into()).include_replicas(true).build())
                     .await?;
                 watch.next().await?;
                 Ok(())
@@ -1199,8 +1193,107 @@ async fn reconnect_loop_bounds_real_unsupported_watch_errors() {
     .await
     .expect("permanent refusals terminate promptly")
     .expect_err("permanent refusal");
-    assert_eq!(error, "invalid resource: include-replicas watches do not support cursor resume");
+    assert!(error.starts_with("invalid resource: unknown resource kind 'nope'"), "{error}");
     assert_eq!(attempts.load(Ordering::SeqCst), 1, "one bounded attempt");
+}
+
+// #3108: an include-replicas watch of an engine-served kind resumes across a reconnect from the
+// cursor its bookmark carried: the reconnected watch names first the change made while the
+// connector was away, without a snapshot.
+#[tokio::test]
+async fn reconnect_resumes_an_include_replicas_watch_from_its_cursor() {
+    use flotilla_client::resource::{ResourceClient, ResourceWatchRequest};
+    use flotilla_core::in_process::InProcessDaemon;
+    use flotilla_discovery_testkit::fake_discovery;
+    use flotilla_protocol::ResourceRecordType;
+    use flotilla_resources::{ChangeRequest, InputMeta, K8sResourceObject, ResourceObject};
+    use flotilla_store::ResourceBackend;
+    let tmp = tempfile::tempdir().expect("config directory");
+    std::fs::write(tmp.path().join("daemon.toml"), "machine_id = \"pm-resume-3108\"\n").expect("machine id");
+    let daemon = InProcessDaemon::new_with_resource_backend(
+        vec![],
+        Arc::new(ConfigStore::with_base(tmp.path())),
+        fake_discovery(false),
+        HostName::new("local"),
+        ResourceBackend::new(InMemoryBackend::default()),
+        std::sync::Arc::new(flotilla_discovery_testkit::HostPeerOverlay::default()),
+    )
+    .await;
+    let observations = daemon.resource_backend().using::<ChangeRequest>("flotilla");
+    let json = subject_envelope().records[0].object.clone().expect("fixture observation");
+    let object = ResourceObject::<ChangeRequest>::from_k8s_object(
+        serde_json::from_value::<K8sResourceObject<ChangeRequest>>(json).expect("typed observation"),
+    )
+    .expect("observation");
+    let request = |cursor: Option<flotilla_protocol::ResourceCursor>| {
+        ResourceWatchRequest::builder().kind("changerequests".into()).include_replicas(true).maybe_cursor(cursor).build()
+    };
+    let attempts = AtomicUsize::new(0);
+    let cursor = std::sync::Mutex::new(None);
+    let resumed = std::sync::Mutex::new(None);
+    let (observations, object, request, cursor, resumed) = (&observations, &object, &request, &cursor, &resumed);
+    let error = tokio::time::timeout(
+        Duration::from_secs(10),
+        run_reconnecting(
+            || {
+                attempts.fetch_add(1, Ordering::SeqCst);
+                let daemon = daemon.clone() as Arc<dyn DaemonHandle>;
+                async move { Ok(daemon) }
+            },
+            move |daemon| {
+                async move {
+                    let client = ResourceClient::new(daemon);
+                    let held = cursor.lock().expect("cursor").clone();
+                    let Some(held) = held else {
+                        // Session one: read to the bookmark, keep its cursor, and lose the session
+                        // after a change request is created.
+                        let mut watch = client.watch(request(None)).await?;
+                        loop {
+                            let envelope = watch.next().await?.ok_or_else(|| "the watch ended".to_owned())?;
+                            if envelope.records.iter().any(|record| record.record_type == ResourceRecordType::Bookmark) {
+                                *cursor.lock().expect("cursor") = Some(envelope.cursor);
+                                break;
+                            }
+                        }
+                        observations
+                            .create(&InputMeta::builder().name(object.metadata.name.clone()).build(), &object.spec)
+                            .await
+                            .map_err(|error| error.to_string())?;
+                        return Err(SessionFailure::Daemon("connection reset".into()));
+                    };
+                    // Session two: resume, take the first event after its bookmark, then end with a
+                    // permanent refusal.
+                    let mut watch = client.watch(request(Some(held))).await?;
+                    let bookmark = watch.next().await?.ok_or_else(|| "the resumed watch ended".to_owned())?;
+                    if bookmark.records.iter().any(|record| record.record_type != ResourceRecordType::Bookmark) {
+                        return Err(SessionFailure::Daemon(format!("a resumed watch sends no snapshot: {bookmark:?}")));
+                    }
+                    let envelope = watch.next().await?.ok_or_else(|| "the resumed watch ended".to_owned())?;
+                    *resumed.lock().expect("resumed") = Some(envelope);
+                    client.watch(ResourceWatchRequest::builder().kind("nope".into()).include_replicas(true).build()).await?.next().await?;
+                    Ok(())
+                }
+            },
+        ),
+    )
+    .await
+    .expect("the resumed session ends")
+    .expect_err("the closing refusal");
+    assert!(error.starts_with("invalid resource: unknown resource kind 'nope'"), "{error}");
+    assert_eq!(attempts.load(Ordering::SeqCst), 2, "one reconnect");
+    let resumed = resumed.lock().expect("resumed").take().expect("the resumed watch's first envelope");
+    let names: Vec<_> = resumed
+        .records
+        .iter()
+        .map(|record| {
+            (record.record_type, record.object.as_ref().and_then(|object| object["metadata"]["name"].as_str()).map(str::to_owned))
+        })
+        .collect();
+    assert_eq!(
+        names,
+        vec![(ResourceRecordType::Modified, Some(object.metadata.name.clone()))],
+        "the resume names first the change made while away"
+    );
 }
 
 // #2523: namespaces newly appearing in the named-query graph bootstrap their

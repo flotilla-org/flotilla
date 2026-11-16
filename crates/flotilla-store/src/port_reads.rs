@@ -3,7 +3,7 @@
 //! own reads count under the stored kind's name; so the port's count under the kind's name with
 //! [`PORT`] after it, and the two are never summed.
 
-use flotilla_resources::engine_records::{KindRecords, Record};
+use flotilla_resources::engine_records::{KindRecords, LogPosition, Record};
 use flotilla_schema::reads::{self, ReadShape};
 
 use crate::Resource;
@@ -45,9 +45,25 @@ pub(crate) async fn sources<R: Resource>(records: &dyn KindRecords<R>) -> Result
     counted(ReadShape::WholeKind, records.sources().await)
 }
 
+/// Every home's records, and the position they were read at.
+pub(crate) async fn positioned<R: Resource>(records: &dyn KindRecords<R>) -> Result<(Vec<Record<R>>, LogPosition), String> {
+    let read = records.positioned().await;
+    let kind = port::<R>();
+    reads::read(&kind, ReadShape::WholeKind);
+    if let Ok((listed, _)) = &read {
+        reads::rows(&kind, listed.len());
+    }
+    read
+}
+
 /// Every home's record `name`.
 pub(crate) async fn copies<R: Resource>(records: &dyn KindRecords<R>, name: &str) -> Result<Vec<Record<R>>, String> {
     counted(ReadShape::Keyed, records.copies(name).await)
+}
+
+/// Every home's record `name` that the listing holds.
+pub(crate) async fn sources_named<R: Resource>(records: &dyn KindRecords<R>, name: &str) -> Result<Vec<Record<R>>, String> {
+    counted(ReadShape::Keyed, records.sources_named(name).await)
 }
 
 /// The open records addressed to `receiver`, where the port keeps them indexed.

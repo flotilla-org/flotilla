@@ -839,27 +839,30 @@ impl<T: Resource> TypedResolver<T> {
     /// Read the local collection's list/watch position without decoding objects.
     /// HTTP uses collection metadata from the standard list endpoint.
     pub async fn current_position(&self) -> Result<crate::ResourcePosition, ResourceError> {
-        // An engine-served kind has no position to resume from, as its lists carry none.
-        if self.backend.engine_serves(T::API_PATHS.kind) {
-            return Ok(crate::ResourcePosition { resource_version: String::new(), generation: None });
+        // An engine-served kind's position is where its port's reading stands in the logs.
+        if let Some(position) = self.backend.definitions::<T>(&self.namespace).engine_position().await {
+            return Ok(crate::ResourcePosition { resource_version: position?, generation: None });
         }
         dispatch_backend!(self, current_position_typed)
     }
 
     pub async fn list(&self) -> Result<ResourceList<T>, ResourceError> {
-        if let Some(local) = self.engine_local().await {
-            return Ok(ResourceList { items: local?, resource_version: String::new(), generation: None });
+        // Positioned before the list: a resume from it names again any change the list holds.
+        if let Some(position) = self.backend.definitions::<T>(&self.namespace).engine_position().await {
+            let local = self.engine_local().await.ok_or_else(|| ResourceError::other("the engine stopped serving this kind"))?;
+            return Ok(ResourceList { items: local?, resource_version: position?, generation: None });
         }
         dispatch_backend!(self, list_typed)
     }
 
     pub async fn list_matching_labels(&self, required: &BTreeMap<String, String>) -> Result<ResourceList<T>, ResourceError> {
-        if let Some(local) = self.engine_local().await {
+        if let Some(position) = self.backend.definitions::<T>(&self.namespace).engine_position().await {
+            let local = self.engine_local().await.ok_or_else(|| ResourceError::other("the engine stopped serving this kind"))?;
             let items = local?
                 .into_iter()
                 .filter(|object| required.iter().all(|(key, value)| object.metadata.labels.get(key) == Some(value)))
                 .collect();
-            return Ok(ResourceList { items, resource_version: String::new(), generation: None });
+            return Ok(ResourceList { items, resource_version: position?, generation: None });
         }
         dispatch_backend!(self, list_typed_matching_labels, required)
     }
@@ -1017,19 +1020,18 @@ impl<T: Resource> TypedResolver<T> {
     }
 
     pub async fn watch(&self, start: WatchStart) -> Result<WatchStream<T>, ResourceError> {
-        if self.backend.engine_serves(T::API_PATHS.kind) {
-            // An engine-served kind's lists carry no position, so a resume cannot be honoured:
-            // refuse it as expired, and the caller watches from now and lists again.
-            if let WatchStart::FromVersion(requested_version)
-            | WatchStart::FromVersionInGeneration { resource_version: requested_version, .. } = start
-            {
-                return Err(ResourceError::WatchExpired { requested_version, compacted_through: None });
+        let definitions = self.backend.definitions::<T>(&self.namespace);
+        let watched = match &start {
+            // An engine-served kind resumes from the position its list or watch handed out.
+            WatchStart::FromVersion(requested_version)
+            | WatchStart::FromVersionInGeneration { resource_version: requested_version, .. } => {
+                definitions.engine_watch_from(requested_version).await
             }
-        }
-        if let Some(watch) = self.backend.definitions::<T>(&self.namespace).engine_watch().await {
             // An engine-served kind streams every home's changes from now.
-            let (_, stream) = watch?;
-            let events = stream.map(|event| {
+            WatchStart::Now => definitions.engine_watch().await.map(|watch| watch.map(|(_, stream)| stream)),
+        };
+        if let Some(stream) = watched {
+            let events = stream?.map(|event| {
                 event.map(|event| match event {
                     ReadWatchEvent::Added(read) => crate::WatchEvent::Added(read.object),
                     ReadWatchEvent::Modified(read) => crate::WatchEvent::Modified(read.object),
@@ -1068,7 +1070,7 @@ mod tests {
     use std::{collections::BTreeMap, sync::Arc};
 
     use flotilla_resources::{
-        engine_records::{KindRecords, Record},
+        engine_records::{KindRecords, LogPosition, Record, Since},
         Artifact, ImageBuild, Resource, Vessel, VesselSpec,
     };
     use futures::stream::BoxStream;
@@ -1118,6 +1120,18 @@ mod tests {
                 return Err("the records could not be read".into());
             }
             Ok(self.records.clone())
+        }
+        async fn positioned(&self) -> Result<(Vec<Record<R>>, LogPosition), String> {
+            Ok((self.sources().await?, LogPosition::default()))
+        }
+        async fn position(&self) -> Result<LogPosition, String> {
+            Ok(LogPosition::default())
+        }
+        async fn changed_since(&self, _: &LogPosition) -> Result<Since, String> {
+            Ok(Since::Expired("no log is held".into()))
+        }
+        async fn copies(&self, name: &str) -> Result<Vec<Record<R>>, String> {
+            Ok(self.sources().await?.into_iter().filter(|record| record.name == name).collect())
         }
         async fn apply(
             &self,

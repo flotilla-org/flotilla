@@ -17,7 +17,7 @@ use futures::{stream::BoxStream, StreamExt};
 
 use flotilla_protocol::{LifecycleReading, NodeId};
 use flotilla_resources::{
-    engine_records::{KindRecords, Record},
+    engine_records::{KindRecords, LogPosition, Record, Since, UnloggedJournal},
     environment_records::{EnvironmentChange, EnvironmentRecord},
     lifecycle_reads::{ChangeCursor, LifecycleReads},
     terminal_records::{newest_launches, TerminalChange, TerminalHolderView, TerminalRecord, TerminalRecords},
@@ -49,9 +49,39 @@ struct Listing {
     /// Where the next pass reads the changes since this one; none before the first.
     cursors: Option<Cursors>,
     sessions: BTreeMap<Session, Entry>,
+    /// The sessions whose view changed, in this run: what a reading resumes from.
+    changed: UnloggedJournal,
 }
 
 impl Listing {
+    /// Holds `entries` in place of every session held.
+    fn replace(&mut self, entries: Vec<(Session, Entry)>) {
+        let entries: BTreeMap<Session, Entry> = entries.into_iter().collect();
+        let gone: Vec<Session> = self.sessions.keys().filter(|session| !entries.contains_key(*session)).cloned().collect();
+        for session in gone {
+            if self.sessions.remove(&session).is_some_and(|entry| entry.view.is_some()) {
+                self.changed.record([session.1]);
+            }
+        }
+        self.extend(entries);
+    }
+
+    /// Holds each of `entries`, counting each whose view changed.
+    fn extend(&mut self, entries: impl IntoIterator<Item = (Session, Entry)>) {
+        for (session, entry) in entries {
+            let shown = |entry: &Entry| entry.view.as_ref().map(|view| view.version);
+            if self.sessions.get(&session).map(shown) != Some(shown(&entry)) {
+                self.changed.record([session.1.clone()]);
+            }
+            self.sessions.insert(session, entry);
+        }
+    }
+
+    /// Where a reader stands that has read the sessions held.
+    fn read(&self) -> LogPosition {
+        LogPosition { homes: BTreeMap::new(), unlogged: Some(self.changed.read()) }
+    }
+
     /// How far the listing has read: the log and this home's observations, by its cursors.
     fn position(&self) -> u64 {
         self.cursors.as_ref().map_or(0, Cursors::position)
@@ -201,6 +231,15 @@ impl TerminalViews {
 
     /// The listed records `keep` selects: only those are copied out of the listing.
     async fn listed_where(&self, keep: impl Fn(&Record<TerminalSession>) -> bool) -> Result<Vec<Record<TerminalSession>>, ResourceError> {
+        Ok(self.positioned_where(keep, |_| ()).await?.0)
+    }
+
+    /// [`Self::listed_where`], and what `at` reads of the listing they were copied from.
+    async fn positioned_where<T>(
+        &self,
+        keep: impl Fn(&Record<TerminalSession>) -> bool,
+        at: impl FnOnce(&Listing) -> T,
+    ) -> Result<(Vec<Record<TerminalSession>>, T), ResourceError> {
         let mut listing = self.listing.lock().await;
         let held = listing.cursors.take();
         let (cursors, dirt) = self
@@ -226,7 +265,7 @@ impl TerminalViews {
                 Err(error) => Err(error),
             };
             match sessions {
-                Ok(sessions) => listing.sessions = sessions.into_iter().collect(),
+                Ok(sessions) => listing.replace(sessions),
                 Err(error) => {
                     // What it holds is not known to be current: the next pass reads afresh.
                     listing.cursors = None;
@@ -239,7 +278,8 @@ impl TerminalViews {
                 return Err(error);
             }
         }
-        Ok(listing.sessions.values().filter_map(|entry| entry.view.as_ref().filter(|view| keep(view)).cloned()).collect())
+        let listed = listing.sessions.values().filter_map(|entry| entry.view.as_ref().filter(|view| keep(view)).cloned()).collect();
+        Ok((listed, at(&listing)))
     }
 
     /// Composes again the sessions `dirt` touched in `listing`, and takes in their new launches.
@@ -280,7 +320,7 @@ impl TerminalViews {
         records.extend(again.into_iter().filter_map(|session| listing.sessions.get(&session).map(|entry| (session, entry.record.clone()))));
         let entries = self.entries(records.into_values().collect()).await?;
         let entries = listing.stamped(entries)?;
-        listing.sessions.extend(entries);
+        listing.extend(entries);
         Ok(())
     }
 
@@ -525,10 +565,28 @@ impl KindRecords<TerminalSession> for TerminalViews {
         self.engine_sources().await
     }
 
+    async fn positioned(&self) -> Result<(Vec<Record<TerminalSession>>, LogPosition), String> {
+        self.positioned_where(|_| true, Listing::read).await.map_err(|error| error.to_string())
+    }
+
+    async fn position(&self) -> Result<LogPosition, String> {
+        Ok(self.positioned_where(|_| false, Listing::read).await.map_err(|error| error.to_string())?.1)
+    }
+
+    /// Named from the listing's own changes, which take in this home's observations: within this
+    /// run only.
+    async fn changed_since(&self, position: &LogPosition) -> Result<Since, String> {
+        let since = |listing: &Listing| match listing.changed.since(position.unlogged.as_ref()) {
+            Ok(names) => Since::Changed { names, through: listing.read() },
+            Err(reason) => Since::Expired(reason),
+        };
+        Ok(self.positioned_where(|_| false, since).await.map_err(|error| error.to_string())?.1)
+    }
+
     /// Every home's listed copy of `name`, and this home's newest launch of it however it ended.
     async fn copies(&self, name: &str) -> Result<Vec<Record<TerminalSession>>, String> {
         let here = self.home();
-        let mut copies = self.listed_where(|object| object.name == name).await.map_err(|error| error.to_string())?;
+        let mut copies = self.sources_named(name).await?;
         if !copies.iter().any(|object| object.home == here) {
             let owned = name.to_owned();
             let record = self.blocking(move |reads| reads.terminals()?.get(&owned, None)).await.map_err(|error| error.to_string())?;
@@ -537,6 +595,11 @@ impl KindRecords<TerminalSession> for TerminalViews {
             }
         }
         Ok(copies)
+    }
+
+    /// Every home's listed copy of `name`: a released launch is listed no more.
+    async fn sources_named(&self, name: &str) -> Result<Vec<Record<TerminalSession>>, String> {
+        self.listed_where(|object| object.name == name).await.map_err(|error| error.to_string())
     }
 
     async fn apply(

@@ -11,6 +11,7 @@ use std::{
 };
 
 use super::reads::created_at;
+use super::resume::logged_since;
 use super::watch::CommitsSeen;
 use super::watch::SharedChanges;
 use chrono::{DateTime, Utc};
@@ -19,7 +20,7 @@ use flotilla_engine_store::{
     plain::{PendingChange, PlainError, PlainLog},
 };
 use flotilla_resources::{
-    engine_records::{KindRecords, Record},
+    engine_records::{KindRecords, LogPosition, Record, Since},
     Resource,
 };
 use flotilla_schema::{Kind, NewChange, Timestamp};
@@ -263,6 +264,26 @@ impl<K: PlainKind> KindRecords<K::Resource> for PlainRecords<K> {
                 held.clone().map_err(|error| tracing::warn!(%error, kind = K::KIND, "skipping a record that does not encode")).ok()
             })
             .collect())
+    }
+
+    async fn positioned(&self) -> Result<(Vec<Record<K::Resource>>, LogPosition), String> {
+        let resident = self.refresh()?;
+        let records = resident
+            .records
+            .values()
+            .filter_map(|held| {
+                held.clone().map_err(|error| tracing::warn!(%error, kind = K::KIND, "skipping a record that does not encode")).ok()
+            })
+            .collect();
+        Ok((records, LogPosition::logged(resident.follower.cursors().clone())))
+    }
+
+    async fn position(&self) -> Result<LogPosition, String> {
+        Ok(LogPosition::logged(self.refresh()?.follower.cursors().clone()))
+    }
+
+    async fn changed_since(&self, position: &LogPosition) -> Result<Since, String> {
+        logged_since(&self.service, [K::CODE], position)
     }
 
     /// Every home's record `name`, read from the resident map by name.

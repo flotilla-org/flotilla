@@ -18,7 +18,7 @@ use axum::{
 use chrono::{DateTime, Utc};
 use flotilla_protocol::EnvironmentId;
 use flotilla_resources::{
-    engine_records::{KindRecords, Record},
+    engine_records::{KindRecords, LogPosition, Record, Since},
     AccessDelivery, Clock, InputMeta, CONVOY_LABEL,
 };
 use flotilla_store::ResourceBackend;
@@ -214,6 +214,81 @@ async fn resource_watch_streams_newline_delimited_events() {
         lines.lines().map(|line| serde_json::from_str::<serde_json::Value>(line).expect("one JSON event per line")).collect::<Vec<_>>();
     assert!(events.iter().any(|event| event["object"]["metadata"]["name"] == "before"));
     assert!(events.iter().any(|event| event["type"] == "ADDED" && event["object"]["metadata"]["name"] == "after"));
+}
+
+/// The collection's resourceVersion, as a list over `path` returns it, encoded for a query.
+async fn listed_version(daemon: &Incarnation, path: &str) -> String {
+    let listed = daemon.call(CallerAuth::Socket(None), get(path)).await;
+    assert_eq!(listed.status, StatusCode::OK);
+    let version = listed.json()["metadata"]["resourceVersion"].as_str().expect("a listing's resourceVersion").to_owned();
+    url::form_urlencoded::byte_serialize(version.as_bytes()).collect()
+}
+
+// #3108: a collection watch resumes from a listing's resourceVersion, with or without the other
+// homes' copies: it sends no snapshot, and its first event is the change made since the listing.
+#[tokio::test]
+async fn resource_watch_resumes_from_a_listing_resource_version() {
+    for replicas in ["", "&includeReplicas=true"] {
+        let daemon = Incarnation::new();
+        let deliveries = daemon.backend.using::<AccessDelivery>("flotilla");
+        deliveries.create(&InputMeta::builder().name("before".into()).build(), &delivery("demo")).await.expect("seed delivery");
+        let path = "/apis/flotilla.work/v1/namespaces/flotilla/accessdeliveries";
+        let listing = if replicas.is_empty() { path.to_owned() } else { format!("{path}?includeReplicas=true") };
+        let version = listed_version(&daemon, &listing).await;
+        deliveries.create(&InputMeta::builder().name("after".into()).build(), &delivery("demo")).await.expect("delivery since");
+        let mut request = get(&format!("{path}?watch=true&resourceVersion={version}{replicas}"));
+        request.extensions_mut().insert(CallerAuth::Socket(None));
+        let response = daemon.router.clone().oneshot(request).await.expect("router");
+        assert_eq!(response.status(), StatusCode::OK, "{replicas}");
+        let mut body = response.into_body().into_data_stream();
+        let mut received = Vec::new();
+        while !received.contains(&b'\n') {
+            let chunk = tokio::time::timeout(std::time::Duration::from_secs(5), futures::StreamExt::next(&mut body))
+                .await
+                .expect("watch event in time")
+                .expect("watch open")
+                .expect("watch chunk");
+            received.extend_from_slice(&chunk);
+        }
+        let line = String::from_utf8(received).expect("UTF-8");
+        let first: serde_json::Value = serde_json::from_str(line.lines().next().expect("a line")).expect("one JSON event");
+        assert_eq!((first["type"].as_str(), first["object"]["metadata"]["name"].as_str()), (Some("MODIFIED"), Some("after")), "{replicas}");
+    }
+}
+
+// #3108: a watch from a resourceVersion is gone (410) once the log no longer holds what followed
+// it: another home's Forges reached this store as a snapshot, which logs nothing to read since.
+#[tokio::test]
+async fn resource_watch_from_before_a_snapshot_catch_up_is_gone() {
+    use flotilla_resources::{Forge, ForgeKind, ForgeSpec};
+    let daemon = Incarnation::new();
+    let service = &daemon._store.as_ref().expect("an engine store").service;
+    let forge = |id: &str| {
+        ForgeSpec::builder()
+            .forge_id(id.to_owned())
+            .kind(ForgeKind::Forgejo)
+            .hosts([format!("{id}.example")].into())
+            .https_url(format!("https://{id}.example"))
+            .git_ssh_host(format!("{id}.example"))
+            .build()
+    };
+    let beta = flotilla_provisioning_testkit::other_home::OtherHome::open("beta");
+    beta.definition::<Forge>("beta-one", &forge("one")).await;
+    beta.replicate_to(service);
+    let path = "/apis/flotilla.work/v1/namespaces/flotilla/forges";
+    let version = listed_version(&daemon, &format!("{path}?includeReplicas=true")).await;
+    beta.definition::<Forge>("beta-two", &forge("two")).await;
+    beta.replicate_to(service);
+    for replicas in ["", "&includeReplicas=true"] {
+        // A watch that started would stream until dropped.
+        let resumed = tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            daemon.call(CallerAuth::Socket(None), get(&format!("{path}?watch=true&resourceVersion={version}{replicas}"))),
+        )
+        .await
+        .expect("a resume past a snapshot is answered, not started");
+        assert_eq!(resumed.status, StatusCode::GONE, "{replicas}");
+    }
 }
 
 // Only the main Unix socket mints login codes, and only when a TCP listener exists to
@@ -447,6 +522,18 @@ impl<R: flotilla_resources::Resource> KindRecords<R> for EveryKindEmpty {
         Ok(Vec::new())
     }
     async fn sources(&self) -> Result<Vec<Record<R>>, String> {
+        Ok(Vec::new())
+    }
+    async fn positioned(&self) -> Result<(Vec<Record<R>>, LogPosition), String> {
+        Ok((Vec::new(), LogPosition::default()))
+    }
+    async fn position(&self) -> Result<LogPosition, String> {
+        Ok(LogPosition::default())
+    }
+    async fn changed_since(&self, _: &LogPosition) -> Result<Since, String> {
+        Ok(Since::Changed { names: Default::default(), through: LogPosition::default() })
+    }
+    async fn copies(&self, _: &str) -> Result<Vec<Record<R>>, String> {
         Ok(Vec::new())
     }
     async fn apply(

@@ -9,6 +9,21 @@ pub trait ChangeCursor<C>: Send {
     /// How far its passes have read the log: it never falls, and moves with every entry a pass
     /// reads.
     fn position(&self) -> u64;
+    /// Each home's sequence its passes have read through.
+    fn read_through(&self) -> std::collections::BTreeMap<String, u64>;
+    /// The records written since each home's sequence in `at`, read once and leaving the cursor
+    /// where it is, with each home's sequence they were read through. A home `at` does not name
+    /// is read from the start of its log.
+    fn since(&self, at: &std::collections::BTreeMap<String, u64>) -> Result<CursorSince, String>;
+}
+
+/// What a [`ChangeCursor`] read of the records written since some sequences found.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum CursorSince {
+    /// The records written, by name and home, and each home's sequence read through.
+    Changed { written: Vec<(String, String)>, through: std::collections::BTreeMap<String, u64> },
+    /// The log no longer holds what was written since: why.
+    Expired(String),
 }
 
 /// A provisioning kind whose lifecycle the engine can hold.

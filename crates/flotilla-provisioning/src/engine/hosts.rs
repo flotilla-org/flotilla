@@ -30,7 +30,7 @@ use flotilla_protocol::{
     EnvironmentId, HostSummary, NodeId, NodeInfo, SystemInfo,
 };
 use flotilla_resources::{
-    engine_records::{KindRecords, Record},
+    engine_records::{KindRecords, LogPosition, Record, Since, UnloggedJournal},
     CredentialExpiry, FulfilmentFacts, HarnessFacts, Host, HostCondition, HostConnection, HostSpec, HostStatus, LocalImageInventories,
     AGENT_ADAPTERS_CAPABILITY, CODEX_CENTRAL_LOGIN_CAPABILITY, CREDENTIAL_EXPIRY_CAPABILITY, ENVIRONMENT_PROVIDERS_CAPABILITY,
     HELD_CREDENTIALS_CAPABILITY, IMAGE_DIGESTS_CAPABILITY, OWNING_DAEMON_CAPABILITY, PLACEMENT_CAPABILITY, SSH_HOST_CAPABILITY,
@@ -43,6 +43,7 @@ use serde_json::{json, Value};
 
 use super::host_import;
 use super::reads::created_at;
+use super::resume::followed_since;
 use super::watch::CommitsSeen;
 use super::watch::SharedChanges;
 use crate::stored::host::{Class, Condition, HostObservation, HostRecord, Readiness};
@@ -299,6 +300,9 @@ pub struct EngineHosts {
     changes: SharedChanges,
     /// Held across a write's read and its edit, so the observers at this home write one at a time.
     writing: tokio::sync::Mutex<()>,
+    /// This run, which no change outside the log is counted in: a reading resumes only within it,
+    /// as when each home was last heard is this run's judgement.
+    unlogged: UnloggedJournal,
     clock: Arc<dyn flotilla_resources::Clock>,
 }
 
@@ -324,6 +328,7 @@ impl EngineHosts {
             log,
             resident: Mutex::new(Resident { follower, records: Records::new() }),
             writing: tokio::sync::Mutex::new(()),
+            unlogged: UnloggedJournal::default(),
             clock,
         };
         let homes = opened.service.homes();
@@ -343,6 +348,11 @@ impl EngineHosts {
                 .map_err(|error| error.to_string())?;
         }
         Ok(opened)
+    }
+
+    /// A reading through `homes`' sequences, in this run.
+    fn positioned_at(&self, homes: BTreeMap<String, u64>) -> LogPosition {
+        LogPosition { homes, unlogged: Some(self.unlogged.read()) }
     }
 
     /// Brings the resident map up to the store: every entry written since the last refresh.
@@ -520,6 +530,28 @@ impl KindRecords<Host> for EngineHosts {
     async fn sources(&self) -> Result<Vec<Record<Host>>, String> {
         let resident = self.refresh()?;
         Ok(resident.records.iter().filter_map(|((name, home), held)| self.object(name, home, held)).collect())
+    }
+
+    async fn positioned(&self) -> Result<(Vec<Record<Host>>, LogPosition), String> {
+        let resident = self.refresh()?;
+        let records = resident.records.iter().filter_map(|((name, home), held)| self.object(name, home, held)).collect();
+        Ok((records, self.positioned_at(resident.follower.cursors().clone())))
+    }
+
+    async fn position(&self) -> Result<LogPosition, String> {
+        Ok(self.positioned_at(self.refresh()?.follower.cursors().clone()))
+    }
+
+    async fn changed_since(&self, position: &LogPosition) -> Result<Since, String> {
+        if let Err(reason) = self.unlogged.since(position.unlogged.as_ref()) {
+            return Ok(Since::Expired(reason));
+        }
+        Ok(match followed_since(&self.service, [HOST, OBSERVATION], position)? {
+            Ok((changed, through)) => {
+                Since::Changed { names: changed.into_iter().map(|identity| identity.name).collect(), through: self.positioned_at(through) }
+            }
+            Err(reason) => Since::Expired(reason),
+        })
     }
 
     /// Every home's Host `name`, read from the resident map by name.

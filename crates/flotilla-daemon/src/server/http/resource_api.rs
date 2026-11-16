@@ -9,7 +9,8 @@ use flotilla_schema_sqlite::stream::Service;
 use flotilla_store::{
     get_resource_kind, get_resource_kind_all_provenances, get_resource_kind_including_replicas, list_resource_kind,
     list_resource_kind_including_replicas, list_resource_kind_replica_sources, registered_resource_namespaces, watch_resource_kind,
-    watch_resource_kind_from, watch_resource_kind_including_replicas, DynamicResourceWatch, ResourceBackend, REGISTERED_RESOURCE_KINDS,
+    watch_resource_kind_from, watch_resource_kind_including_replicas, watch_resource_kind_including_replicas_from, DynamicResourceWatch,
+    ResourceBackend, REGISTERED_RESOURCE_KINDS,
 };
 
 /// What the resource API answers, before it is written to a connection.
@@ -266,22 +267,19 @@ pub(in crate::server) async fn respond(
     if replica_sources {
         return Reply::error(400, "replica sources are a collection read, not a watch");
     }
-    let watched = if include_replicas {
-        if query.contains_key("resourceVersion") {
-            Err(ResourceError::invalid("include-replicas watches do not support resourceVersion resume"))
-        } else {
-            watch_resource_kind_including_replicas(&backend, namespace, kind).await
+    let start = query.get("resourceVersion").map(|resource_version| match query.get("generation") {
+        Some(generation) => {
+            WatchStart::FromVersionInGeneration { generation: generation.clone(), resource_version: resource_version.clone() }
         }
-    } else if let Some(resource_version) = query.get("resourceVersion") {
-        let start = match query.get("generation") {
-            Some(generation) => {
-                WatchStart::FromVersionInGeneration { generation: generation.clone(), resource_version: resource_version.clone() }
-            }
-            None => WatchStart::FromVersion(resource_version.clone()),
-        };
-        watch_resource_kind_from(&backend, namespace, kind, start).await
-    } else {
-        watch_resource_kind(&backend, namespace, kind).await
+        None => WatchStart::FromVersion(resource_version.clone()),
+    });
+    // An engine-served kind's include-replicas watch resumes from its list's position; any other
+    // kind's is refused.
+    let watched = match (include_replicas, start) {
+        (true, Some(start)) => watch_resource_kind_including_replicas_from(&backend, namespace, kind, start).await,
+        (true, None) => watch_resource_kind_including_replicas(&backend, namespace, kind).await,
+        (false, Some(start)) => watch_resource_kind_from(&backend, namespace, kind, start).await,
+        (false, None) => watch_resource_kind(&backend, namespace, kind).await,
     };
 
     match watched {

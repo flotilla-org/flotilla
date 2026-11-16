@@ -19,7 +19,7 @@ use flotilla_protocol::{LifecycleReading, NodeId};
 use flotilla_resources::{
     checkout_records::{latest_launches, CheckoutChange, CheckoutHolder, CheckoutLaunch, Launches},
     convoy_records::ConvoyChange,
-    engine_records::{KindRecords, Record},
+    engine_records::{KindRecords, LogPosition, Record, Since, UnloggedJournal},
     environment_records::{EnvironmentChange, EnvironmentRecord},
     lifecycle_reads::{ChangeCursor, LifecycleReads},
     terminal_records::{TerminalChange, TerminalRecord},
@@ -73,9 +73,21 @@ struct Listing {
     /// How many convoy changes their watch has told: with the cursors' positions, how far the
     /// listing has read.
     told: u64,
+    /// The launches whose view changed, in this run: what a reading resumes from.
+    changed: UnloggedJournal,
 }
 
 impl Listing {
+    /// Each listed launch's version, by its name.
+    fn shown(&self) -> BTreeMap<String, u64> {
+        self.works.values().filter_map(|entry| Some((entry.record.name.clone(), entry.view.as_ref()?.version))).collect()
+    }
+
+    /// Where a reader stands that has read the launches listed.
+    fn read(&self) -> LogPosition {
+        LogPosition { homes: BTreeMap::new(), unlogged: Some(self.changed.read()) }
+    }
+
     /// How far the listing has read: the log, by its cursors, and the convoys' changes told.
     fn position(&self) -> u64 {
         self.cursors.as_ref().map_or(0, Cursors::position).saturating_add(self.told)
@@ -263,6 +275,11 @@ impl VesselViews {
     /// deleted at its convoy's teardown; one that ended otherwise is listed while its convoy is
     /// live, its end shown.
     async fn listed(&self) -> Result<Vec<Record<Vessel>>, ResourceError> {
+        Ok(self.listed_at(|_| ()).await?.0)
+    }
+
+    /// [`Self::listed`], and what `at` reads of the listing they were copied from.
+    async fn listed_at<T>(&self, at: impl FnOnce(&Listing) -> T) -> Result<(Vec<Record<Vessel>>, T), ResourceError> {
         let mut listing = self.listing.lock().await;
         let (mut dirt, watched) = {
             let mut held = self.dirt.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
@@ -300,7 +317,7 @@ impl VesselViews {
             listing.current = false;
             return Err(error);
         }
-        Ok(listing.works.values().filter_map(|entry| entry.view.clone()).collect())
+        Ok((listing.works.values().filter_map(|entry| entry.view.clone()).collect(), at(&listing)))
     }
 
     /// Reads and composes every launch afresh into `listing`, kept from pass to pass when `keep`.
@@ -310,11 +327,22 @@ impl VesselViews {
         // Each view read again keeps its version while it shows the same.
         let entries = listing.stamped(entries)?;
         listing.current = keep;
+        let shown = listing.shown();
         listing.works.clear();
         listing.names.clear();
         for (work, entry) in entries {
             listing.names.insert(entry.record.name.clone(), work.clone());
             listing.works.insert(work, entry);
+        }
+        let now = listing.shown();
+        let changed: Vec<String> = shown
+            .iter()
+            .filter(|(name, version)| now.get(*name) != Some(version))
+            .map(|(name, _)| name.clone())
+            .chain(now.iter().filter(|(name, version)| shown.get(*name) != Some(version)).map(|(name, _)| name.clone()))
+            .collect();
+        for name in changed {
+            listing.changed.record([name]);
         }
         Ok(())
     }
@@ -370,8 +398,15 @@ impl VesselViews {
         records.extend(again.into_iter().filter_map(|work| listing.works.get(&work).map(|entry| (work, entry.record.clone()))));
         let entries = self.entries(records.into_values().collect()).await?;
         for (work, entry) in listing.stamped(entries)? {
-            if let Some(replaced) = listing.works.get(&work).filter(|held| held.record.name != entry.record.name) {
-                listing.names.remove(&replaced.record.name);
+            let shown = |entry: &Entry| entry.view.as_ref().map(|view| view.version);
+            match listing.works.get(&work) {
+                Some(replaced) if replaced.record.name != entry.record.name => {
+                    let replaced = replaced.record.name.clone();
+                    listing.names.remove(&replaced);
+                    listing.changed.record([replaced, entry.record.name.clone()]);
+                }
+                Some(held) if shown(held) == shown(&entry) => {}
+                _ => drop(listing.changed.record([entry.record.name.clone()])),
             }
             listing.names.insert(entry.record.name.clone(), work.clone());
             listing.works.insert(work, entry);
@@ -612,8 +647,27 @@ impl KindRecords<Vessel> for VesselViews {
     }
 
     /// The one launch `name` names: launch names are unique across homes.
+    /// The one launch `name` names, as launch names are unique across homes.
     async fn copies(&self, name: &str) -> Result<Vec<Record<Vessel>>, String> {
         Ok(self.get(name).await?.into_iter().collect())
+    }
+
+    async fn positioned(&self) -> Result<(Vec<Record<Vessel>>, LogPosition), String> {
+        self.listed_at(Listing::read).await.map_err(|error| error.to_string())
+    }
+
+    async fn position(&self) -> Result<LogPosition, String> {
+        Ok(self.positioned().await?.1)
+    }
+
+    /// Named from the listing's own changes, which take in the convoys' notes: within this run
+    /// only.
+    async fn changed_since(&self, position: &LogPosition) -> Result<Since, String> {
+        let since = |listing: &Listing| match listing.changed.since(position.unlogged.as_ref()) {
+            Ok(names) => Since::Changed { names, through: listing.read() },
+            Err(reason) => Since::Expired(reason),
+        };
+        Ok(self.listed_at(since).await.map_err(|error| error.to_string())?.1)
     }
 
     async fn apply(

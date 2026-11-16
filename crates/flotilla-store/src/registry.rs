@@ -529,14 +529,30 @@ pub async fn watch_resource_kind_from(
 
 /// A merged-view bootstrap: register local and replica streams before reading
 /// the initial members. Consumers apply `initial` once, then every queued stream
-/// event in order (including deletions). The overlay cursor is descriptive only;
-/// this watch cannot resume from a list cursor. Reconnect with a fresh snapshot.
+/// event in order (including deletions). An engine-served kind's cursor is its
+/// position, which [`watch_resource_kind_including_replicas_from`] resumes from;
+/// any other kind's overlay cursor is descriptive only. Reconnect with a fresh snapshot.
 pub async fn watch_resource_kind_including_replicas(
     backend: &ResourceBackend,
     namespace: &str,
     requested_kind: &str,
 ) -> Result<DynamicResourceWatch, ResourceError> {
-    dispatch_resource_kind!(lookup_resource_kind(requested_kind)?.resource, watch_typed_including_replicas(backend, namespace).await)
+    dispatch_resource_kind!(lookup_resource_kind(requested_kind)?.resource, watch_typed_including_replicas(backend, namespace, None).await)
+}
+
+/// [`watch_resource_kind_including_replicas`] resumed from `start`'s cursor, which an engine-served
+/// kind's include-replicas list or watch handed out: no initial members, and first each change
+/// since. Refused for any other kind, whose overlay cursor cannot be resumed from.
+pub async fn watch_resource_kind_including_replicas_from(
+    backend: &ResourceBackend,
+    namespace: &str,
+    requested_kind: &str,
+    start: WatchStart,
+) -> Result<DynamicResourceWatch, ResourceError> {
+    dispatch_resource_kind!(
+        lookup_resource_kind(requested_kind)?.resource,
+        watch_typed_including_replicas(backend, namespace, Some(start)).await
+    )
 }
 
 pub async fn list_resource_kind_replica_sources(
@@ -863,6 +879,7 @@ async fn query_engine_typed<T: Resource>(
     namespace: &str,
     query: &crate::StoreQuery,
 ) -> Result<Value, ResourceError> {
+    let resource_version = replica_list_version::<T>(backend, namespace).await?;
     let listed = backend.query_declared::<T>(namespace, query).await?;
     let items = listed
         .items
@@ -874,13 +891,12 @@ async fn query_engine_typed<T: Resource>(
             Ok(value)
         })
         .collect::<Result<Vec<_>, ResourceError>>()?;
-    // The engine has no store-wide version or generation for a query: "overlay" is the list
-    // sentinel the other engine reads send, and generation stays absent. The local root is the
-    // authority a remote definitions query merges against.
+    // The engine's position, taken before the query, is the version a watch resumes from; it has
+    // no generation. The local root is the authority a remote definitions query merges against.
     Ok(json!({
         "apiVersion": api_version(T::API_PATHS),
         "kind": format!("{}List", T::API_PATHS.kind),
-        "metadata": {"resourceVersion": "overlay", "localRoot": backend.local_root()?},
+        "metadata": {"resourceVersion": resource_version, "localRoot": backend.local_root()?},
         "items": items,
     }))
 }
@@ -899,6 +915,7 @@ async fn list_typed_including_replicas<T: Resource>(
     backend: &ResourceBackend,
     namespace: &str,
 ) -> Result<DynamicResourceList, ResourceError> {
+    let resource_version = replica_list_version::<T>(backend, namespace).await?;
     let listed = backend.including_replicas::<T>(namespace).list().await?;
     let items = listed.items.iter().map(read_object_value).collect::<Result<Vec<_>, _>>()?;
     Ok(DynamicResourceList {
@@ -908,18 +925,23 @@ async fn list_typed_including_replicas<T: Resource>(
         value: json!({
             "apiVersion": api_version(T::API_PATHS),
             "kind": format!("{}List", T::API_PATHS.kind),
-            "metadata": {"resourceVersion": "overlay"},
+            "metadata": {"resourceVersion": resource_version},
             "items": items,
         }),
     })
 }
 
 async fn list_typed_replica_sources<T: Resource>(backend: &ResourceBackend, namespace: &str) -> Result<DynamicResourceList, ResourceError> {
+    let resource_version = replica_list_version::<T>(backend, namespace).await?;
     let listed = backend.including_replicas::<T>(namespace).list_sources().await?;
-    dynamic_read_list::<T>(namespace, listed)
+    dynamic_read_list::<T>(namespace, listed, resource_version)
 }
 
-fn dynamic_read_list<T: Resource>(namespace: &str, listed: ReadResourceList<T>) -> Result<DynamicResourceList, ResourceError> {
+fn dynamic_read_list<T: Resource>(
+    namespace: &str,
+    listed: ReadResourceList<T>,
+    resource_version: String,
+) -> Result<DynamicResourceList, ResourceError> {
     let items = listed.items.iter().map(read_object_value).collect::<Result<Vec<_>, _>>()?;
     Ok(DynamicResourceList {
         kind: T::API_PATHS.kind.to_string(),
@@ -928,7 +950,7 @@ fn dynamic_read_list<T: Resource>(namespace: &str, listed: ReadResourceList<T>) 
         value: json!({
             "apiVersion": api_version(T::API_PATHS),
             "kind": format!("{}List", T::API_PATHS.kind),
-            "metadata": {"resourceVersion": "overlay"},
+            "metadata": {"resourceVersion": resource_version},
             "items": items,
         }),
     })
@@ -964,7 +986,8 @@ async fn get_typed_including_replicas<T: Resource>(
 
 async fn get_all_typed<T: Resource>(backend: &ResourceBackend, namespace: &str, name: &str) -> Result<DynamicResourceList, ResourceError> {
     let listed = backend.including_replicas::<T>(namespace).get_all(name).await?;
-    dynamic_read_list::<T>(namespace, listed)
+    // A name's copies are not a collection a watch resumes over.
+    dynamic_read_list::<T>(namespace, listed, "overlay".to_owned())
 }
 
 async fn delete_typed<T: Resource>(backend: &ResourceBackend, namespace: &str, name: &str) -> Result<DynamicResourceDelete, ResourceError> {
@@ -1204,7 +1227,26 @@ fn dynamic_watch<T: Resource>(
 async fn watch_typed_including_replicas<T: Resource>(
     backend: &ResourceBackend,
     namespace: &str,
+    start: Option<WatchStart>,
 ) -> Result<DynamicResourceWatch, ResourceError> {
+    let definitions = backend.definitions::<T>(namespace);
+    if let Some(WatchStart::FromVersion(resource_version) | WatchStart::FromVersionInGeneration { resource_version, .. }) = start {
+        let Some(stream) = definitions.engine_watch_from(&resource_version).await else {
+            return Err(ResourceError::invalid("include-replicas watches do not support resourceVersion resume"));
+        };
+        let stream = stream?.map(|event| event.and_then(|event| read_watch_event_value(&event))).boxed();
+        return Ok(DynamicResourceWatch {
+            kind: T::API_PATHS.kind.to_string(),
+            plural: T::API_PATHS.plural.to_string(),
+            namespace: namespace.to_string(),
+            resource_version,
+            generation: None,
+            initial: Vec::new(),
+            stream,
+        });
+    }
+    // Positioned before the stream and the members: a resume from it names again any change they hold.
+    let resource_version = replica_list_version::<T>(backend, namespace).await?;
     let resolver = backend.including_replicas::<T>(namespace);
     // Subscribe before listing to cover the handoff. WatchChannel is bounded
     // (256 events); overflow reports WatchExpired rather than growing a queue.
@@ -1220,11 +1262,17 @@ async fn watch_typed_including_replicas<T: Resource>(
         kind: T::API_PATHS.kind.to_string(),
         plural: T::API_PATHS.plural.to_string(),
         namespace: namespace.to_string(),
-        resource_version: "overlay".to_string(),
+        resource_version,
         generation: None,
         initial,
         stream,
     })
+}
+
+/// The cursor an include-replicas read of `T` carries: an engine-served kind's position, taken
+/// before the read; for any other kind the overlay sentinel, which no watch resumes from.
+async fn replica_list_version<T: Resource>(backend: &ResourceBackend, namespace: &str) -> Result<String, ResourceError> {
+    backend.definitions::<T>(namespace).engine_position().await.unwrap_or_else(|| Ok("overlay".to_owned()))
 }
 
 async fn apply_typed<T: Resource>(

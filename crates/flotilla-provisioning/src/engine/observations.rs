@@ -25,7 +25,9 @@ use flotilla_engine_store::{
 };
 use flotilla_resources::{
     address::record_name,
-    engine_records::{BranchChangeRequest, ChangeRequestBranches, KindRecords, ObservationFailures, Record, SourceObservers},
+    engine_records::{
+        BranchChangeRequest, ChangeRequestBranches, KindRecords, LogPosition, ObservationFailures, Record, Since, SourceObservers,
+    },
     ChangeRequest, ChangeRequestSpec, ChangeRequestStatus, Issue, IssueSpec, IssueStatus, Resource,
 };
 use flotilla_schema::{Kind, KindCode, NewChange, Timestamp};
@@ -33,6 +35,7 @@ use flotilla_schema_sqlite::{stream::Service, Read, ResourceId, StoreError};
 use futures::stream::BoxStream;
 
 use super::reads::created_at;
+use super::resume::logged_since;
 use super::watch::CommitsSeen;
 use super::watch::SharedChanges;
 use crate::stored::forge_observation::{ChangeRequestRecord, IssueRecord};
@@ -234,6 +237,9 @@ impl ObservedAs for Issue {
 
 /// A record with when its values were last confirmed.
 type Confirmed<R> = (DateTime<Utc>, Record<R>);
+
+/// Copies with the sequences the resident map was read through.
+type PositionedCopies<R> = (Vec<Confirmed<R>>, BTreeMap<String, u64>);
 
 /// Every home's records, by kind, name and home.
 type Records = BTreeMap<(&'static str, String, String), Held>;
@@ -481,8 +487,14 @@ impl EngineObservations {
     /// Every home's copy of `K`'s records, or of its record `name` alone, with when each was last
     /// confirmed. A record that does not encode is reported once and not read.
     fn copies_of<K: Observed>(&self, name: Option<&str>) -> Result<Vec<Confirmed<K::Resource>>, String> {
+        Ok(self.positioned_copies::<K>(name)?.0)
+    }
+
+    /// [`Self::copies_of`], and the sequences the resident map was read through.
+    fn positioned_copies<K: Observed>(&self, name: Option<&str>) -> Result<PositionedCopies<K::Resource>, String> {
         let kind = K::NAME;
         let mut resident = self.refresh()?;
+        let position = resident.follower.cursors().clone();
         let Resident { records, warned, .. } = &mut *resident;
         let held = match name {
             Some(name) => {
@@ -505,7 +517,7 @@ impl EngineObservations {
                 }
             }
         }
-        Ok(copies)
+        Ok((copies, position))
     }
 
     /// Each name's copy as several homes' resolve: the most recently confirmed, this home's on a tie.
@@ -598,6 +610,19 @@ impl<R: ObservedAs> KindRecords<R> for EngineObservations {
 
     async fn sources(&self) -> Result<Vec<Record<R>>, String> {
         Ok(self.copies_of::<R::Record>(None)?.into_iter().map(|(_, copy)| copy).collect())
+    }
+
+    async fn positioned(&self) -> Result<(Vec<Record<R>>, LogPosition), String> {
+        let (copies, position) = self.positioned_copies::<R::Record>(None)?;
+        Ok((copies.into_iter().map(|(_, copy)| copy).collect(), LogPosition::logged(position)))
+    }
+
+    async fn position(&self) -> Result<LogPosition, String> {
+        Ok(LogPosition::logged(self.refresh()?.follower.cursors().clone()))
+    }
+
+    async fn changed_since(&self, position: &LogPosition) -> Result<Since, String> {
+        logged_since(&self.service, [R::Record::CODE], position)
     }
 
     async fn copies(&self, name: &str) -> Result<Vec<Record<R>>, String> {

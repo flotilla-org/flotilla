@@ -18,7 +18,7 @@ use flotilla_resources::{
     address::subject_for,
     convoy::{admission::AdmissionDocument, engine::launch_address},
     convoy_records::{ConvoyChange, ConvoyEnd, ConvoyListing, ConvoyMemory, ConvoyRecord, ConvoyRecords, SeatRecord, UnreadableLaunch},
-    lifecycle_reads::ChangeCursor,
+    lifecycle_reads::{ChangeCursor, CursorSince},
     ConvoyStatus, DiscoveredSubject, SubjectDiscovery, SubjectDiscoverySource,
 };
 use flotilla_schema::{Identity, Kind, KindCode, Timestamp};
@@ -185,6 +185,30 @@ impl ChangeCursor<ConvoyChange> for ConvoyCursor {
 
     fn position(&self) -> u64 {
         self.followed.position()
+    }
+
+    fn read_through(&self) -> BTreeMap<String, u64> {
+        self.followed.read_through()
+    }
+
+    /// Each stall record written is read as the launch it is about.
+    fn since(&self, at: &BTreeMap<String, u64>) -> Result<CursorSince, String> {
+        let (changed, through) = match self.followed.written_since(at)? {
+            Ok(written) => written,
+            Err(reason) => return Ok(CursorSince::Expired(reason)),
+        };
+        let changes = self
+            .service
+            .with_store(|store| changes_of(&mut store.read()?, changed.into_iter().map(Followed::Changed).collect()))
+            .map_err(|error| format!("engine convoys' changes: {error}"))?;
+        let written = changes
+            .into_iter()
+            .filter_map(|change| match change {
+                ConvoyChange::Changed { name, home } => Some((name, home)),
+                ConvoyChange::Rescanned => None,
+            })
+            .collect();
+        Ok(CursorSince::Changed { written, through })
     }
 }
 

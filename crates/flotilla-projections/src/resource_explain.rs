@@ -7,8 +7,11 @@ use flotilla_protocol::{
     CommandValue, DaemonEvent, EvidenceFreshness, ExplainedCondition, NodeId, RepoIdentity, ResourceCursor, ResourceReadEnvelope,
     ResourceReadRecord, ResourceRecordProvenance, ResourceRecordType, StepStatus,
 };
-use flotilla_resources::{ConditionValue, IntegrationCondition, ResourceError, ResourceProvenance, WatchStart};
-use flotilla_store::{watch_resource_kind, watch_resource_kind_from, watch_resource_kind_including_replicas, ResourceBackend};
+use flotilla_resources::{ConditionValue, IntegrationCondition, ResourceProvenance, WatchStart};
+use flotilla_store::{
+    watch_resource_kind, watch_resource_kind_from, watch_resource_kind_including_replicas, watch_resource_kind_including_replicas_from,
+    ResourceBackend,
+};
 use futures::StreamExt;
 use tokio_util::sync::CancellationToken;
 
@@ -41,7 +44,9 @@ pub async fn run_resource_watch_command(context: ResourceWatchCommandContext) ->
     // Cancellation below also drops any partial setup.
     let setup = async {
         match (context.include_replicas, start) {
-            (true, Some(_)) => Err(ResourceError::invalid("include-replicas watches do not support cursor resume")),
+            (true, Some(start)) => {
+                watch_resource_kind_including_replicas_from(&context.backend, &context.namespace, &context.kind, start).await
+            }
             (true, None) => watch_resource_kind_including_replicas(&context.backend, &context.namespace, &context.kind).await,
             (false, Some(start)) => watch_resource_kind_from(&context.backend, &context.namespace, &context.kind, start).await,
             (false, None) => watch_resource_kind(&context.backend, &context.namespace, &context.kind).await,

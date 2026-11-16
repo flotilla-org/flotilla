@@ -23,7 +23,7 @@ use flotilla_engine_store::{
 };
 use flotilla_resources::{
     definitions::{origin, stamp, DefinitionOrigin},
-    engine_records::{KindRecords, Record},
+    engine_records::{KindRecords, LogPosition, Record, Since, UnloggedJournal},
     DeclarationRefusedCondition, DispatchQueueAttention, DispatchQueueEntry, OperationalEntriesCondition, Project, ProjectSpec,
     ProjectStatus,
 };
@@ -33,6 +33,7 @@ use futures::stream::BoxStream;
 
 use super::provenance;
 use super::reads::created_at;
+use super::resume::followed_since;
 use super::watch::CommitsSeen;
 use super::watch::SharedChanges;
 use crate::stored::manifest_root::ManifestRoot;
@@ -229,8 +230,10 @@ pub struct EngineProjects {
     /// Held across each write, so this home's writes of one Project (its definition and its
     /// operations record together) never interleave. Taken before `resident` and `judged`.
     writing: Mutex<()>,
-    /// Ticks on each change of a judgement, which the log does not carry.
+    /// Ticks on each change of a judgement, which the log does not carry, with their count.
     judged_changes: tokio::sync::watch::Sender<u64>,
+    /// The names each change of a judgement touched. Taken under `judged`.
+    unlogged: Mutex<UnloggedJournal>,
     clock: Arc<dyn flotilla_resources::Clock>,
 }
 
@@ -255,6 +258,7 @@ impl EngineProjects {
             judged: Mutex::default(),
             writing: Mutex::default(),
             judged_changes: tokio::sync::watch::Sender::new(0),
+            unlogged: Mutex::default(),
             clock,
         };
         let homes = opened.service.homes();
@@ -389,8 +393,20 @@ impl EngineProjects {
         if held.queue != queue {
             held.queue = queue;
             held.revision += 1;
-            self.judged_changes.send_modify(|tick| *tick += 1);
+            self.judged_change(name);
         }
+    }
+
+    /// Counts a change of `name`'s judgement, under the judgements' lock, and ticks watchers.
+    fn judged_change(&self, name: &str) {
+        let count = locked(&self.unlogged).record([name.to_owned()]);
+        self.judged_changes.send_replace(count);
+    }
+
+    /// A reading through `homes`' sequences and the judgements counted so far; taken under the
+    /// judgements' lock, with the records it positions.
+    fn positioned_at(&self, homes: BTreeMap<String, u64>) -> LogPosition {
+        LogPosition { homes, unlogged: Some(locked(&self.unlogged).read()) }
     }
 }
 
@@ -421,7 +437,7 @@ impl KindRecords<Project> for EngineProjects {
 
     /// This home's dispatch judgements.
     fn unlogged_changes(&self) -> Option<u64> {
-        Some(*self.judged_changes.borrow())
+        Some(locked(&self.unlogged).count())
     }
 
     fn home(&self) -> String {
@@ -453,6 +469,44 @@ impl KindRecords<Project> for EngineProjects {
         names.dedup();
         let judged = locked(&self.judged);
         Ok(names.into_iter().flat_map(|name| self.objects(&resident.records, &judged, name)).filter_map(skip_unencoded).collect())
+    }
+
+    async fn positioned(&self) -> Result<(Vec<Record<Project>>, LogPosition), String> {
+        let resident = self.refresh()?;
+        let mut names: Vec<&String> = resident.records.keys().map(|(name, _)| name).collect();
+        names.dedup();
+        let judged = locked(&self.judged);
+        let records =
+            names.into_iter().flat_map(|name| self.objects(&resident.records, &judged, name)).filter_map(skip_unencoded).collect();
+        Ok((records, self.positioned_at(resident.follower.cursors().clone())))
+    }
+
+    async fn position(&self) -> Result<LogPosition, String> {
+        let resident = self.refresh()?;
+        let _judged = locked(&self.judged);
+        Ok(self.positioned_at(resident.follower.cursors().clone()))
+    }
+
+    /// A root's change names every Project of its home: its baselines hold the paths they read with.
+    async fn changed_since(&self, position: &LogPosition) -> Result<Since, String> {
+        let (changed, through) = match followed_since(&self.service, [PROJECT, OPS, ROOT], position)? {
+            Ok(followed) => followed,
+            Err(reason) => return Ok(Since::Expired(reason)),
+        };
+        let resident = self.refresh()?;
+        let _judged = locked(&self.judged);
+        let mut names = match locked(&self.unlogged).since(position.unlogged.as_ref()) {
+            Ok(names) => names,
+            Err(reason) => return Ok(Since::Expired(reason)),
+        };
+        for identity in changed {
+            if identity.kind == ROOT {
+                names.extend(resident.records.keys().filter(|(_, home)| *home == identity.home).map(|(name, _)| name.clone()));
+            } else {
+                names.insert(identity.name);
+            }
+        }
+        Ok(Since::Changed { names, through: self.positioned_at(through) })
     }
 
     /// Every home's record `name`, read from the resident map by name.
@@ -512,8 +566,9 @@ impl KindRecords<Project> for EngineProjects {
         // conditions, never conditions with no Project.
         self.remove::<ProjectOpsRecord>(name)?;
         self.remove::<ProjectDefinition>(name)?;
-        if locked(&self.judged).remove(name).is_some() {
-            self.judged_changes.send_modify(|tick| *tick += 1);
+        let mut judged = locked(&self.judged);
+        if judged.remove(name).is_some() {
+            self.judged_change(name);
         }
         Ok(())
     }

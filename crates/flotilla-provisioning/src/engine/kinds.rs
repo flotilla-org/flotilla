@@ -10,7 +10,7 @@
 //! as the change's item.
 
 use std::{
-    collections::BTreeMap,
+    collections::{BTreeMap, BTreeSet},
     sync::{Arc, Mutex, MutexGuard, PoisonError},
 };
 
@@ -21,7 +21,7 @@ use flotilla_engine_store::{
 use flotilla_resources::{
     definition_provenance::SEEDING_MANAGER,
     definitions::{origin, stamp},
-    engine_records::{KindRecords, Record},
+    engine_records::{KindRecords, LogPosition, Record, Since},
     FulfilmentKind, FulfilmentKindSpec, CONVOY_LABEL, MANAGED_BY_LABEL, PLACEMENT_SNAPSHOT_KIND, PREPARED_SNAPSHOT_LABEL,
 };
 use flotilla_schema::{ChangeHeader, ChangeItem, Identity, Kind, KindCode, NewChange, Timestamp};
@@ -30,6 +30,7 @@ use futures::stream::BoxStream;
 
 use super::provenance;
 use super::reads::created_at;
+use super::resume::followed_since;
 use super::watch::CommitsSeen;
 use super::watch::SharedChanges;
 use crate::stored::{manifest_root::ManifestRoot, placement::FulfilmentKindDefinition};
@@ -328,6 +329,33 @@ impl KindRecords<FulfilmentKind> for EngineKinds {
     async fn sources(&self) -> Result<Vec<Held>, String> {
         let resident = self.refresh()?;
         Ok(resident.records.values().cloned().collect())
+    }
+
+    async fn positioned(&self) -> Result<(Vec<Held>, LogPosition), String> {
+        let resident = self.refresh()?;
+        Ok((resident.records.values().cloned().collect(), LogPosition::logged(resident.follower.cursors().clone())))
+    }
+
+    async fn position(&self) -> Result<LogPosition, String> {
+        Ok(LogPosition::logged(self.refresh()?.follower.cursors().clone()))
+    }
+
+    /// A root's change names every kind of its home: its baselines hold the paths they read with.
+    async fn changed_since(&self, position: &LogPosition) -> Result<Since, String> {
+        let (changed, through) = match followed_since(&self.service, [CODE, ROOT], position)? {
+            Ok(followed) => followed,
+            Err(reason) => return Ok(Since::Expired(reason)),
+        };
+        let resident = self.refresh()?;
+        let mut names = BTreeSet::new();
+        for identity in changed {
+            if identity.kind == ROOT {
+                names.extend(resident.records.keys().filter(|(_, home)| *home == identity.home).map(|(name, _)| name.clone()));
+            } else {
+                names.insert(identity.name);
+            }
+        }
+        Ok(Since::Changed { names, through: LogPosition::logged(through) })
     }
 
     /// Every home's record `name`, read from the resident map by name.

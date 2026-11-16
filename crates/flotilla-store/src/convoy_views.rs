@@ -28,7 +28,7 @@ use flotilla_protocol::{LifecycleReading, NodeId};
 use flotilla_resources::{
     convoy::view::VesselReading,
     convoy_records::{ConvoyChange, ConvoyJoins, ConvoyNotes, ConvoyRecord, ConvoyRecords, WorkFacts},
-    engine_records::{KindRecords, Record},
+    engine_records::{KindRecords, LogPosition, Record, Since, UnloggedJournal},
     lifecycle_reads::{ChangeCursor, LifecycleReads},
     terminal_records::{newest_launches, TerminalChange},
     vessel_records::{interrupted_message, VesselChange},
@@ -73,6 +73,8 @@ struct HeldViews {
     refill_owed: bool,
     /// The launches held as unreadable, by `(home, launch)`, at the version last told.
     unreadable: BTreeMap<(String, String), u64>,
+    /// The launches whose view changed, in this run: what a reading resumes from.
+    changed: UnloggedJournal,
 }
 
 /// A launch's view and the version it is handed out at.
@@ -231,6 +233,7 @@ impl ConvoyViews {
                 owed: BTreeSet::new(),
                 refill_owed: false,
                 unreadable: BTreeMap::new(),
+                changed: UnloggedJournal::default(),
             };
             self.refill(&mut held).await?;
             *state = Some(held);
@@ -379,7 +382,7 @@ impl ConvoyViews {
         // Each view read again keeps its version while it shows the same; the rest leave.
         let read =
             composed.iter().map(|composed| (composed.home.clone(), composed.view.object.metadata.name.clone())).collect::<BTreeSet<_>>();
-        held.views.retain(|key, _| read.contains(key));
+        held.retain(&read);
         let listed = listing.unreadable.iter().map(|launch| (launch.home.clone(), launch.name.clone())).collect::<BTreeSet<_>>();
         held.unreadable.retain(|key, _| listed.contains(key));
         held.insert(composed).map_err(ResourceError::other)?;
@@ -530,6 +533,24 @@ impl KindRecords<Convoy> for ConvoyViews {
         self.engine_copies(name).await
     }
 
+    async fn positioned(&self) -> Result<(Vec<Record<Convoy>>, LogPosition), String> {
+        let (held, position) = self
+            .with_held(|held| (held.views.iter().map(|((home, _), held)| (home.clone(), held.clone())).collect::<Vec<_>>(), held.read()))
+            .await
+            .map_err(|error| error.to_string())?;
+        Ok((held.into_iter().map(|(home, held)| view_record(held, home)).collect(), position))
+    }
+
+    async fn position(&self) -> Result<LogPosition, String> {
+        self.with_held(HeldViews::read).await.map_err(|error| error.to_string())
+    }
+
+    /// Named from the views' own changes, which take in this home's notes: within this run only.
+    async fn changed_since(&self, position: &LogPosition) -> Result<Since, String> {
+        let position = position.clone();
+        self.with_held(move |held| held.since(&position)).await.map_err(|error| error.to_string())
+    }
+
     async fn apply(
         &self,
         name: &str,
@@ -573,6 +594,19 @@ struct Composed {
 }
 
 impl HeldViews {
+    /// Where a reader stands that has read the views held.
+    fn read(&self) -> LogPosition {
+        LogPosition { homes: BTreeMap::new(), unlogged: Some(self.changed.read()) }
+    }
+
+    /// The launches whose view changed since `position`.
+    fn since(&self, position: &LogPosition) -> Since {
+        match self.changed.since(position.unlogged.as_ref()) {
+            Ok(names) => Since::Changed { names, through: self.read() },
+            Err(reason) => Since::Expired(reason),
+        }
+    }
+
     /// How far the views have read: the log, by their cursors, and this home's notes.
     fn position(&self) -> u64 {
         self.cursors_read.saturating_add(self.notes_read)
@@ -600,14 +634,27 @@ impl HeldViews {
                     && held.view.object.status == view.object.status
             });
             let version = crate::held_listing::version(held.map(|held| held.version), same, position)?;
+            if !same {
+                self.changed.record([key.1.clone()]);
+            }
             self.views.insert(key, HeldView { view, version });
         }
         Ok(())
     }
 
     fn remove(&mut self, key: &(String, String)) {
-        self.views.remove(key);
+        if self.views.remove(key).is_some() {
+            self.changed.record([key.1.clone()]);
+        }
         self.unreadable.remove(key);
+    }
+
+    /// Keeps only the views `keep` names.
+    fn retain(&mut self, keep: &BTreeSet<(String, String)>) {
+        let gone: Vec<_> = self.views.keys().filter(|key| !keep.contains(*key)).cloned().collect();
+        for key in &gone {
+            self.remove(key);
+        }
     }
 }
 

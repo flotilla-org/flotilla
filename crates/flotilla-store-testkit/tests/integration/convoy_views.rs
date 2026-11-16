@@ -19,7 +19,7 @@ use flotilla_resources::{
     convoy::admission::AdmissionDocument,
     convoy_records::{ConvoyChange, ConvoyListing, ConvoyMemory, ConvoyNotes, ConvoyRecord, ConvoyRecords, CrewNotes},
     engine_records::KindRecords,
-    lifecycle_reads::{ChangeCursor, LifecycleReads, ProvisioningKind},
+    lifecycle_reads::{ChangeCursor, CursorSince, LifecycleReads, ProvisioningKind},
     promises::{Promise, PromiseKind, PromiseSource, PromiseState},
     terminal_records::{
         TerminalChange, TerminalLaunchRequest, TerminalLaunchSource, TerminalObservations, TerminalRecord, TerminalRecords, TerminalRenewal,
@@ -134,6 +134,14 @@ impl<C> ChangeCursor<C> for Unchanging {
     fn position(&self) -> u64 {
         0
     }
+
+    fn read_through(&self) -> BTreeMap<String, u64> {
+        BTreeMap::new()
+    }
+
+    fn since(&self, _: &BTreeMap<String, u64>) -> Result<CursorSince, String> {
+        Ok(CursorSince::Changed { written: Vec::new(), through: BTreeMap::new() })
+    }
 }
 
 /// A gate a blocking read waits at while it is closed, telling `reaching` that it waits.
@@ -181,6 +189,14 @@ impl ChangeCursor<ConvoyChange> for Written {
 
     fn position(&self) -> u64 {
         self.passed
+    }
+
+    fn read_through(&self) -> BTreeMap<String, u64> {
+        BTreeMap::new()
+    }
+
+    fn since(&self, _: &BTreeMap<String, u64>) -> Result<CursorSince, String> {
+        Ok(CursorSince::Expired("the written changes hold no log".into()))
     }
 }
 

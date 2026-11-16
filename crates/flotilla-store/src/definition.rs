@@ -8,13 +8,13 @@ use std::{
 use chrono::{DateTime, Utc};
 use flotilla_protocol::NodeId;
 use flotilla_resources::{
-    engine_records::{KindRecords, Record},
+    engine_records::{KindRecords, LogPosition, Record, Since},
     ObjectMeta, ReadResourceObject, ReadWatchEvent,
 };
 use futures::{stream::BoxStream, StreamExt};
 use serde_json::{Map, Value};
 
-use crate::engine_feed::EngineSnapshot;
+use crate::engine_feed::Copies;
 use crate::port_reads;
 use crate::ProjectHierarchyStoreExt;
 use crate::{
@@ -87,6 +87,13 @@ impl<T: Resource> DefinitionResolver<T> {
         let listed = if self.holds_engine_records() { port_reads::list(records).await.map_err(ResourceError::other)? } else { Vec::new() };
         let objects = listed.into_iter().map(|record| self.object(record)).collect();
         with_builtins(T::API_PATHS.kind, &self.namespace, objects, None)
+    }
+
+    /// Where a reading of the engine's records of this kind now starts, as a resource version a
+    /// watch resumes from; `None` unless the kind is served by the engine.
+    pub(crate) async fn engine_position(&self) -> Option<Result<String, ResourceError>> {
+        let records = self.records()?;
+        Some(records.position().await.map(|position| position.encode()).map_err(ResourceError::other))
     }
 
     /// The engine's records of this kind as replica reads, every home's copy with its home as
@@ -171,62 +178,103 @@ impl<T: Resource> DefinitionResolver<T> {
             };
             return Some(Ok((initial, futures::stream::pending().boxed())));
         }
+        let watch = match self.engine_watcher(&records.home(), false).await? {
+            Ok(watch) => watch,
+            Err(error) => return Some(Err(error)),
+        };
+        let initial = watch.seen.reads.values().map(|(_, read)| clone_read(read)).collect();
+        Some(Ok((initial, watch.stream())))
+    }
+
+    /// The engine's records of this kind as a watch resumed from `requested_version`, a position
+    /// an engine list or watch handed out: each name changed since as its current read, or deleted,
+    /// then each later change. Expired where the position cannot be resumed from. `None` unless
+    /// the kind is served by the engine.
+    pub(crate) async fn engine_watch_from(
+        &self,
+        requested_version: &str,
+    ) -> Option<Result<BoxStream<'static, Result<ReadWatchEvent<T>, ResourceError>>, ResourceError>> {
+        let records = self.records()?;
+        let expired = || ResourceError::WatchExpired { requested_version: requested_version.to_owned(), compacted_through: None };
+        let Some(position) = LogPosition::decode(requested_version) else { return Some(Err(expired())) };
+        if !self.holds_engine_records() {
+            return Some(Ok(futures::stream::pending().boxed()));
+        }
+        let mut watch = match self.engine_watcher(&records.home(), true).await? {
+            Ok(watch) => watch,
+            Err(error) => return Some(Err(error)),
+        };
+        // Read after the watcher's records: every name changed before them is named here, and
+        // each change after them is also in a later batch.
+        let names = match records.changed_since(&position).await {
+            Ok(Since::Changed { names, .. }) => names,
+            Ok(Since::Expired(reason)) => {
+                tracing::info!(kind = T::API_PATHS.kind, %reason, "an engine watch's position expired");
+                return Some(Err(expired()));
+            }
+            Err(error) => return Some(Err(ResourceError::other(error))),
+        };
+        let position = watch.feed.state().position.encode();
+        for name in names.into_iter().filter(|name| !flotilla_resources::builtins::is_builtin(T::API_PATHS.kind, name)) {
+            // A name named but not held changed and is gone: whether the resumer held it is not known.
+            let event = match watch.seen.reads.get(&name) {
+                Some((_, read)) => ReadWatchEvent::Modified(clone_read(read)),
+                None => ReadWatchEvent::DeletedByName {
+                    tombstone: flotilla_resources::ResourceTombstone {
+                        name,
+                        namespace: self.namespace.clone(),
+                        resource_version: position.clone(),
+                        annotations: BTreeMap::new(),
+                    },
+                    provenance: ResourceProvenance::Local,
+                },
+            };
+            watch.pending.push_back(Ok(event));
+        }
+        Some(Ok(watch.stream()))
+    }
+
+    /// A watcher of the kind's shared feed, holding the reads of its records now; for a resume,
+    /// with every change committed before it.
+    async fn engine_watcher(&self, home: &str, resuming: bool) -> Option<Result<EngineWatch<T>, ResourceError>> {
         let feed = match self.backend.engine_feed::<T>().await? {
             Ok(feed) => feed,
             Err(error) => return Some(Err(error)),
         };
-        let (current, snapshots) = feed.subscribe();
+        // Subscribed before the records are read: a batch after them is in the watcher's next events.
+        let serials = feed.serials();
+        if resuming {
+            // The records hold every change committed before the resume, so each name it reads
+            // since its position shows as the feed holds it now, and later changes come in batches.
+            feed.read_through_now().await;
+        }
         let mut seen = SeenReads::<T>::default();
-        let initial = match self.diff(&records.home(), &current, &mut seen) {
-            Ok(_) => seen.reads.values().map(|(_, read)| clone_read(read)).collect(),
-            Err(error) => return Some(Err(error)),
+        let serial = {
+            let state = feed.state();
+            if let Err(error) = self.diff(home, &state.records, &mut seen) {
+                return Some(Err(error));
+            }
+            state.serial
         };
-        // Each poll converts the newest listing the watcher has not taken, so a listing published
-        // before a read is in the watcher's next events, and a slow watcher holds only its own reads.
-        let watch = EngineWatch {
-            _feed: feed,
-            snapshots,
+        Some(Ok(EngineWatch {
+            feed,
+            serials,
+            serial,
             seen,
             pending: VecDeque::new(),
             resolver: Self::new(self.backend.clone(), self.namespace.clone()),
-            home: records.home(),
-        };
-        let stream = futures::stream::unfold(watch, |mut watch| async move {
-            loop {
-                if let Some(event) = watch.pending.pop_front() {
-                    return Some((event, watch));
-                }
-                watch.snapshots.changed().await.ok()?;
-                let snapshot = watch.snapshots.borrow_and_update().clone();
-                match watch.resolver.diff(&watch.home, &snapshot, &mut watch.seen) {
-                    Ok(events) => watch.pending.extend(events.into_iter().map(Ok)),
-                    Err(error) => watch.pending.push_back(Err(error)),
-                }
-            }
-        })
-        .boxed();
-        Some(Ok((initial, stream)))
+            home: home.to_owned(),
+        }))
     }
 
-    /// The watch events taking `seen` to `snapshot`, with the built-ins: a record whose home,
+    /// The watch events taking `seen` to every record, with the built-ins: a record whose home,
     /// version, labels and annotations are unchanged keeps its earlier read without decoding again.
     /// A name several homes hold reads as the last listed.
-    fn diff(&self, home: &str, snapshot: &EngineSnapshot<T>, seen: &mut SeenReads<T>) -> Result<Vec<ReadWatchEvent<T>>, ResourceError> {
-        let listed = snapshot.as_ref().as_ref().map_err(|error| ResourceError::other(error.clone()))?;
+    fn diff(&self, home: &str, records: &Copies<T>, seen: &mut SeenReads<T>) -> Result<Vec<ReadWatchEvent<T>>, ResourceError> {
         let mut current = BTreeMap::new();
-        for record in listed {
+        for record in records.values().flatten() {
             let stamp = RecordStamp::of(record);
-            let read = match seen.reads.get(&record.name) {
-                Some((Some(before), read)) if *before == stamp => clone_read(read),
-                _ => {
-                    let provenance = if record.home == home {
-                        ResourceProvenance::Local
-                    } else {
-                        ResourceProvenance::Replica { origin_root: NodeId::new(record.home.clone()), last_synced_at: Utc::now() }
-                    };
-                    ReadResourceObject { object: self.object(record.clone()), provenance }
-                }
-            };
+            let read = self.read_of(home, record, &stamp, seen);
             current.insert(record.name.clone(), (Some(stamp), read));
         }
         for object in builtin_objects::<T>(T::API_PATHS.kind, &self.namespace)? {
@@ -237,19 +285,56 @@ impl<T: Resource> DefinitionResolver<T> {
         for (name, (_, read)) in &current {
             match previous.remove(name) {
                 None => pending.push(ReadWatchEvent::Added(clone_read(read))),
-                Some((_, before))
-                    if before.object.metadata.resource_version != read.object.metadata.resource_version
-                        || before.object.metadata.labels != read.object.metadata.labels
-                        || before.object.metadata.annotations != read.object.metadata.annotations =>
-                {
-                    pending.push(ReadWatchEvent::Modified(clone_read(read)))
-                }
+                Some((_, before)) if changed(&before, read) => pending.push(ReadWatchEvent::Modified(clone_read(read))),
                 Some(_) => {}
             }
         }
         pending.extend(previous.into_values().map(|(_, read)| ReadWatchEvent::Deleted(read)));
         seen.reads = current;
         Ok(pending)
+    }
+
+    /// The watch events taking `seen` to `records` for `names` alone, as [`Self::diff`] reads
+    /// them; a built-in's name stays the built-in.
+    fn diff_names(&self, home: &str, records: &Copies<T>, names: &BTreeSet<String>, seen: &mut SeenReads<T>) -> Vec<ReadWatchEvent<T>> {
+        let mut pending = Vec::new();
+        for name in names.iter().filter(|name| !flotilla_resources::builtins::is_builtin(T::API_PATHS.kind, name)) {
+            let current = records.get(name).and_then(|copies| copies.last()).map(|record| {
+                let stamp = RecordStamp::of(record);
+                let read = self.read_of(home, record, &stamp, seen);
+                (stamp, read)
+            });
+            match (seen.reads.remove(name), current) {
+                (None, Some((stamp, read))) => {
+                    pending.push(ReadWatchEvent::Added(clone_read(&read)));
+                    seen.reads.insert(name.clone(), (Some(stamp), read));
+                }
+                (Some((_, before)), Some((stamp, read))) => {
+                    if changed(&before, &read) {
+                        pending.push(ReadWatchEvent::Modified(clone_read(&read)));
+                    }
+                    seen.reads.insert(name.clone(), (Some(stamp), read));
+                }
+                (Some((_, before)), None) => pending.push(ReadWatchEvent::Deleted(before)),
+                (None, None) => {}
+            }
+        }
+        pending
+    }
+
+    /// `record`'s read: the one `seen` holds while its stamp is unchanged, else converted afresh.
+    fn read_of(&self, home: &str, record: &Record<T>, stamp: &RecordStamp, seen: &SeenReads<T>) -> ReadResourceObject<T> {
+        match seen.reads.get(&record.name) {
+            Some((Some(before), read)) if before == stamp => clone_read(read),
+            _ => {
+                let provenance = if record.home == home {
+                    ResourceProvenance::Local
+                } else {
+                    ResourceProvenance::Replica { origin_root: NodeId::new(record.home.clone()), last_synced_at: Utc::now() }
+                };
+                ReadResourceObject { object: self.object(record.clone()), provenance }
+            }
+        }
     }
 
     /// Writes `spec` under `meta`'s name at this home, with the origin `meta`'s stamps name.
@@ -788,12 +873,63 @@ pub(crate) fn record_object<T: Resource>(namespace: &str, record: Record<T>) -> 
 /// One watcher's place in its kind's engine listings: the reads it has converted and the events
 /// of the last listing it has not yet handed on.
 struct EngineWatch<T: Resource> {
-    _feed: std::sync::Arc<crate::engine_feed::EngineFeed<T>>,
-    snapshots: tokio::sync::watch::Receiver<EngineSnapshot<T>>,
+    feed: std::sync::Arc<crate::engine_feed::EngineFeed<T>>,
+    serials: tokio::sync::watch::Receiver<u64>,
+    /// The serial of the feed's last batch taken.
+    serial: u64,
     seen: SeenReads<T>,
     pending: VecDeque<Result<ReadWatchEvent<T>, ResourceError>>,
     resolver: DefinitionResolver<T>,
     home: String,
+}
+
+impl<T: Resource> EngineWatch<T> {
+    /// Each event, as the watcher takes the feed's batches: the names a batch read again are
+    /// converted, and every record is compared again after a fresh listing or batches missed.
+    fn stream(self) -> BoxStream<'static, Result<ReadWatchEvent<T>, ResourceError>> {
+        futures::stream::unfold(self, |mut watch| async move {
+            loop {
+                if let Some(event) = watch.pending.pop_front() {
+                    return Some((event, watch));
+                }
+                watch.serials.changed().await.ok()?;
+                watch.take();
+            }
+        })
+        .boxed()
+    }
+
+    /// The events of the batches after the last taken.
+    fn take(&mut self) {
+        let EngineWatch { feed, serial, seen, pending, resolver, home, .. } = self;
+        let state = feed.state();
+        if state.serial == *serial {
+            return;
+        }
+        let mut names = BTreeSet::new();
+        let mut whole = false;
+        match state.after(*serial) {
+            None => whole = true,
+            Some(batches) => {
+                for batch in batches {
+                    match batch {
+                        crate::engine_feed::Batch::Changed(changed) => names.extend(changed.iter().cloned()),
+                        crate::engine_feed::Batch::Relisted => whole = true,
+                        crate::engine_feed::Batch::Failed(error) => pending.push_back(Err(ResourceError::other(error.clone()))),
+                    }
+                }
+            }
+        }
+        let events = match whole {
+            true => resolver.diff(home, &state.records, seen),
+            false => Ok(resolver.diff_names(home, &state.records, &names, seen)),
+        };
+        *serial = state.serial;
+        match events {
+            Ok(events) => pending.extend(events.into_iter().map(Ok)),
+            Err(error) => pending.push_back(Err(error)),
+        }
+    }
 }
 
 struct SeenReads<T: Resource> {
@@ -819,6 +955,13 @@ impl RecordStamp {
     fn of<T: Resource>(record: &Record<T>) -> Self {
         Self { home: record.home.clone(), version: record.version, labels: record.labels.clone(), annotations: record.annotations.clone() }
     }
+}
+
+/// Whether `read` shows a change from `before`: its version, labels or annotations moved.
+fn changed<T: Resource>(before: &ReadResourceObject<T>, read: &ReadResourceObject<T>) -> bool {
+    before.object.metadata.resource_version != read.object.metadata.resource_version
+        || before.object.metadata.labels != read.object.metadata.labels
+        || before.object.metadata.annotations != read.object.metadata.annotations
 }
 
 /// A copy of `read`; `ReadResourceObject` is `Clone` only for `Clone` kinds.

@@ -26,7 +26,7 @@ use flotilla_resources::account_access::{
     BindingState as OldState, EpochEntry, GrantName, GrantScope, PendingBinding, ProvisionRecord, ProvisionWrite, ACCOUNT_BINDING_LABEL,
     ACCOUNT_CREDENTIAL_LABEL,
 };
-use flotilla_resources::engine_records::{KindRecords, Record};
+use flotilla_resources::engine_records::{KindRecords, LogPosition, Record, Since};
 use flotilla_resources::CONVOY_LABEL;
 use flotilla_schema::{CreatedAt, Identity, Kind, KindCode, NewChange, Ref, State, Timestamp};
 use flotilla_schema_sqlite::{stream::Service, Read, StoreError};
@@ -36,6 +36,7 @@ use futures::stream::BoxStream;
 use chrono::{DateTime, Utc};
 
 use super::reads::created_at;
+use super::resume::{followed_since, logged_since};
 use super::watch::CommitsSeen;
 use super::watch::EngineWatch;
 use crate::stored::account::{
@@ -894,6 +895,24 @@ impl KindRecords<BindingResource> for EngineAccounts {
         self.bindings(Some(name))
     }
 
+    async fn positioned(&self) -> Result<(Vec<Record<BindingResource>>, LogPosition), String> {
+        let resident = self.refresh()?;
+        let bindings = resident
+            .bindings
+            .iter()
+            .map(|((home, _), binding)| binding_object(binding, home, &resident.created))
+            .collect::<Result<_, _>>()?;
+        Ok((bindings, LogPosition::logged(resident.follower.cursors().clone())))
+    }
+
+    async fn position(&self) -> Result<LogPosition, String> {
+        Ok(LogPosition::logged(self.refresh()?.follower.cursors().clone()))
+    }
+
+    async fn changed_since(&self, position: &LogPosition) -> Result<Since, String> {
+        logged_since(&self.service, [BINDING], position)
+    }
+
     async fn list(&self) -> Result<Vec<Record<BindingResource>>, String> {
         Ok(resolved(self.bindings(None)?, &self.home))
     }
@@ -943,6 +962,44 @@ impl KindRecords<ProvisionResource> for EngineAccounts {
 
     async fn copies(&self, name: &str) -> Result<Vec<Record<ProvisionResource>>, String> {
         self.provisions(Some(name))
+    }
+
+    async fn positioned(&self) -> Result<(Vec<Record<ProvisionResource>>, LogPosition), String> {
+        let resident = self.refresh()?;
+        let provisions = resident
+            .provisions
+            .values()
+            .map(|provision| provision_object(provision, &resident.bindings, &resident.created))
+            .collect::<Result<_, _>>()?;
+        Ok((provisions, LogPosition::logged(resident.follower.cursors().clone())))
+    }
+
+    async fn position(&self) -> Result<LogPosition, String> {
+        Ok(LogPosition::logged(self.refresh()?.follower.cursors().clone()))
+    }
+
+    /// A binding's change names the provisions it labels with its convoy.
+    async fn changed_since(&self, position: &LogPosition) -> Result<Since, String> {
+        let (changed, through) = match followed_since(&self.service, [BINDING, PROVISION], position)? {
+            Ok(followed) => followed,
+            Err(reason) => return Ok(Since::Expired(reason)),
+        };
+        let resident = self.refresh()?;
+        let mut names = BTreeSet::new();
+        for identity in changed {
+            if identity.kind == BINDING {
+                names.extend(
+                    resident
+                        .provisions
+                        .values()
+                        .filter(|provision| provision.spec.binding.home == identity.home && provision.spec.binding.name == identity.name)
+                        .map(|provision| provision.name.clone()),
+                );
+            } else {
+                names.insert(identity.name);
+            }
+        }
+        Ok(Since::Changed { names, through: LogPosition::logged(through) })
     }
 
     async fn list(&self) -> Result<Vec<Record<ProvisionResource>>, String> {

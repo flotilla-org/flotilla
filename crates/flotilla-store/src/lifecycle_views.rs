@@ -24,9 +24,9 @@ use flotilla_protocol::LifecycleReading;
 use flotilla_resources::{
     checkout_records::{CheckoutLaunch, Launches},
     clone_records::{launched, CloneRecord},
-    engine_records::{KindRecords, Record},
+    engine_records::{KindRecords, LogPosition, Record, Since},
     environment_records::EnvironmentRecord,
-    lifecycle_reads::{ChangeCursor, LifecycleReads, RecordSet},
+    lifecycle_reads::{ChangeCursor, CursorSince, LifecycleReads, RecordSet},
     Checkout, ClonePhase, CloneStatus, Environment, EnvironmentPhase, EnvironmentStatus, ImageBuild, Resource,
 };
 
@@ -62,11 +62,25 @@ impl<R: Resource> Default for Versions<R> {
     }
 }
 
-/// A cursor read only for how far it has read.
+impl<R: Resource<Spec: PartialEq, Status: PartialEq>> Versions<R> {
+    /// The version `record`, showing `launch`, is handed out at: the one last handed out under
+    /// `key` while it shows the same, else `position`.
+    fn version(&self, key: &(String, String), record: &Record<R>, launch: &str, position: u64) -> Result<u64, String> {
+        let before = self.held.get(key);
+        let same = before.is_some_and(|(before, shown)| shown == launch && crate::held_listing::shows_the_same(record, before));
+        crate::held_listing::version(before.map(|(before, _)| before.version), same, position)
+    }
+}
+
+/// A cursor read for how far it has read, and for what was written since a reading.
 trait Position: Send {
     /// Passes the changes since the last pass; how far it has read. A pass that fails leaves it
     /// where it was.
     fn pass(&mut self) -> u64;
+    /// Each home's sequence it has read through.
+    fn read_through(&self) -> BTreeMap<String, u64>;
+    /// The records written since `at`, leaving it where it is.
+    fn since(&self, at: &BTreeMap<String, u64>) -> Result<CursorSince, String>;
 }
 
 impl<C: Send> Position for Box<dyn ChangeCursor<C>> {
@@ -75,6 +89,14 @@ impl<C: Send> Position for Box<dyn ChangeCursor<C>> {
             tracing::debug!(%error, "a lifecycle view's cursor did not pass; its versions move past the last");
         }
         self.position()
+    }
+
+    fn read_through(&self) -> BTreeMap<String, u64> {
+        ChangeCursor::read_through(self.as_ref())
+    }
+
+    fn since(&self, at: &BTreeMap<String, u64>) -> Result<CursorSince, String> {
+        ChangeCursor::since(self.as_ref(), at)
     }
 }
 
@@ -86,31 +108,90 @@ impl LifecycleViews {
     /// `R`'s records, each at the version it is handed out at: the version last handed out under
     /// its home and name while it shows the same, else how far the log was read before them.
     async fn versioned<R: LifecycleKind>(&self) -> Result<Vec<Record<R>>, String> {
-        let Some(versions) = R::versions(self) else { return Ok(R::records(self).await?.into_iter().map(|(record, _)| record).collect()) };
+        Ok(self.positioned::<R>().await?.0)
+    }
+
+    /// [`Self::versioned`], and each home's sequence the records were read at or after.
+    async fn positioned<R: LifecycleKind>(&self) -> Result<(Vec<Record<R>>, LogPosition), String> {
+        let Some(versions) = R::versions(self) else {
+            return Ok((R::records(self).await?.into_iter().map(|(record, _)| record).collect(), LogPosition::default()));
+        };
         let mut versions = versions.lock().await;
-        let (cursor, started) = (versions.cursor.take(), versions.started);
         // The position before the records: every entry it counts is read into them.
-        let (cursor, position) = self
-            .blocking(move |reads| {
-                let mut cursor = if started { cursor } else { R::cursor(reads)? };
-                let position = cursor.as_mut().map_or(0, |cursor| cursor.pass());
-                Ok((cursor, position))
-            })
-            .await?;
-        versions.cursor = cursor;
-        versions.started = true;
+        let (position, through) = self.passed(&mut versions).await?;
         let mut held = BTreeMap::new();
         let mut records = Vec::new();
         for (mut record, launch) in R::records(self).await? {
             let key = (record.home.clone(), record.name.clone());
-            let before = versions.held.get(&key);
-            let same = before.is_some_and(|(before, shown)| *shown == launch && crate::held_listing::shows_the_same(&record, before));
-            record.version = crate::held_listing::version(before.map(|(before, _)| before.version), same, position)?;
+            record.version = versions.version(&key, &record, &launch, position)?;
             held.insert(key, (record.clone(), launch));
             records.push(record);
         }
         versions.held = held;
+        Ok((records, LogPosition::logged(through)))
+    }
+
+    /// Every home's record `name`, each read by its name at each home the log is followed at.
+    async fn named<R: LifecycleKind>(&self, name: &str) -> Result<Vec<Record<R>>, String> {
+        let Some(versions) = R::versions(self) else { return Ok(Vec::new()) };
+        let mut versions = versions.lock().await;
+        let (position, through) = self.passed(&mut versions).await?;
+        if versions.cursor.is_none() {
+            drop(versions);
+            return Ok(self.versioned::<R>().await?.into_iter().filter(|record| record.name == name).collect());
+        }
+        let read = R::named(self, name.to_owned(), through.into_keys().collect()).await?;
+        let mut records = Vec::new();
+        let mut held = Vec::new();
+        for (mut record, launch) in read {
+            let key = (record.home.clone(), record.name.clone());
+            record.version = versions.version(&key, &record, &launch, position)?;
+            held.push((key, (record.clone(), launch)));
+            records.push(record);
+        }
+        versions.held.retain(|(_, held), _| held != name);
+        versions.held.extend(held);
         Ok(records)
+    }
+
+    /// The names written since `position`, by the records' log.
+    async fn changed<R: LifecycleKind>(&self, position: &LogPosition) -> Result<Since, String> {
+        let Some(versions) = R::versions(self) else { return Err(R::records(self).await.err().unwrap_or_default()) };
+        let mut versions = versions.lock().await;
+        self.passed(&mut versions).await?;
+        let (cursor, at) = (versions.cursor.take(), position.homes.clone());
+        let (cursor, since) = self
+            .blocking(move |_| {
+                let since = cursor.as_ref().map(|cursor| cursor.since(&at)).transpose()?;
+                Ok((cursor, since))
+            })
+            .await?;
+        versions.cursor = cursor;
+        Ok(match since {
+            Some(CursorSince::Changed { written, through }) => Since::Changed {
+                names: written.into_iter().map(|(name, _)| R::named_by(&name).to_owned()).collect(),
+                through: LogPosition::logged(through),
+            },
+            Some(CursorSince::Expired(reason)) => Since::Expired(reason),
+            None => Since::Expired("no log of these records is held here".to_owned()),
+        })
+    }
+
+    /// Passes `R`'s cursor, started at the first read: how far it has read, and each home's
+    /// sequence.
+    async fn passed<R: LifecycleKind>(&self, versions: &mut Versions<R>) -> Result<(u64, BTreeMap<String, u64>), String> {
+        let (cursor, started) = (versions.cursor.take(), versions.started);
+        let (cursor, position, through) = self
+            .blocking(move |reads| {
+                let mut cursor = if started { cursor } else { R::cursor(reads)? };
+                let position = cursor.as_mut().map_or(0, |cursor| cursor.pass());
+                let through = cursor.as_ref().map(|cursor| cursor.read_through()).unwrap_or_default();
+                Ok((cursor, position, through))
+            })
+            .await?;
+        versions.cursor = cursor;
+        versions.started = true;
+        Ok((position, through))
     }
 
     async fn blocking<T: Send + 'static>(
@@ -142,6 +223,16 @@ trait LifecycleKind: Resource<Spec: PartialEq, Status: PartialEq> + Sized {
     /// Every home's record of every name, each with the launch it shows where a later launch
     /// showing the same is still a change.
     async fn records(views: &LifecycleViews) -> Result<Vec<(Record<Self>, String)>, String>;
+
+    /// [`LifecycleKind::records`] of `name` alone, read by its name at each of `homes`.
+    async fn named(_views: &LifecycleViews, _name: String, _homes: Vec<String>) -> Result<Vec<(Record<Self>, String)>, String> {
+        Ok(Vec::new())
+    }
+
+    /// The name of the record a written record of its log shows as.
+    fn named_by(written: &str) -> &str {
+        written
+    }
 
     /// Where its views' versions are kept; none for a kind served only to refuse.
     fn versions(_views: &LifecycleViews) -> Option<&tokio::sync::Mutex<Versions<Self>>> {
@@ -178,6 +269,21 @@ impl LifecycleKind for flotilla_resources::Clone {
         Ok(newest_launches(records).into_iter().filter_map(clone_object).map(|record| (record, String::new())).collect())
     }
 
+    async fn named(views: &LifecycleViews, name: String, homes: Vec<String>) -> Result<Vec<(Record<Self>, String)>, String> {
+        let records = views
+            .blocking(move |reads| {
+                let clones = reads.clones()?;
+                homes.iter().filter_map(|home| clones.get(&name, Some(home)).transpose()).collect::<Result<Vec<_>, _>>()
+            })
+            .await?;
+        Ok(records.into_iter().filter_map(clone_object).map(|record| (record, String::new())).collect())
+    }
+
+    /// A launch shows as its clone.
+    fn named_by(written: &str) -> &str {
+        launched(written)
+    }
+
     fn versions(views: &LifecycleViews) -> Option<&tokio::sync::Mutex<Versions<Self>>> {
         Some(&views.clones)
     }
@@ -193,6 +299,16 @@ impl LifecycleKind for Environment {
 
     async fn records(views: &LifecycleViews) -> Result<Vec<(Record<Self>, String)>, String> {
         let records = views.blocking(|reads| reads.environments()?.every()).await?;
+        Ok(records.into_iter().filter_map(environment_object).map(|record| (record, String::new())).collect())
+    }
+
+    async fn named(views: &LifecycleViews, name: String, homes: Vec<String>) -> Result<Vec<(Record<Self>, String)>, String> {
+        let records = views
+            .blocking(move |reads| {
+                let environments = reads.environments()?;
+                homes.iter().filter_map(|home| environments.get(&name, Some(home)).transpose()).collect::<Result<Vec<_>, _>>()
+            })
+            .await?;
         Ok(records.into_iter().filter_map(environment_object).map(|record| (record, String::new())).collect())
     }
 
@@ -219,6 +335,31 @@ impl LifecycleKind for Checkout {
                 (checkout_object(record), launch)
             })
             .collect())
+    }
+
+    async fn named(views: &LifecycleViews, name: String, homes: Vec<String>) -> Result<Vec<(Record<Self>, String)>, String> {
+        let records = views
+            .blocking(move |reads| {
+                let checkouts = reads.checkouts()?;
+                let mut records = Vec::new();
+                for home in &homes {
+                    records.extend(checkouts.launches(Launches::Named { name: &name, home: Some(home) })?);
+                }
+                Ok(records)
+            })
+            .await?;
+        Ok(newest_checkout_launches(records)
+            .into_iter()
+            .map(|record| {
+                let launch = record.name.clone();
+                (checkout_object(record), launch)
+            })
+            .collect())
+    }
+
+    /// A launch, or a fact or integration written under its name, shows as its checkout.
+    fn named_by(written: &str) -> &str {
+        launched(written)
     }
 
     fn versions(views: &LifecycleViews) -> Option<&tokio::sync::Mutex<Versions<Self>>> {
@@ -392,6 +533,27 @@ impl<R: LifecycleKind> KindRecords<R> for LifecycleViews {
 
     async fn sources(&self) -> Result<Vec<Record<R>>, String> {
         self.versioned::<R>().await
+    }
+
+    async fn positioned(&self) -> Result<(Vec<Record<R>>, LogPosition), String> {
+        self.positioned::<R>().await
+    }
+
+    async fn position(&self) -> Result<LogPosition, String> {
+        let Some(versions) = R::versions(self) else { return Ok(LogPosition::default()) };
+        let mut versions = versions.lock().await;
+        Ok(LogPosition::logged(self.passed(&mut versions).await?.1))
+    }
+
+    async fn changed_since(&self, position: &LogPosition) -> Result<Since, String> {
+        self.changed::<R>(position).await
+    }
+
+    async fn copies(&self, name: &str) -> Result<Vec<Record<R>>, String> {
+        if R::versions(self).is_none() {
+            return Ok(self.versioned::<R>().await?.into_iter().filter(|record| record.name == name).collect());
+        }
+        self.named::<R>(name).await
     }
 
     async fn apply(

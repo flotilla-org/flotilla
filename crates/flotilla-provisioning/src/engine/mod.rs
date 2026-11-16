@@ -37,6 +37,7 @@ pub(crate) mod provenance;
 pub mod reads;
 pub mod repositories;
 pub mod repository_import;
+pub mod resume;
 pub mod terminal_actuator;
 pub mod terminals;
 #[cfg(test)]

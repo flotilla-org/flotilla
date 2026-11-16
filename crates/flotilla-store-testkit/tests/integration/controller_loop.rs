@@ -8,7 +8,7 @@ use std::{
 };
 
 use flotilla_resources::{
-    engine_records::{KindRecords, Record},
+    engine_records::{KindRecords, LogPosition, Record, Since},
     ApiPaths, InputMeta, LifecycleAuthority, NoStatusPatch, Resource, ResourceError, ResourceObject, StatusPatch,
 };
 use flotilla_store::{
@@ -2052,6 +2052,8 @@ async fn a_failing_reconcile_without_a_policy_parks_after_ten_tries_and_a_change
 #[derive(Debug, Default)]
 struct HeldListingPort {
     records: Mutex<Vec<Record<PrimaryResource>>>,
+    /// Each write's name, in order: the log a position counts.
+    written: Mutex<Vec<String>>,
     subscribers: Mutex<Vec<futures::channel::mpsc::UnboundedSender<()>>>,
     subscribed: AtomicBool,
     listed: AtomicBool,
@@ -2072,6 +2074,7 @@ impl HeldListingPort {
             status: None,
         };
         self.records.lock().expect("records").push(record);
+        self.written.lock().expect("written").push(name.into());
         for subscriber in self.subscribers.lock().expect("subscribers").iter() {
             subscriber.unbounded_send(()).ok();
         }
@@ -2100,6 +2103,22 @@ impl KindRecords<PrimaryResource> for HeldListingPort {
             self.release.notified().await;
         }
         Ok(listed)
+    }
+    async fn positioned(&self) -> Result<(Vec<Record<PrimaryResource>>, LogPosition), String> {
+        let position = self.position().await?;
+        Ok((self.sources().await?, position))
+    }
+    async fn position(&self) -> Result<LogPosition, String> {
+        let written = self.written.lock().expect("written").len() as u64;
+        Ok(LogPosition::logged([("kiwi".to_owned(), written)].into()))
+    }
+    async fn changed_since(&self, position: &LogPosition) -> Result<Since, String> {
+        let from = position.homes.get("kiwi").copied().unwrap_or(0) as usize;
+        let names = self.written.lock().expect("written").get(from..).ok_or("ahead of the log")?.iter().cloned().collect();
+        Ok(Since::Changed { names, through: self.position().await? })
+    }
+    async fn copies(&self, name: &str) -> Result<Vec<Record<PrimaryResource>>, String> {
+        Ok(self.get(name).await?.into_iter().collect())
     }
     async fn apply(
         &self,

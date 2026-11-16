@@ -293,9 +293,9 @@ async fn watched_snapshot(
     }
 }
 
-// A client whose watch of an engine-served kind drops reconnects with its cursor: the engine keeps
-// no position to resume from, so the resume is refused as expired, and the client's fresh watch
-// converges on the records as they are, with an update and a delete made in the gap.
+// A client whose watch of an engine-served kind drops reconnects with its cursor: the resume names
+// the update and the delete made in the gap, without a snapshot, and a fresh watch converges on
+// the records as they are.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_resource_watch_reconnecting_after_a_gap_converges_on_the_records() {
     use flotilla_client::resource::ResourceWatchRequest;
@@ -326,8 +326,27 @@ async fn a_resource_watch_reconnecting_after_a_gap_converges_on_the_records() {
     assert!(matches!(deleted, CommandValue::ResourceDeleted(_)), "delete: {deleted:?}");
 
     let mut resumed = daemon.resources().watch(request().cursor(cursor).build()).await.expect("reconnect");
-    let refused = resumed.next().await.expect_err("a resume from the engine's records is refused");
-    assert!(refused.contains("expired"), "the refusal says the cursor expired: {refused}");
+    let mut gap = std::collections::BTreeMap::new();
+    while !(gap.contains_key("watched-kept") && gap.contains_key("watched-gone")) {
+        let envelope = tokio::time::timeout(std::time::Duration::from_secs(10), resumed.next())
+            .await
+            .expect("the gap's changes in time")
+            .expect("the resume reads")
+            .expect("the resume is open");
+        for record in envelope.records {
+            assert_ne!(record.record_type, flotilla_protocol::ResourceRecordType::Current, "a resume sends no snapshot");
+            if let Some(object) = record.object {
+                let name = object["metadata"]["name"].as_str().expect("a named record").to_owned();
+                gap.insert(name, (record.record_type, object));
+            }
+        }
+    }
+    let (kept_type, kept) = gap.get("watched-kept").expect("the update made in the gap");
+    assert_eq!(*kept_type, flotilla_protocol::ResourceRecordType::Modified);
+    let kept: FulfilmentKindSpec = serde_json::from_value(kept["spec"].clone()).expect("spec");
+    assert_eq!(kept.grants, updated.grants, "the resume carries the update");
+    assert_eq!(gap.get("watched-gone").map(|(record_type, _)| *record_type), Some(flotilla_protocol::ResourceRecordType::Deleted));
+    resumed.cancel().await.expect("cancel");
 
     let mut fresh = daemon.resources().watch(request().build()).await.expect("watch again");
     let (records, _) = watched_snapshot(&mut fresh).await;

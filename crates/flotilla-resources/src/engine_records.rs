@@ -58,6 +58,112 @@ impl<R: crate::Resource> Clone for Record<R> {
     }
 }
 
+/// Where a reading of a kind's records stands: the sequence of each home's log it read through
+/// and, for a port whose records change in memory as well, the run that holds them and how many of
+/// its changes it had read. A reader hands it back to resume from it; its encoding is opaque to
+/// readers.
+#[derive(Clone, Debug, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct LogPosition {
+    #[serde(rename = "h")]
+    pub homes: BTreeMap<String, u64>,
+    #[serde(rename = "u", default, skip_serializing_if = "Option::is_none")]
+    pub unlogged: Option<UnloggedRead>,
+}
+
+/// How many of a port's changes in memory had been read, in the run that holds them.
+#[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct UnloggedRead {
+    pub run: String,
+    pub read: u64,
+}
+
+/// The prefix of an encoded [`LogPosition`], naming its encoding.
+const POSITION_ENCODING: &str = "e1:";
+
+impl LogPosition {
+    /// A position wholly in the log: each home's sequence read through.
+    pub fn logged(homes: BTreeMap<String, u64>) -> Self {
+        Self { homes, unlogged: None }
+    }
+
+    /// The position as a resource version.
+    pub fn encode(&self) -> String {
+        format!("{POSITION_ENCODING}{}", serde_json::to_string(self).expect("a position encodes"))
+    }
+
+    /// A resource version [`LogPosition::encode`] made; `None` for any other.
+    pub fn decode(version: &str) -> Option<Self> {
+        serde_json::from_str(version.strip_prefix(POSITION_ENCODING)?).ok()
+    }
+}
+
+/// How many changes an [`UnloggedJournal`] remembers the names of.
+const JOURNAL: usize = 1024;
+
+/// The names each change held in memory touched, by its count, within one run: what lets a port
+/// whose records change in memory (outside the log, or as views it holds) name its changes since a
+/// position. Lost at a restart, so a position from another run expires.
+#[derive(Debug)]
+pub struct UnloggedJournal {
+    run: String,
+    count: u64,
+    touched: std::collections::VecDeque<(u64, std::collections::BTreeSet<String>)>,
+}
+
+impl Default for UnloggedJournal {
+    fn default() -> Self {
+        Self { run: uuid::Uuid::new_v4().to_string(), count: 0, touched: std::collections::VecDeque::new() }
+    }
+}
+
+impl UnloggedJournal {
+    /// Records one change, touching `names`; returns its count.
+    pub fn record(&mut self, names: impl IntoIterator<Item = String>) -> u64 {
+        self.count += 1;
+        self.touched.push_back((self.count, names.into_iter().collect()));
+        if self.touched.len() > JOURNAL {
+            self.touched.pop_front();
+        }
+        self.count
+    }
+
+    /// How many changes this run has counted.
+    pub fn count(&self) -> u64 {
+        self.count
+    }
+
+    /// Where a reader stands that has read every change counted so far.
+    pub fn read(&self) -> UnloggedRead {
+        UnloggedRead { run: self.run.clone(), read: self.count }
+    }
+
+    /// The names touched since `read`; `Err` holds why they cannot be named: no read, another
+    /// run's, one past the count, or one older than the journal remembers.
+    pub fn since(&self, read: Option<&UnloggedRead>) -> Result<std::collections::BTreeSet<String>, String> {
+        let Some(read) = read else { return Err("the position holds no read of the changes held in memory".to_owned()) };
+        if read.run != self.run {
+            return Err("the position was read from another run, whose changes held in memory were lost at its restart".to_owned());
+        }
+        if read.read > self.count {
+            return Err(format!("the position read {} changes held in memory, past the {} counted", read.read, self.count));
+        }
+        let oldest = self.touched.front().map_or(self.count + 1, |(count, _)| *count);
+        if read.read + 1 < oldest {
+            return Err(format!("the changes held in memory since {} are no longer remembered", read.read));
+        }
+        Ok(self.touched.iter().filter(|(count, _)| *count > read.read).flat_map(|(_, names)| names.iter().cloned()).collect())
+    }
+}
+
+/// What changed since a [`LogPosition`].
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum Since {
+    /// The names whose records may have changed, as read through `through`.
+    Changed { names: std::collections::BTreeSet<String>, through: LogPosition },
+    /// The changes since cannot be named; a reader lists again.
+    Expired(String),
+}
+
 /// An engine port serving resource kind `R`. A name several homes hold reads as this home's
 /// record, else the lexically first home's; writes are this home's alone.
 #[async_trait::async_trait]
@@ -85,10 +191,20 @@ pub trait KindRecords<R: crate::Resource>: Send + Sync + std::fmt::Debug {
     async fn list(&self) -> Result<Vec<Record<R>>, String>;
     /// Every home's record of every name.
     async fn sources(&self) -> Result<Vec<Record<R>>, String>;
-    /// Every home's record `name`: those [`KindRecords::sources`] lists, unless the port can read
-    /// one name alone.
-    async fn copies(&self, name: &str) -> Result<Vec<Record<R>>, String> {
-        Ok(self.sources().await?.into_iter().filter(|record| record.name == name).collect())
+    /// [`KindRecords::sources`] and the position they were read at, in one read.
+    async fn positioned(&self) -> Result<(Vec<Record<R>>, LogPosition), String>;
+    /// The position a read now starts from.
+    async fn position(&self) -> Result<LogPosition, String>;
+    /// The names whose records may have changed since `position`, read through the position it
+    /// returns; expired when the log or the port's memory can no longer name them all.
+    async fn changed_since(&self, position: &LogPosition) -> Result<Since, String>;
+    /// Every home's record `name`, as a read by name finds it.
+    async fn copies(&self, name: &str) -> Result<Vec<Record<R>>, String>;
+    /// Every home's record `name` that [`KindRecords::sources`] lists: what a reader of the
+    /// listing holds of it. The same as [`KindRecords::copies`] unless a name reads records the
+    /// listing leaves out.
+    async fn sources_named(&self, name: &str) -> Result<Vec<Record<R>>, String> {
+        self.copies(name).await
     }
     /// Every home's open record addressed to `receiver`, through the port's own index; `None`
     /// when the port keeps none, and readers filter [`KindRecords::sources`].
@@ -178,4 +294,45 @@ pub trait ChangeRequestBranches: Send + Sync + std::fmt::Debug {
     async fn found_on_branch(&self, found: &BranchChangeRequest) -> Result<(), String>;
     /// Every home's change requests in `(service, scope)` found merging from `branch`.
     async fn on_branch(&self, service: &str, scope: &str, branch: &str) -> Result<Vec<BranchChangeRequest>, String>;
+}
+
+#[cfg(test)]
+mod tests {
+    use std::collections::BTreeSet;
+
+    use super::*;
+
+    // Behaviour: a journal names what changed since a read in its own run, and refuses a read
+    // from another run, from past its count, or from before what it remembers.
+    #[test]
+    fn a_journal_names_changes_only_within_its_run_and_memory() {
+        let mut journal = UnloggedJournal::default();
+        let start = journal.read();
+        journal.record(["a".to_owned()]);
+        let middle = journal.read();
+        journal.record(["b".to_owned(), "c".to_owned()]);
+        assert_eq!(journal.since(Some(&start)), Ok(["a", "b", "c"].map(str::to_owned).into()));
+        assert_eq!(journal.since(Some(&middle)), Ok(["b", "c"].map(str::to_owned).into()));
+        assert_eq!(journal.since(Some(&journal.read())), Ok(BTreeSet::new()));
+        assert!(journal.since(Some(&UnloggedRead { run: "other".into(), read: 0 })).is_err());
+        assert!(journal.since(Some(&UnloggedRead { read: 9, ..journal.read() })).is_err());
+        assert!(journal.since(None).is_err());
+        for _ in 0..JOURNAL {
+            journal.record(["d".to_owned()]);
+        }
+        assert!(journal.since(Some(&start)).is_err(), "forgotten");
+        assert!(journal.since(Some(&journal.read())).is_ok());
+    }
+
+    // Behaviour: a position reads back from its encoding, which nothing else decodes as.
+    #[test]
+    fn a_position_reads_back_from_its_encoding() {
+        let position = LogPosition {
+            homes: BTreeMap::from([("kiwi".to_owned(), 7), ("feta:2".to_owned(), 0)]),
+            unlogged: Some(UnloggedRead { run: "run".into(), read: 3 }),
+        };
+        assert_eq!(LogPosition::decode(&position.encode()), Some(position));
+        assert_eq!(LogPosition::decode("12"), None);
+        assert_eq!(LogPosition::decode(""), None);
+    }
 }

@@ -18,7 +18,7 @@ use flotilla_engine_store::{
 };
 use flotilla_resources::{
     definition_provenance::{SUPERSEDED_BY_ANNOTATION, VERIFICATION_PROJECT_ANNOTATION, VERIFICATION_PROVENANCE_ANNOTATION},
-    engine_records::{KindRecords, Record},
+    engine_records::{KindRecords, LogPosition, Record, Since},
     Repository, RepositoryKey, RepositorySpec, RepositoryStatus,
 };
 use flotilla_schema::{Kind, KindCode, NewChange, Timestamp};
@@ -26,6 +26,7 @@ use flotilla_schema_sqlite::{stream::Service, Read, StoreError};
 use futures::stream::BoxStream;
 
 use super::reads::created_at;
+use super::resume::logged_since;
 use super::watch::CommitsSeen;
 use super::watch::SharedChanges;
 use crate::stored::repository::{RepositoryRecord, VerificationProvenance};
@@ -269,6 +270,26 @@ impl KindRecords<Repository> for EngineRepositories {
                 held.clone().map_err(|error| tracing::warn!(%error, "skipping a repository record that does not encode")).ok()
             })
             .collect())
+    }
+
+    async fn positioned(&self) -> Result<(Vec<Record<Repository>>, LogPosition), String> {
+        let resident = self.refresh()?;
+        let records = resident
+            .records
+            .values()
+            .filter_map(|held| {
+                held.clone().map_err(|error| tracing::warn!(%error, "skipping a repository record that does not encode")).ok()
+            })
+            .collect();
+        Ok((records, LogPosition::logged(resident.follower.cursors().clone())))
+    }
+
+    async fn position(&self) -> Result<LogPosition, String> {
+        Ok(LogPosition::logged(self.refresh()?.follower.cursors().clone()))
+    }
+
+    async fn changed_since(&self, position: &LogPosition) -> Result<Since, String> {
+        logged_since(&self.service, [CODE], position)
     }
 
     /// Every home's record `name`, read from the resident map by name.

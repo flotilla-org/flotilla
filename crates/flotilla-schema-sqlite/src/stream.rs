@@ -108,7 +108,7 @@ struct Round<'a> {
 /// Whether `home`'s sequence continues right after `after` in this store: its next entry or
 /// change is `after + 1`. A store that holds another home from a snapshot holds none of its
 /// sequence before the cut, so a cursor there is served a snapshot, not a tail with a gap.
-fn continues(read: &mut crate::Read<'_>, home: &str, after: u64, last: u64) -> Result<bool, StoreError> {
+pub fn continues(read: &mut crate::Read<'_>, home: &str, after: u64, last: u64) -> Result<bool, StoreError> {
     if after == last {
         return Ok(true);
     }

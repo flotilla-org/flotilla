@@ -8,16 +8,19 @@ use std::{
     sync::{Arc, RwLock},
 };
 
-use flotilla_engine_store::watch::EngineWatch;
+use flotilla_engine_store::{
+    follow::{self, Resumed},
+    watch::EngineWatch,
+};
 use flotilla_resources::{
-    engine_records::{KindRecords, Record},
+    engine_records::{KindRecords, LogPosition, Record, Since},
     Message as OldMessage, MessageSpec, MessageStatus, ReadResourceObject, ResourceProvenance,
 };
 use flotilla_schema::Kind as _;
 use flotilla_state_machines::{machines::message::Message, Resource};
 use futures::stream::BoxStream;
 
-use super::MessagePrimitives;
+use super::{view::record_name, MessagePrimitives};
 
 /// The engine's messages served under the daemon's provisioning namespace, the one the old
 /// shapes' role addresses are read in.
@@ -91,6 +94,27 @@ impl KindRecords<OldMessage> for MessageRecords {
     /// Each message has one home, its receiver's, so every source is its only record.
     async fn sources(&self) -> Result<Vec<Record<OldMessage>>, String> {
         self.list().await
+    }
+
+    /// Positioned before the messages are read, so a change among them is named again, never missed.
+    async fn positioned(&self) -> Result<(Vec<Record<OldMessage>>, LogPosition), String> {
+        let position = self.position().await?;
+        Ok((self.list().await?, position))
+    }
+
+    async fn position(&self) -> Result<LogPosition, String> {
+        follow::position_on(self.primitives.service()).map(LogPosition::logged).map_err(|error| error.to_string())
+    }
+
+    async fn changed_since(&self, position: &LogPosition) -> Result<Since, String> {
+        let resumed = follow::since_on(self.primitives.service(), [Resource::<Message>::CODE], &position.homes);
+        Ok(match resumed.map_err(|error| error.to_string())? {
+            Resumed::Followed { changed, through } => Since::Changed {
+                names: changed.iter().filter_map(|identity| record_name(&identity.name)).collect(),
+                through: LogPosition::logged(through),
+            },
+            Resumed::Expired(reason) => Since::Expired(reason),
+        })
     }
 
     /// The one record `name` names, its receiver's home's.

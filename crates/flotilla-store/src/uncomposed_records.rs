@@ -4,7 +4,7 @@
 use std::{collections::BTreeMap, marker::PhantomData};
 
 use async_trait::async_trait;
-use flotilla_resources::engine_records::{KindRecords, Record};
+use flotilla_resources::engine_records::{KindRecords, LogPosition, Record, Since};
 use futures::stream::BoxStream;
 
 use crate::Resource;
@@ -53,6 +53,18 @@ impl<R: Resource> KindRecords<R> for Uncomposed<R> {
     }
 
     async fn copies(&self, _: &str) -> Result<Vec<Record<R>>, String> {
+        self.refused()
+    }
+
+    async fn positioned(&self) -> Result<(Vec<Record<R>>, LogPosition), String> {
+        self.refused()
+    }
+
+    async fn position(&self) -> Result<LogPosition, String> {
+        self.refused()
+    }
+
+    async fn changed_since(&self, _: &LogPosition) -> Result<Since, String> {
         self.refused()
     }
 
