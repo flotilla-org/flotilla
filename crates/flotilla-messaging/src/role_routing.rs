@@ -18,6 +18,11 @@ use crate::{
 
 pub const FLEET_STORE_SENDER: &str = "system:fleet-store";
 
+/// A charter notice's record name: one per receiver, sender and charter revision.
+pub fn charter_notice_name(inbox: &flotilla_address::Address, sender: &flotilla_address::Address, revision: &str) -> String {
+    flotilla_address::message_record_name(inbox.as_str(), sender.as_str(), &format!("charter@{revision}"))
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct RoleContact {
     pub address: String,
@@ -379,7 +384,6 @@ async fn reconcile_charter_notifications_from_receivers(
     projects: Vec<&ResourceObject<Project>>,
 ) -> Result<(), ResourceError> {
     use crate::{Intent, IntentExpectation, IntentReference, MessageRelation, ResourceProvenance, TerminalSessionSource};
-    use sha2::{Digest, Sha256};
     let namespace = inbox.namespace();
     // Nothing is admitted before the fleet is designated.
     let Some(sender) = inbox.sender().await? else { return Ok(()) };
@@ -432,8 +436,8 @@ async fn reconcile_charter_notifications_from_receivers(
         if briefed == Some(&revision) {
             continue;
         }
-        let name = format!("charter-{:x}", Sha256::digest(format!("{receiver}\0{revision}").as_bytes()));
         let receiver_inbox = flotilla_resources::convoy::engine::role_inbox(&receiver).map_err(ResourceError::invalid)?;
+        let name = charter_notice_name(&receiver_inbox, &sender, &revision);
         {
             let admission = inbox.admission();
             let _admission = admission.lock().await;

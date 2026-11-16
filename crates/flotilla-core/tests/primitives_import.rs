@@ -705,3 +705,124 @@ async fn named_designation_imports_fleet_role_messages() {
     assert_eq!(to_fleet.resource.name(), "fleet:lab/role:nudge/message:to-fleet");
     assert!(rehearse(&imported).is_empty(), "all imported records restore into the engine store");
 }
+
+// A charter notice delivered before the cut-over, named from its receiver's old spelling, imports
+// under the name a charter pass gives it, so the pass at the same revision finds it and sends no
+// second notice.
+#[tokio::test]
+async fn an_imported_charter_notice_is_the_one_a_charter_pass_finds() {
+    use std::sync::Arc;
+
+    use flotilla_core::primitives::import::write_messages;
+    use flotilla_engine_messages::{roles::designated_fleet_roles, EngineCharterNotices};
+    use flotilla_engine_messages_testkit::{designate_fleet, EngineMessagesHome};
+    use flotilla_engine_store::Import;
+    use flotilla_messaging::{
+        charter_notice_name, reconcile_charter_notifications_with_receivers, CharterProseRenderer, MessageReceiverSnapshot,
+        FLEET_STORE_SENDER,
+    };
+    use flotilla_resources::{
+        definition_provenance::CHARTER_REVISION_ANNOTATION, InputMeta, Project, ProjectSpec, RoleDefinition, Selector, TerminalBrief,
+        TerminalCrewContext, TerminalSession, TerminalSessionSource, TerminalSessionSpec, CONVOY_LABEL, ROLE_LABEL, VESSEL_LABEL,
+    };
+    use flotilla_schema_sqlite::stream::Service;
+    use flotilla_store::ResourceBackend;
+    use flotilla_store_memory::InMemoryBackend;
+    use sha2::{Digest, Sha256};
+
+    const NS: &str = "flotilla";
+    const GUIDE: &str = "root/root-one/work/guide";
+    let backend = ResourceBackend::new(InMemoryBackend::default());
+    designate_fleet(&backend, NS).await;
+    backend
+        .definitions::<Project>(NS)
+        .apply(
+            &InputMeta::builder()
+                .name("root".into())
+                .annotations(BTreeMap::from([(CHARTER_REVISION_ANNOTATION.into(), "first".into())]))
+                .build(),
+            &ProjectSpec::builder()
+                .display_name("root".into())
+                .role_definitions(BTreeMap::from([("guide".into(), RoleDefinition::default())]))
+                .build(),
+        )
+        .await
+        .expect("project");
+    backend
+        .using::<Convoy>(NS)
+        .create(
+            &InputMeta::builder().name("root-one".into()).build(),
+            &ConvoySpec::builder().workflow_ref("workflow".into()).project_ref("root".into()).build(),
+        )
+        .await
+        .expect("convoy");
+    let holder = TerminalSessionSpec::builder()
+        .env_ref("host-direct".into())
+        .role("guide".into())
+        .cwd("/workspace".into())
+        .pool("cleat".into())
+        .source(TerminalSessionSource::Agent {
+            selector: Selector::for_capability("coding"),
+            brief: TerminalBrief { path: "guide.md".into(), content: "guide".into(), artifact_digest: None, copies: Vec::new() },
+            context: Box::new(TerminalCrewContext { namespace: NS.into(), convoy: "root-one".into(), vessel_ref: "root-one-work".into() }),
+        })
+        .build();
+    backend
+        .using::<TerminalSession>(NS)
+        .create(
+            &InputMeta::builder()
+                .name("terminal-root-one".into())
+                .labels(BTreeMap::from([
+                    (CONVOY_LABEL.into(), "root-one".into()),
+                    (ROLE_LABEL.into(), "guide".into()),
+                    (VESSEL_LABEL.into(), "work".into()),
+                ]))
+                .build(),
+            &holder,
+        )
+        .await
+        .expect("holder");
+
+    // The notice as the old pass wrote it, delivered to the guide.
+    let subject =
+        MessageReference::ControlRecord { resource: ResourceRef::new("flotilla.work/v1", "Project", NS, "root"), revision: "first".into() };
+    let old_name = format!("charter-{:x}", Sha256::digest(format!("{GUIDE}\0first").as_bytes()));
+    let mut notice = spec(GUIDE, FLEET_STORE_SENDER, MessageExpectation::None);
+    notice.references = vec![subject.clone()];
+    notice.subject = Some(subject);
+    let receiver = ResolvedMessageReceiver { role_address: Some(GUIDE.into()), ..delivered() };
+    let records = [record(&old_name, notice, status(MessagePhase::Delivered, Some(1), Some(receiver)))];
+    let roles = designated_fleet_roles(&backend, NS).await.expect("fleet roles");
+    let held = OldStoreRecords::empty(NS);
+    let conversion = Conversion { roles: &roles, forges: &[], records: &held };
+    let imported = import_all(records.iter().map(|record| OldMessage { record, home: HOME.into() }), &conversion, &world(&records))
+        .into_iter()
+        .map(|result| match result {
+            Ok(Imported::Message(message)) => *message,
+            other => panic!("not imported: {other:?}"),
+        })
+        .collect::<Vec<_>>();
+    let inbox = imported[0].resource.spec().inbox.clone();
+    let sender = imported[0].resource.spec().sender.clone();
+    assert_eq!(imported[0].resource.name(), format!("{inbox}/message:{}", charter_notice_name(&inbox, &sender, "first")));
+
+    let dir = tempfile::tempdir().expect("store directory");
+    let path = dir.path().join("decided.sqlite");
+    let registry = || flotilla_engine_store::registry().expect("engine kind registry");
+    {
+        let mut target = Import::create(&path, HOME, registry()).expect("import target");
+        assert!(write_messages(&imported, &mut target).is_empty(), "the notice is written");
+    }
+    let service = Arc::new(Service::open(&path, HOME, registry()).expect("decided store"));
+    let home = EngineMessagesHome::over(service, NS, &backend);
+    let primitives = home.primitives();
+    let notices = EngineCharterNotices { primitives: Arc::clone(primitives), namespace: NS.into() };
+    let receivers = MessageReceiverSnapshot::load(&backend, NS).await.expect("receivers");
+    let projects = backend.including_replicas::<Project>(NS).list().await.expect("projects");
+    reconcile_charter_notifications_with_receivers(&notices, &CharterProseRenderer, &backend, &receivers, &projects)
+        .await
+        .expect("charter pass");
+
+    assert!(primitives.message(imported[0].resource.name()).await.expect("load").is_some(), "the imported notice is stored");
+    assert!(primitives.open_in(&inbox).expect("open messages").is_empty(), "no second notice at the revision already delivered");
+}

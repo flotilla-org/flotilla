@@ -19,7 +19,8 @@ use std::collections::{BTreeMap, BTreeSet};
 
 use flotilla_address::{Address, Kind};
 use flotilla_engine_store::{ImportTarget, IMPORT_WRITER};
-use flotilla_resources::{Message, MessageExpectation, MessagePhase, ResolvedMessageReceiver, ResourceObject};
+use flotilla_messaging::{charter_notice_name, FLEET_STORE_SENDER};
+use flotilla_resources::{Message, MessageExpectation, MessagePhase, MessageReference, ResolvedMessageReceiver, ResourceObject};
 use flotilla_schema::{CreatedAt, NewChange, Timestamp};
 use flotilla_state_machines::{
     machines::{
@@ -136,6 +137,21 @@ pub fn imported_name(inbox: &Address, record: &str) -> Result<String, String> {
     Address::message(inbox, record).map(|address| address.as_str().to_owned()).map_err(|error| error.to_string())
 }
 
+/// The address an old record takes under `inbox`. A charter notice is named
+/// as a charter pass names one, from its parties and revision, so the pass
+/// finds it; every other record keeps its old name.
+fn record_address(record: &ResourceObject<Message>, inbox: &Address, conversion: &Conversion<'_>) -> Result<String, String> {
+    let spec = &record.spec;
+    match &spec.subject {
+        Some(MessageReference::ControlRecord { resource, revision })
+            if spec.sender == FLEET_STORE_SENDER && resource.kind == "Project" && record.metadata.name.starts_with("charter-") =>
+        {
+            imported_name(inbox, &charter_notice_name(inbox, &conversion.sender_of(spec)?, revision))
+        }
+        _ => imported_name(inbox, &record.metadata.name),
+    }
+}
+
 /// Maps one old record onto the new spec and state, at version `version`
 /// (its admission sequence at its home, assigned in old acceptance order).
 pub fn import_message(
@@ -178,11 +194,11 @@ fn convert(
     let reference = |name: &str| -> Result<MessageRef, String> {
         let other = world.message(name).ok_or_else(|| format!("referenced message `{name}` was not read"))?;
         let inbox = conversion.receiver(&other.record.spec)?;
-        Ok(MessageRef::new(imported_name(&inbox, name)?, other.home.clone()))
+        Ok(MessageRef::new(record_address(other.record, &inbox, conversion)?, other.home.clone()))
     };
     let mut spec = conversion.spec(&old.record.spec, &reference)?;
     spec.admitted_seq = version;
-    let name = imported_name(&spec.inbox, record)?;
+    let name = record_address(old.record, &spec.inbox, conversion)?;
     let status = old.record.status.as_ref().ok_or_else(|| "the record has no status".to_owned())?;
     let receiver = || -> Result<Receiver, Unimported> {
         let resolved = status.resolved_receiver.as_ref().ok_or_else(|| "a delivered phase without its receiver".to_owned())?;
@@ -220,7 +236,9 @@ fn convert(
             let successor =
                 world.message(&by).ok_or_else(|| missing("its successor is gone", format!("its successor `{by}` was not read")))?;
             let inbox = conversion.receiver(&successor.record.spec)?;
-            let by = imported_name(&inbox, &by)?.parse().map_err(|error: flotilla_address::Error| error.to_string())?;
+            let by = record_address(successor.record, &inbox, conversion)?
+                .parse()
+                .map_err(|error: flotilla_address::Error| error.to_string())?;
             MessageState::Dropped { reason: DropReason::Superseded { by }, receiver: kept()?, delivered_at, watermark: None }
         }
         MessagePhase::DeadLettered => {
