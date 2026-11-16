@@ -219,10 +219,9 @@ impl<T: Resource> DefinitionResolver<T> {
     /// batch.
     pub(crate) async fn engine_watch_from_fed(&self, requested_version: &str) -> Option<Result<FedStream<T>, ResourceError>> {
         let records = self.records()?;
-        let expired = |reason: String| ResourceError::WatchExpired {
-            requested_version: requested_version.to_owned(),
-            compacted_through: None,
-            reason,
+        let expired = |reason: String| {
+            tracing::info!(kind = T::API_PATHS.kind, %reason, "engine watch: its position expired; the watcher lists afresh");
+            ResourceError::WatchExpired { requested_version: requested_version.to_owned(), compacted_through: None, reason }
         };
         let Some(position) = LogPosition::decode(requested_version) else {
             return Some(Err(expired("cursor not readable: it is not a position this daemon handed out".to_owned())));
