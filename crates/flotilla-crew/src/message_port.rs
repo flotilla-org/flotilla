@@ -4,19 +4,13 @@
 
 use flotilla_address::Address;
 use flotilla_messaging::{Admitted, Intent, SentMessage};
-use flotilla_resources::{MessageSpec, ResourceError};
+use flotilla_resources::ResourceError;
 
 use crate::{crew_ops::CrewService, leaf_engine::Party};
 
 impl CrewService {
     pub(crate) fn message_primitives(&self) -> Result<std::sync::Arc<dyn flotilla_messaging::EngineMessages>, ResourceError> {
         crate::ports::installed_messages(&self.message_path)
-    }
-
-    /// An old-shaped intent in the engine's terms, as admission takes it.
-    // Goes once every producer builds its intent in the engine's terms (#3108).
-    pub(crate) async fn intent_of(&self, namespace: &str, old: &MessageSpec) -> Result<Intent, ResourceError> {
-        self.message_primitives()?.intent_of(namespace, old).await
     }
 
     /// Where the Message `intent` replies to stands, read as its admission reads it.

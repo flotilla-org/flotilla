@@ -2,9 +2,15 @@
 //! import share, so a sent message and an imported one are stored alike.
 
 use flotilla_messaging::{Intent, IntentExpectation};
-use flotilla_state_machines::machines::message::{Expectation, MessageBody, MessageRef, MessageReference, MessageSpec};
+use flotilla_resources::MessageRelation;
+use flotilla_schema::Timestamp;
+use flotilla_state_machines::machines::message::{Expectation, MessageBody, MessageRef, MessageReference, MessageSpec, Relation};
 
-use crate::convert::{relation, timestamp, UNBOUND_AFTER};
+/// How long an inbox may stay unbound before a message to it may be dropped
+/// as undeliverable: a crew's holder can take this long to provision or
+/// restart. A fleet role's inbox has no consumer yet, so replies to it drop
+/// once this runs out (owner ruling 4, 2026-10-19).
+pub const UNBOUND_AFTER: chrono::Duration = chrono::Duration::hours(24);
 
 /// `intent` as the engine stores it, naming the messages it answers and replaces by the
 /// references admission located for them.
@@ -30,9 +36,19 @@ pub fn engine_spec(intent: &Intent, in_reply_to: Option<MessageRef>, supersedes:
         in_reply_to,
         supersedes,
         expectation,
-        deadline: intent.deadline.as_ref().map(timestamp),
+        deadline: intent.deadline.as_ref().map(Timestamp::from_datetime),
         unbound_after: UNBOUND_AFTER.num_microseconds().expect("bounded"),
         delivery_condition: intent.delivery_condition.clone(),
         ..MessageSpec::new(intent.sender.clone(), intent.inbox.clone(), relation(intent.relation), body)
     })
+}
+
+fn relation(relation: MessageRelation) -> Relation {
+    match relation {
+        MessageRelation::Supervisor => Relation::Supervisor,
+        MessageRelation::Peer => Relation::Peer,
+        MessageRelation::Dependency => Relation::Dependency,
+        MessageRelation::Dependee => Relation::Dependee,
+        MessageRelation::System => Relation::System,
+    }
 }

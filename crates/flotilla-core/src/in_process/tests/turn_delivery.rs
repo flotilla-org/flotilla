@@ -328,13 +328,13 @@ async fn read_by_routing_a_reply(count: usize) -> (u64, u64) {
     let primitives = super::support::install_engine_messages(&daemon);
     let crew = flotilla_resources::crew_role_address("flotilla", &probe.convoy, "work", "coder");
     for index in 0..count {
-        let intent = flotilla_resources::MessageSpec::builder()
-            .sender("system:turn-rules".into())
-            .receiver(crew.clone())
-            .relation(flotilla_resources::MessageRelation::System)
-            .body(format!("other {index}"))
-            .build();
-        primitives.admit_old("flotilla", &format!("other-{index}"), &intent).await.expect("another message");
+        let intent = flotilla_engine_messages_testkit::intent(
+            "system:turn-rules",
+            &crew,
+            flotilla_resources::MessageRelation::System,
+            format!("other {index}"),
+        );
+        primitives.admit(&format!("other-{index}"), &intent).await.expect("another message");
     }
     let reply = serde_json::json!({
         "apiVersion":"flotilla.work/v1", "kind":"Message", "metadata":{"name":"reply"},

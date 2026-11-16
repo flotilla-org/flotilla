@@ -106,19 +106,19 @@ async fn supervisor_turn_reconciliation_noop_contract() {
                 )
                 .await
                 .expect("running terminal");
-            let intent = flotilla_resources::MessageSpec::builder()
-                .sender("system:nudge".into())
-                .receiver("flotilla/convoy/govern/governor".into())
-                .relation(flotilla_resources::MessageRelation::System)
-                .body("supervise".into())
-                .build();
+            let receiver = "flotilla/convoy/govern/governor";
+            let intent = flotilla_engine_messages_testkit::intent(
+                "system:nudge",
+                receiver,
+                flotilla_resources::MessageRelation::System,
+                "supervise",
+            );
             flotilla_engine_messages_testkit::designate_fleet(&backend, namespace).await;
             let primitives = install_engine_messages(&daemon);
-            primitives.admit_old(namespace, "input", &intent).await.expect("new Message");
+            primitives.admit("input", &intent).await.expect("new Message");
             if terminal_message {
                 // Delivered, it awaits nothing more: it has ended.
-                flotilla_engine_messages_testkit::deliver_turn(&primitives, namespace, &intent.receiver, "input", "session", Utc::now())
-                    .await;
+                flotilla_engine_messages_testkit::deliver_turn(&primitives, namespace, receiver, "input", "session", Utc::now()).await;
             }
             let state = if terminal_message { "new-only ended Message" } else { "new-only Message" };
             assert_supervisor_turn_passes_are_idle(&daemon, &backend, namespace, state, passes).await;

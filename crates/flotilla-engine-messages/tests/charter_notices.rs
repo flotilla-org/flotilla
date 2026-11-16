@@ -6,15 +6,15 @@ use std::collections::BTreeMap;
 use std::sync::Arc;
 
 use flotilla_engine_messages::{EngineCharterNotices, MessagePrimitives};
-use flotilla_engine_messages_testkit::{designate_fleet, EngineMessagesHome};
+use flotilla_engine_messages_testkit::{designate_fleet, intent, EngineMessagesHome};
 use flotilla_messaging::{
     reconcile_charter_notifications_with_receivers, CharterBriefInput, CharterBriefRenderer, CharterNotices, CharterProseRenderer,
     MessageReceiverSnapshot,
 };
 use flotilla_resources::definition_provenance::CHARTER_REVISION_ANNOTATION;
 use flotilla_resources::{
-    Convoy, ConvoySpec, InputMeta, MessageRelation, MessageSpec, Project, ProjectSpec, ResolvedCascade, ResourceError, RoleDefinition,
-    Selector, TerminalBrief, TerminalCrewContext, TerminalSession, TerminalSessionPhase, TerminalSessionSource, TerminalSessionSpec,
+    Convoy, ConvoySpec, InputMeta, MessageRelation, Project, ProjectSpec, ResolvedCascade, ResourceError, RoleDefinition, Selector,
+    TerminalBrief, TerminalCrewContext, TerminalSession, TerminalSessionPhase, TerminalSessionSource, TerminalSessionSpec,
     TerminalSessionStatus, WorkflowSnapshot, CONVOY_LABEL, ROLE_ADDRESS_ANNOTATION, ROLE_LABEL, VESSEL_LABEL,
 };
 use flotilla_state_machines::machines::message::{DropReason, MessageState};
@@ -116,13 +116,8 @@ async fn read_by_a_charter_pass(count: usize) -> (u64, u64) {
     let primitives = home.primitives();
     apply_and_notify(&backend, primitives, "first").await;
     for index in 0..count {
-        let other = MessageSpec::builder()
-            .sender("system:turn-rules".into())
-            .receiver(RECEIVER.into())
-            .relation(MessageRelation::System)
-            .body(format!("other {index}"))
-            .build();
-        primitives.admit_old(NAMESPACE, &format!("other-{index}"), &other).await.expect("another message");
+        let other = intent("system:turn-rules", RECEIVER, MessageRelation::System, format!("other {index}"));
+        primitives.admit(&format!("other-{index}"), &other).await.expect("another message");
     }
     let ((), reads) = measure(apply_and_notify(&backend, primitives, "second")).await;
     reads.get("Message").map_or((0, 0), |counts| (counts.decoded, counts.converted))
@@ -211,13 +206,8 @@ async fn custom_charter_renderer_uses_structured_revision_and_does_not_lock_admi
         async fn render(&self, _: CharterBriefInput<'_>) -> Result<String, ResourceError> {
             let witness = self.calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
             let _admission = self.admission.lock().await;
-            let independent = MessageSpec::builder()
-                .sender("system:turn-rules".into())
-                .receiver("flotilla/observer".into())
-                .relation(MessageRelation::System)
-                .body("independent admission".into())
-                .build();
-            self.primitives.admit_old(NAMESPACE, &format!("render-witness-{witness}"), &independent).await?;
+            let independent = intent("system:turn-rules", "flotilla/observer", MessageRelation::System, "independent admission");
+            self.primitives.admit(&format!("render-witness-{witness}"), &independent).await?;
             Ok("Custom template without revision marker".into())
         }
     }

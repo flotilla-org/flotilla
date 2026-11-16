@@ -428,7 +428,6 @@ pub fn delivered_at(resource: &Resource<Message>) -> Option<DateTime<Utc>> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::convert::{Conversion, NoRecords};
 
     struct Charter;
     impl ViewLookups for Charter {
@@ -457,13 +456,7 @@ mod tests {
         assert_eq!(spell("project:flotilla/role:operator"), "principal:operator");
         assert_eq!(spell("fleet:fleet/role:operator"), "principal:operator");
         assert_eq!(spell("project:flotilla/role:gui-approver"), "flotilla/gui-approver");
-        let conversion = Conversion { roles: &roles, forges: &[], records: &NoRecords };
-        let reply = OldSpec::builder()
-            .sender(spell("project:flotilla/role:operator"))
-            .receiver("flotilla/gui-approver".into())
-            .relation(MessageRelation::Supervisor)
-            .body("approved".into())
-            .build();
-        assert_eq!(conversion.sender_of(&reply).expect("operator").as_str(), "project:flotilla/role:operator");
+        let operator = roles.principal_role(&spell("project:flotilla/role:operator"), Some("flotilla"), Vec::new());
+        assert_eq!(operator.expect("operator").as_str(), "project:flotilla/role:operator");
     }
 }

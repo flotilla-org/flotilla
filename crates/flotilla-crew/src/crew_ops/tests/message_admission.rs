@@ -78,21 +78,22 @@ async fn follow_up_reference_releases_from_message_evidence() {
 /// The Message rows loaded and converted while one turn about the convoy is delivered to a coder
 /// whose inbox holds `count` open messages about nothing.
 async fn read_by_one_turn(count: usize) -> (u64, u64) {
-    use flotilla_resources::{MessageRelation, MessageSpec};
+    use flotilla_messaging::Intent;
+    use flotilla_resources::MessageRelation;
 
     use crate::leaf_engine::CrewTurnIntent;
     let (crew, _backend, probe, held) = fixture(CrewWorkPhase::Working).await;
     probe.fail.store(false, Ordering::SeqCst);
     let primitives = held.messages().primitives();
-    let coder = flotilla_resources::crew_role_address("flotilla", &held.launch, "work", "coder");
+    let coder = flotilla_resources::convoy::engine::role_inbox(&held.receiver("work", "coder")).expect("the coder's inbox");
     for index in 0..count {
-        let intent = MessageSpec::builder()
-            .sender("system:turn-rules".into())
-            .receiver(coder.clone())
-            .relation(MessageRelation::System)
-            .body(format!("open {index}"))
-            .build();
-        primitives.admit_old("flotilla", &format!("open-{index}"), &intent).await.expect("admit an open message");
+        let intent = Intent::new(
+            flotilla_engine_messages_testkit::party("system:turn-rules"),
+            coder.clone(),
+            MessageRelation::System,
+            format!("open {index}"),
+        );
+        primitives.admit(&format!("open-{index}"), &intent).await.expect("admit an open message");
     }
     let request = CrewTurnIntent::builder()
         .namespace("flotilla".into())
@@ -122,7 +123,8 @@ async fn a_turn_finds_what_it_supersedes_without_converting_open_messages() {
 /// The Message rows loaded and converted while follow-ups delivered to `count` other convoys'
 /// coders continue their work.
 async fn read_by_follow_ups(count: usize) -> (u64, u64) {
-    use flotilla_resources::{MessageRelation, MessageSpec};
+    use flotilla_messaging::Intent;
+    use flotilla_resources::MessageRelation;
     let (crew, backend, _probe, held) = fixture(CrewWorkPhase::Working).await;
     let primitives = held.messages().primitives();
     let mut followed = Vec::new();
@@ -131,13 +133,15 @@ async fn read_by_follow_ups(count: usize) -> (u64, u64) {
             held.engine.admit(&format!("other-{index}"), super::crew_spec(), flotilla_engine_convoys_testkit::single_agent("coder")).await;
         let receiver = flotilla_resources::crew_role_address("flotilla", &launch, "work", "coder");
         let name = format!("follow-up-{index}");
-        let intent = MessageSpec::builder()
-            .sender("principal:operator".into())
-            .receiver(receiver.clone())
-            .relation(MessageRelation::Supervisor)
-            .body(format!("continue {index}"))
-            .build();
-        primitives.admit_old("flotilla", &name, &intent).await.expect("admit the follow-up");
+        // The operator sends as the operator role of the crew's project.
+        let mut intent = Intent::new(
+            flotilla_engine_messages_testkit::party("project:flotilla/role:operator"),
+            flotilla_resources::convoy::engine::role_inbox(&receiver).expect("the coder's inbox"),
+            MessageRelation::Supervisor,
+            format!("continue {index}"),
+        );
+        intent.principal = Some("operator".into());
+        primitives.admit(&name, &intent).await.expect("admit the follow-up");
         held.messages().deliver_turn(&receiver, &name, "session").await;
         let mut status = held.engine.view(&backend, &launch).await.status.unwrap_or_default();
         let coder = flotilla_resources::CrewWorkState::builder()
@@ -170,7 +174,8 @@ async fn follow_ups_are_read_once_each_without_converting_them() {
 #[tokio::test]
 async fn remote_suppression_restores_workflow_before_replication() {
     use flotilla_engine_messages_testkit::EngineMessagesHome;
-    use flotilla_resources::{MessageExpectation, MessageReference, MessageRelation, MessageSpec};
+    use flotilla_messaging::{Intent, IntentExpectation};
+    use flotilla_resources::MessageRelation;
 
     use crate::leaf_engine::{CrewTurnIntent, ResourceIntentPublisher};
     // Boundary stand-in for the ordinary cross-host resource mutation endpoint: the receiver home
@@ -197,20 +202,15 @@ async fn remote_suppression_restores_workflow_before_replication() {
     probe.fail.store(false, Ordering::SeqCst);
     // The receiver home keeps its own Message store; it reads the same declarations.
     let inbox = EngineMessagesHome::open("remote", "flotilla", &backend);
-    let subject = MessageReference::ControlRecord {
-        resource: ResourceRef::new("flotilla.work/v1", "Convoy", "flotilla", held.launch.clone()),
-        revision: "revision".into(),
-    };
-    let existing = MessageSpec::builder()
-        .sender("system:turn-rules".into())
-        .receiver(held.receiver("work", "coder"))
-        .relation(MessageRelation::System)
-        .body("prior open request".into())
-        .references(vec![subject.clone()])
-        .subject(subject.clone())
-        .expectation(MessageExpectation::Reply)
-        .build();
-    inbox.primitives().admit_old("flotilla", "canonical", &existing).await.unwrap();
+    let mut existing = Intent::new(
+        flotilla_engine_messages_testkit::party("system:turn-rules"),
+        flotilla_resources::convoy::engine::role_inbox(&held.receiver("work", "coder")).expect("the coder's inbox"),
+        MessageRelation::System,
+        "prior open request",
+    );
+    existing.references = vec![super::convoy_subject(&held.launch, "revision")];
+    existing.expectation = IntentExpectation::Reply;
+    inbox.primitives().admit("canonical", &existing).await.unwrap();
     inbox.deliver_turn(&held.receiver("work", "coder"), "canonical", "session").await;
     let publisher = Arc::new(ReceiverPublisher(inbox));
     let publisher_port: Arc<dyn ResourceIntentPublisher> = publisher.clone();
@@ -262,13 +262,9 @@ async fn turn_admission_errors_restore_the_owned_activation() {
             let inbox = self.primitives.inbox_for(namespace, receiver).await?;
             let turn_rules = self.primitives.inbox_for(namespace, "system:turn-rules").await?;
             let name = flotilla_resources::message_record_name(inbox.as_str(), turn_rules.as_str(), "turn-delivery:failure:failure-head");
-            let spec = flotilla_resources::MessageSpec::builder()
-                .sender("system:legacy".into())
-                .receiver(receiver.into())
-                .relation(flotilla_resources::MessageRelation::System)
-                .body("concurrent intent".into())
-                .build();
-            self.primitives.admit_old(namespace, &name, &spec).await.map_err(|error| error.to_string())?;
+            // Another producer's intent, sent as turn-rules, under the same name.
+            let spec = flotilla_messaging::Intent::new(turn_rules, inbox, flotilla_resources::MessageRelation::System, "concurrent intent");
+            self.primitives.admit(&name, &spec).await.map_err(|error| error.to_string())?;
             Ok(())
         }
     }

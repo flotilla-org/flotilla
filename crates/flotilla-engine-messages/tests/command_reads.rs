@@ -6,7 +6,8 @@ use flotilla_address::Address;
 use flotilla_engine_messages::MessagePrimitives;
 use flotilla_engine_messages_testkit::{designate_fleet, EngineMessagesHome};
 use flotilla_inbox::InboxBackend;
-use flotilla_resources::{MessageExpectation, MessageReference, MessageRelation, MessageSpec};
+use flotilla_messaging::{Intent, IntentExpectation, IntentReference};
+use flotilla_resources::MessageRelation;
 use flotilla_schema::Timestamp;
 use flotilla_state_machines::{machines::message::Deliver, Transport};
 use flotilla_store::{
@@ -19,22 +20,19 @@ const NAMESPACE: &str = "flotilla";
 const CODER: &str = "flotilla/coder";
 const REVIEWER: &str = "flotilla/reviewer";
 
-fn message(sender: &str, receiver: &str, relation: MessageRelation, body: &str) -> MessageSpec {
-    MessageSpec::builder().sender(sender.into()).receiver(receiver.into()).relation(relation).body(body.into()).build()
+fn message(sender: &str, receiver: &str, relation: MessageRelation, body: &str) -> Intent {
+    flotilla_engine_messages_testkit::intent(sender, receiver, relation, body)
 }
 
-/// A reference to the project: converted with no record read.
-fn about_the_project() -> MessageReference {
-    MessageReference::ControlRecord {
-        resource: flotilla_protocol::ResourceRef::new("flotilla.work/v1", "Project", NAMESPACE, "flotilla"),
-        revision: "1".into(),
-    }
+/// A reference to the project.
+fn about_the_project() -> IntentReference {
+    IntentReference::new(Address::project("flotilla").expect("project"), flotilla_address::Revision::new("1".to_owned()).expect("revision"))
 }
 
 /// The reviewer's escalation to the coder that expects a ruling, about the project.
-fn escalation(body: &str) -> MessageSpec {
-    MessageSpec {
-        expectation: MessageExpectation::Reply,
+fn escalation(body: &str) -> Intent {
+    Intent {
+        expectation: IntentExpectation::Reply,
         references: vec![about_the_project()],
         ..message(REVIEWER, CODER, MessageRelation::Supervisor, body)
     }
@@ -53,21 +51,21 @@ async fn seeded(others: usize) -> (EngineMessagesHome, ResourceBackend) {
     primitives.inbox().bind(inbox.clone(), session.clone()).await.expect("bind");
     for n in 0..others {
         let name = format!("history-{n}");
-        primitives.admit_old(NAMESPACE, &name, &message(REVIEWER, CODER, MessageRelation::Supervisor, &name)).await.expect("admit");
+        primitives.admit(&name, &message(REVIEWER, CODER, MessageRelation::Supervisor, &name)).await.expect("admit");
         let (id, _) = primitives.locate_in(&inbox, &name).expect("locate").expect("admitted");
         primitives.inbox().receive(&session, &id, Transport::Turn).await.expect("receipt");
         primitives.inbox().deliver(&id, Deliver { receiver: session.clone(), transport: Transport::Turn }).await.expect("deliver");
         let other = format!("flotilla/other-{n}");
         primitives
-            .admit_old(NAMESPACE, &format!("elsewhere-{n}"), &message(REVIEWER, &other, MessageRelation::Supervisor, "elsewhere"))
+            .admit(&format!("elsewhere-{n}"), &message(REVIEWER, &other, MessageRelation::Supervisor, "elsewhere"))
             .await
             .expect("admit");
     }
-    primitives.admit_old(NAMESPACE, "brief", &message(REVIEWER, CODER, MessageRelation::Supervisor, "first brief")).await.expect("admit");
-    primitives.admit_old(NAMESPACE, "escalation", &escalation("second brief")).await.expect("admit");
-    primitives.admit_old(NAMESPACE, "turn", &message("system:turn-rules", CODER, MessageRelation::System, "a turn")).await.expect("admit");
+    primitives.admit("brief", &message(REVIEWER, CODER, MessageRelation::Supervisor, "first brief")).await.expect("admit");
+    primitives.admit("escalation", &escalation("second brief")).await.expect("admit");
+    primitives.admit("turn", &message("system:turn-rules", CODER, MessageRelation::System, "a turn")).await.expect("admit");
     let stall = message("system:stall-judge", CODER, MessageRelation::Supervisor, "a stall");
-    primitives.admit_old(NAMESPACE, "stall", &stall).await.expect("admit");
+    primitives.admit("stall", &stall).await.expect("admit");
     (home, backend)
 }
 
@@ -77,13 +75,13 @@ async fn command_reads(others: usize) -> Vec<(String, ReadCounts)> {
     let primitives: &MessagePrimitives = home.primitives();
     let mut costs = Vec::new();
 
-    let next = primitives.intent_of(NAMESPACE, &message(REVIEWER, CODER, MessageRelation::Supervisor, "next")).await.expect("intent");
+    let next = message(REVIEWER, CODER, MessageRelation::Supervisor, "next");
     let (undelivered, reads) = measure_now(|| primitives.undelivered_from(&next));
     let undelivered = undelivered.expect("undelivered read").expect("an undelivered brief");
     assert_eq!((undelivered.standing.name.as_str(), undelivered.body.as_str()), ("escalation", "second brief"));
     costs.push((format!("undelivered_from: {}", undelivered.standing.name), reads));
 
-    let ruling = primitives.intent_of(NAMESPACE, &escalation("")).await.expect("intent");
+    let ruling = escalation("");
     let about = ruling.references.iter().map(|reference| reference.address.clone()).collect::<Vec<_>>();
     let (awaited, reads) = measure_now(|| primitives.awaited_reply_from(&ruling.sender, &ruling.inbox, &about));
     assert_eq!(awaited.expect("awaited read").as_deref(), Some("escalation"));

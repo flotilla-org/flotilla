@@ -3,10 +3,10 @@
 //! expecting nothing; it is open while Pending, and is known by its sender and subject.
 
 use flotilla_address::Address;
-use flotilla_state_machines::machines::message::{MessageReference, MessageSpec, Relation};
+use flotilla_state_machines::machines::message::{MessageBody, MessageReference, MessageSpec, Relation};
 
 use super::{
-    convert::{body, UNBOUND_AFTER},
+    admission::UNBOUND_AFTER,
     roles::{FleetRole, FleetRoles, CAPABILITIES, STALL_JUDGE, STANDING, TEARDOWN, TURN_RULES},
 };
 
@@ -90,7 +90,12 @@ impl Attention {
         Ok(MessageSpec {
             references,
             unbound_after: UNBOUND_AFTER.num_microseconds().expect("bounded"),
-            ..MessageSpec::new(sender, inbox, Relation::System, body(&self.reason, None)?)
+            ..MessageSpec::new(
+                sender,
+                inbox,
+                Relation::System,
+                MessageBody::text(self.reason.clone()).map_err(|error| format!("body: {error}"))?,
+            )
         })
     }
 }

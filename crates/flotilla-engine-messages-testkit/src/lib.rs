@@ -4,12 +4,12 @@
 
 use std::sync::{Arc, RwLock};
 
-use flotilla_engine_messages::{records::MessageRecords, MessagePrimitives};
+use flotilla_engine_messages::{records::MessageRecords, roles::FleetRoles, MessagePrimitives};
 use flotilla_inbox::InboxBackend;
-use flotilla_messaging::EngineMessages;
+use flotilla_messaging::{EngineMessages, Intent};
 use flotilla_resources::{
-    attentions::Attentions, Clock, FleetDesignation, FleetDesignationSpec, InputMeta, Message as OldMessage, Project, ProjectSpec,
-    ReadResourceObject, ResourceError, SystemClock, FLEET_DESIGNATION_NAME,
+    attentions::Attentions, Clock, FleetDesignation, FleetDesignationSpec, InputMeta, Message as OldMessage, MessageRelation, Project,
+    ProjectSpec, ReadResourceObject, ResourceError, SystemClock, FLEET_DESIGNATION_NAME,
 };
 use flotilla_schema::{Address, Timestamp};
 use flotilla_schema_sqlite::stream::Service;
@@ -142,6 +142,22 @@ pub async fn deliver_turn(
     inbox.bind(address, consumer.clone()).await.expect("bind the session");
     inbox.receive(&consumer, &id, Transport::Turn).await.expect("receipt");
     inbox.deliver(&id, Deliver { receiver: consumer, transport: Transport::Turn }).await.expect("deliver");
+}
+
+/// The inbox `party` names in fleet `lab`, which [`designate_fleet`] designates: a crew seat
+/// (`P/C/V/R` or `P/R`) or a `system:` producer as [`FleetRoles::inbox`] reads it, else an engine
+/// address as written. A person is written as the role address they hold.
+pub fn party(party: &str) -> Address {
+    if party.starts_with("system:") || !party.contains(':') {
+        return FleetRoles::declared("lab").and_then(|roles| roles.inbox(party)).unwrap_or_else(|error| panic!("{party}: {error}"));
+    }
+    party.parse().unwrap_or_else(|error| panic!("{party}: {error}"))
+}
+
+/// A message `body` from `sender` to `receiver`, each read by [`party`], as `relation`,
+/// expecting nothing.
+pub fn intent(sender: &str, receiver: &str, relation: MessageRelation, body: impl Into<String>) -> Intent {
+    Intent::new(party(sender), party(receiver), relation, body)
 }
 
 /// Declares Project `fleet` in `namespace` and designates it, so the fleet roles the system

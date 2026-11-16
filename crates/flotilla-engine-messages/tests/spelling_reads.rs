@@ -8,8 +8,8 @@ use std::collections::BTreeMap;
 
 use flotilla_engine_messages_testkit::{designate_fleet, EngineMessagesHome};
 use flotilla_resources::{
-    artifact::blob_digest_of, Artifact, ArtifactSpec, Convoy, ConvoySpec, InputMeta, MessageRelation, MessageSpec, Project, ProjectSpec,
-    Repository, RepositorySpec, Selector, TerminalBrief, TerminalCrewContext, TerminalSession, TerminalSessionSource, TerminalSessionSpec,
+    artifact::blob_digest_of, Artifact, ArtifactSpec, Convoy, ConvoySpec, InputMeta, MessageRelation, Project, ProjectSpec, Repository,
+    RepositorySpec, Selector, TerminalBrief, TerminalCrewContext, TerminalSession, TerminalSessionSource, TerminalSessionSpec,
     CONVOY_LABEL, ROLE_LABEL, VESSEL_LABEL,
 };
 use flotilla_store::ResourceBackend;
@@ -108,13 +108,8 @@ async fn open_read(unrelated: usize) -> ReadSnapshot {
     let home = EngineMessagesHome::open("home", NAMESPACE, &backend);
     let primitives = home.primitives();
     for (name, receiver) in [("to-crew", HELD), ("to-remote", ELSEWHERE)] {
-        let intent = MessageSpec::builder()
-            .sender("system:turn-rules".into())
-            .receiver(receiver.into())
-            .relation(MessageRelation::System)
-            .body(name.into())
-            .build();
-        primitives.admit_old(NAMESPACE, name, &intent).await.expect("admit");
+        let intent = flotilla_engine_messages_testkit::intent("system:turn-rules", receiver, MessageRelation::System, name);
+        primitives.admit(name, &intent).await.expect("admit");
     }
 
     let before = backend.read_snapshot();

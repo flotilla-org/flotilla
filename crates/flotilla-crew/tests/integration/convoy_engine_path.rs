@@ -731,7 +731,7 @@ async fn a_message_commit_wakes_the_convoys_holding_delivery_without_listing_mes
     use flotilla_crew::ports::MessagePath;
     use flotilla_engine_messages_testkit::{designate_fleet, EngineMessagesHome};
     use flotilla_messaging::EngineMessages;
-    use flotilla_resources::{MessageRelation, MessageSpec};
+    use flotilla_resources::MessageRelation;
     use flotilla_store::controller::WorkQueueSender;
     let backend = ResourceBackend::new(InMemoryBackend::default());
     designate_fleet(&backend, NAMESPACE).await;
@@ -749,13 +749,13 @@ async fn a_message_commit_wakes_the_convoys_holding_delivery_without_listing_mes
     let admit = |n: usize| {
         let primitives = Arc::clone(&primitives);
         async move {
-            let intent = MessageSpec::builder()
-                .sender("system:turn-rules".into())
-                .receiver("flotilla/c/work/coder".into())
-                .relation(MessageRelation::System)
-                .body(format!("turn {n}"))
-                .build();
-            primitives.admit_old(NAMESPACE, &format!("turn-{n}"), &intent).await.expect("admit");
+            let intent = flotilla_engine_messages_testkit::intent(
+                "system:turn-rules",
+                "flotilla/c/work/coder",
+                MessageRelation::System,
+                format!("turn {n}"),
+            );
+            primitives.admit(&format!("turn-{n}"), &intent).await.expect("admit");
         }
     };
     // The test's reads and its watches' count for one caller, as a controller's watches do.
@@ -1290,13 +1290,6 @@ struct Turns {
 impl flotilla_messaging::EngineMessages for Turns {
     async fn holds(&self, _: &flotilla_address::Address, _: &str) -> Result<bool, flotilla_resources::ResourceError> {
         unreachable!("the convoy reconciler reads no message by name")
-    }
-    async fn intent_of(
-        &self,
-        _: &str,
-        _: &flotilla_resources::MessageSpec,
-    ) -> Result<flotilla_messaging::Intent, flotilla_resources::ResourceError> {
-        unreachable!("the convoy reconciler sends nothing")
     }
     async fn admitted(
         &self,

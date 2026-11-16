@@ -24,11 +24,9 @@ use flotilla_state_machines::{
     Resource, StoredState, Version,
 };
 
-use flotilla_engine_messages::{
-    attention::{Attention, Cause, Read},
-    convert::Conversion,
-};
+use flotilla_engine_messages::attention::{Attention, Cause, Read};
 
+use super::convert::Conversion;
 use super::import::{check, imported_name, ImportDrop, ImportRefusal, Imported, ImportedMessage};
 
 pub mod retired;

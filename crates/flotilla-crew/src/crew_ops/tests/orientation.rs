@@ -119,7 +119,7 @@ fn orientation_follows_live_project(tc: hegel::TestCase) {
 // messages for this crew. No transport concurrency affects this read scenario.
 #[tokio::test]
 async fn crew_list_never_reads_message_history() {
-    use flotilla_resources::{Message, MessageRelation, MessageSpec};
+    use flotilla_resources::MessageRelation;
 
     let (crew, backend, _, held) = fixture(CrewWorkPhase::Working).await;
     let context = CrewCommandContext {
@@ -137,19 +137,13 @@ async fn crew_list_never_reads_message_history() {
     expected_reads.assert_no_lists("crew list");
     // History on the engine, past several pages of its scans and index reads: messages to other
     // convoys' seats and to this crew's own.
-    let messages = backend.using::<Message>("flotilla");
+    let primitives = held.messages().primitives();
     for index in 0..103 {
         let receiver = if index < 100 { format!("flotilla/other-{index}/work/coder") } else { held.receiver("work", "coder") };
-        messages
-            .create(
-                &InputMeta::builder().name(format!("inbox-{index}")).build(),
-                &MessageSpec::builder()
-                    .sender("system:turn-rules".into())
-                    .receiver(receiver)
-                    .relation(MessageRelation::System)
-                    .body("test".into())
-                    .build(),
-            )
+        let inbox = flotilla_resources::convoy::engine::role_inbox(&receiver).unwrap();
+        let sender = flotilla_engine_messages_testkit::party("system:turn-rules");
+        primitives
+            .admit(&format!("inbox-{index}"), &flotilla_messaging::Intent::new(sender, inbox, MessageRelation::System, "test"))
             .await
             .unwrap();
     }

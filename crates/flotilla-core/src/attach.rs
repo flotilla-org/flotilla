@@ -2322,19 +2322,13 @@ mod tests {
             create_running_session(&engine, &environment, "terminal-main", &main, "coder").await;
             for n in 0..unrelated {
                 create_identity_convoy(&daemon, &format!("unrelated-{n}"), "other", Some("other")).await;
-                backend
-                    .using::<flotilla_resources::Message>("flotilla")
-                    .create(
-                        &test_meta(&format!("message-{n}")),
-                        &flotilla_resources::MessageSpec::builder()
-                            .sender("other/source".into())
-                            .receiver("other/receiver".into())
-                            .relation(flotilla_resources::MessageRelation::Peer)
-                            .body("other".into())
-                            .build(),
-                    )
-                    .await
-                    .expect("noise message");
+                let noise = flotilla_engine_messages_testkit::intent(
+                    "other/source",
+                    "other/receiver",
+                    flotilla_resources::MessageRelation::Peer,
+                    "other",
+                );
+                daemon.message_primitives().expect("message path").admit(&format!("message-{n}"), &noise).await.expect("noise message");
             }
             // Count this resolver's real store collaborators. Daemon startup,
             // projection materialization and provider-retirement tasks share

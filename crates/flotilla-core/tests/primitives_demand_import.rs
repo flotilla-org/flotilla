@@ -3,6 +3,7 @@
 use std::collections::BTreeMap;
 
 use chrono::{DateTime, TimeZone, Utc};
+use flotilla_core::primitives::convert::Conversion;
 use flotilla_core::primitives::{
     demand_import::{
         import_demands,
@@ -14,7 +15,7 @@ use flotilla_core::primitives::{
     },
     import::{check, Imported},
 };
-use flotilla_engine_messages::{convert::Conversion, roles::FleetRoles, OldStoreRecords};
+use flotilla_engine_messages::{roles::FleetRoles, OldStoreRecords};
 use flotilla_protocol::{PrincipalRef, ResourceRef};
 use flotilla_resources::{Convoy, ConvoyEnsure, ConvoySpec, ObjectMeta, ResourceObject, TerminalSession, Vessel, CONVOY_LABEL, ROLE_LABEL};
 use flotilla_state_machines::machines::message::MessageState;

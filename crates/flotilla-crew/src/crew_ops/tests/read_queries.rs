@@ -2,7 +2,7 @@ use super::*;
 use chrono::Utc;
 use flotilla_protocol::CrewCommandContext;
 use flotilla_resources::checkout_records::{CheckoutHolder, CheckoutRecord, CheckoutRecords as _, Inspection, Landed};
-use flotilla_resources::{ChangeRequest, ChangeRequestSpec, Message, MessageRelation, MessageSpec};
+use flotilla_resources::{ChangeRequest, ChangeRequestSpec, MessageRelation};
 use flotilla_store::StoreExt;
 
 /// The coder's context in the fixture convoy's vessel.
@@ -34,19 +34,13 @@ async fn interactive_crew_reads_ignore_unrelated_resources() {
                     flotilla_engine_convoys_testkit::single_agent("coder"),
                 )
                 .await;
-            backend
-                .using::<Message>("flotilla")
-                .create(
-                    &InputMeta::builder().name(name.clone()).build(),
-                    &MessageSpec::builder()
-                        .sender("flotilla/other".into())
-                        .receiver("flotilla/other-convoy/work/coder".into())
-                        .relation(MessageRelation::Supervisor)
-                        .body("other".into())
-                        .build(),
-                )
-                .await
-                .expect("unrelated message");
+            let unrelated = flotilla_engine_messages_testkit::intent(
+                "flotilla/other",
+                "flotilla/other-convoy/work/coder",
+                MessageRelation::Supervisor,
+                "other",
+            );
+            held.messages().primitives().admit(&name, &unrelated).await.expect("unrelated message");
             held.engine.launch_session(&TerminalLaunchRequest {
                 session: format!("terminal-{n}"),
                 environment: "other".into(),

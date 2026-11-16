@@ -1002,13 +1002,13 @@ async fn read_by_one_judgement(others: usize) -> (u64, u64, u64) {
         home.vessel(&launch, "work", "env");
         let convoy = home.view(&backend, &launch).await;
         let seat = flotilla_resources::convoy_crew_seats("flotilla", &convoy).remove(0);
-        let intent = flotilla_resources::MessageSpec::builder()
-            .sender("system:turn-rules".into())
-            .receiver(seat)
-            .relation(flotilla_resources::MessageRelation::System)
-            .body(format!("turn {index}"))
-            .build();
-        home.messages.primitives().admit_old("flotilla", &format!("turn-{index}"), &intent).await.expect("admit the turn");
+        let intent = flotilla_messaging::Intent::new(
+            flotilla_engine_messages_testkit::party("system:turn-rules"),
+            flotilla_resources::convoy::engine::role_inbox(&seat).expect("the seat's inbox"),
+            flotilla_resources::MessageRelation::System,
+            format!("turn {index}"),
+        );
+        home.messages.primitives().admit(&format!("turn-{index}"), &intent).await.expect("admit the turn");
         objects.insert(launch, convoy);
     }
     for convoy in objects.values() {

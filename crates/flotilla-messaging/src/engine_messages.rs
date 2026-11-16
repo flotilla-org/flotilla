@@ -61,14 +61,6 @@ pub trait EngineMessages: Send + Sync {
     /// Whether `inbox` holds the message `record`, local or replicated, read by its exact identity
     /// without loading it.
     async fn holds(&self, inbox: &flotilla_address::Address, record: &str) -> Result<bool, flotilla_resources::ResourceError>;
-    /// An old-shaped intent in the engine's terms, its parties and references resolved as
-    /// admission resolved them.
-    // Goes once every producer builds its intent in the engine's terms (#3108).
-    async fn intent_of(
-        &self,
-        namespace: &str,
-        old: &flotilla_resources::MessageSpec,
-    ) -> Result<crate::Intent, flotilla_resources::ResourceError>;
     /// The inbox of fleet role `role` (`fleet:<fleet>/role:<role>`), read on the FleetDesignation
     /// by its name; refused for a role the fleet does not declare.
     async fn fleet_role(&self, namespace: &str, role: &str) -> Result<flotilla_address::Address, flotilla_resources::ResourceError>;

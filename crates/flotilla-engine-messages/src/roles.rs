@@ -4,7 +4,7 @@
 use std::collections::BTreeMap;
 
 use flotilla_address::{Address, Kind};
-use flotilla_resources::{FleetDesignation, FleetDesignationSpec, ResourceError, FLEET_DESIGNATION_NAME};
+use flotilla_resources::{convoy::engine::role_inbox, FleetDesignation, FleetDesignationSpec, ResourceError, FLEET_DESIGNATION_NAME};
 use flotilla_store::ResourceBackend;
 
 /// A declared fleet role: its name under the fleet, and what it does.
@@ -159,6 +159,61 @@ impl FleetRoles {
             name => self.address(name),
         }
     }
+
+    /// The inbox a crew seat or a `system:` producer names: `P/C/V/R` is the convoy role
+    /// `project:P/convoy:C/role:R` (the vessel dropped), `P/R` the standing role
+    /// `project:P/role:R`, and `system:<name>` the fleet role it names. A person and a topic have
+    /// no inbox of their own here.
+    pub fn inbox(&self, receiver: &str) -> Result<Address, String> {
+        if receiver.starts_with("system:") {
+            return self.system_sender(receiver).ok_or_else(|| format!("`{receiver}` names no declared fleet role"));
+        }
+        if receiver.starts_with("principal:") {
+            return Err(format!("`{receiver}` is a person, whose role depends on the message's context"));
+        }
+        if receiver.starts_with("topic:") {
+            return Err(format!("`{receiver}` is a topic; resolve its subscriber's role first"));
+        }
+        role_inbox(receiver)
+    }
+
+    /// What a stall is about: a whole convoy by its address, or a seat as [`Self::inbox`] reads it.
+    pub fn stall_subject(&self, subject: &str) -> Result<Address, String> {
+        if subject.starts_with("project:") {
+            let address: Address = subject.parse().map_err(|error| format!("invalid stall subject: {error}"))?;
+            if address.kind() == Kind::Convoy {
+                return Ok(address);
+            }
+            return Err(format!("`{subject}` is not a convoy address"));
+        }
+        self.inbox(subject)
+    }
+
+    /// A person's role in `project`, or under the fleet with no project (#3938). `held` are the
+    /// roles `project`'s own charter declares `principal` holds: one is theirs, and several are
+    /// refused rather than guessed between. With none declared, `principal:<role>` names that
+    /// person role and anyone else holds the operator role, as one person consumer holds every
+    /// person role at the roll.
+    pub fn principal_role(&self, principal: &str, project: Option<&str>, mut held: Vec<String>) -> Result<Address, String> {
+        let name =
+            principal.strip_prefix("principal:").filter(|name| !name.is_empty()).ok_or_else(|| format!("`{principal}` is no person"))?;
+        let default = PERSON_ROLES.iter().find(|role| role.name == name).unwrap_or(&OPERATOR).name;
+        let Some(project) = project else {
+            return Ok(self.person(default).expect("a declared person role"));
+        };
+        held.sort();
+        let role = match held.as_slice() {
+            [] => default,
+            [role] => role.as_str(),
+            several => {
+                return Err(format!(
+                    "`{principal}` holds roles {} in project `{project}`; the message names no one of them",
+                    several.iter().map(|role| format!("`{role}`")).collect::<Vec<_>>().join(", ")
+                ))
+            }
+        };
+        Address::project(project).and_then(|project| project.child(Kind::Role, role)).map_err(|error| format!("`{principal}`: {error}"))
+    }
 }
 
 /// The fleet identity comes only from the replicated designation.
@@ -202,5 +257,51 @@ mod tests {
         assert_eq!(roles.person_role_of(&crew), None, "a convoy's crew role is no person role");
         let overridden = roles.declare("checks", "Reports check results.").expect("override");
         assert_eq!(overridden.address("checks").map(|a| a.to_string()), Some("fleet:fleet/role:checks".into()));
+    }
+
+    // Behaviour: role addresses drop the vessel; system producers send as
+    // their fleet role; people need a message's context, and topics have no inbox here.
+    #[test]
+    fn receivers_and_senders_map_to_host_free_role_addresses() {
+        let roles = FleetRoles::declared("fleet").expect("roles");
+        assert_eq!(roles.inbox("flotilla/demo/work/coder").expect("convoy role").as_str(), "project:flotilla/convoy:demo/role:coder");
+        assert_eq!(roles.inbox("flotilla/gui-approver").expect("standing role").as_str(), "project:flotilla/role:gui-approver");
+        assert_eq!(roles.inbox("system:turn-rules").expect("fleet role").as_str(), "fleet:fleet/role:turn-rules");
+        assert_eq!(roles.inbox("system:hold").expect("held turns").as_str(), "fleet:fleet/role:turn-rules");
+        assert!(roles.inbox("principal:alice").is_err(), "a person has no address outside a message's context");
+        assert!(roles.inbox("topic:flotilla/reviews").is_err());
+        assert!(roles.inbox("system:unknown").is_err());
+    }
+
+    // Behaviour: a standing role's launch is named by its own address, escaped in the old
+    // receiver's segment; the inbox is that launch's role, not an address of the escaped text.
+    #[test]
+    fn a_standing_launch_receiver_is_its_launch_role() {
+        let roles = FleetRoles::declared("fleet").expect("roles");
+        let launch = format!("{}#5", flotilla_resources::convoy::engine::standing_name("flotilla", "governor").expect("standing name"));
+        let receiver = flotilla_resources::crew_role_address("flotilla", &launch, "govern", "governor");
+        let project = Address::project("flotilla").expect("project");
+        let expected = flotilla_resources::convoy::engine::launch_address(&project, &launch)
+            .expect("launch")
+            .child(Kind::Role, "governor")
+            .expect("role");
+        assert_eq!(roles.inbox(&receiver).expect("standing launch role").as_str(), expected.as_str());
+    }
+
+    // Behaviour (#3938): a person is the role they hold in a project, the fleet's with no
+    // project; a role the charter declares for them is theirs, and several are refused.
+    #[test]
+    fn a_person_is_the_role_they_hold_in_a_project() {
+        let roles = FleetRoles::declared("fleet").expect("roles");
+        let role = |principal: &str, project: Option<&str>, held: &[&str]| {
+            roles.principal_role(principal, project, held.iter().map(|role| (*role).to_owned()).collect())
+        };
+        assert_eq!(role("principal:alice", Some("flotilla"), &[]).expect("operator").as_str(), "project:flotilla/role:operator");
+        assert_eq!(role("principal:operator", Some("flotilla"), &[]).expect("operator").as_str(), "project:flotilla/role:operator");
+        assert_eq!(role("principal:bob", Some("flotilla"), &["owner"]).expect("owner").as_str(), "project:flotilla/role:owner");
+        let ambiguous = role("principal:eve", Some("flotilla"), &["owner", "lead"]).expect_err("ambiguous");
+        assert!(ambiguous.contains("`lead`, `owner`"), "{ambiguous}");
+        assert_eq!(role("principal:alice", None, &[]).expect("fleet").as_str(), "fleet:fleet/role:operator");
+        assert!(role("flotilla/demo/work/coder", None, &[]).is_err(), "no person");
     }
 }

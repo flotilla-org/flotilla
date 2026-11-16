@@ -2,11 +2,11 @@ use super::*;
 use flotilla_store::load_metrics::CallerReads;
 use flotilla_store_testkit::{ReadCountsBackendExt, ReadOperation};
 
-// Startup adopts old queues. Watch notifications reconcile current Message evidence
+// Startup runs one pass. Watch notifications reconcile current Message evidence
 // only, even when replica/session events arrive in separate batches, and no timer
 // wakes the task.
 #[tokio::test]
-async fn legacy_adoption_runs_only_at_startup() {
+async fn startup_runs_one_pass_and_watches_drive_the_rest() {
     let temp = tempfile::tempdir().expect("config");
     fs::write(temp.path().join("daemon.toml"), "machine_id = \"legacy-adoption-test\"\n").expect("daemon config");
     let backend = ResourceBackend::new(flotilla_store_memory::InMemoryBackend::default()).with_read_counts();
@@ -22,7 +22,7 @@ async fn legacy_adoption_runs_only_at_startup() {
     });
     let task = tokio_util::task::AbortOnDropHandle::new(task);
     ready.await.expect("startup ready");
-    assert_eq!(backend.read_snapshot().since(&before).calls("Convoy", ReadOperation::Query), 3);
+    assert_eq!(backend.read_snapshot().since(&before).calls("Convoy", ReadOperation::Query), 1);
     for sender in [&convoy_sender, &session_sender] {
         let before = backend.read_snapshot();
         sender.unbounded_send(Ok(())).expect("watch event");
@@ -53,17 +53,18 @@ async fn a_message_commit_runs_a_pass_without_listing_messages() {
     let daemon = daemon_with_backend(Vec::new(), Arc::new(ConfigStore::with_base(temp.path())), backend.clone()).await;
     let primitives = daemon.open_message_primitives().expect("message path");
     designate_fleet(&daemon).await;
-    let intent = flotilla_resources::MessageSpec::builder()
-        .sender("system:turn-rules".into())
-        .receiver("flotilla/c/work/coder".into())
-        .relation(flotilla_resources::MessageRelation::System)
-        .body("turn".into())
-        .build();
+    // The designated fleet here is `fleet`, so turn-rules sends as `fleet:fleet/role:turn-rules`.
+    let intent = flotilla_engine_messages_testkit::intent(
+        "fleet:fleet/role:turn-rules",
+        "flotilla/c/work/coder",
+        flotilla_resources::MessageRelation::System,
+        "turn",
+    );
     // The test's and the task's reads count for one caller.
     let reads = Arc::new(CallerReads::default());
     let rows = || reads.snapshot().get("Message").map_or((0, 0), |counts| (counts.decoded, counts.converted));
     // Admission reads back the message it admits; what one admission costs, with nothing listening.
-    attributed(Arc::clone(&reads), primitives.admit_old(NAMESPACE, "first", &intent)).await.expect("admit");
+    attributed(Arc::clone(&reads), primitives.admit("first", &intent)).await.expect("admit");
     let admission = rows();
 
     let (task, ready) = within(&reads, || super::super::tasks::spawn_pending_supervisor_turn_task(Arc::clone(&daemon), NAMESPACE.into()));
@@ -71,7 +72,7 @@ async fn a_message_commit_runs_a_pass_without_listing_messages() {
     ready.await.expect("startup ready");
 
     let (before, read) = (backend.read_snapshot(), rows());
-    attributed(Arc::clone(&reads), primitives.admit_old(NAMESPACE, "turn", &intent)).await.expect("admit");
+    attributed(Arc::clone(&reads), primitives.admit("turn", &intent)).await.expect("admit");
     tokio::time::timeout(Duration::from_secs(5), async {
         while backend.read_snapshot().since(&before).calls("Convoy", ReadOperation::Query) == 0 {
             tokio::task::yield_now().await;

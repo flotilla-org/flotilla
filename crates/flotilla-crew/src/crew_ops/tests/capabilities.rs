@@ -339,13 +339,13 @@ async fn read_by_a_card_change(count: usize) -> (u64, u64) {
     let (crew, backend, _, held) = fixture(CrewWorkPhase::Working).await;
     let primitives = held.messages().primitives();
     for index in 0..count {
-        let intent = flotilla_resources::MessageSpec::builder()
-            .sender("system:turn-rules".into())
-            .receiver(held.receiver("work", "coder"))
-            .relation(flotilla_resources::MessageRelation::System)
-            .body(format!("open {index}"))
-            .build();
-        primitives.admit_old("flotilla", &format!("open-{index}"), &intent).await.expect("admit an open message");
+        let intent = flotilla_messaging::Intent::new(
+            flotilla_engine_messages_testkit::party("system:turn-rules"),
+            flotilla_resources::convoy::engine::role_inbox(&held.receiver("work", "coder")).expect("the coder's inbox"),
+            flotilla_resources::MessageRelation::System,
+            format!("open {index}"),
+        );
+        primitives.admit(&format!("open-{index}"), &intent).await.expect("admit an open message");
     }
     let session = backend.using::<ResourceTerminalSession>("flotilla").get("session").await.expect("session");
     let tracker = CapabilityCardTracker::with_message_path(crew.message_path.clone());

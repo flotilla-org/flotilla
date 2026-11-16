@@ -6,9 +6,9 @@ use std::sync::Arc;
 use flotilla_engine_messages::MessagePrimitives;
 use flotilla_engine_messages_testkit::Served;
 use flotilla_inbox::InboxBackend;
+use flotilla_messaging::{Intent, IntentExpectation, IntentReference};
 use flotilla_resources::{
-    FleetDesignation, FleetDesignationSpec, InputMeta, MessageReference, MessageRelation, MessageSpec, Project, ProjectSpec, SystemClock,
-    FLEET_DESIGNATION_NAME,
+    FleetDesignation, FleetDesignationSpec, InputMeta, MessageRelation, Project, ProjectSpec, SystemClock, FLEET_DESIGNATION_NAME,
 };
 use flotilla_schema_sqlite::stream::Service;
 use flotilla_state_machines::machines::message::{Message, MessageState};
@@ -59,13 +59,9 @@ async fn primitives_over(
     Served::new(MessagePrimitives::open("home-a", service, backend.clone(), clock).expect("primitives"), backend)
 }
 
-fn intent(sender: &str, receiver: &str) -> MessageSpec {
-    MessageSpec::builder()
-        .sender(sender.into())
-        .receiver(receiver.into())
-        .relation(MessageRelation::System)
-        .body(format!("from {sender}"))
-        .build()
+/// A message from `sender` to `receiver`, each a crew seat, a `system:` producer or an address.
+fn intent(sender: &str, receiver: &str) -> Intent {
+    flotilla_engine_messages_testkit::intent(sender, receiver, MessageRelation::System, format!("from {sender}"))
 }
 
 /// The engine record of `record`, admitted to `receiver` (an old address), read in its inbox.
@@ -92,7 +88,7 @@ async fn system_producers_send_as_their_fleet_roles() {
     for role in ["turn-rules", "nudge", "stall-judge", "capabilities", "fleet-store", "standing", "teardown"] {
         let sender = format!("system:{role}");
         let record = flotilla_resources::message_record_name(CREW, &sender, role);
-        primitives.admit_old(NAMESPACE, &record, &intent(&sender, CREW)).await.expect("admitted");
+        primitives.admit(&record, &intent(&sender, CREW)).await.expect("admitted");
         let message = engine_message(&primitives, CREW, &record).await;
         assert_eq!(message.spec().sender.as_str(), format!("fleet:lab/role:{role}"));
         assert_eq!(message.spec().inbox.as_str(), "project:flotilla/convoy:demo/role:coder");
@@ -100,12 +96,12 @@ async fn system_producers_send_as_their_fleet_roles() {
     }
     // The held turn's name keys on `system:hold`; it sends as turn-rules.
     let held = flotilla_resources::message_record_name("system:hold", "system:turn-rules", "hold:demo:work:coder:rule:1");
-    primitives.admit_old(NAMESPACE, &held, &intent("system:turn-rules", CREW)).await.expect("held turn");
+    primitives.admit(&held, &intent("system:turn-rules", CREW)).await.expect("held turn");
     assert_eq!(engine_message(&primitives, CREW, &held).await.spec().sender.as_str(), "fleet:lab/role:turn-rules");
     // A repeated key is the same message: nothing more is admitted.
     let inbox = primitives.inbox_for(NAMESPACE, CREW).await.expect("the crew's inbox");
     let count = primitives.inbox_messages(&inbox).expect("messages").len();
-    primitives.admit_old(NAMESPACE, &held, &intent("system:turn-rules", CREW)).await.expect("repeat");
+    primitives.admit(&held, &intent("system:turn-rules", CREW)).await.expect("repeat");
     assert_eq!(primitives.inbox_messages(&inbox).expect("messages").len(), count);
 }
 
@@ -117,14 +113,14 @@ async fn a_reply_to_a_fleet_role_reaches_its_inbox() {
     let primitives = primitives(&dir).await;
     let original = flotilla_resources::message_record_name(CREW, "system:nudge", "stall-nudge-1");
     let mut nudge = intent("system:nudge", CREW);
-    nudge.references =
-        vec![MessageReference::Issue { service: "github".into(), scope: "flotilla-org/flotilla".into(), number: 7, revision: "1".into() }];
-    primitives.admit_old(NAMESPACE, &original, &nudge).await.expect("nudge");
+    let issue = flotilla_resources::address::stored_issue_address("github", "flotilla-org/flotilla", 7, &[]).expect("issue");
+    nudge.references = vec![IntentReference::new(issue, flotilla_address::Revision::new("1".to_owned()).expect("revision"))];
+    primitives.admit(&original, &nudge).await.expect("nudge");
     let reply_name = flotilla_resources::message_record_name("system:nudge", CREW, "reply-1");
     let mut reply = intent(CREW, "system:nudge");
     reply.relation = MessageRelation::Peer;
     reply.in_reply_to = Some(original.clone());
-    primitives.admit_old(NAMESPACE, &reply_name, &reply).await.expect("reply");
+    primitives.admit(&reply_name, &reply).await.expect("reply");
     let stored = engine_message(&primitives, "system:nudge", &reply_name).await;
     assert_eq!(stored.spec().inbox.as_str(), "fleet:lab/role:nudge");
     assert_eq!(stored.spec().sender.as_str(), "project:flotilla/convoy:demo/role:coder");
@@ -153,9 +149,9 @@ async fn the_sweep_reconciles_receipts_and_settles_replies_from_open_messages_on
     let dir = tempfile::tempdir().expect("tempdir");
     let primitives = primitives(&dir).await;
     let mut turn = intent("system:turn-rules", CREW);
-    turn.expectation = flotilla_resources::MessageExpectation::Reply;
+    turn.expectation = IntentExpectation::Reply;
     let record = flotilla_resources::message_record_name(CREW, "system:turn-rules", "rule@1");
-    primitives.admit_old(NAMESPACE, &record, &turn).await.expect("turn");
+    primitives.admit(&record, &turn).await.expect("turn");
     let message = engine_message(&primitives, CREW, &record).await;
     let consumer = primitives.register("crew-session", flotilla_schema::Timestamp(1)).await.expect("consumer");
     let inbox = primitives.inbox();
@@ -178,7 +174,7 @@ async fn the_sweep_reconciles_receipts_and_settles_replies_from_open_messages_on
     answer.relation = MessageRelation::Peer;
     answer.in_reply_to = Some(record.clone());
     let answer_name = flotilla_resources::message_record_name("system:turn-rules", CREW, "reply@1");
-    primitives.admit_old(NAMESPACE, &answer_name, &answer).await.expect("answer");
+    primitives.admit(&answer_name, &answer).await.expect("answer");
     let report = primitives.sweep(NAMESPACE, now, &mut open).await.expect("sweep");
     assert_eq!(report.answered, 1);
     assert!(matches!(engine_message(&primitives, CREW, &record).await.state(), MessageState::Settled { .. }));
@@ -206,21 +202,23 @@ async fn the_sweep_settles_held_outcomes_and_withdraws_on_a_false_delivery_condi
         .await
         .expect("active convoy");
     let primitives = primitives_over(&dir, backend, Arc::new(SystemClock)).await;
-    let leaf = |text: &str| text.parse::<flotilla_protocol::Leaf>().expect("condition");
-    let send = |key: &str, edit: &dyn Fn(&mut MessageSpec)| {
+    // A condition as the crew's project reads it.
+    let leaf = |text: &str| {
+        let leaf = text.parse::<flotilla_protocol::Leaf>().expect("condition");
+        flotilla_resources::address::leaf_condition(&leaf, Some("flotilla"), &[]).expect("an ADR 0066 condition")
+    };
+    let send = |key: &str, edit: &dyn Fn(&mut Intent)| {
         let mut spec = intent("system:turn-rules", CREW);
         edit(&mut spec);
         (flotilla_resources::message_record_name(CREW, "system:turn-rules", key), spec)
     };
-    let (met, met_spec) = send("met", &|spec| {
-        spec.expectation = flotilla_resources::MessageExpectation::Outcome { condition: leaf("convoy/demo .status.phase == Active") }
-    });
-    let (unmet, unmet_spec) = send("unmet", &|spec| {
-        spec.expectation = flotilla_resources::MessageExpectation::Outcome { condition: leaf("convoy/demo .status.phase == Completed") }
-    });
+    let (met, met_spec) =
+        send("met", &|spec| spec.expectation = IntentExpectation::Outcome { condition: leaf("convoy/demo .status.phase == Active") });
+    let (unmet, unmet_spec) =
+        send("unmet", &|spec| spec.expectation = IntentExpectation::Outcome { condition: leaf("convoy/demo .status.phase == Completed") });
     let (moot, moot_spec) = send("moot", &|spec| spec.delivery_condition = Some(leaf("convoy/demo .status.phase == Completed")));
     for (name, spec) in [(&met, &met_spec), (&unmet, &unmet_spec), (&moot, &moot_spec)] {
-        primitives.admit_old(NAMESPACE, name, spec).await.expect("admitted");
+        primitives.admit(name, spec).await.expect("admitted");
     }
     let mut open = OpenMessages::default();
     let now = flotilla_schema::Timestamp::from_datetime(&chrono::Utc::now());
@@ -248,7 +246,7 @@ async fn the_sweep_wakes_at_the_earliest_of_several_deadlines() {
         let mut spec = intent("system:nudge", CREW);
         spec.deadline = Some(start + chrono::Duration::seconds(seconds));
         let record = flotilla_resources::message_record_name(CREW, "system:nudge", key);
-        primitives.admit_old(NAMESPACE, &record, &spec).await.expect("admitted");
+        primitives.admit(&record, &spec).await.expect("admitted");
     }
     let at = |seconds: i64| flotilla_schema::Timestamp::from_datetime(&(start + chrono::Duration::seconds(seconds)));
     let mut open = OpenMessages::default();
@@ -272,7 +270,7 @@ async fn a_fresh_sweep_index_seeds_open_messages_from_a_scan() {
     let mut names = Vec::new();
     for key in ["early@1", "early@2"] {
         let record = flotilla_resources::message_record_name(CREW, "system:nudge", key);
-        primitives.admit_old(NAMESPACE, &record, &intent("system:nudge", CREW)).await.expect("admit");
+        primitives.admit(&record, &intent("system:nudge", CREW)).await.expect("admit");
         names.push(located(&primitives, CREW, &record).await.0);
     }
     let mut restarted = OpenMessages::default();
@@ -283,7 +281,7 @@ async fn a_fresh_sweep_index_seeds_open_messages_from_a_scan() {
     assert_eq!(open, names);
     // Later writes are read from the log, from the seeded cursor on.
     let later = flotilla_resources::message_record_name(CREW, "system:nudge", "later@1");
-    primitives.admit_old(NAMESPACE, &later, &intent("system:nudge", CREW)).await.expect("admit");
+    primitives.admit(&later, &intent("system:nudge", CREW)).await.expect("admit");
     restarted.refresh(&primitives).expect("tail");
     assert_eq!(restarted.open().count(), 3);
 }
@@ -301,12 +299,12 @@ async fn a_stall_is_open_until_the_supervisors_reply_lands() {
     let send = |id: &str| {
         let mut stall = intent(CREW, supervisor);
         stall.relation = MessageRelation::Supervisor;
-        stall.expectation = flotilla_resources::MessageExpectation::Reply;
+        stall.expectation = IntentExpectation::Reply;
         (flotilla_resources::message_record_name(supervisor, CREW, id), stall)
     };
     let (name, stall) = send("stall-1");
-    primitives.admit_old(NAMESPACE, &name, &stall).await.expect("stall sent");
-    assert!(primitives.await_reply_old(NAMESPACE, &name, &stall, "home-a", "stall", Some(CREW)).await.expect("recorded"));
+    primitives.admit(&name, &stall).await.expect("stall sent");
+    assert!(primitives.await_reply(NAMESPACE, &name, &stall, "home-a", "stall", Some(CREW)).await.expect("recorded"));
     assert!(primitives.awaiting().stalled(&seat).expect("read"), "the seat is stalled");
     let awaited = MessageRef::new(format!("project:fleet/role:governor/message:{name}"), "home-a");
     assert_eq!(primitives.awaiting().get(&awaited).expect("record").spec().recipient.as_str(), "project:fleet/role:governor");
@@ -318,27 +316,27 @@ async fn a_stall_is_open_until_the_supervisors_reply_lands() {
         (flotilla_resources::message_record_name(CREW, supervisor, id), reply)
     };
     let (reply_name, reply) = resume("resume-1", &name);
-    primitives.admit_old(NAMESPACE, &reply_name, &reply).await.expect("reply");
+    primitives.admit(&reply_name, &reply).await.expect("reply");
     assert_eq!(primitives.awaiting().get(&awaited).expect("record").label(), AwaitingReplyLabel::Answered);
     assert!(!primitives.awaiting().stalled(&seat).expect("read"), "answered");
 
     // The reply first, then the record: answered as it is written.
     let (late, stall) = send("stall-2");
-    primitives.admit_old(NAMESPACE, &late, &stall).await.expect("stall sent");
+    primitives.admit(&late, &stall).await.expect("stall sent");
     let (reply_name, reply) = resume("resume-2", &late);
-    primitives.admit_old(NAMESPACE, &reply_name, &reply).await.expect("reply");
+    primitives.admit(&reply_name, &reply).await.expect("reply");
     // A send may have persisted its record before a later reconciliation read failed.
     let mut partial = primitives.awaiting().get(&awaited).expect("earlier record").spec().clone();
     partial.message = MessageRef::new(format!("project:fleet/role:governor/message:{late}"), "home-a");
     primitives.awaiting().record(partial.clone(), flotilla_schema::Timestamp(1)).expect("record persisted before retry");
     assert_eq!(primitives.awaiting().get(&partial.message).expect("partial record").label(), AwaitingReplyLabel::Open);
-    assert!(!primitives.await_reply_old(NAMESPACE, &late, &stall, "home-a", "stall", Some(CREW)).await.expect("retry reconciles reply"));
+    assert!(!primitives.await_reply(NAMESPACE, &late, &stall, "home-a", "stall", Some(CREW)).await.expect("retry reconciles reply"));
     let awaited = MessageRef::new(format!("project:fleet/role:governor/message:{late}"), "home-a");
     assert_eq!(primitives.awaiting().get(&awaited).expect("record").label(), AwaitingReplyLabel::Answered);
     // A send expecting nothing records nothing.
     let (plain, mut note) = send("note");
-    note.expectation = flotilla_resources::MessageExpectation::None;
-    assert!(!primitives.await_reply_old(NAMESPACE, &plain, &note, "home-a", "reply", None).await.expect("nothing"));
+    note.expectation = IntentExpectation::Nothing;
+    assert!(!primitives.await_reply(NAMESPACE, &plain, &note, "home-a", "reply", None).await.expect("nothing"));
 }
 
 // Behaviour (#3730 review): a message superseded at this home withdraws its sender's record here,
@@ -353,27 +351,27 @@ async fn a_superseded_send_withdraws_its_awaiting_record() {
     let supervisor = "fleet/governor";
     let mut stall = intent(CREW, supervisor);
     stall.relation = MessageRelation::Supervisor;
-    stall.expectation = flotilla_resources::MessageExpectation::Reply;
+    stall.expectation = IntentExpectation::Reply;
     let first = flotilla_resources::message_record_name(supervisor, CREW, "stall-1");
-    primitives.admit_old(NAMESPACE, &first, &stall).await.expect("first");
-    primitives.await_reply_old(NAMESPACE, &first, &stall, "home-a", "stall", Some(CREW)).await.expect("recorded");
+    primitives.admit(&first, &stall).await.expect("first");
+    primitives.await_reply(NAMESPACE, &first, &stall, "home-a", "stall", Some(CREW)).await.expect("recorded");
     let mut again = stall.clone();
     again.supersedes = Some(first.clone());
     let second = flotilla_resources::message_record_name(supervisor, CREW, "stall-2");
-    primitives.admit_old(NAMESPACE, &second, &again).await.expect("second, superseding the first");
+    primitives.admit(&second, &again).await.expect("second, superseding the first");
     let awaited = MessageRef::new(format!("project:fleet/role:governor/message:{first}"), "home-a");
     assert_eq!(primitives.awaiting().get(&awaited).expect("open").label(), AwaitingReplyLabel::Open, "kept until the successor's record");
     assert!(primitives.awaiting().stalled(&seat).expect("read"), "still stalled between admission and record");
-    primitives.await_reply_old(NAMESPACE, &second, &again, "home-a", "stall", Some(CREW)).await.expect("the successor's record");
+    primitives.await_reply(NAMESPACE, &second, &again, "home-a", "stall", Some(CREW)).await.expect("the successor's record");
     assert_eq!(primitives.awaiting().get(&awaited).expect("read from the store").label(), AwaitingReplyLabel::Withdrawn);
     assert_eq!(primitives.awaiting().open_about(&seat).expect("read").len(), 1, "only the successor's stall is open");
 
     // A successor that awaits nothing withdraws the predecessor's record as it is admitted.
     let mut note = stall.clone();
-    note.expectation = flotilla_resources::MessageExpectation::None;
+    note.expectation = IntentExpectation::Nothing;
     note.supersedes = Some(second.clone());
     let third = flotilla_resources::message_record_name(supervisor, CREW, "note");
-    primitives.admit_old(NAMESPACE, &third, &note).await.expect("a note superseding the second");
+    primitives.admit(&third, &note).await.expect("a note superseding the second");
     assert!(!primitives.awaiting().stalled(&seat).expect("read"), "the withdrawn stall is not open");
 }
 
@@ -389,29 +387,29 @@ async fn a_newer_stall_about_the_seat_replaces_the_older_once_written() {
     let stall = |sender: &str, receiver: &str, id: &str| {
         let mut stall = intent(sender, receiver);
         stall.relation = MessageRelation::Supervisor;
-        stall.expectation = flotilla_resources::MessageExpectation::Reply;
+        stall.expectation = IntentExpectation::Reply;
         (flotilla_resources::message_record_name(receiver, sender, id), stall)
     };
     let record = |receiver: &str, name: &str| MessageRef::new(format!("project:fleet/role:{receiver}/message:{name}"), "home-a");
     // The crew's stall to its bosun, then the judge's escalation to the governor.
     let (to_bosun, first) = stall(CREW, "fleet/bosun", "stall-1");
-    primitives.admit_old(NAMESPACE, &to_bosun, &first).await.expect("to the bosun");
-    primitives.await_reply_old(NAMESPACE, &to_bosun, &first, "home-a", "stall", Some(CREW)).await.expect("recorded");
+    primitives.admit(&to_bosun, &first).await.expect("to the bosun");
+    primitives.await_reply(NAMESPACE, &to_bosun, &first, "home-a", "stall", Some(CREW)).await.expect("recorded");
     let (to_governor, second) = stall(CREW, "fleet/governor", "stall-2");
-    primitives.admit_old(NAMESPACE, &to_governor, &second).await.expect("to the governor");
+    primitives.admit(&to_governor, &second).await.expect("to the governor");
     assert_eq!(primitives.awaiting().open_about(&seat).expect("read").len(), 1, "admission alone replaces nothing");
-    primitives.await_reply_old(NAMESPACE, &to_governor, &second, "home-a", "stall", Some(CREW)).await.expect("recorded");
+    primitives.await_reply(NAMESPACE, &to_governor, &second, "home-a", "stall", Some(CREW)).await.expect("recorded");
     assert_eq!(primitives.awaiting().get(&record("bosun", &to_bosun)).expect("bosun").label(), AwaitingReplyLabel::Withdrawn);
     assert_eq!(primitives.awaiting().get(&record("governor", &to_governor)).expect("governor").label(), AwaitingReplyLabel::Open);
     // The bosun escalating it in turn: its record, about the crew's seat, replaces the crew's.
     let (from_bosun, third) = stall("fleet/bosun", "fleet/admiral", "stall-3");
-    primitives.admit_old(NAMESPACE, &from_bosun, &third).await.expect("to the admiral");
-    primitives.await_reply_old(NAMESPACE, &from_bosun, &third, "home-a", "stall", Some(CREW)).await.expect("recorded");
+    primitives.admit(&from_bosun, &third).await.expect("to the admiral");
+    primitives.await_reply(NAMESPACE, &from_bosun, &third, "home-a", "stall", Some(CREW)).await.expect("recorded");
     assert_eq!(primitives.awaiting().get(&record("governor", &to_governor)).expect("governor").label(), AwaitingReplyLabel::Withdrawn);
     let open = primitives.awaiting().open_about(&seat).expect("read");
     assert_eq!(open.iter().map(|record| record.spec().sender.as_str()).collect::<Vec<_>>(), vec!["project:fleet/role:bosun"]);
     // A repeat of an earlier send records nothing more and leaves the newest stall open.
-    primitives.await_reply_old(NAMESPACE, &from_bosun, &third, "home-a", "stall", Some(CREW)).await.expect("repeat");
+    primitives.await_reply(NAMESPACE, &from_bosun, &third, "home-a", "stall", Some(CREW)).await.expect("repeat");
     assert!(primitives.awaiting().stalled(&seat).expect("read"));
 }
 
@@ -428,10 +426,10 @@ async fn a_cleared_stall_withdraws_its_subjects_records() {
         assert!(primitives.end_stalls(NAMESPACE, &[subject.to_owned()], None, "cleared").await.expect("nothing open").is_empty());
         let mut stall = intent("system:stall-judge", "fleet/governor");
         stall.relation = MessageRelation::Supervisor;
-        stall.expectation = flotilla_resources::MessageExpectation::Reply;
+        stall.expectation = IntentExpectation::Reply;
         let name = flotilla_resources::message_record_name("fleet/governor", "system:stall-judge", "stall-1");
-        primitives.admit_old(NAMESPACE, &name, &stall).await.expect("sent");
-        primitives.await_reply_old(NAMESPACE, &name, &stall, "home-a", "stall", Some(subject)).await.expect("recorded");
+        primitives.admit(&name, &stall).await.expect("sent");
+        primitives.await_reply(NAMESPACE, &name, &stall, "home-a", "stall", Some(subject)).await.expect("recorded");
         // Another vessel's seat of the same role shares the record's subject: it keeps the records.
         let twin = "flotilla/demo/other/coder";
         assert!(primitives.end_stalls(NAMESPACE, &[twin.to_owned()], Some(subject), "cleared").await.expect("kept").is_empty());
@@ -446,24 +444,24 @@ async fn a_cleared_stall_withdraws_its_subjects_records() {
     }
 }
 
-// Behaviour (#3730 review nit): a system producer with no fleet role has no inbox for the reply, so
-// its send records nothing, quietly, rather than failing every pass. The stall judge is a fleet role
-// and a person holds the operator role of the project (#3938), so their sends are recorded as theirs.
+// Behaviour (#3730 review nit): the stall judge is a fleet role and a person holds the operator role
+// of the project (#3938), so their sends are recorded as theirs.
 #[tokio::test]
-async fn a_sender_with_no_inbox_records_nothing() {
+async fn a_role_senders_awaiting_is_recorded_as_theirs() {
     let dir = tempfile::tempdir().expect("tempdir");
     let primitives = primitives(&dir).await;
     let ask = |sender: &str| {
         let mut ask = intent(sender, "fleet/governor");
-        ask.expectation = flotilla_resources::MessageExpectation::Reply;
+        ask.expectation = IntentExpectation::Reply;
         (flotilla_resources::message_record_name("fleet/governor", sender, "ask"), ask)
     };
-    let (name, unknown) = ask("system:no-such-producer");
-    assert!(!primitives.await_reply_old(NAMESPACE, &name, &unknown, "home-a", "reply", None).await.expect("nothing to await"));
-    for sender in ["system:stall-judge", "principal:alice"] {
-        let (name, recorded) = ask(sender);
+    for sender in ["system:stall-judge", "project:fleet/role:operator"] {
+        let (name, mut recorded) = ask(sender);
+        if sender.starts_with("project:") {
+            recorded.principal = Some("alice".into());
+        }
         assert!(
-            primitives.await_reply_old(NAMESPACE, &name, &recorded, "home-a", "reply", None).await.expect("the sender's record"),
+            primitives.await_reply(NAMESPACE, &name, &recorded, "home-a", "reply", None).await.expect("the sender's record"),
             "{sender}"
         );
     }
@@ -521,7 +519,7 @@ async fn an_undelivered_turn_holds_delivery_for_one_hold() {
     let other = "flotilla/demo/work/reviewer";
     assert_eq!(primitives.delivery_held_until(NAMESPACE, CREW).await.expect("read"), None, "nothing admitted");
     let record = flotilla_resources::message_record_name(CREW, "system:nudge", "late");
-    primitives.admit_old(NAMESPACE, &record, &intent("system:nudge", CREW)).await.expect("admitted");
+    primitives.admit(&record, &intent("system:nudge", CREW)).await.expect("admitted");
     let admitted = flotilla_schema::Timestamp::from_datetime(&flotilla_resources::Clock::now(clock.as_ref())).to_datetime().expect("now");
     assert_eq!(
         primitives.delivery_held_until(NAMESPACE, CREW).await.expect("read"),
@@ -533,7 +531,7 @@ async fn an_undelivered_turn_holds_delivery_for_one_hold() {
     assert_eq!(primitives.delivery_held_until(NAMESPACE, CREW).await.expect("read"), None, "the hold ends after one delivery hold");
 
     let delivered = flotilla_resources::message_record_name(other, "system:nudge", "delivered");
-    primitives.admit_old(NAMESPACE, &delivered, &intent("system:nudge", other)).await.expect("admitted");
+    primitives.admit(&delivered, &intent("system:nudge", other)).await.expect("admitted");
     assert!(primitives.delivery_held_until(NAMESPACE, other).await.expect("read").is_some());
     let message = engine_message(&primitives, other, &delivered).await;
     let consumer = primitives.register("reviewer-session", flotilla_schema::Timestamp(1)).await.expect("consumer");

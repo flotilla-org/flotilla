@@ -22,7 +22,6 @@ use flotilla_state_machines::{
 
 use super::{
     attention::{Attention, Cause, Read},
-    convert::{Conversion, NoRecords, ReferenceAddresses},
     roles::FleetRoles,
     MessagePrimitives,
 };
@@ -125,25 +124,6 @@ impl MessagePrimitives {
     }
 }
 
-/// A project's declaration, read for the roles its charter says a person holds there.
-struct Declared(Option<ResourceObject<Project>>);
-
-impl ReferenceAddresses for Declared {
-    fn address(&self, reference: &flotilla_resources::MessageReference) -> Result<Address, String> {
-        NoRecords.address(reference)
-    }
-
-    fn principal_roles(&self, project: &str, principal: &str) -> Vec<String> {
-        let declared = self.0.as_ref().filter(|declared| declared.metadata.name == project);
-        declared
-            .into_iter()
-            .flat_map(|declared| &declared.spec.role_definitions)
-            .filter(|(_, definition)| definition.principal.as_deref() == Some(principal))
-            .map(|(role, _)| role.clone())
-            .collect()
-    }
-}
-
 /// The attentions among `messages`: from an attention's sender, about one subject, in text.
 fn attentions_among(roles: &FleetRoles, messages: impl Iterator<Item = (String, Resource<Message>)>) -> Vec<Held> {
     messages
@@ -189,11 +169,18 @@ impl MessagePrimitives {
         principal: &str,
         project: Option<&str>,
     ) -> Result<Address, String> {
-        let declared = match project {
+        let declared: Option<ResourceObject<Project>> = match project {
             Some(project) => self.keyed_reads().declared::<Project>(namespace, project).await.map_err(|error| error.to_string())?,
             None => None,
         };
-        Conversion { roles, forges: &[], records: &Declared(declared) }.person(principal, project)
+        // The roles the project's own charter declares the principal holds.
+        let held = declared
+            .into_iter()
+            .flat_map(|declared| declared.spec.role_definitions)
+            .filter(|(_, definition)| definition.principal.as_deref() == Some(principal))
+            .map(|(role, _)| role)
+            .collect();
+        roles.principal_role(principal, project, held)
     }
 
     /// The engine's cause and person inbox for a fact, read from the records it names.

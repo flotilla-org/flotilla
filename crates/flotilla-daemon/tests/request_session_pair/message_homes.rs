@@ -10,9 +10,10 @@ use flotilla_core::in_process::InProcessDaemon;
 use flotilla_daemon_api::daemon::DaemonHandle;
 use flotilla_engine_messages::MessagePrimitives;
 use flotilla_inbox::InboxBackend;
+use flotilla_messaging::{IntentExpectation, IntentReference};
 use flotilla_resources::{
-    ConvoySpec, MessageExpectation, MessageReference, MessageRelation, MessageSpec, ResourceProvenance, Selector, TerminalBrief,
-    TerminalCrewContext, TerminalSessionSource, TerminalSessionSpec,
+    ConvoySpec, MessageRelation, ResourceProvenance, Selector, TerminalBrief, TerminalCrewContext, TerminalSessionSource,
+    TerminalSessionSpec,
 };
 use flotilla_schema::Timestamp;
 use flotilla_schema_sqlite::stream::{Follower, Service};
@@ -114,11 +115,10 @@ fn crew_session(convoy: &str, vessel: &str) -> TerminalSessionSpec {
     }
 }
 
-fn convoy_ref(name: &str) -> MessageReference {
-    MessageReference::ControlRecord {
-        resource: flotilla_protocol::ResourceRef::new("flotilla.work/v1", "Convoy", NS, name),
-        revision: "1".into(),
-    }
+/// Convoy `name` of project NS, as the message's subject at revision 1.
+fn convoy_ref(name: &str) -> IntentReference {
+    let address = flotilla_resources::convoy::engine::convoy_reference_address(name, Some(NS)).expect("the convoy's address");
+    IntentReference::subject(address, flotilla_address::Revision::new("1".to_owned()).expect("revision"))
 }
 
 // The tracing proof includes this fixture with no cancellation steps.
@@ -190,17 +190,11 @@ pub(super) async fn messages_are_homed_at_the_receiver_and_replies_route_by_subj
     // A sends as turn-rules to B's crew, about convoy X. The crew's receiver names its launch.
     let receiver = format!("flotilla/{crew}/work/coder");
     let request = flotilla_resources::message_record_name(&receiver, "system:turn-rules", "rule:checks@1");
-    let intent = MessageSpec::builder()
-        .sender("system:turn-rules".into())
-        .receiver(receiver.clone())
-        .relation(MessageRelation::System)
-        .body("checks settled; please review".into())
-        .references(vec![convoy_ref(&subject_x)])
-        .subject(convoy_ref(&subject_x))
-        .expectation(MessageExpectation::Reply)
-        .build();
-    let routed = engine_a.intent_of(NS, &intent).await.expect("the send in the engine's terms");
-    a.publish_message(NS, &request, &routed).await.expect("routed send");
+    let mut intent =
+        flotilla_engine_messages_testkit::intent("system:turn-rules", &receiver, MessageRelation::System, "checks settled; please review");
+    intent.references = vec![convoy_ref(&subject_x)];
+    intent.expectation = IntentExpectation::Reply;
+    a.publish_message(NS, &request, &intent).await.expect("routed send");
     let (home, sent) = homed(&engine_b, &receiver, &request).await.expect("the message is created at the receiver's home");
     assert_eq!(home, home_b);
     assert_eq!(sent.spec().sender.as_str(), "fleet:lab/role:turn-rules");
@@ -223,15 +217,9 @@ pub(super) async fn messages_are_homed_at_the_receiver_and_replies_route_by_subj
     let reads = Arc::new(StoreReads { home: Arc::clone(&store_b), served: Default::default() });
     engine_a.install_home_reads(reads.clone()).expect("home reads");
     let reply = flotilla_resources::message_record_name("system:turn-rules", &receiver, "reply@1");
-    let answer = MessageSpec::builder()
-        .sender(receiver.clone())
-        .receiver("system:turn-rules".into())
-        .relation(MessageRelation::Peer)
-        .body("reviewed".into())
-        .in_reply_to(request.clone())
-        .build();
-    let routed = engine_b.intent_of(NS, &answer).await.expect("the reply in the engine's terms");
-    b.publish_message(NS, &reply, &routed).await.expect("routed reply");
+    let mut answer = flotilla_engine_messages_testkit::intent(&receiver, "system:turn-rules", MessageRelation::Peer, "reviewed");
+    answer.in_reply_to = Some(request.clone());
+    b.publish_message(NS, &reply, &answer).await.expect("routed reply");
     // Routing by subject and the admission each read the original at B.
     let served = reads.served.lock().expect("served").clone();
     assert!(!served.is_empty() && served.iter().all(|name| name == sent.name()), "the misses were read at B: {served:?}");
@@ -243,11 +231,9 @@ pub(super) async fn messages_are_homed_at_the_receiver_and_replies_route_by_subj
     let read = engine_a.read_message(&request, sent.spec().inbox.clone()).await.expect("routed read");
     assert!(read.remote && read.age_micros >= 0 && read.home == home_b, "{read:?}");
     // A reply link resolves at the original's home; a name no home holds is absent, not unknown.
-    let answered = engine_a.intent_of(NS, &answer).await.expect("intent");
-    assert_eq!(engine_a.resolve_in_reply_to(&answered).await, flotilla_messaging::MessageResolution::Found);
-    let unsent =
-        MessageSpec { in_reply_to: Some(flotilla_resources::message_record_name(&receiver, "system:turn-rules", "never")), ..answer };
-    let unsent = engine_a.intent_of(NS, &unsent).await.expect("intent");
+    assert_eq!(engine_a.resolve_in_reply_to(&answer).await, flotilla_messaging::MessageResolution::Found);
+    let mut unsent = answer;
+    unsent.in_reply_to = Some(flotilla_resources::message_record_name(&receiver, "system:turn-rules", "never"));
     assert_eq!(engine_a.resolve_in_reply_to(&unsent).await, flotilla_messaging::MessageResolution::Absent);
 
     pump(&store_b, &home_b, &store_a, &mut b_to_a);
@@ -275,10 +261,10 @@ pub(super) async fn messages_are_homed_at_the_receiver_and_replies_route_by_subj
     use flotilla_state_machines::machines::{awaiting_reply::AwaitingReplyLabel, message::MessageRef};
     let mut observer = OpenMessages::default();
     for (step, DropStep { action, late_record, restart }) in operations.iter().enumerate() {
-        let name = flotilla_resources::message_record_name(&intent.receiver, &intent.sender, &format!("cancel-{step}"));
+        let name = flotilla_resources::message_record_name(&receiver, "system:turn-rules", &format!("cancel-{step}"));
         let mut cancel = intent.clone();
         cancel.deadline = matches!(action, DropAction::Expire).then(|| Utc::now() - chrono::Duration::seconds(1));
-        let routed = engine_a.intent_of(NS, &cancel).await.expect("intent");
+        let routed = &cancel;
         // Exercise receiver admission through the router, then resume the sender's
         // record write separately to model a delayed or retried send continuation.
         let mut events = a.subscribe();
@@ -305,11 +291,11 @@ pub(super) async fn messages_are_homed_at_the_receiver_and_replies_route_by_subj
         .expect("receiver admission finishes");
         assert!(matches!(result, flotilla_protocol::CommandValue::ResourceObject(_)), "{result:?}");
 
-        let (_, message) = homed(&engine_b, &cancel.receiver, &name).await.expect("receiver admitted");
+        let (_, message) = homed(&engine_b, &receiver, &name).await.expect("receiver admitted");
         let reference = MessageRef::new(message.name(), &home_b);
         assert!(engine_a.awaiting().get(&reference).is_none(), "sender continuation has not written its record yet");
         if !*late_record {
-            engine_a.await_reply_old(NS, &name, &cancel, &home_b, "reply", None).await.expect("sender record");
+            engine_a.await_reply(NS, &name, &cancel, &home_b, "reply", None).await.expect("sender record");
         }
         pump(&store_b, &home_b, &store_a, &mut b_to_a);
         engine_a.sweep(NS, Timestamp::from_datetime(&Utc::now()), &mut observer).await.expect("live observation");
@@ -317,20 +303,16 @@ pub(super) async fn messages_are_homed_at_the_receiver_and_replies_route_by_subj
             DropAction::Supersede => {
                 let next = format!("{name}-successor");
                 let mut successor = cancel.clone();
-                successor.expectation = MessageExpectation::None;
+                successor.expectation = IntentExpectation::Nothing;
                 successor.supersedes = Some(name.clone());
-                let routed = engine_a.intent_of(NS, &successor).await.expect("the successor in the engine's terms");
-                a.publish_message(NS, &next, &routed).await.expect("routed supersession");
+                a.publish_message(NS, &next, &successor).await.expect("routed supersession");
             }
-            DropAction::Withdraw => engine_b.withdraw(NS, &cancel.receiver, &name, &crew).await.expect("receiver withdrawal"),
+            DropAction::Withdraw => engine_b.withdraw(NS, &receiver, &name, &crew).await.expect("receiver withdrawal"),
             DropAction::Expire => {
                 engine_b.sweep(NS, Timestamp::from_datetime(&Utc::now()), &mut OpenMessages::default()).await.expect("receiver expiry");
             }
         }
-        assert!(matches!(
-            homed(&engine_b, &cancel.receiver, &name).await.expect("receiver message").1.state(),
-            MessageState::Dropped { .. }
-        ));
+        assert!(matches!(homed(&engine_b, &receiver, &name).await.expect("receiver message").1.state(), MessageState::Dropped { .. }));
         if !*late_record {
             assert_eq!(
                 engine_a.awaiting().get(&reference).expect("sender record").label(),
@@ -345,7 +327,7 @@ pub(super) async fn messages_are_homed_at_the_receiver_and_replies_route_by_subj
         }
         if *late_record {
             engine_a.sweep(NS, Timestamp::from_datetime(&Utc::now()), &mut observer).await.expect("drop arrives before the record");
-            engine_a.await_reply_old(NS, &name, &cancel, &home_b, "reply", None).await.expect("late sender record");
+            engine_a.await_reply(NS, &name, &cancel, &home_b, "reply", None).await.expect("late sender record");
             assert_eq!(engine_a.awaiting().get(&reference).expect("late record").label(), AwaitingReplyLabel::Withdrawn);
         }
         if *restart {
@@ -354,7 +336,7 @@ pub(super) async fn messages_are_homed_at_the_receiver_and_replies_route_by_subj
         for _ in 0..2 {
             engine_a.sweep(NS, Timestamp::from_datetime(&Utc::now()), &mut observer).await.expect("sender observes receiver drop");
             assert_eq!(engine_a.awaiting().get(&reference).expect("sender record").label(), AwaitingReplyLabel::Withdrawn);
-            assert!(!engine_a.await_reply_old(NS, &name, &cancel, &home_b, "reply", None).await.expect("repeat send"));
+            assert!(!engine_a.await_reply(NS, &name, &cancel, &home_b, "reply", None).await.expect("repeat send"));
             assert_eq!(engine_a.awaiting().get(&reference).expect("repeated record").label(), AwaitingReplyLabel::Withdrawn);
             assert_eq!(
                 engine_a.awaiting().get(&MessageRef::new(sent.name(), &home_b)).expect("answered record").label(),

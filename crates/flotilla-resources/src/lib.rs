@@ -82,7 +82,6 @@ pub mod manifest_roots;
 #[doc(hidden)]
 pub mod message;
 mod message_inbox;
-mod message_migration;
 #[doc(hidden)]
 pub mod placement;
 mod platform;
@@ -288,7 +287,6 @@ pub use message_inbox::{
     convoy_crew_seats, convoy_of_segment, convoy_seat_turns, convoy_segment, crew_role_address, parse_crew_role_address,
     parse_topic_address, qualify_message_address, validate_message_address, MessageAddressContext, ROLE_ADDRESS_ANNOTATION,
 };
-pub use message_migration::{legacy_message_sender, legacy_message_spec};
 pub use workflow_template::{
     builtin_workflow_templates, current_builtin_workflow_name, implement_review_workflow_spec, interactive_single_workflow_spec,
     leaf_operator, legacy_field_path, legacy_template_text, parse_leaf_template, single_agent_shepherd_workflow_spec,

@@ -608,19 +608,14 @@ async fn kind_discovery_on_the_engine_home_reads_no_old_store() {
 // none of its records.
 #[tokio::test]
 async fn engine_records_are_not_read_through_another_namespace() {
-    use flotilla_resources::{MessageRelation, MessageSpec};
+    use flotilla_resources::MessageRelation;
 
     let backend = ResourceBackend::new(InMemoryBackend::default());
     backend.serve_engine_in("flotilla");
     flotilla_engine_messages_testkit::designate_fleet(&backend, "flotilla").await;
     let home = flotilla_engine_messages_testkit::EngineMessagesHome::open("home-a", "flotilla", &backend);
-    let spec = MessageSpec::builder()
-        .sender("flotilla/reviewer".into())
-        .receiver("flotilla/coder".into())
-        .relation(MessageRelation::Peer)
-        .body("a".into())
-        .build();
-    home.primitives().admit_old("flotilla", "to-coder", &spec).await.expect("admit");
+    let spec = flotilla_engine_messages_testkit::intent("flotilla/reviewer", "flotilla/coder", MessageRelation::Peer, "a");
+    home.primitives().admit("to-coder", &spec).await.expect("admit");
     let daemon = Incarnation::over(backend, ListenerOrigin::known(ORIGIN));
     let items = |reply: Reply| {
         assert_eq!(reply.status, StatusCode::OK, "{:?}", reply.body);
@@ -637,18 +632,13 @@ async fn engine_records_are_not_read_through_another_namespace() {
 // it, rather than answering with every record.
 #[tokio::test]
 async fn engine_served_kind_refuses_an_undeclared_query_field() {
-    use flotilla_resources::{MessageRelation, MessageSpec};
+    use flotilla_resources::MessageRelation;
 
     let backend = ResourceBackend::new(InMemoryBackend::default());
     flotilla_engine_messages_testkit::designate_fleet(&backend, "flotilla").await;
     let home = flotilla_engine_messages_testkit::EngineMessagesHome::open("home-a", "flotilla", &backend);
-    let spec = MessageSpec::builder()
-        .sender("flotilla/reviewer".into())
-        .receiver("flotilla/coder".into())
-        .relation(MessageRelation::Peer)
-        .body("a".into())
-        .build();
-    home.primitives().admit_old("flotilla", "to-coder", &spec).await.expect("admit");
+    let spec = flotilla_engine_messages_testkit::intent("flotilla/reviewer", "flotilla/coder", MessageRelation::Peer, "a");
+    home.primitives().admit("to-coder", &spec).await.expect("admit");
     let daemon = Incarnation::over(backend, ListenerOrigin::known(ORIGIN));
     let reply = daemon
         .call(CallerAuth::Socket(None), get("/apis/flotilla.work/v1/namespaces/flotilla/messages?fieldSelector=spec.unknown%3Dx"))
@@ -662,23 +652,24 @@ async fn engine_served_kind_refuses_an_undeclared_query_field() {
 // one message.
 #[tokio::test]
 async fn message_queries_answer_only_the_engine_messages_they_select() {
-    use flotilla_resources::{MessageRelation, MessageSpec};
+    use flotilla_resources::MessageRelation;
     use flotilla_store::MessageQuery;
 
     let backend = ResourceBackend::new(InMemoryBackend::default());
     flotilla_engine_messages_testkit::designate_fleet(&backend, "flotilla").await;
     let home = flotilla_engine_messages_testkit::EngineMessagesHome::open("home-a", "flotilla", &backend);
-    let intent = |sender: &str, receiver: &str, body: &str| {
-        MessageSpec::builder().sender(sender.into()).receiver(receiver.into()).relation(MessageRelation::Peer).body(body.into()).build()
-    };
+    let intent =
+        |sender: &str, receiver: &str, body: &str| flotilla_engine_messages_testkit::intent(sender, receiver, MessageRelation::Peer, body);
     let primitives = home.primitives();
+    let mut answer = intent("flotilla/coder", "flotilla/reviewer", "d");
+    answer.in_reply_to = Some("to-coder-a".into());
     for (name, spec) in [
         ("to-coder-a", intent("flotilla/reviewer", "flotilla/coder", "a")),
         ("to-coder-b", intent("flotilla/reviewer", "flotilla/coder", "b")),
         ("to-reviewer", intent("flotilla/coder", "flotilla/reviewer", "c")),
-        ("answer", MessageSpec { in_reply_to: Some("to-coder-a".into()), ..intent("flotilla/coder", "flotilla/reviewer", "d") }),
+        ("answer", answer),
     ] {
-        primitives.admit_old("flotilla", name, &spec).await.unwrap_or_else(|error| panic!("admit {name}: {error}"));
+        primitives.admit(name, &spec).await.unwrap_or_else(|error| panic!("admit {name}: {error}"));
     }
     let daemon = Incarnation::over(backend, ListenerOrigin::known(ORIGIN));
     let names = |reply: Reply| {

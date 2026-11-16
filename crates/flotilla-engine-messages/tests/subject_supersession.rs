@@ -6,8 +6,9 @@
 use std::sync::Arc;
 
 use flotilla_engine_messages::MessagePrimitives;
-use flotilla_engine_messages_testkit::{designate_fleet, EngineMessagesHome};
-use flotilla_resources::{MessageExpectation, MessageReference, MessageRelation, MessageSpec};
+use flotilla_engine_messages_testkit::{designate_fleet, party, EngineMessagesHome};
+use flotilla_messaging::{Intent, IntentExpectation, IntentReference};
+use flotilla_resources::MessageRelation;
 use flotilla_state_machines::machines::message::{DropReason, MessageState};
 use flotilla_store::ResourceBackend;
 use flotilla_store_memory::InMemoryBackend;
@@ -15,20 +16,18 @@ use flotilla_store_memory::InMemoryBackend;
 const NAMESPACE: &str = "flotilla";
 const RECEIVER: &str = "flotilla/convoy/work/coder";
 
-fn change_request(revision: &str) -> MessageReference {
-    MessageReference::ChangeRequest { service: "github.com".into(), scope: "org/repo".into(), number: 1, revision: revision.into() }
+/// A change request at `revision`, as the subject of a message.
+fn change_request(revision: &str) -> IntentReference {
+    let address = flotilla_resources::address::stored_change_request_address("github.com", "org/repo", 1, &[]).expect("change request");
+    IntentReference::subject(address, flotilla_address::Revision::new(revision.to_owned()).expect("revision"))
 }
 
-fn spec(subject: Option<MessageReference>, expectation: MessageExpectation) -> MessageSpec {
-    MessageSpec::builder()
-        .sender("flotilla/checks".into())
-        .receiver(RECEIVER.into())
-        .relation(MessageRelation::System)
-        .body("review the settled checks".into())
-        .references(subject.clone().into_iter().collect())
-        .maybe_subject(subject)
-        .expectation(expectation)
-        .build()
+fn spec(subject: Option<IntentReference>, expectation: IntentExpectation) -> Intent {
+    let mut intent =
+        flotilla_engine_messages_testkit::intent("flotilla/checks", RECEIVER, MessageRelation::System, "review the settled checks");
+    intent.references = subject.into_iter().collect();
+    intent.expectation = expectation;
+    intent
 }
 
 /// The state of message `record` sent to `receiver`.
@@ -65,24 +64,23 @@ async fn subject_supersession_follows_identity_and_expectation() {
         let home = EngineMessagesHome::open("home", NAMESPACE, &backend);
         let primitives = home.primitives();
         let first =
-            spec(has_subject.then(|| change_request("head")), if open { MessageExpectation::Reply } else { MessageExpectation::None });
-        primitives.admit_old(NAMESPACE, "first", &first).await.expect("first");
+            spec(has_subject.then(|| change_request("head")), if open { IntentExpectation::Reply } else { IntentExpectation::Nothing });
+        primitives.admit("first", &first).await.expect("first");
         if delivered {
             home.deliver_turn(RECEIVER, "first", "session").await;
         }
         let mut second = first.clone();
         second.body = "replacement".into();
         if !same_revision && has_subject {
-            second.subject = Some(change_request("new-head"));
-            second.references = second.subject.clone().into_iter().collect();
+            second.references = vec![change_request("new-head")];
         }
         if !same_sender {
-            second.sender = "flotilla/review".into();
+            second.sender = party("flotilla/review");
         }
         if !same_receiver {
-            second.receiver = "flotilla/convoy/work/reviewer".into();
+            second.inbox = party("flotilla/convoy/work/reviewer");
         }
-        let admitted = primitives.admit_old(NAMESPACE, "second", &second).await.expect("second");
+        let admitted = primitives.admit("second", &second).await.expect("second");
         let matches = has_subject && same_revision && same_sender && same_receiver;
         let suppressed = matches && delivered && open;
         assert_eq!(admitted.record == "first", suppressed, "case {case:06b}: suppressed");
@@ -103,12 +101,12 @@ async fn concurrent_same_subject_admissions_leave_one_pending_message() {
     designate_fleet(&backend, NAMESPACE).await;
     let home = EngineMessagesHome::open("home", NAMESPACE, &backend);
     let primitives: Arc<MessagePrimitives> = Arc::clone(home.primitives());
-    let original = spec(Some(change_request("head")), MessageExpectation::Reply);
+    let original = spec(Some(change_request("head")), IntentExpectation::Reply);
     let mut tasks = Vec::new();
     for index in 0..8 {
         let primitives = Arc::clone(&primitives);
         let spec = original.clone();
-        tasks.push(tokio::spawn(async move { primitives.admit_old(NAMESPACE, &format!("message-{index}"), &spec).await.expect("admit") }));
+        tasks.push(tokio::spawn(async move { primitives.admit(&format!("message-{index}"), &spec).await.expect("admit") }));
     }
     for task in tasks {
         task.await.expect("join");

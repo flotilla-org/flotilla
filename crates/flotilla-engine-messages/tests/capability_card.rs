@@ -1,14 +1,14 @@
-//! A crew session's capability card is admitted on the engine (#3108): its subject, the old
-//! TerminalSession reference, is stored as the session's seat with the card's revision, and the
-//! crew's old-shape view names the session again.
+//! A crew session's capability card is admitted on the engine (#3108): its subject is the
+//! session's seat at the card's revision, and the crew's old-shape view names the session.
 
 use std::collections::BTreeMap;
 
-use flotilla_engine_messages_testkit::{designate_fleet, EngineMessagesHome};
+use flotilla_engine_messages_testkit::{designate_fleet, intent, party, EngineMessagesHome};
+use flotilla_messaging::IntentReference;
 use flotilla_protocol::ResourceRef;
 use flotilla_resources::{
-    message_record_name, Convoy, ConvoySpec, InputMeta, MessageReference, MessageRelation, MessageSpec, Selector, TerminalBrief,
-    TerminalCrewContext, TerminalSession, TerminalSessionSource, TerminalSessionSpec, CONVOY_LABEL, ROLE_LABEL, VESSEL_LABEL,
+    message_record_name, Convoy, ConvoySpec, InputMeta, MessageReference, MessageRelation, Selector, TerminalBrief, TerminalCrewContext,
+    TerminalSession, TerminalSessionSource, TerminalSessionSpec, CONVOY_LABEL, ROLE_LABEL, VESSEL_LABEL,
 };
 use flotilla_store::ResourceBackend;
 use flotilla_store_memory::InMemoryBackend;
@@ -67,15 +67,11 @@ async fn a_capability_card_is_admitted_about_its_sessions_seat() {
         resource: ResourceRef::new("flotilla.work/v1", "TerminalSession", NAMESPACE, "session"),
         revision: "capabilities@7".into(),
     };
-    let card = MessageSpec::builder()
-        .sender(sender.into())
-        .receiver(receiver.into())
-        .relation(MessageRelation::System)
-        .body("## Your capabilities\n".into())
-        .references(vec![subject.clone()])
-        .subject(subject.clone())
-        .build();
-    primitives.admit_old(NAMESPACE, &name, &card).await.expect("the card is admitted");
+    // The card's producer names the session's seat as its subject, at the card's revision.
+    let mut card = intent(sender, receiver, MessageRelation::System, "## Your capabilities\n");
+    let revision = flotilla_address::Revision::new("capabilities@7".to_owned()).expect("revision");
+    card.references = vec![IntentReference::subject(party(receiver), revision)];
+    primitives.admit(&name, &card).await.expect("the card is admitted");
 
     let inbox = primitives.inbox_for(NAMESPACE, receiver).await.expect("the receiver's inbox");
     let (id, _) = primitives.locate_in(&inbox, &name).expect("locate").expect("the admitted card");

@@ -4,12 +4,13 @@
 
 use std::collections::BTreeMap;
 
+use flotilla_address::Revision;
 use flotilla_engine_messages::{view::turn_header, OldStoreRecords};
-use flotilla_engine_messages_testkit::{designate_fleet, EngineMessagesHome};
+use flotilla_engine_messages_testkit::{designate_fleet, intent, EngineMessagesHome};
+use flotilla_messaging::{IntentExpectation, IntentReference};
 use flotilla_resources::{
-    Convoy, ConvoySpec, InputMeta, MessageExpectation, MessageReference, MessageRelation, MessageSpec, ResourceRef, Selector,
-    TerminalBrief, TerminalCrewContext, TerminalSession, TerminalSessionSource, TerminalSessionSpec, CONVOY_LABEL, ROLE_LABEL,
-    VESSEL_LABEL,
+    convoy::engine::convoy_reference_address, Convoy, ConvoySpec, InputMeta, MessageRelation, Selector, TerminalBrief, TerminalCrewContext,
+    TerminalSession, TerminalSessionSource, TerminalSessionSpec, CONVOY_LABEL, ROLE_LABEL, VESSEL_LABEL,
 };
 use flotilla_store::ResourceBackend;
 use flotilla_store_memory::InMemoryBackend;
@@ -62,35 +63,16 @@ async fn a_turn_header_frames_as_the_old_view_did() {
     }
     let home = EngineMessagesHome::open("home", NAMESPACE, &backend);
     let primitives = home.primitives();
-    let convoy = MessageReference::ControlRecord {
-        resource: ResourceRef::new("flotilla.work/v1", "Convoy", NAMESPACE, "crew"),
-        revision: "1".into(),
-    };
-    let intents = [
-        MessageSpec::builder()
-            .sender(REVIEWER.into())
-            .receiver(CODER.into())
-            .relation(MessageRelation::Peer)
-            .body("Please address the review.".into())
-            .subject(convoy.clone())
-            .references(vec![convoy])
-            .expectation(MessageExpectation::Reply)
-            .build(),
-        MessageSpec::builder()
-            .sender("principal:alice".into())
-            .receiver(CODER.into())
-            .relation(MessageRelation::Supervisor)
-            .body("Continue the work.".into())
-            .build(),
-        MessageSpec::builder()
-            .sender("system:turn-rules".into())
-            .receiver(CODER.into())
-            .relation(MessageRelation::System)
-            .body("Complete this turn.".into())
-            .build(),
-    ];
+    let convoy = convoy_reference_address("crew", None).expect("the convoy's address");
+    let mut review = intent(REVIEWER, CODER, MessageRelation::Peer, "Please address the review.");
+    review.references = vec![IntentReference::subject(convoy, Revision::new("1".to_owned()).expect("revision"))];
+    review.expectation = IntentExpectation::Reply;
+    // A person sends as the role they hold in the crew's project.
+    let mut follow_up = intent("project:flotilla/role:operator", CODER, MessageRelation::Supervisor, "Continue the work.");
+    follow_up.principal = Some("alice".into());
+    let intents = [review, follow_up, intent("system:turn-rules", CODER, MessageRelation::System, "Complete this turn.")];
     for (index, intent) in intents.iter().enumerate() {
-        primitives.admit_old(NAMESPACE, &format!("turn-{index}"), intent).await.expect("admit");
+        primitives.admit(&format!("turn-{index}"), intent).await.expect("admit");
     }
 
     let roles = primitives.roles(NAMESPACE).await.expect("fleet roles");

@@ -1,7 +1,7 @@
 //! Message as the old store's typed paths see it (#3108): the generic resource verbs read the
 //! engine's messages in their old shape, with each address as the engine stores it, at every home
-//! that holds them, and an apply admits one. A message's state moves only
-//! through its machine, so a status write or delete through those verbs is refused.
+//! that holds them. A message is admitted only from its sender's intent and its state moves only
+//! through its machine, so an apply, a status write or a delete through those verbs is refused.
 
 use std::{
     collections::BTreeMap,
@@ -133,13 +133,9 @@ impl KindRecords<OldMessage> for MessageRecords {
         name: &str,
         _labels: &BTreeMap<String, String>,
         _annotations: &BTreeMap<String, String>,
-        spec: &MessageSpec,
+        _spec: &MessageSpec,
     ) -> Result<Record<OldMessage>, String> {
-        let namespace = self.namespace();
-        let intent = self.primitives.intent_of(&namespace, spec).await.map_err(|error| error.to_string())?;
-        let (id, _) = self.primitives.admit_at(name, &intent).await.map_err(|error| error.to_string())?;
-        let view = self.primitives.verb_get(&namespace, &id).map_err(|error| error.to_string())?;
-        self.object(view.ok_or_else(|| format!("Message {name} is not readable after its admission"))?)
+        Err(format!("Message {name} is admitted from its sender's intent, not written in the old shape; apply a Message document whose spec is that intent"))
     }
 
     async fn set_status(&self, name: &str, _status: &MessageStatus) -> Result<Record<OldMessage>, String> {

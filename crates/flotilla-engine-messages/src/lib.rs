@@ -14,7 +14,6 @@ pub mod admission;
 pub mod attention;
 pub mod attentions;
 pub mod awaiting;
-pub mod convert;
 pub mod keyed_reads;
 pub mod ports;
 mod principal_roles;
@@ -29,7 +28,6 @@ use std::{
 };
 
 use self::{
-    convert::{Conversion, ReferenceAddresses},
     roles::{designated_fleet_roles, FleetRoles, FLEET_STORE},
     view::{old_view, record_name, ViewLookups},
 };
@@ -40,8 +38,8 @@ use flotilla_messaging::MessageResolution;
 use flotilla_resources::convoy::engine::convoy_reference_address;
 use flotilla_resources::{
     address::{artifact_address, record_name as address_record_name, repository_address},
-    Artifact, Convoy, ForgeSpec, Message as OldMessage, MessageReference as OldReference, MessageSpec as OldSpec, Project,
-    ReadResourceObject, Repository, ResourceError, ResourceObject, ResourceProvenance, TerminalSession, TerminalSessionSource,
+    Artifact, Convoy, ForgeSpec, Message as OldMessage, MessageReference as OldReference, Project, ReadResourceObject, Repository,
+    ResourceError, ResourceObject, ResourceProvenance, TerminalSession, TerminalSessionSource,
 };
 use flotilla_schema::{
     reads::{self, carry},
@@ -896,8 +894,7 @@ impl MessagePrimitives {
     /// The inbox messages to `receiver`, an old address, are admitted to. The address alone and
     /// the fleet roles name it: no other record is read.
     pub async fn inbox_for(&self, namespace: &str, receiver: &str) -> Result<Address, String> {
-        let roles = self.roles(namespace).await?;
-        Conversion { roles: &roles, forges: &[], records: &convert::NoRecords }.inbox(receiver)
+        self.roles(namespace).await?.inbox(receiver)
     }
 
     /// The messages waiting in the person roles' inboxes (#3938), at every
@@ -1037,51 +1034,6 @@ impl MessagePrimitives {
         Ok(self.roles(namespace).await?.person_role_of(inbox).map(str::to_owned))
     }
 
-    /// An old-shaped intent in the engine's terms, as admission takes it.
-    // Goes once every producer builds its intent in the engine's terms (#3108).
-    pub async fn intent_of(&self, namespace: &str, old: &OldSpec) -> Result<flotilla_messaging::Intent, ResourceError> {
-        // Held to the old spec's rules first, as the old store held it (an interrupt only from a
-        // supervisor, references holding the subject).
-        <OldMessage as flotilla_resources::Resource>::validate_spec(
-            &flotilla_resources::InputMeta::builder().name("intent".to_owned()).build(),
-            old,
-        )?;
-        let roles = self.roles(namespace).await.map_err(ResourceError::invalid)?;
-        self.spell(&mut OldStoreRecords::empty(namespace), |records| {
-            Conversion { roles: &roles, forges: records.forges(), records }.intent(old)
-        })
-        .await?
-        .map_err(ResourceError::invalid)
-    }
-
-    /// Admits an old-shaped intent: [`Self::intent_of`], then [`Self::admit`].
-    // Goes once every producer builds its intent in the engine's terms (#3108).
-    pub async fn admit_old(&self, namespace: &str, name: &str, old: &OldSpec) -> Result<flotilla_messaging::Admitted, ResourceError> {
-        let intent = self.intent_of(namespace, old).await?;
-        self.admit(name, &intent).await
-    }
-
-    /// Records the sender's half of an old-shaped send: [`Self::intent_of`], then
-    /// [`Self::await_reply`]. A system producer with no fleet role has no inbox to receive the
-    /// reply, so nothing awaits it.
-    // Goes once every producer builds its intent in the engine's terms (#3108).
-    pub async fn await_reply_old(
-        &self,
-        namespace: &str,
-        name: &str,
-        old: &OldSpec,
-        home: &str,
-        kind: &str,
-        about: Option<&str>,
-    ) -> Result<bool, String> {
-        let intent = match self.intent_of(namespace, old).await {
-            Ok(intent) => intent,
-            Err(_) if old.sender.starts_with("system:") => return Ok(false),
-            Err(error) => return Err(error.to_string()),
-        };
-        self.await_reply(namespace, name, &intent, home, kind, about).await
-    }
-
     /// Admits an intent at this home, its receiver's: maps it onto the engine spec and enqueues it
     /// as `<inbox>/message:<record name>`. A repeated name is the message already admitted.
     pub async fn admit(&self, name: &str, intent: &flotilla_messaging::Intent) -> Result<flotilla_messaging::Admitted, ResourceError> {
@@ -1187,8 +1139,7 @@ impl MessagePrimitives {
         let roles = self.roles(namespace).await?;
         let (sender, recipient) = (intent.sender.clone(), intent.inbox.clone());
         let message = MessageRef::new(Address::message(&recipient, name).map_err(|error| error.to_string())?.as_str(), home);
-        let conversion = Conversion { roles: &roles, forges: &[], records: &convert::NoRecords };
-        let subject = about.map(|about| conversion.stall_subject(about)).transpose()?;
+        let subject = about.map(|about| roles.stall_subject(about)).transpose()?;
         // The predecessor whose record this send's record replaces, wherever it is homed.
         let superseded = match &intent.supersedes {
             Some(older) => {
@@ -1204,7 +1155,7 @@ impl MessagePrimitives {
             subject,
             kind: kind.to_owned(),
             awaited,
-            deadline: intent.deadline.as_ref().map(convert::timestamp),
+            deadline: intent.deadline.as_ref().map(Timestamp::from_datetime),
         };
         let awaiting = Arc::clone(&self.awaiting);
         let service = Arc::clone(&self.service);
@@ -1274,11 +1225,10 @@ impl MessagePrimitives {
             return Ok(Vec::new());
         }
         let roles = self.roles(namespace).await?;
-        let conversion = Conversion { roles: &roles, forges: &[], records: &convert::NoRecords };
-        let kept = stalled.map(|seat| conversion.stall_subject(seat)).transpose()?;
+        let kept = stalled.map(|seat| roles.stall_subject(seat)).transpose()?;
         let mut subjects = Vec::new();
         for seat in seats {
-            let subject = conversion.stall_subject(seat)?;
+            let subject = roles.stall_subject(seat)?;
             if Some(&subject) != kept.as_ref() && !subjects.contains(&subject) {
                 subjects.push(subject);
             }
@@ -1399,7 +1349,7 @@ impl MessagePrimitives {
     /// operator's command is.
     pub async fn withdraw(&self, namespace: &str, receiver: &str, record: &str, convoy: &str) -> Result<(), String> {
         let roles = self.roles(namespace).await?;
-        let inbox = Conversion { roles: &roles, forges: &[], records: &convert::NoRecords }.inbox(receiver)?;
+        let inbox = roles.inbox(receiver)?;
         let (id, home) = self.locate_in(&inbox, record)?.ok_or_else(|| format!("message `{record}` is not in this home's replica"))?;
         if home != self.home {
             return Err(format!("message `{record}` is homed at {home}; withdraw it there"));
@@ -1561,7 +1511,7 @@ impl MessagePrimitives {
     pub async fn delivery_held_until(&self, namespace: &str, receiver: &str) -> Result<Option<chrono::DateTime<chrono::Utc>>, String> {
         // Nothing is admitted until the fleet is designated.
         let Ok(roles) = self.roles_or_wait(namespace).await? else { return Ok(None) };
-        let inbox = Conversion { roles: &roles, forges: &[], records: &convert::NoRecords }.inbox(receiver)?;
+        let inbox = roles.inbox(receiver)?;
         let hold = flotilla_resources::delivery_hold::DELIVERY_HOLD_FOR.num_microseconds().expect("a bounded hold");
         let now = self.world.now();
         Ok(self
@@ -1678,7 +1628,7 @@ impl MessagePrimitives {
         record: &str,
     ) -> Result<Option<ReadResourceObject<OldMessage>>, ResourceError> {
         let roles = self.roles(namespace).await.map_err(ResourceError::invalid)?;
-        let inbox = Conversion { roles: &roles, forges: &[], records: &convert::NoRecords }.inbox(receiver);
+        let inbox = roles.inbox(receiver);
         self.view_in(namespace, &roles, inbox, record).await
     }
 
@@ -1801,8 +1751,7 @@ impl MessagePrimitives {
         named: &[(String, String)],
     ) -> Result<Vec<ReadResourceObject<OldMessage>>, ResourceError> {
         let (roles, inboxes) = self.inboxes_of(namespace, receivers).await?;
-        let conversion = Conversion { roles: &roles, forges: &[], records: &convert::NoRecords };
-        let rows = self.seat_rows(&inboxes, &named_inboxes(&conversion, named))?;
+        let rows = self.seat_rows(&inboxes, &named_inboxes(&roles, named))?;
         let receivers: Vec<String> = receivers.iter().cloned().chain(named.iter().map(|(receiver, _)| receiver.clone())).collect();
         self.spelled_to(rows, namespace, &roles, &receivers).await
     }
@@ -1818,10 +1767,9 @@ impl MessagePrimitives {
         named: &[(String, String)],
     ) -> Result<Vec<flotilla_messaging::SeatMessage>, ResourceError> {
         let roles = self.roles(namespace).await.map_err(ResourceError::invalid)?;
-        let conversion = Conversion { roles: &roles, forges: &[], records: &convert::NoRecords };
         let mut seats = BTreeMap::new();
         for receiver in receivers {
-            match conversion.inbox(receiver) {
+            match roles.inbox(receiver) {
                 Ok(inbox) => {
                     seats.entry(inbox).or_insert_with(|| receiver.clone());
                 }
@@ -1829,7 +1777,7 @@ impl MessagePrimitives {
             }
         }
         let inboxes: BTreeSet<Address> = seats.keys().cloned().collect();
-        let named = named_inboxes(&conversion, named);
+        let named = named_inboxes(&roles, named);
         for (inbox, receiver, _) in &named {
             seats.entry(inbox.clone()).or_insert_with(|| (*receiver).to_owned());
         }
@@ -1851,9 +1799,8 @@ impl MessagePrimitives {
         named: &[(String, String)],
     ) -> Result<Vec<flotilla_messaging::SentMessage>, ResourceError> {
         let roles = self.roles(namespace).await.map_err(ResourceError::invalid)?;
-        let conversion = Conversion { roles: &roles, forges: &[], records: &convert::NoRecords };
         let mut sent = Vec::new();
-        for (inbox, receiver, record) in named_inboxes(&conversion, named) {
+        for (inbox, receiver, record) in named_inboxes(&roles, named) {
             let Some((id, home)) = self.locate_in(&inbox, record).map_err(ResourceError::other)? else { continue };
             let Some((_, created, resource)) = self.load_at(id, home)? else { continue };
             sent.extend(sent_message(receiver.to_owned(), &resource, created));
@@ -1893,10 +1840,9 @@ impl MessagePrimitives {
     /// sent and no fleet role did: each seat's pending index, in admission order.
     pub async fn queued_briefs(&self, namespace: &str, seats: &[String]) -> Result<Vec<flotilla_messaging::SentMessage>, ResourceError> {
         let roles = self.roles(namespace).await.map_err(ResourceError::invalid)?;
-        let conversion = Conversion { roles: &roles, forges: &[], records: &convert::NoRecords };
         let mut briefs = Vec::new();
         for seat in seats {
-            let inbox = match conversion.inbox(seat) {
+            let inbox = match roles.inbox(seat) {
                 Ok(inbox) => inbox,
                 Err(error) => {
                     tracing::debug!(%seat, %error, "a seat with no inbox holds no message");
@@ -1948,14 +1894,13 @@ impl MessagePrimitives {
     /// context, so a principal is read in every person role's inbox.
     async fn inboxes_of(&self, namespace: &str, receivers: &[String]) -> Result<(FleetRoles, BTreeSet<Address>), ResourceError> {
         let roles = self.roles(namespace).await.map_err(ResourceError::invalid)?;
-        let conversion = Conversion { roles: &roles, forges: &[], records: &convert::NoRecords };
         let mut inboxes = BTreeSet::new();
         for receiver in receivers {
             if receiver.starts_with("principal:") {
                 inboxes.extend(self.person_inboxes(namespace).await.map_err(ResourceError::other)?);
                 continue;
             }
-            match conversion.inbox(receiver) {
+            match roles.inbox(receiver) {
                 Ok(inbox) => {
                     inboxes.insert(inbox);
                 }
@@ -2042,9 +1987,6 @@ enum SameSubject {
 impl flotilla_messaging::EngineMessages for MessagePrimitives {
     async fn holds(&self, inbox: &Address, record: &str) -> Result<bool, ResourceError> {
         MessagePrimitives::holds(self, inbox, record)
-    }
-    async fn intent_of(&self, namespace: &str, old: &OldSpec) -> Result<flotilla_messaging::Intent, ResourceError> {
-        MessagePrimitives::intent_of(self, namespace, old).await
     }
     async fn admitted(&self, inbox: &Address, record: &str) -> Result<Option<flotilla_messaging::AdmittedMessage>, ResourceError> {
         MessagePrimitives::admitted(self, inbox, record)
@@ -2243,10 +2185,10 @@ fn sent_message(seat: String, resource: &Resource<Message>, created: CreatedAt) 
     })
 }
 
-fn named_inboxes<'a>(conversion: &Conversion<'_>, named: &'a [(String, String)]) -> Vec<(Address, &'a str, &'a str)> {
+fn named_inboxes<'a>(roles: &FleetRoles, named: &'a [(String, String)]) -> Vec<(Address, &'a str, &'a str)> {
     named
         .iter()
-        .filter_map(|(receiver, record)| match conversion.inbox(receiver) {
+        .filter_map(|(receiver, record)| match roles.inbox(receiver) {
             Ok(inbox) => Some((inbox, receiver.as_str(), record.as_str())),
             Err(error) => {
                 tracing::debug!(%receiver, %record, %error, "a receiver with no inbox holds no message");
@@ -2457,8 +2399,11 @@ fn live(convoys: &[ResourceObject<Convoy>]) -> BTreeSet<String> {
         .collect()
 }
 
-impl ReferenceAddresses for OldStoreRecords {
-    fn missing(&self, reference: &OldReference) -> Option<&'static str> {
+/// What the old store's import reads of the records an old message names (#3108).
+impl OldStoreRecords {
+    /// Why `reference` cannot be addressed when the record it names is not held or its kind has
+    /// no address; `None` when only its value is at fault.
+    pub fn reference_missing(&self, reference: &OldReference) -> Option<&'static str> {
         match reference {
             OldReference::ControlRecord { resource, .. } if matches!(resource.kind.as_str(), "Convoy" | "Project") => None,
             OldReference::ControlRecord { resource, .. } if resource.kind == "TerminalSession" => {
@@ -2472,17 +2417,20 @@ impl ReferenceAddresses for OldStoreRecords {
             _ => None,
         }
     }
-    fn convoy_project(&self, convoy: &str) -> Option<String> {
-        OldStoreRecords::convoy_project(self, convoy)
-    }
-    fn convoy_ended(&self, convoy: &str) -> bool {
+
+    /// Whether `convoy` has ended: Landed, Abandoned or Failed, or no longer held.
+    pub fn convoy_ended(&self, convoy: &str) -> bool {
         self.convoy(convoy);
         !self.live_convoys.contains(convoy)
     }
-    fn principal_roles(&self, project: &str, principal: &str) -> Vec<String> {
+
+    /// The roles `project`'s own charter declares `principal` holds, by name.
+    pub fn principal_roles(&self, project: &str, principal: &str) -> Vec<String> {
         self.principal_backed(project).filter(|(_, holder)| *holder == principal).map(|(role, _)| role.to_owned()).collect()
     }
-    fn address(&self, reference: &OldReference) -> Result<Address, String> {
+
+    /// The ADR 0066 address of the record `reference` names.
+    pub fn reference_address(&self, reference: &OldReference) -> Result<Address, String> {
         match reference {
             OldReference::ControlRecord { resource, .. } if resource.kind == "Convoy" => self.convoy_address(&resource.name),
             OldReference::ControlRecord { resource, .. } if resource.kind == "Project" => {

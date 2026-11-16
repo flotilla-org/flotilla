@@ -8,7 +8,7 @@ use chrono::{DateTime, TimeZone, Utc};
 use flotilla_address::Address;
 use flotilla_engine_messages_testkit::{designate_fleet, EngineMessagesHome};
 use flotilla_inbox::InboxBackend;
-use flotilla_resources::{Clock, Message, MessageRelation, MessageSpec};
+use flotilla_resources::{Clock, Message, MessageRelation};
 use flotilla_schema::Timestamp;
 use flotilla_state_machines::{machines::message::Deliver, Transport};
 use flotilla_store::ResourceBackend;
@@ -47,13 +47,8 @@ async fn a_message_reads_its_admission_time_after_it_is_delivered() {
     let session = primitives.register("session-coder", Timestamp::from_datetime(&at(1_000))).await.expect("register");
     primitives.inbox().bind(inbox.clone(), session.clone()).await.expect("bind");
 
-    let intent = MessageSpec::builder()
-        .sender("system:turn-rules".into())
-        .receiver(CODER.into())
-        .relation(MessageRelation::System)
-        .body("review the plan".into())
-        .build();
-    primitives.admit_old(NAMESPACE, "plan", &intent).await.expect("admit");
+    let intent = flotilla_engine_messages_testkit::intent("system:turn-rules", CODER, MessageRelation::System, "review the plan");
+    primitives.admit("plan", &intent).await.expect("admit");
 
     clock.set(at(2_000));
     let (id, _) = primitives.locate_in(&inbox, "plan").expect("locate").expect("admitted");

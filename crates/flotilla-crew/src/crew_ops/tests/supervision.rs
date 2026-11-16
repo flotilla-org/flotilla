@@ -199,41 +199,6 @@ async fn operator_supervision_messages_working_crew() {
     assert!(held.convoy(&backend).await.status.expect("status").stalled.is_none());
 }
 
-// Legacy PendingBrief adoption is replay-safe and retains both attribution and continuation intent.
-#[tokio::test]
-async fn legacy_pending_brief_is_adopted_once_before_withdrawal() {
-    let (crew, backend, _probe, held) = fixture(CrewWorkPhase::Working).await;
-    // Decode the exact previous-generation record rather than invoking a retired producer: the
-    // home's notes on its launch hold it, as an imported launch's do.
-    held.engine
-        .note(&backend, &held.launch, |status| {
-            status.turn_deliveries.entry("operator".into()).or_default().pending_brief = Some(
-                serde_json::from_value(serde_json::json!({
-                    "vessel": "work", "role": "coder", "content": "legacy follow-up", "queued_at": "2026-10-01T00:00:00Z",
-                    "sender": {"kind": "operator-resume", "principal": {"namespace": "flotilla", "name": "alice"}}
-                }))
-                .expect("legacy PendingBrief"),
-            );
-        })
-        .await;
-    for _ in 0..2 {
-        crew.adopt_legacy_convoy_queues_once("flotilla", None).await.expect("adoption");
-        crew.reconcile_pending_supervisor_turns_once("flotilla").await.expect("follow-up");
-    }
-    let messages = backend.using::<flotilla_resources::Message>("flotilla").list().await.expect("inbox").items;
-    assert_eq!(messages.len(), 1);
-    // The engine stores a person as the role they send in; the principal goes to the trace.
-    assert_eq!(messages[0].spec.sender, "project:flotilla/role:operator");
-    assert_eq!(messages[0].spec.body, "legacy follow-up");
-    let status = held.convoy(&backend).await.status.expect("status");
-    assert!(status.pending_brief().is_none());
-    assert_eq!(status.crew_work["work"]["coder"].pending_follow_up.as_ref().expect("continuation").name, messages[0].metadata.name);
-    assert_eq!(
-        crew.withdraw_pending_brief("flotilla", &held.launch).await.expect("withdraw adopted Message"),
-        Some("legacy follow-up".into())
-    );
-}
-
 /// Supervision by the operator alone, the last rung.
 fn operator_supervision(snapshot: &mut WorkflowSnapshot) {
     snapshot.supervision = Some(vec![flotilla_resources::SupervisionTarget::Operator]);
@@ -244,7 +209,7 @@ fn operator_supervision(snapshot: &mut WorkflowSnapshot) {
 #[ignore = "engine admission refuses principal: supervision addresses; see decisions 03:20"]
 fn governor_rulings_reply_to_the_source_escalation(tc: hegel::TestCase) {
     use flotilla_protocol::CrewSupervisionAction;
-    use flotilla_resources::{MessageExpectation, MessageReference, MessageRelation, MessageSpec, StallRung, StallSupervisor};
+    use flotilla_resources::{MessageRelation, StallRung, StallSupervisor};
     use hegel::generators as gs;
     let escalation_visible = tc.draw(gs::booleans());
     // All three rulings reply to the source escalation. Escalate additionally
@@ -267,20 +232,19 @@ fn governor_rulings_reply_to_the_source_escalation(tc: hegel::TestCase) {
             .await;
         let coder = held.receiver("work", "coder");
         let governor_address = flotilla_resources::crew_role_address("flotilla", &governor, "watch", "governor");
-        let escalation = MessageSpec::builder()
-            .sender(coder.clone())
-            .receiver(governor_address.clone())
-            .relation(MessageRelation::Supervisor)
-            .body("blocked".into())
-            .expectation(MessageExpectation::Reply)
-            .references(vec![MessageReference::ControlRecord {
-                resource: ResourceRef::new("flotilla.work/v1", "Convoy", "flotilla", &held.launch),
-                revision: convoy.metadata.resource_version,
-            }])
-            .build();
+        let mut escalation = flotilla_messaging::Intent::new(
+            flotilla_resources::convoy::engine::role_inbox(&coder).expect("the coder's seat"),
+            flotilla_resources::convoy::engine::role_inbox(&governor_address).expect("the governor's seat"),
+            MessageRelation::Supervisor,
+            "blocked",
+        );
+        escalation.expectation = flotilla_messaging::IntentExpectation::Reply;
+        escalation.references = vec![flotilla_messaging::IntentReference::new(
+            flotilla_resources::convoy::engine::convoy_reference_address(&held.launch, Some("flotilla")).expect("the convoy's address"),
+            flotilla_address::Revision::new(convoy.metadata.resource_version).expect("revision"),
+        )];
         let messages = held.messages().messages();
         if escalation_visible {
-            let escalation = messages.intent_of("flotilla", &escalation).await.expect("intent");
             messages.admit("source-escalation", &escalation).await.expect("escalation");
         }
         // No visible escalation and no supervision index must produce an unlinked ruling,
@@ -323,7 +287,6 @@ fn governor_rulings_reply_to_the_source_escalation(tc: hegel::TestCase) {
 #[ignore = "engine admission refuses principal: supervision addresses; see decisions 03:20"]
 async fn supervisor_decision_survives_authority_disappearing_after_publication() {
     use flotilla_messaging::EngineMessages;
-    use flotilla_resources::MessageSpec;
 
     use crate::leaf_engine::ResourceIntentPublisher;
     // Boundary stand-in: the receiver admits intent, then an operator abandons the convoy before
@@ -338,8 +301,7 @@ async fn supervisor_decision_survives_authority_disappearing_after_publication()
     impl ResourceIntentPublisher for ReceiverAndTeardown {
         async fn publish(self: Arc<Self>, namespace: &str, document: serde_json::Value) -> Result<ResourceRef, String> {
             let name = document["metadata"]["name"].as_str().expect("name").to_string();
-            let spec: MessageSpec = serde_json::from_value(document["spec"].clone()).expect("intent");
-            let intent = self.messages.intent_of(namespace, &spec).await.map_err(|error| error.to_string())?;
+            let intent: flotilla_messaging::Intent = serde_json::from_value(document["spec"].clone()).expect("intent");
             self.messages.admit(&name, &intent).await.map_err(|error| error.to_string())?;
             let convoy = self.backend.using::<ResourceConvoy>(namespace).get(&self.launch).await.map_err(|error| error.to_string())?;
             self.engine.abandon(&convoy, "operator", "torn down").await?;
@@ -447,13 +409,13 @@ async fn read_by_a_repeated_hold(count: usize) -> (u64, u64) {
     let (crew, _backend, _, held) = fixture(CrewWorkPhase::Done).await;
     let primitives = held.messages().primitives();
     for index in 0..count {
-        let intent = flotilla_resources::MessageSpec::builder()
-            .sender("system:turn-rules".into())
-            .receiver(held.receiver("work", "coder"))
-            .relation(flotilla_resources::MessageRelation::System)
-            .body(format!("open {index}"))
-            .build();
-        primitives.admit_old("flotilla", &format!("open-{index}"), &intent).await.expect("admit an open message");
+        let intent = flotilla_messaging::Intent::new(
+            flotilla_engine_messages_testkit::party("system:turn-rules"),
+            flotilla_resources::convoy::engine::role_inbox(&held.receiver("work", "coder")).expect("the coder's inbox"),
+            flotilla_resources::MessageRelation::System,
+            format!("open {index}"),
+        );
+        primitives.admit(&format!("open-{index}"), &intent).await.expect("admit an open message");
     }
     let request = crate::leaf_engine::CrewTurnIntent::builder()
         .namespace("flotilla".into())
@@ -1088,7 +1050,6 @@ async fn terminal_legacy_brief_is_ignored() {
         .await
         .status;
     assert_eq!(status.as_ref().expect("status").phase, ConvoyPhase::Landed);
-    crew.adopt_legacy_convoy_queues_once("flotilla", None).await.expect("adoption");
     crew.reconcile_pending_supervisor_turns_once("flotilla").await.expect("reconcile");
     assert!(backend.using::<flotilla_resources::Message>("flotilla").list().await.expect("messages").items.is_empty());
     assert_eq!(held.convoy(&backend).await.status, status);

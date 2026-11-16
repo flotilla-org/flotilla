@@ -19,8 +19,8 @@ use flotilla_resources::{
     message_record_name,
     terminal_records::TerminalRecords,
     vessel_records::{VesselLaunchRequest, VesselRecord, VesselRecords, VesselStep},
-    Convoy, ConvoySpec, ConvoyStatus, CrewSource, CrewSpec, InputMeta, MessageReference, MessageRelation, MessageSpec, Selector,
-    TerminalBrief, TerminalCrewContext, TerminalSession, TerminalSessionSource, TerminalSessionSpec, VesselRequirement, WorkflowSnapshot,
+    Convoy, ConvoySpec, ConvoyStatus, CrewSource, CrewSpec, InputMeta, MessageReference, MessageRelation, Selector, TerminalBrief,
+    TerminalCrewContext, TerminalSession, TerminalSessionSource, TerminalSessionSpec, VesselRequirement, WorkflowSnapshot,
 };
 use flotilla_store::ResourceBackend;
 use flotilla_store_memory::InMemoryBackend;
@@ -146,14 +146,11 @@ async fn seat_spelled(others: usize) -> VesselReads {
         resource: ResourceRef::new("flotilla.work/v1", "TerminalSession", NAMESPACE, &session),
         revision: "1".into(),
     };
-    let intent = MessageSpec::builder()
-        .sender(sender.into())
-        .receiver(receiver.into())
-        .relation(MessageRelation::System)
-        .body("about the seat".into())
-        .references(vec![seat.clone()])
-        .build();
-    primitives.admit_old(NAMESPACE, &name, &intent).await.expect("admit");
+    // A reference to the session's seat, which is the receiver's own role.
+    let mut intent = flotilla_engine_messages_testkit::intent(sender, receiver, MessageRelation::System, "about the seat");
+    let revision = flotilla_address::Revision::new("1".to_owned()).expect("revision");
+    intent.references = vec![flotilla_messaging::IntentReference::new(flotilla_engine_messages_testkit::party(receiver), revision)];
+    primitives.admit(&name, &intent).await.expect("admit");
 
     let view = primitives.view_to(NAMESPACE, receiver, &name).await.expect("view").expect("the message's view").object;
     assert_eq!(view.spec.references, vec![seat], "the seat is spelled as the session its vessel at `third` holds");

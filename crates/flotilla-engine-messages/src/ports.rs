@@ -26,7 +26,6 @@ use flotilla_resources::{
 use flotilla_store::{ResourceBackend, WeakResourceBackend};
 
 use super::{
-    convert::{Conversion, NoRecords},
     keyed_reads::{snapshot_work, KeyedReads},
     roles::FleetRoles,
     view::condition_leaf,
@@ -167,13 +166,12 @@ impl RoleBindings for RoleRouting {
         )
         .await
         .map_err(|error| error.to_string())?;
-        let conversion = Conversion { roles, forges: &[], records: &NoRecords };
         let mut holders = Vec::new();
         for Candidate { terminal, session_id, addresses } in candidates {
             let mut inboxes = BTreeSet::new();
             for address in addresses {
                 match snapshot.resolve(&address) {
-                    Ok(Some(resolved)) if resolved.object.metadata.name == terminal.metadata.name => match conversion.inbox(&address) {
+                    Ok(Some(resolved)) if resolved.object.metadata.name == terminal.metadata.name => match roles.inbox(&address) {
                         Ok(inbox) => {
                             inboxes.insert(inbox);
                         }

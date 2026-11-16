@@ -667,9 +667,6 @@ where
     let (ready_tx, ready_rx) = oneshot::channel();
     let task = tokio::spawn(inherit(async move {
         let mut ready_tx = Some(ready_tx);
-        // Legacy convoy queues are adopted once at startup, retried only after a failure: the
-        // generation that stopped writing them (#2710) has been rolled across the fleet.
-        let mut adopt_legacy = true;
         let mut pass_failures = 0_u32;
         let mut watch_failures = 0_u32;
         loop {
@@ -687,15 +684,6 @@ where
             // writes, or its own watch events would keep this loop running.
             loop {
                 let mut failed = false;
-                if adopt_legacy {
-                    match daemon.adopt_legacy_convoy_queues_once(&namespace).await {
-                        Ok(()) => adopt_legacy = false,
-                        Err(error) => {
-                            warn!(%error, %namespace, "failed to adopt legacy convoy queues");
-                            failed = true;
-                        }
-                    }
-                }
                 if let Err(error) = daemon.reconcile_pending_supervisor_turns_once(&namespace).await {
                     warn!(%error, %namespace, "failed to reconcile pending supervisor turns");
                     failed = true;

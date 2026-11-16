@@ -2021,19 +2021,14 @@ mod tests {
     // messages alone: one delivered and settled is not listed.
     #[tokio::test]
     async fn message_views_without_evidence_list_only_open_engine_messages() {
-        use flotilla_resources::{MessageRelation, MessageSpec};
+        use flotilla_resources::MessageRelation;
 
         let backend = ResourceBackend::new(InMemoryBackend::default());
         flotilla_engine_messages_testkit::designate_fleet(&backend, "flotilla").await;
         let home = flotilla_engine_messages_testkit::EngineMessagesHome::open("home-a", "flotilla", &backend);
         for name in ["waiting", "settled"] {
-            let intent = MessageSpec::builder()
-                .sender("system:turn-rules".into())
-                .receiver("flotilla/coder".into())
-                .relation(MessageRelation::System)
-                .body(name.into())
-                .build();
-            home.primitives().admit_old("flotilla", name, &intent).await.expect("admit");
+            let intent = flotilla_engine_messages_testkit::intent("system:turn-rules", "flotilla/coder", MessageRelation::System, name);
+            home.primitives().admit(name, &intent).await.expect("admit");
         }
         home.deliver_turn("flotilla/coder", "settled", "session-coder").await;
         let views = super::crew_message_views(&backend, "flotilla").await.expect("message views");

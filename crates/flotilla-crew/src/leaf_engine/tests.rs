@@ -460,13 +460,13 @@ async fn project_supervision_case(governors: &[(&str, u64, ConvoyPhase)]) -> Cas
 // recording delivery collaborator, with explicit time rather than sleeps.
 /// An operator's Message to the coder, accepted and waiting for delivery.
 async fn message_to_coder(case: &Case, name: &str, body: &str) {
-    let spec = flotilla_resources::MessageSpec::builder()
-        .sender("principal:implicit".into())
-        .receiver(case.coder())
-        .body(body.into())
-        .relation(flotilla_resources::MessageRelation::Supervisor)
-        .build();
-    case.home.messages.primitives().admit_old("flotilla", name, &spec).await.expect("message accepted");
+    let inbox = flotilla_resources::convoy::engine::role_inbox(&case.coder()).expect("the coder's inbox");
+    // The operator sends as the operator role of the coder's project.
+    let project = inbox.get(flotilla_address::Kind::Project).expect("the coder's project").to_owned();
+    let operator = flotilla_engine_messages_testkit::party(&format!("project:{project}/role:operator"));
+    let mut spec = flotilla_messaging::Intent::new(operator, inbox, flotilla_resources::MessageRelation::Supervisor, body);
+    spec.principal = Some("implicit".into());
+    case.home.messages.primitives().admit(name, &spec).await.expect("message accepted");
 }
 
 /// Records Message `name` delivered to the coder's session at `at`, as its delivery does.

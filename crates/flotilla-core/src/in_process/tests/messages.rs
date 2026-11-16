@@ -185,14 +185,14 @@ async fn message_routing_refuses_unknown_homes_and_finished_convoys() {
         Some(NodeId::new("remote-holder-home"))
     );
     // A system producer sends as its fleet role, to the crew that replies.
-    let original = flotilla_resources::MessageSpec::builder()
-        .sender("system:turn-rules".into())
-        .receiver("flotilla/c/work/coder".into())
-        .relation(flotilla_resources::MessageRelation::System)
-        .body("request".into())
-        .build();
+    let original = flotilla_engine_messages_testkit::intent(
+        "system:turn-rules",
+        "flotilla/c/work/coder",
+        flotilla_resources::MessageRelation::System,
+        "request",
+    );
     designate_fleet(&backend).await;
-    install_engine_messages(&daemon).admit_old("flotilla", "system-request", &original).await.expect("original system request");
+    install_engine_messages(&daemon).admit("system-request", &original).await.expect("original system request");
     let reply = serde_json::json!({"spec":{"sender":"project:flotilla/convoy:c/role:coder","inbox":"fleet:lab/role:turn-rules","relation":"peer","body":"answer","in_reply_to":"system-request"}});
     assert_eq!(daemon.message_creation_origin("flotilla", &reply).await.expect("system reply home"), Some(daemon.node_id().clone()));
     let convoys = backend.using::<ResourceConvoy>("flotilla");
@@ -233,7 +233,7 @@ async fn message_routing_refuses_unknown_homes_and_finished_convoys() {
 // is measured.
 #[tokio::test]
 async fn message_send_reads_ignore_unrelated_history() {
-    use flotilla_resources::{MessageRelation, MessageSpec};
+    use flotilla_resources::MessageRelation;
     use flotilla_store_testkit::{assert_flat_reads, measure_reads, ReadBudget, ReadCountsBackendExt, ReadOperation, ReadSnapshot};
     async fn send_reads(unrelated: usize) -> (ReadSnapshot, ReadSnapshot) {
         let temp = tempfile::tempdir().expect("config directory");
@@ -258,13 +258,13 @@ async fn message_send_reads_ignore_unrelated_history() {
                 .await
                 .expect("convoy");
             if index != 0 {
-                let unrelated = MessageSpec::builder()
-                    .sender("flotilla/checks".into())
-                    .receiver(format!("flotilla/{name}/work/coder"))
-                    .relation(MessageRelation::System)
-                    .body("unrelated".into())
-                    .build();
-                primitives.admit_old("flotilla", &format!("history-{index}"), &unrelated).await.expect("unrelated message");
+                let unrelated = flotilla_engine_messages_testkit::intent(
+                    "flotilla/checks",
+                    &format!("flotilla/{name}/work/coder"),
+                    MessageRelation::System,
+                    "unrelated",
+                );
+                primitives.admit(&format!("history-{index}"), &unrelated).await.expect("unrelated message");
             }
         }
         let document = serde_json::json!({
@@ -337,14 +337,16 @@ async fn a_persons_message_traces_its_principal_and_records_its_role() {
     .await;
     let primitives = install_engine_messages(&daemon);
     designate_fleet(&backend).await;
-    for (name, principal, traced) in [("from-nobody", "principal:implicit", "none named"), ("from-alice", "principal:alice", "alice")] {
-        let intent = flotilla_resources::MessageSpec::builder()
-            .sender(principal.into())
-            .receiver("system:turn-rules".into())
-            .relation(flotilla_resources::MessageRelation::Peer)
-            .body("ruling".into())
-            .build();
-        primitives.admit_old("flotilla", name, &intent).await.expect("admitted");
+    // With no project in the message's context, a person sends as the fleet's operator role.
+    for (name, principal, traced) in [("from-nobody", "implicit", "none named"), ("from-alice", "alice", "alice")] {
+        let mut intent = flotilla_engine_messages_testkit::intent(
+            "fleet:lab/role:operator",
+            "system:turn-rules",
+            flotilla_resources::MessageRelation::Peer,
+            "ruling",
+        );
+        intent.principal = Some(principal.into());
+        primitives.admit(name, &intent).await.expect("admitted");
         assert_eq!(stored_sender(&primitives, "system:turn-rules", name).await, "fleet:lab/role:operator", "the record names the role");
         let logged = String::from_utf8(lines.0.lock().expect("lines").clone()).expect("UTF-8");
         assert!(logged.contains(&format!("message.principal=\"{traced}\"")), "{logged}");
@@ -355,7 +357,7 @@ async fn a_persons_message_traces_its_principal_and_records_its_role() {
 // the role it holds there, and the crew's view reads that role back as the principal.
 #[tokio::test]
 async fn a_declared_principal_reads_back_under_its_own_name() {
-    use flotilla_resources::{MessageRelation, MessageSpec, Project, ProjectSpec, RoleDefinition};
+    use flotilla_resources::{MessageRelation, Project, ProjectSpec, RoleDefinition};
     use std::collections::BTreeMap;
 
     let temp = tempfile::tempdir().expect("tempdir");
@@ -376,13 +378,11 @@ async fn a_declared_principal_reads_back_under_its_own_name() {
     let charter =
         ProjectSpec::builder().display_name("Flotilla".into()).role_definitions(BTreeMap::from([("owner".into(), owner)])).build();
     backend.definitions::<Project>("flotilla").apply(&test_meta("flotilla"), &charter).await.expect("project");
-    let intent = MessageSpec::builder()
-        .sender("principal:alice".into())
-        .receiver("flotilla/gui-approver".into())
-        .relation(MessageRelation::Peer)
-        .body("approved".into())
-        .build();
-    primitives.admit_old("flotilla", "from-alice", &intent).await.expect("admitted");
+    // Alice holds the owner role the charter declares for her in the receiver's project.
+    let mut intent =
+        flotilla_engine_messages_testkit::intent("project:flotilla/role:owner", "flotilla/gui-approver", MessageRelation::Peer, "approved");
+    intent.principal = Some("alice".into());
+    primitives.admit("from-alice", &intent).await.expect("admitted");
     assert_eq!(
         stored_sender(&primitives, "flotilla/gui-approver", "from-alice").await,
         "project:flotilla/role:owner",

@@ -6,9 +6,10 @@
 use std::future::Future;
 
 use flotilla_address::Address;
-use flotilla_engine_messages_testkit::{designate_fleet, EngineMessagesHome};
+use flotilla_engine_messages_testkit::{designate_fleet, party, EngineMessagesHome};
 use flotilla_inbox::InboxBackend;
-use flotilla_resources::{MessageRelation, MessageSpec};
+use flotilla_messaging::Intent;
+use flotilla_resources::MessageRelation;
 use flotilla_schema::Timestamp;
 use flotilla_state_machines::{machines::message::Deliver, Transport};
 use flotilla_store::{
@@ -20,16 +21,12 @@ use flotilla_store_memory::InMemoryBackend;
 const NAMESPACE: &str = "flotilla";
 const BUSY: &str = "flotilla/coder";
 const QUIET: &str = "flotilla/reviewer";
-const PERSON: &str = "principal:alice";
+/// A person's role in no project's context: the fleet's operator.
+const PERSON: &str = "fleet:lab/role:operator";
 const SETTLED: usize = 2000;
 
-fn intent(receiver: &str, body: &str) -> MessageSpec {
-    MessageSpec::builder()
-        .sender("system:turn-rules".into())
-        .receiver(receiver.into())
-        .relation(MessageRelation::System)
-        .body(body.into())
-        .build()
+fn intent(receiver: &str, body: &str) -> Intent {
+    flotilla_engine_messages_testkit::intent("system:turn-rules", receiver, MessageRelation::System, body)
 }
 
 /// The Messages decoded and converted.
@@ -61,7 +58,7 @@ async fn reads_by_receiver_and_by_name_load_only_their_messages() {
 
     for n in 0..SETTLED {
         let name = format!("settled-{n}");
-        primitives.admit_old(NAMESPACE, &name, &intent(BUSY, &name)).await.expect("admit");
+        primitives.admit(&name, &intent(BUSY, &name)).await.expect("admit");
         let (id, _) = primitives.locate_in(&inbox, &name).expect("locate").expect("admitted");
         primitives.inbox().receive(&session, &id, Transport::Turn).await.expect("receipt");
         primitives.inbox().deliver(&id, Deliver { receiver: session.clone(), transport: Transport::Turn }).await.expect("deliver");
@@ -70,24 +67,24 @@ async fn reads_by_receiver_and_by_name_load_only_their_messages() {
     let mark = Timestamp::from_datetime(&chrono::Utc::now());
     for n in 0..2 {
         let name = format!("late-{n}");
-        primitives.admit_old(NAMESPACE, &name, &intent(BUSY, &name)).await.expect("admit");
+        primitives.admit(&name, &intent(BUSY, &name)).await.expect("admit");
         let (id, _) = primitives.locate_in(&inbox, &name).expect("locate").expect("admitted");
         primitives.inbox().receive(&session, &id, Transport::Turn).await.expect("receipt");
         primitives.inbox().deliver(&id, Deliver { receiver: session.clone(), transport: Transport::Turn }).await.expect("deliver");
     }
     for n in 0..3 {
         let name = format!("waiting-{n}");
-        primitives.admit_old(NAMESPACE, &name, &intent(BUSY, &name)).await.expect("admit");
+        primitives.admit(&name, &intent(BUSY, &name)).await.expect("admit");
     }
     for n in 0..2 {
         let name = format!("quiet-{n}");
-        primitives.admit_old(NAMESPACE, &name, &intent(QUIET, &name)).await.expect("admit");
+        primitives.admit(&name, &intent(QUIET, &name)).await.expect("admit");
     }
-    let to_person = MessageSpec { sender: "system:stall-judge".into(), ..intent(PERSON, "stalled") };
-    primitives.admit_old(NAMESPACE, "for-a-person", &to_person).await.expect("admit");
+    let to_person = Intent { sender: party("system:stall-judge"), ..intent(PERSON, "stalled") };
+    primitives.admit("for-a-person", &to_person).await.expect("admit");
     let total = SETTLED + 2 + 3 + 2 + 1;
 
-    let next = primitives.intent_of(NAMESPACE, &intent(BUSY, "next")).await.expect("intent");
+    let next = intent(BUSY, "next");
     let (waiting, cost) = measured_now(|| primitives.undelivered_from(&next));
     assert_eq!(waiting.expect("pending read").expect("waiting").standing.name, "waiting-2");
     assert_eq!(cost, (3, 0), "a pending read loads only the waiting messages and converts none");
@@ -96,7 +93,7 @@ async fn reads_by_receiver_and_by_name_load_only_their_messages() {
     assert_eq!(settled.expect("by-name read").expect("held").object.metadata.name, "settled-17");
     assert_eq!(cost, (1, 1), "a by-name read loads and converts one message");
 
-    let quiet_inbox = primitives.intent_of(NAMESPACE, &intent(QUIET, "quiet-1")).await.expect("intent").inbox;
+    let quiet_inbox = party(QUIET);
     let (named, cost) = measured_now(|| primitives.admitted(&quiet_inbox, "quiet-1"));
     assert_eq!(named.expect("by-name read").expect("held").superseded_by, None);
     assert_eq!(cost, (1, 0), "a by-name read for an intent loads one message and converts none");
@@ -109,7 +106,7 @@ async fn reads_by_receiver_and_by_name_load_only_their_messages() {
     assert!(held.expect("hold read").is_some(), "the waiting messages hold delivery");
     assert_eq!(cost.0, 3, "a delivery hold loads only the waiting messages");
 
-    let ruling = primitives.intent_of(NAMESPACE, &intent(BUSY, "ruling")).await.expect("intent");
+    let ruling = intent(BUSY, "ruling");
     let about = ruling.references.iter().map(|reference| reference.address.clone()).collect::<Vec<_>>();
     let (awaited, cost) = measured_now(|| primitives.awaited_reply_from(&ruling.sender, &ruling.inbox, &about));
     assert_eq!(awaited.expect("open read"), None, "no open message expects a reply");

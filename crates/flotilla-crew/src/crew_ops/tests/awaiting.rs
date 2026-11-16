@@ -10,12 +10,9 @@ use std::sync::{Arc, Mutex};
 use async_trait::async_trait;
 use chrono::{DateTime, Utc};
 use flotilla_address::Address;
-use flotilla_engine_messages::{
-    convert::{Conversion, ReferenceAddresses},
-    roles::FleetRoles,
-};
+use flotilla_engine_messages::roles::FleetRoles;
 use flotilla_messaging::{Intent, IntentExpectation};
-use flotilla_resources::{MessageReference, MessageSpec, ResourceError};
+use flotilla_resources::ResourceError;
 
 use super::fixture_with_message_path;
 use crate::leaf_engine::{CrewTurnIntent, Party};
@@ -30,22 +27,6 @@ struct RecordingMessages {
     failures: AtomicUsize,
     records: Mutex<Vec<(String, String)>>,
     ended: Mutex<Vec<(Vec<String>, Option<String>)>>,
-}
-
-/// The records these tests' intents refer to: the convoys and projects they name.
-struct Named;
-impl ReferenceAddresses for Named {
-    fn address(&self, reference: &MessageReference) -> Result<Address, String> {
-        match reference {
-            MessageReference::ControlRecord { resource, .. } if resource.kind == "Convoy" => {
-                Address::convoy(&resource.name).map_err(|error| error.to_string())
-            }
-            MessageReference::ControlRecord { resource, .. } if resource.kind == "Project" => {
-                Address::project(&resource.name).map_err(|error| error.to_string())
-            }
-            other => Err(format!("{other:?} is not named in these tests")),
-        }
-    }
 }
 
 impl RecordingMessages {
@@ -107,10 +88,6 @@ impl EngineMessages for RecordingMessages {
     async fn holds(&self, inbox: &Address, record: &str) -> Result<bool, ResourceError> {
         Ok(self.admitted.lock().expect("admitted").get(record).is_some_and(|(intent, _)| intent.inbox == *inbox))
     }
-    async fn intent_of(&self, _namespace: &str, old: &MessageSpec) -> Result<Intent, ResourceError> {
-        let roles = FleetRoles::declared("fleet").expect("declared roles");
-        Conversion { roles: &roles, forges: &[], records: &Named }.intent(old).map_err(ResourceError::invalid)
-    }
     async fn admitted(&self, inbox: &Address, record: &str) -> Result<Option<flotilla_messaging::AdmittedMessage>, ResourceError> {
         let held = self.admitted.lock().expect("admitted").get(record).is_some_and(|(intent, _)| intent.inbox == *inbox);
         Ok(held.then(|| flotilla_messaging::AdmittedMessage { home: self.home(), superseded_by: None }))
@@ -137,8 +114,8 @@ impl EngineMessages for RecordingMessages {
     }
     async fn person(&self, _namespace: &str, principal: &str, project: Option<&str>) -> Result<Address, ResourceError> {
         let roles = FleetRoles::declared("fleet").expect("declared roles");
-        let conversion = Conversion { roles: &roles, forges: &[], records: &Named };
-        conversion.person(&format!("principal:{principal}"), project).map_err(ResourceError::invalid)
+        // No charter here declares a role for anyone.
+        roles.principal_role(&format!("principal:{principal}"), project, Vec::new()).map_err(ResourceError::invalid)
     }
     async fn queued_briefs(&self, _namespace: &str, seats: &[String]) -> Result<Vec<flotilla_messaging::SentMessage>, ResourceError> {
         let roles = FleetRoles::declared("fleet").expect("declared roles");

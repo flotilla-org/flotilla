@@ -4984,11 +4984,6 @@ impl InProcessDaemon {
         self.crew.deliver_turn(request).await.map(|admission| admission.rung)
     }
 
-    /// Recover previous-generation queue intent at startup and periodic resync.
-    pub async fn adopt_legacy_convoy_queues_once(&self, namespace: &str) -> Result<(), String> {
-        self.crew.adopt_legacy_convoy_queues_once(namespace, None).await
-    }
-
     pub async fn reconcile_pending_supervisor_turns_once(&self, namespace: &str) -> Result<(), String> {
         self.crew.reconcile_pending_supervisor_turns_once(namespace).await
     }
