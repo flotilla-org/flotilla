@@ -18,7 +18,7 @@ pub use other_home::{
 };
 use std::sync::Arc;
 pub use terminals::TerminalsFixture;
-pub use vessels::VesselsFixture;
+pub use vessels::{FollowedVessels, VesselsFixture};
 
 use flotilla_provisioning::engine::reads::{LifecycleReadPort, StoreReads};
 use flotilla_resources::{environment_records::EnvironmentRecords, lifecycle_reads::LifecycleReads, ResourceObject};

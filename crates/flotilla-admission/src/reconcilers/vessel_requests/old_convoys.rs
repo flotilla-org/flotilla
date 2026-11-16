@@ -4,11 +4,11 @@
 use std::collections::BTreeMap;
 
 use flotilla_protocol::CanonicalHostId;
-use flotilla_resources::{Convoy, ReadResourceObject, ResourceObject, ResourceProvenance, WorkPhase};
+use flotilla_resources::{Convoy, ReadResourceObject, ReadWatchEvent, ResourceObject, ResourceProvenance, WorkPhase};
 use flotilla_store::ResourceBackend;
 use futures::{stream::BoxStream, StreamExt};
 
-use super::{ConvoyStanding, ConvoyWorks, WorkNeedingVessel};
+use super::{ConvoyStanding, ConvoyTouched, ConvoyWorks, ConvoyWorksRead, WorkNeedingVessel};
 
 /// The old store's convoys in one namespace, at the home `backend` serves.
 #[derive(Clone)]
@@ -22,20 +22,57 @@ impl OldConvoyWorks {
         Self { backend, namespace: namespace.into() }
     }
 
+    fn here(&self) -> String {
+        self.backend.local_root().map(|root| root.as_str().to_owned()).unwrap_or_default()
+    }
+
     /// Every convoy read here, by name and home.
     async fn convoys(&self) -> Result<BTreeMap<(String, String), ResourceObject<Convoy>>, String> {
-        let here = self.backend.local_root().map(|root| root.as_str().to_owned()).unwrap_or_default();
+        let here = self.here();
         let sources = self.backend.including_replicas::<Convoy>(&self.namespace).list().await.map_err(|error| error.to_string())?.items;
         Ok(sources.into_iter().map(|source| homed(source, &here)).collect())
+    }
+
+    /// Convoy `convoy` homed at `convoy_home`, read by its name.
+    async fn read(&self, convoy: &str, convoy_home: &str) -> Result<Option<ResourceObject<Convoy>>, String> {
+        let here = self.here();
+        let copies = self.backend.including_replicas::<Convoy>(&self.namespace).get_all(convoy).await.map_err(|error| error.to_string())?;
+        Ok(copies.items.into_iter().map(|source| homed(source, &here)).find(|((_, home), _)| home == convoy_home).map(|(_, convoy)| convoy))
+    }
+}
+
+fn standing(convoy: &ResourceObject<Convoy>) -> ConvoyStanding {
+    if convoy.status.as_ref().is_some_and(|status| status.phase.is_terminal()) {
+        ConvoyStanding::Ended
+    } else {
+        ConvoyStanding::Live
+    }
+}
+
+/// The works of `convoy`, named `name` and homed at `convoy_home`, that run on a vessel now.
+fn works(name: &str, convoy_home: &str, convoy: &ResourceObject<Convoy>) -> Vec<WorkNeedingVessel> {
+    let Some(status) = convoy.status.as_ref().filter(|status| !status.phase.is_terminal()) else { return Vec::new() };
+    let Some(snapshot) = status.workflow_snapshot.as_ref() else { return Vec::new() };
+    snapshot
+        .vessels
+        .iter()
+        .filter(|requirement| status.work.get(&requirement.name).is_some_and(|work| needs_vessel(work.phase)))
+        .filter_map(|requirement| {
+            let host = placed_host(convoy, &requirement.name)?;
+            Some(WorkNeedingVessel { convoy: name.to_owned(), convoy_home: convoy_home.to_owned(), work: requirement.name.clone(), host })
+        })
+        .collect()
+}
+
+fn home(provenance: &ResourceProvenance, here: &str) -> String {
+    match provenance {
+        ResourceProvenance::Local => here.to_owned(),
+        ResourceProvenance::Replica { origin_root, .. } => origin_root.as_str().to_owned(),
     }
 }
 
 fn homed(source: ReadResourceObject<Convoy>, here: &str) -> ((String, String), ResourceObject<Convoy>) {
-    let home = match &source.provenance {
-        ResourceProvenance::Local => here.to_owned(),
-        ResourceProvenance::Replica { origin_root, .. } => origin_root.as_str().to_owned(),
-    };
-    ((source.object.metadata.name.clone(), home), source.object)
+    ((source.object.metadata.name.clone(), home(&source.provenance, here)), source.object)
 }
 
 /// Whether a work in `phase` runs on a vessel.
@@ -59,37 +96,40 @@ fn placed_host(convoy: &ResourceObject<Convoy>, work: &str) -> Option<Option<Can
 #[async_trait::async_trait]
 impl ConvoyWorks for OldConvoyWorks {
     async fn works_needing_vessel(&self) -> Result<Vec<WorkNeedingVessel>, String> {
-        let mut works = Vec::new();
-        for ((name, convoy_home), convoy) in self.convoys().await? {
-            let Some(status) = convoy.status.as_ref().filter(|status| !status.phase.is_terminal()) else { continue };
-            let Some(snapshot) = status.workflow_snapshot.as_ref() else { continue };
-            for requirement in &snapshot.vessels {
-                if !status.work.get(&requirement.name).is_some_and(|work| needs_vessel(work.phase)) {
-                    continue;
-                }
-                let Some(host) = placed_host(&convoy, &requirement.name) else { continue };
-                works.push(WorkNeedingVessel {
-                    convoy: name.clone(),
-                    convoy_home: convoy_home.clone(),
-                    work: requirement.name.clone(),
-                    host,
-                });
-            }
-        }
-        Ok(works)
+        Ok(self.convoys().await?.iter().flat_map(|((name, convoy_home), convoy)| works(name, convoy_home, convoy)).collect())
+    }
+
+    async fn convoy(&self, convoy: &str, convoy_home: &str) -> Result<Option<ConvoyWorksRead>, String> {
+        Ok(self.read(convoy, convoy_home).await?.map(|object| ConvoyWorksRead {
+            standing: standing(&object),
+            works: object
+                .status
+                .iter()
+                .filter_map(|status| status.workflow_snapshot.as_ref())
+                .flat_map(|snapshot| snapshot.vessels.iter().map(|requirement| requirement.name.clone()))
+                .collect(),
+            needing: works(convoy, convoy_home, &object),
+        }))
     }
 
     async fn standing(&self, convoy: &str, convoy_home: &str) -> Result<ConvoyStanding, String> {
-        let convoys = self.convoys().await?;
-        Ok(match convoys.get(&(convoy.to_owned(), convoy_home.to_owned())) {
-            None => ConvoyStanding::Gone,
-            Some(convoy) if convoy.status.as_ref().is_some_and(|status| status.phase.is_terminal()) => ConvoyStanding::Ended,
-            Some(_) => ConvoyStanding::Live,
-        })
+        Ok(self.read(convoy, convoy_home).await?.map_or(ConvoyStanding::Gone, |object| standing(&object)))
     }
 
-    async fn changes(&self) -> Result<BoxStream<'static, ()>, String> {
+    async fn changes(&self) -> Result<BoxStream<'static, ConvoyTouched>, String> {
+        let here = self.here();
         let watch = self.backend.including_replicas::<Convoy>(&self.namespace).watch().await.map_err(|error| error.to_string())?;
-        Ok(watch.map(|_| ()).boxed())
+        Ok(watch
+            .map(move |event| match event {
+                Ok(ReadWatchEvent::Added(read) | ReadWatchEvent::Modified(read) | ReadWatchEvent::Deleted(read)) => {
+                    let ((convoy, convoy_home), _) = homed(read, &here);
+                    ConvoyTouched::Convoy { convoy, convoy_home }
+                }
+                Ok(ReadWatchEvent::DeletedByName { tombstone, provenance }) => {
+                    ConvoyTouched::Convoy { convoy: tombstone.name, convoy_home: home(&provenance, &here) }
+                }
+                Err(_) => ConvoyTouched::Every,
+            })
+            .boxed())
     }
 }

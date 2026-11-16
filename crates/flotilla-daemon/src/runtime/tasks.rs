@@ -22,7 +22,10 @@ use flotilla_credentials::CredentialStore;
 use flotilla_discovery::registry::{command_provider_registry, ProviderRegistry};
 use flotilla_environment::environment::EnvironmentInput;
 use flotilla_resources::{Convoy, FulfilmentFacts, Host, HostStatusPatch, Resource, ResourceError, RetryBackoff, TerminalSession, Vessel};
-use flotilla_store::{load_metrics::inherit, watch_resource_kind_including_replicas, ResourceBackend};
+use flotilla_store::{
+    load_metrics::{attributed, caller, inherit},
+    watch_resource_kind_including_replicas, ResourceBackend,
+};
 use flotilla_vcs::vcs::REMOTE_CHECKOUT_ARCHIVE_SWEEP_TIMEOUT;
 use futures::stream::{BoxStream, SelectAll};
 use futures::FutureExt;
@@ -324,7 +327,7 @@ pub(super) fn spawn_vessel_requests(
         // The requester and the Vessel reconciler need distinct health keys, while both remain tied to the resource they manage.
         supervise_controller(Vessel::API_PATHS.plural, supervision, runtime_health, move || {
             let requests = requests.clone();
-            async move { requests.run().await }
+            attributed(caller("VesselRequests"), async move { requests.run().await })
         })
         .await;
     })

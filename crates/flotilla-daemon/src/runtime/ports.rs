@@ -42,7 +42,7 @@ impl flotilla_admission::reconcilers::vessel_requests::VesselReleaseGate for Dae
         // The old store's Convoy, until engine Convoy judges its own reclaim (#3108).
         let convoys = self.daemon.resource_backend().including_replicas::<Convoy>(&self.namespace);
         let convoy = convoys
-            .list()
+            .get_all(convoy)
             .await
             .map_err(|error| error.to_string())?
             .items

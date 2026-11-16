@@ -12,7 +12,9 @@
 //! ended convoy's launch is released, never failed.
 //!
 //! It runs at each change of a convoy, a vessel or a checkout (the evidence a reclaim waits on),
-//! and at the deadline of a replacement it is waiting to request; there is no periodic pass.
+//! and at the deadline of a replacement it is waiting to request; there is no periodic pass. A
+//! pass reads only the convoys the change names, by key: every convoy and every launch here is
+//! read at the first pass and after missed changes alone.
 
 use std::{
     collections::{BTreeMap, BTreeSet},
@@ -23,11 +25,14 @@ use std::{
 use chrono::{DateTime, Utc};
 use flotilla_protocol::{CanonicalHostId, LifecycleReading};
 use flotilla_resources::{
+    checkout_records::{CheckoutChange, CheckoutHolder},
     lifecycle_reads::LifecycleReads,
-    vessel_records::{VesselLaunchRequest, VesselRecord, VesselRecords, VesselStep},
+    vessel_records::{VesselChange, VesselLaunchRequest, VesselRecord, VesselRecords, VesselStep},
     ResourceError, PROVISIONING_RETRY_BACKOFF,
 };
-use futures::{stream::BoxStream, StreamExt};
+use flotilla_store::load_metrics::carry;
+use futures::{stream::BoxStream, FutureExt, StreamExt};
+use tokio::sync::broadcast::error::{RecvError, TryRecvError};
 use tracing::{debug, warn};
 
 mod old_convoys;
@@ -62,16 +67,38 @@ pub enum ConvoyStanding {
     Gone,
 }
 
+/// One convoy as its vessels need it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ConvoyWorksRead {
+    /// Live or Ended.
+    pub standing: ConvoyStanding,
+    /// The name of each work its admission froze, needing a vessel now or not.
+    pub works: Vec<String>,
+    /// The works that run on a vessel now: none once it has ended.
+    pub needing: Vec<WorkNeedingVessel>,
+}
+
+/// What a convoy change names.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ConvoyTouched {
+    /// Convoy `convoy` homed at `convoy_home` changed.
+    Convoy { convoy: String, convoy_home: String },
+    /// Any convoy may have changed: changes were missed.
+    Every,
+}
+
 /// The convoys' side of vessel requests, read at this home from every home's convoys.
 #[async_trait::async_trait]
 pub trait ConvoyWorks: Send + Sync {
     /// Every work of every live convoy that runs on a vessel now: Ready, Launching, Running,
     /// Stalled or Interrupted.
     async fn works_needing_vessel(&self) -> Result<Vec<WorkNeedingVessel>, String>;
+    /// Convoy `convoy` homed at `convoy_home`, read by its key alone; none when no home holds it.
+    async fn convoy(&self, convoy: &str, convoy_home: &str) -> Result<Option<ConvoyWorksRead>, String>;
     /// Where convoy `convoy` homed at `convoy_home` stands.
     async fn standing(&self, convoy: &str, convoy_home: &str) -> Result<ConvoyStanding, String>;
-    /// A tick at each change of any convoy, local or replicated.
-    async fn changes(&self) -> Result<BoxStream<'static, ()>, String>;
+    /// Each change of a convoy, local or replicated.
+    async fn changes(&self) -> Result<BoxStream<'static, ConvoyTouched>, String>;
 }
 
 /// Whether a convoy that has ended may have its vessels released: what they hold is reclaimed
@@ -91,6 +118,10 @@ pub struct VesselRequestPass {
     pub released: Vec<String>,
     /// When a replacement it waited to request falls due.
     pub next: Option<DateTime<Utc>>,
+    /// When each convoy's earliest waiting replacement falls due, by convoy and home.
+    pub due: BTreeMap<ConvoyKey, DateTime<Utc>>,
+    /// The ended convoys whose release the gate refused: judged again as checkouts change.
+    pub refused: BTreeSet<ConvoyKey>,
 }
 
 /// A work that needs a vessel launch here.
@@ -124,50 +155,173 @@ impl VesselRequests {
         Self { works, reads, gate, hosts, local_host_ref }
     }
 
-    /// Runs a pass at each convoy, vessel or checkout change, and when a waiting replacement falls
-    /// due.
+    /// Runs a pass over every convoy first and after missed changes. Otherwise a pass reads only
+    /// the convoys a wake names: a convoy's own change, a change of one of its launches here, a
+    /// checkout change while the gate holds its release, or its waiting replacement falling due.
+    /// The wakes sent during a pass are taken together for the next.
     pub async fn run(&self) -> Result<(), ResourceError> {
         // Follow before the first pass so changes during it are not missed.
         let mut convoy_changes = self.works.changes().await.map_err(ResourceError::other)?;
-        let mut vessel_changes = self.reads.vessels().map_err(ResourceError::other)?.changes();
+        let vessels = self.reads.vessels().map_err(ResourceError::other)?;
+        let (here, mut vessel_changes) = (vessels.home().to_owned(), vessels.changes());
         let mut checkout_changes = self.reads.checkouts().map_err(ResourceError::other)?.changes();
+        let mut due = BTreeMap::<ConvoyKey, DateTime<Utc>>::new();
+        let mut refused = BTreeSet::<ConvoyKey>::new();
+        // The convoys the next pass reads; every convoy when none.
+        let mut convoys: Option<BTreeSet<ConvoyKey>> = None;
         loop {
-            let pass = self.sync_once(Utc::now()).await?;
-            let due = async move {
-                match pass.next {
+            let now = Utc::now();
+            match convoys {
+                None => {
+                    let pass = self.sync_once(now).await?;
+                    (due, refused) = (pass.due, pass.refused);
+                }
+                Some(convoys) if convoys.is_empty() => {}
+                Some(convoys) => {
+                    let pass = self.sync_convoys(&convoys, now).await?;
+                    due.retain(|key, _| !convoys.contains(key));
+                    refused.retain(|key| !convoys.contains(key));
+                    due.extend(pass.due);
+                    refused.extend(pass.refused);
+                }
+            }
+            let mut woken = Woken::default();
+            let next = due.values().min().copied();
+            let falls_due = async move {
+                match next {
                     Some(at) => tokio::time::sleep((at - Utc::now()).to_std().unwrap_or(Duration::ZERO)).await,
                     None => futures::future::pending().await,
                 }
             };
             tokio::select! {
-                change = convoy_changes.next() => {
-                    change.ok_or_else(|| ResourceError::invalid("convoy changes ended"))?;
-                }
-                change = vessel_changes.recv() => {
-                    if let Err(tokio::sync::broadcast::error::RecvError::Closed) = change {
-                        return Err(ResourceError::invalid("vessel changes ended"));
-                    }
-                }
-                change = checkout_changes.recv() => {
-                    if let Err(tokio::sync::broadcast::error::RecvError::Closed) = change {
-                        return Err(ResourceError::invalid("checkout changes ended"));
-                    }
-                }
-                () = due => {}
+                change = convoy_changes.next() => woken.convoy(change)?,
+                change = vessel_changes.recv() => woken.vessel(change, &here)?,
+                change = checkout_changes.recv() => woken.checkout(change)?,
+                () = falls_due => {}
             }
+            while let Some(change) = convoy_changes.next().now_or_never() {
+                woken.convoy(change)?;
+            }
+            while let Some(change) = ready(vessel_changes.try_recv()) {
+                woken.vessel(change, &here)?;
+            }
+            while let Some(change) = ready(checkout_changes.try_recv()) {
+                woken.checkout(change)?;
+            }
+            let now = Utc::now();
+            woken.convoys.extend(due.iter().filter(|(_, at)| **at <= now).map(|(key, _)| key.clone()));
+            convoys = self.woken_convoys(woken, &refused).await?;
         }
+    }
+
+    /// The convoys `woken` names, or `None` for every convoy: a launch names its convoy, and a
+    /// checkout the convoy that holds it when the gate refused that convoy's release.
+    async fn woken_convoys(&self, woken: Woken, refused: &BTreeSet<ConvoyKey>) -> Result<Option<BTreeSet<ConvoyKey>>, ResourceError> {
+        if woken.every {
+            return Ok(None);
+        }
+        let mut convoys = woken.convoys;
+        let (launches, checkouts, every_checkout) = (woken.launches, woken.checkouts, woken.every_checkout);
+        let reads = Arc::clone(&self.reads);
+        let holders = if refused.is_empty() || (checkouts.is_empty() && !every_checkout) {
+            Some(BTreeSet::new())
+        } else if every_checkout {
+            None
+        } else {
+            let reads = Arc::clone(&reads);
+            spawn_blocking(move || {
+                let checkouts_here = reads.checkouts()?;
+                let mut holders = BTreeSet::new();
+                for name in checkouts {
+                    // A checkout another home holds names no holder here: every refused convoy is
+                    // judged again.
+                    match checkouts_here.get(&name, None)? {
+                        Some(record) => holders.extend(record.holder.map(|CheckoutHolder::Convoy(convoy)| convoy)),
+                        None => return Ok(None),
+                    }
+                }
+                Ok(Some(holders))
+            })
+            .await?
+        };
+        match holders {
+            Some(holders) => convoys.extend(refused.iter().filter(|(convoy, _)| holders.contains(convoy)).cloned()),
+            None => convoys.extend(refused.iter().cloned()),
+        }
+        if !launches.is_empty() {
+            let named = spawn_blocking(move || {
+                let vessels = reads.vessels()?;
+                let mut convoys = BTreeSet::new();
+                for launch in launches {
+                    convoys.extend(vessels.get(&launch, None)?.map(|record| (record.convoy, record.convoy_home)));
+                }
+                Ok(convoys)
+            })
+            .await?;
+            convoys.extend(named);
+        }
+        Ok(Some(convoys))
     }
 
     /// One pass over every work needing a vessel and every launch this home holds, at `now`.
     pub async fn sync_once(&self, now: DateTime<Utc>) -> Result<VesselRequestPass, ResourceError> {
         let works = self.works.works_needing_vessel().await.map_err(ResourceError::other)?;
+        self.pass(works, |vessels, here| vessels.at(here), now).await
+    }
+
+    /// One pass over the works of `convoys` and their launches this home holds, at `now`: each
+    /// convoy is read by its key, and its launches by the index of each of its works, whatever
+    /// else this home holds.
+    pub async fn sync_convoys(&self, convoys: &BTreeSet<ConvoyKey>, now: DateTime<Utc>) -> Result<VesselRequestPass, ResourceError> {
+        let mut works = Vec::new();
+        // Each convoy with what its launches are launches of; none for a convoy no home holds.
+        let mut launch_ofs = Vec::new();
+        for (convoy, convoy_home) in convoys {
+            let read = self.works.convoy(convoy, convoy_home).await.map_err(ResourceError::other)?;
+            let launch_of = flotilla_resources::convoy::launch_of(convoy);
+            let of = read.map(|read| {
+                works.extend(read.needing);
+                read.works.iter().map(|work| flotilla_resources::vessel_resource_name(launch_of, work)).collect::<Vec<_>>()
+            });
+            launch_ofs.push(((convoy.clone(), convoy_home.clone()), of));
+        }
+        let held = move |vessels: &dyn VesselRecords, here: &str| {
+            let mut held = Vec::new();
+            for ((convoy, convoy_home), of) in launch_ofs {
+                match of {
+                    Some(of) => {
+                        for launch_of in of {
+                            held.extend(vessels.launches(&convoy, &convoy_home, &launch_of, None)?);
+                        }
+                    }
+                    // Its works are not read: its launches are found among the convoy's of every
+                    // home, once, as the convoy goes.
+                    None => {
+                        let launches = vessels.of_convoy(&convoy)?.into_iter();
+                        held.extend(launches.filter(|record| record.home == here && record.convoy_home == convoy_home));
+                    }
+                }
+            }
+            Ok(held)
+        };
+        self.pass(works, held, now).await
+    }
+
+    /// Requests the launches `works` want and releases the live ones no work wants, given the
+    /// launches `held` reads here.
+    async fn pass(
+        &self,
+        works: Vec<WorkNeedingVessel>,
+        held: impl FnOnce(&dyn VesselRecords, &str) -> Result<Vec<VesselRecord>, String> + Send + 'static,
+        now: DateTime<Utc>,
+    ) -> Result<VesselRequestPass, ResourceError> {
         let (hosts, local_host_ref) = (self.hosts.clone(), self.local_host_ref.clone());
         let (mut pass, unwanted) = self
             .blocking(move |vessels| {
                 let here = vessels.home().to_owned();
                 let wanted = wanted(works, &here, &hosts, &local_host_ref);
-                let plan = plan(&wanted, vessels.at(&here)?, now);
-                let mut pass = VesselRequestPass { next: plan.next, ..Default::default() };
+                let plan = plan(&wanted, held(vessels, &here)?, now);
+                let mut pass = VesselRequestPass { next: plan.next, due: plan.due, ..Default::default() };
                 for request in plan.request {
                     pass.requested.push(vessels.request(&request)?);
                 }
@@ -190,6 +344,7 @@ impl VesselRequests {
                             Ok(()) => true,
                             Err(reason) => {
                                 debug!(convoy = %key.0, home = %key.1, %reason, "an ended convoy's vessels are kept until its reclaim is sanctioned");
+                                pass.refused.insert(key.clone());
                                 false
                             }
                         },
@@ -226,15 +381,77 @@ impl VesselRequests {
         work: impl FnOnce(&dyn VesselRecords) -> Result<T, String> + Send + 'static,
     ) -> Result<T, ResourceError> {
         let reads = Arc::clone(&self.reads);
-        tokio::task::spawn_blocking(move || work(reads.vessels()?))
-            .await
-            .map_err(|error| ResourceError::other(error.to_string()))?
-            .map_err(ResourceError::other)
+        spawn_blocking(move || work(reads.vessels()?)).await
+    }
+}
+
+/// `work` on a blocking thread, its reads counted for the caller current here.
+async fn spawn_blocking<T: Send + 'static>(work: impl FnOnce() -> Result<T, String> + Send + 'static) -> Result<T, ResourceError> {
+    tokio::task::spawn_blocking(carry(work)).await.map_err(|error| ResourceError::other(error.to_string()))?.map_err(ResourceError::other)
+}
+
+/// A broadcast change already sent, if any; a lag or the end of the changes is one too.
+fn ready<T: Clone>(change: Result<T, TryRecvError>) -> Option<Result<T, RecvError>> {
+    match change {
+        Ok(change) => Some(Ok(change)),
+        Err(TryRecvError::Empty) => None,
+        Err(TryRecvError::Lagged(missed)) => Some(Err(RecvError::Lagged(missed))),
+        Err(TryRecvError::Closed) => Some(Err(RecvError::Closed)),
+    }
+}
+
+/// What woke the requester since its last pass.
+#[derive(Default)]
+struct Woken {
+    /// Changes were missed: every convoy is read again.
+    every: bool,
+    convoys: BTreeSet<ConvoyKey>,
+    /// Launches here that changed.
+    launches: BTreeSet<String>,
+    /// Checkout launches here that changed.
+    checkouts: BTreeSet<String>,
+    /// Checkout changes were missed.
+    every_checkout: bool,
+}
+
+impl Woken {
+    fn convoy(&mut self, change: Option<ConvoyTouched>) -> Result<(), ResourceError> {
+        match change.ok_or_else(|| ResourceError::invalid("convoy changes ended"))? {
+            ConvoyTouched::Convoy { convoy, convoy_home } => {
+                self.convoys.insert((convoy, convoy_home));
+            }
+            ConvoyTouched::Every => self.every = true,
+        }
+        Ok(())
+    }
+
+    /// A launch at another home is that home's to request and release.
+    fn vessel(&mut self, change: Result<VesselChange, RecvError>, here: &str) -> Result<(), ResourceError> {
+        match change {
+            Ok(VesselChange::Changed { name, home }) if home == here => {
+                self.launches.insert(name);
+            }
+            Ok(VesselChange::Changed { .. }) => {}
+            Ok(VesselChange::Rescanned) | Err(RecvError::Lagged(_)) => self.every = true,
+            Err(RecvError::Closed) => return Err(ResourceError::invalid("vessel changes ended")),
+        }
+        Ok(())
+    }
+
+    fn checkout(&mut self, change: Result<CheckoutChange, RecvError>) -> Result<(), ResourceError> {
+        match change {
+            Ok(CheckoutChange::Changed(name)) => {
+                self.checkouts.insert(name);
+            }
+            Ok(CheckoutChange::Rescanned) | Err(RecvError::Lagged(_)) => self.every_checkout = true,
+            Err(RecvError::Closed) => return Err(ResourceError::invalid("checkout changes ended")),
+        }
+        Ok(())
     }
 }
 
 /// A convoy's identity: its name and its home.
-type ConvoyKey = (String, String);
+pub type ConvoyKey = (String, String);
 
 /// The works that need a launch here, keyed by convoy, its home and the work's launch name: those
 /// placed on a host this home serves, and those not yet placed in a convoy homed here.
@@ -268,6 +485,8 @@ struct Plan {
     /// Live launches no work wants, each with its convoy: released once that has ended or is gone.
     unwanted: Vec<(String, ConvoyKey)>,
     next: Option<DateTime<Utc>>,
+    /// Each convoy's earliest waiting replacement.
+    due: BTreeMap<ConvoyKey, DateTime<Utc>>,
 }
 
 /// The launches to request, and the live ones no work wants, given the works `wanted` here and
@@ -301,6 +520,8 @@ fn plan(wanted: &BTreeMap<(String, String, String), Wanted>, held: Vec<VesselRec
                     plan.request.push(wanted.request.clone());
                 } else {
                     plan.next = Some(plan.next.map_or(due, |next| next.min(due)));
+                    let convoy = plan.due.entry((key.0.clone(), key.1.clone())).or_insert(due);
+                    *convoy = (*convoy).min(due);
                 }
             }
         }
