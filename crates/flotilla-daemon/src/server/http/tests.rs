@@ -496,6 +496,30 @@ async fn engine_records_are_not_read_through_another_namespace() {
     assert_eq!(read.status, StatusCode::NOT_FOUND, "{:?}", read.body);
 }
 
+// A selector on an undeclared field is refused for a kind the engine serves, as the store refuses
+// it, rather than answering with every record.
+#[tokio::test]
+async fn engine_served_kind_refuses_an_undeclared_query_field() {
+    use flotilla_resources::{MessageRelation, MessageSpec};
+
+    let backend = ResourceBackend::new(InMemoryBackend::default());
+    flotilla_engine_messages_testkit::designate_fleet(&backend, "flotilla").await;
+    let home = flotilla_engine_messages_testkit::EngineMessagesHome::open("home-a", "flotilla", &backend);
+    let spec = MessageSpec::builder()
+        .sender("flotilla/reviewer".into())
+        .receiver("flotilla/coder".into())
+        .relation(MessageRelation::Peer)
+        .body("a".into())
+        .build();
+    home.primitives().admit("flotilla", "to-coder", &spec).await.expect("admit");
+    let daemon = Incarnation::over(backend, ListenerOrigin::known(ORIGIN));
+    let reply = daemon
+        .call(CallerAuth::Socket(None), get("/apis/flotilla.work/v1/namespaces/flotilla/messages?fieldSelector=spec.unknown%3Dx"))
+        .await;
+    assert_eq!(reply.status, StatusCode::BAD_REQUEST, "{:?}", reply.body);
+    assert!(String::from_utf8_lossy(&reply.body).contains("undeclared query field spec.unknown"), "{:?}", reply.body);
+}
+
 // A Message query reads the engine's messages and answers with only those it selects, with or
 // without other homes' copies: a receiver's open messages, every open message, and the replies to
 // one message.

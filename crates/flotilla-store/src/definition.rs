@@ -301,11 +301,13 @@ impl<T: Resource> DefinitionResolver<T> {
     /// then apply causal merge and revalidate the selection against the merged value.
     pub async fn query_declared(&self, query: &crate::StoreQuery) -> Result<Vec<ResourceObject<T>>, ResourceError> {
         ensure_definitions::<T>()?;
-        if let Some(records) = self.records() {
-            return select(self.engine_list(&*records).await?, query);
-        }
         let hydration =
             crate::StoreQuery { all_sources_for_matches: true, include_replicas: true, suppress_self_origin: false, ..query.clone() };
+        if let Some(records) = self.records() {
+            // Refused as the store refuses the hydration.
+            hydration.validate(crate::ResourceKind::of::<T>())?;
+            return select(self.engine_list(&*records).await?, query);
+        }
         let result = self.backend.store().query_decoded(crate::ResourceKind::of::<T>(), &self.namespace, &hydration).await?;
         let root = result.local_root.clone().ok_or_else(|| ResourceError::invalid("definition query has no authority root"))?;
         let merged =
