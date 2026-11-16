@@ -1005,7 +1005,7 @@ impl InProcessDaemon {
             config,
             discovery,
             host_name,
-            ResourceBackend::new(flotilla_store_memory::InMemoryBackend::default()),
+            flotilla_store_memory::engine_home_backend(),
             peer_overlay,
         )
         .await

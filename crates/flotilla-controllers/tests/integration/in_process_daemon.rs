@@ -989,11 +989,20 @@ fn install_engine_reads(daemon: &InProcessDaemon) -> flotilla_provisioning_testk
     install_engine(daemon).checkouts
 }
 
-/// [`install_engine_reads`], keeping the whole engine.
+/// [`install_engine_reads`], keeping the whole engine, with the Message path the daemon's
+/// readers read, as at startup.
 fn install_engine(daemon: &InProcessDaemon) -> flotilla_provisioning_testkit::EngineFixture {
+    open_message_path(daemon);
     let engine = flotilla_provisioning_testkit::EngineFixture::default();
     daemon.install_lifecycle_reads(engine.reads()).expect("engine reads");
     engine
+}
+
+/// Opens `daemon`'s Message path unless it has one.
+fn open_message_path(daemon: &InProcessDaemon) {
+    if daemon.message_primitives().is_none() {
+        daemon.open_message_primitives().expect("the engine Message path");
+    }
 }
 
 /// Crew `role`'s agent session in `environment`, held by `vessel`, as its vessel requests it.
@@ -3341,6 +3350,7 @@ async fn invalid_issue_need_admits_with_warning_in_result_and_explain() {
         FakeDiscoveryProviders::new().with_issue_tracker(provider as Arc<dyn flotilla_issue_tracker::IssueProvider>),
     );
     let (_temp, _repo, daemon) = daemon_for_plain_dir_with_discovery(discovery).await;
+    open_attentions(&daemon).await;
     let backend = daemon.resource_backend();
     create_test_convoy_project(&daemon, Some(source)).await;
     let baseline = start_capability_convoy(&daemon, "baseline", |_| {}).await;
@@ -4765,7 +4775,7 @@ async fn convoy_start_completes_both_names_with_one_ai_call() {
 /// Opens the engine Message path the daemon raises its attentions on, as a running daemon has it,
 /// with the fleet whose roles those attentions are sent as.
 async fn open_attentions(daemon: &InProcessDaemon) {
-    daemon.open_message_primitives().expect("the engine Message path");
+    open_message_path(daemon);
     flotilla_engine_messages_testkit::designate_fleet(&daemon.resource_backend(), "flotilla").await;
 }
 
@@ -9566,7 +9576,7 @@ async fn message_apply_uses_document_namespace_and_status_patches_are_refused() 
     // The engine's readings, which a running daemon always has.
     let _engine = install_engine_reads(&daemon);
     let backend = daemon.resource_backend();
-    let primitives = daemon.open_message_primitives().expect("the engine Message path");
+    let primitives = daemon.message_primitives().expect("the engine Message path");
     flotilla_engine_messages_testkit::designate_fleet(&backend, "flotilla").await;
     // The receiver's convoy, a launch in the document's namespace, the engine's.
     let convoy = flotilla_engine_convoys_testkit::launch(

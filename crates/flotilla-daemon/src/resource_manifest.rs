@@ -1191,6 +1191,8 @@ mod tests {
     };
     use flotilla_store::{patch_resource_annotation, ResourceBackend, MANIFEST_WRITER_SOURCE};
     use flotilla_vcs::factory::GitVcsFactory;
+
+    use crate::testkits::engine::engine;
     use futures::StreamExt;
 
     use super::*;
@@ -1424,6 +1426,8 @@ mod tests {
             std::sync::Arc::new(crate::peer::HostPeerOverlay::default()),
         )
         .await;
+        // Composed with its engine, as the runtime composes a daemon.
+        engine(&daemon);
         let backend = daemon.resource_backend();
         let mut reconciler = ResourceManifestReconciler::new(backend.clone(), daemon.manifest_roots(), NAMESPACE, source.path())
             .with_declared_source("laptop-charter", daemon.local_host_id().expect("host").to_string())

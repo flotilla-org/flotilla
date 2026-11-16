@@ -1,4 +1,3 @@
-use flotilla_store_memory::InMemoryBackend;
 mod caller;
 pub mod change_stream;
 mod client_connection;
@@ -255,9 +254,7 @@ fn build_peer_manager(
 /// its store holds nothing and is not durable. The old `resources.sqlite` is never opened here;
 /// only the first start's import reads it, read-only.
 fn build_embedded_resource_backend() -> ResourceBackend {
-    let backend = ResourceBackend::new(InMemoryBackend::default());
-    backend.compose_as_engine_home();
-    backend
+    flotilla_store_memory::engine_home_backend()
 }
 
 pub fn spawn_embedded_peer_networking(daemon: Arc<InProcessDaemon>, config: &ConfigStore) -> Result<tokio::task::JoinHandle<()>, String> {

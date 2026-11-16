@@ -1,8 +1,21 @@
 use super::*;
 use crate::environment_tools::EnvironmentToolProvisioner;
 use crate::runtime::environments::{mark_unavailable_environment, BackingDisposition};
-use crate::testkits::engine::{engine, runtime_checkouts};
+use crate::testkits::engine::{admit_convoy, engine, runtime_checkouts};
 use flotilla_provisioning::engine::controller::{Backing, BackingEvent};
+
+/// Admits standing convoy `name` with `status` as its next launch on `daemon`'s engine, and
+/// reads the launch back.
+async fn launch_standing(
+    daemon: &InProcessDaemon,
+    name: &str,
+    status: flotilla_resources::ConvoyStatus,
+) -> flotilla_resources::ResourceObject<Convoy> {
+    engine(daemon);
+    let spec = ConvoySpec::builder().workflow_ref("standing".to_string()).build();
+    let launch = admit_convoy(daemon, flotilla_engine_convoys_testkit::convoy(NAMESPACE, name, spec, status)).await;
+    daemon.resource_backend().using::<Convoy>(NAMESPACE).get(&launch).await.expect("launched convoy")
+}
 
 #[tokio::test]
 async fn standing_backing_inspection_accepts_durable_pre_provisioning_failure() {
@@ -19,25 +32,18 @@ async fn standing_backing_inspection_accepts_durable_pre_provisioning_failure() 
         std::sync::Arc::new(crate::peer::HostPeerOverlay::default()),
     )
     .await;
-    let convoys = daemon.resource_backend().using::<Convoy>(NAMESPACE);
-    let convoy = convoys
-        .create(&empty_meta("quartermaster"), &ConvoySpec::builder().workflow_ref("standing".to_string()).build())
-        .await
-        .expect("convoy");
-    let convoy = convoys
-        .update_status(
-            &convoy.metadata.name,
-            &convoy.metadata.resource_version,
-            &flotilla_resources::ConvoyStatus {
-                phase: flotilla_resources::ConvoyPhase::Failed,
-                provisioning: Some(ConvoyProvisioningState::NotStarted),
-                message: Some("workflow validation failed".to_string()),
-                finished_at: Some(Utc::now()),
-                ..Default::default()
-            },
-        )
-        .await
-        .expect("failed convoy status");
+    let convoy = launch_standing(
+        &daemon,
+        "quartermaster",
+        flotilla_resources::ConvoyStatus {
+            phase: flotilla_resources::ConvoyPhase::Failed,
+            provisioning: Some(ConvoyProvisioningState::NotStarted),
+            message: Some("workflow validation failed".to_string()),
+            finished_at: Some(Utc::now()),
+            ..flotilla_engine_convoys_testkit::single_agent("coder")
+        },
+    )
+    .await;
     engine_environments(&daemon);
     let state = ControllerRuntimeState::new(
         daemon,
@@ -66,41 +72,37 @@ async fn standing_backing_inspection_accepts_local_absence_only_after_startup_ob
         std::sync::Arc::new(crate::peer::HostPeerOverlay::default()),
     )
     .await;
-    let convoys = daemon.resource_backend().using::<Convoy>(NAMESPACE);
-    let convoy = convoys
-        .create(&empty_meta("quartermaster"), &ConvoySpec::builder().workflow_ref("standing".to_string()).build())
-        .await
-        .expect("convoy");
-    let convoy = convoys
-        .update_status(
-            &convoy.metadata.name,
-            &convoy.metadata.resource_version,
-            &flotilla_resources::ConvoyStatus {
-                provisioning: Some(ConvoyProvisioningState::Started { started_at: Utc::now() }),
-                workflow_snapshot: Some(flotilla_resources::WorkflowSnapshot {
-                    cascade: None,
-                    vessels: vec![VesselRequirement::builder().name("work".to_string()).crew(Vec::new()).build()],
-                    exit: None,
-                    turn_delivery: Default::default(),
-                    stall_nudges: Default::default(),
-                    supervision: None,
-                }),
-                placement_decision: Some(
-                    PlacementDecision::builder()
-                        .kind("docker".to_string())
-                        .target_host(PlacementTargetHost {
-                            reference: CanonicalHostId::resolved("host-test"),
-                            display_name: "host-test".to_string(),
-                        })
-                        .build(),
-                ),
-                ..Default::default()
-            },
-        )
-        .await
-        .expect("convoy status");
+    let convoy = launch_standing(
+        &daemon,
+        "quartermaster",
+        flotilla_resources::ConvoyStatus {
+            provisioning: Some(ConvoyProvisioningState::Started { started_at: Utc::now() }),
+            workflow_snapshot: Some(flotilla_resources::WorkflowSnapshot {
+                cascade: None,
+                vessels: vec![VesselRequirement::builder()
+                    .name("work".to_string())
+                    .crew(vec![flotilla_engine_convoys_testkit::agent("coder")])
+                    .build()],
+                exit: None,
+                turn_delivery: Default::default(),
+                stall_nudges: Default::default(),
+                supervision: None,
+            }),
+            placement_decision: Some(
+                PlacementDecision::builder()
+                    .kind("docker".to_string())
+                    .target_host(PlacementTargetHost {
+                        reference: CanonicalHostId::resolved("host-test"),
+                        display_name: "host-test".to_string(),
+                    })
+                    .build(),
+            ),
+            ..Default::default()
+        },
+    )
+    .await;
     // A launch that holds no environment: provisioning began and its backing is unaccounted for.
-    engine(&daemon).vessels.request("quartermaster", "work", "host-test");
+    engine(&daemon).vessels.request(&convoy.metadata.name, "work", "host-test");
     let mut registry = ProviderRegistry::new();
     let sibling: EnvironmentHandle = Arc::new(TestInteriorEnvironment {
         id: EnvironmentId::new("env-quartermaster-extra-work"),
@@ -150,30 +152,28 @@ async fn standing_backing_inspection_trusts_live_docker_over_failed_resource_pha
     )
     .await;
     // A standing convoy's environments are those its vessels hold.
-    let convoys = daemon.resource_backend().using::<Convoy>(NAMESPACE);
     let mut standing = Vec::new();
     for name in ["quartermaster", "purser"] {
-        let convoy =
-            convoys.create(&empty_meta(name), &ConvoySpec::builder().workflow_ref("standing".to_string()).build()).await.expect("convoy");
-        let convoy = convoys
-            .update_status(
-                &convoy.metadata.name,
-                &convoy.metadata.resource_version,
-                &flotilla_resources::ConvoyStatus {
-                    provisioning: Some(ConvoyProvisioningState::Started { started_at: Utc::now() }),
-                    workflow_snapshot: Some(flotilla_resources::WorkflowSnapshot {
-                        cascade: None,
-                        vessels: vec![VesselRequirement::builder().name("work".to_string()).crew(Vec::new()).build()],
-                        exit: None,
-                        turn_delivery: Default::default(),
-                        stall_nudges: Default::default(),
-                        supervision: None,
-                    }),
-                    ..Default::default()
-                },
-            )
-            .await
-            .expect("convoy status");
+        let convoy = launch_standing(
+            &daemon,
+            name,
+            flotilla_resources::ConvoyStatus {
+                provisioning: Some(ConvoyProvisioningState::Started { started_at: Utc::now() }),
+                workflow_snapshot: Some(flotilla_resources::WorkflowSnapshot {
+                    cascade: None,
+                    vessels: vec![VesselRequirement::builder()
+                        .name("work".to_string())
+                        .crew(vec![flotilla_engine_convoys_testkit::agent("coder")])
+                        .build()],
+                    exit: None,
+                    turn_delivery: Default::default(),
+                    stall_nudges: Default::default(),
+                    supervision: None,
+                }),
+                ..Default::default()
+            },
+        )
+        .await;
         standing.push(convoy);
     }
     let [convoy, unrealised]: [_; 2] = standing.try_into().expect("two convoys");
@@ -181,12 +181,12 @@ async fn standing_backing_inspection_trusts_live_docker_over_failed_resource_pha
     let spec = docker_environment_spec("host-test", BTreeSet::new());
     let vessels = &engine(&daemon).vessels;
     // A launch realised under its container, after a failed attempt on the daemon's side.
-    let quartermaster = vessels.request("quartermaster", "work", "host-test");
+    let quartermaster = vessels.request(&convoy.metadata.name, "work", "host-test");
     environments.request("quartermaster-work", &spec, Some(&quartermaster));
     environments.retry("quartermaster-work", "provider registry unavailable");
     environments.ready("quartermaster-work", "test-interior", Default::default());
     // A launch whose only attempt failed before it was realised has no container identity.
-    let purser = vessels.request("purser", "work", "host-test");
+    let purser = vessels.request(&unrealised.metadata.name, "work", "host-test");
     environments.request("purser-work", &spec, Some(&purser));
     environments.retry("purser-work", "provider registry unavailable");
     let handle: EnvironmentHandle = Arc::new(TestInteriorEnvironment {

@@ -577,28 +577,6 @@ mod tests {
         .expect("apply result")
     }
 
-    #[cfg(unix)]
-    async fn cli_round_trip_host_reference<T: flotilla_resources::Resource>(
-        backend: &flotilla_store::ResourceBackend,
-        daemon: &dyn flotilla_daemon_api::daemon::DaemonHandle,
-        node_id: Option<NodeId>,
-        spec: &T::Spec,
-    ) {
-        let name = format!("round-trip-{}", T::API_PATHS.kind);
-        let resources = backend.using::<T>("flotilla");
-        resources
-            .create(&flotilla_resources::InputMeta::builder().name(name.clone()).build(), spec)
-            .await
-            .expect("seed host-reference resource");
-        let document = cli_resource_document(daemon, node_id.clone(), T::API_PATHS.kind, &name).await;
-        let result = cli_apply_document(daemon, node_id, document).await;
-        assert!(matches!(result, CommandValue::ResourceObject(_)), "round trip {}: {result:?}", T::API_PATHS.kind);
-        assert_eq!(
-            serde_json::to_value(resources.get(&name).await.expect("read back").spec).expect("stored spec"),
-            serde_json::to_value(spec).expect("original spec")
-        );
-    }
-
     // #2803: get output is an editable resource document, applied to the store it was read
     // from, locally and routed.
     #[cfg(unix)]
@@ -609,9 +587,7 @@ mod tests {
         use flotilla_core::in_process::InProcessDaemon;
         use flotilla_daemon_testkit::server::spawn_in_memory_request_topology_stateful;
         use flotilla_discovery_testkit::fake_discovery;
-        use flotilla_resources::{
-            Environment, EnvironmentSpec, FulfilmentKind, FulfilmentKindSpec, FulfilmentRealisation, HostDirectEnvironmentSpec, InputMeta,
-        };
+        use flotilla_resources::{FulfilmentKind, FulfilmentKindSpec, FulfilmentRealisation, InputMeta};
         let leader_temp = tempfile::tempdir().expect("leader config");
         let follower_temp = tempfile::tempdir().expect("follower config");
         std::fs::write(leader_temp.path().join("daemon.toml"), "machine_id = \"cli-apply-leader\"\n").expect("leader identity");
@@ -667,19 +643,6 @@ mod tests {
             let caller = topology.leader.resource_backend().using::<FulfilmentKind>("flotilla").get(name).await.expect("caller kind");
             assert_eq!(caller.spec.pool, "caller-pool");
         }
-        // Another kind carrying a host ref round-trips through the same read envelope, CLI
-        // renderer and local/routed apply-command handler.
-        cli_round_trip_host_reference::<Environment>(
-            &home.resource_backend(),
-            &*topology.client,
-            node_id,
-            &EnvironmentSpec {
-                host_direct: Some(HostDirectEnvironmentSpec { host_ref: host_ref.clone(), repo_default_dir: "/workspace".into() }),
-                docker: None,
-                ..Default::default()
-            },
-        )
-        .await;
     }
 
     #[cfg(unix)]

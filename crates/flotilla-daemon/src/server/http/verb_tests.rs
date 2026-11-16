@@ -479,6 +479,8 @@ async fn requests_that_do_not_fit_the_verb_are_refused_whole() {
 #[tokio::test]
 async fn convoy_explain_finds_a_convoy_by_its_record_name_or_role() {
     let (_dir, daemon) = super::super::tests::empty_daemon().await;
+    // An explanation reads the convoy's messages.
+    daemon.open_message_primitives().expect("the engine Message path");
     let namespace = daemon.provisioning_namespace().await;
     let labels = BTreeMap::from([(ROLE_LABEL.to_owned(), "fix-3774".to_owned()), (PROJECT_LABEL.to_owned(), "flotilla".to_owned())]);
     let spec = ConvoySpec::builder().workflow_ref("workflow".into()).project_ref("flotilla".into()).role("fix-3774".into()).build();
