@@ -21,8 +21,8 @@ use flotilla_resources::{
     lifecycle_reads::{ChangeCursor, CursorSince},
     ConvoyStatus, DiscoveredSubject, SubjectDiscovery, SubjectDiscoverySource,
 };
-use flotilla_schema::{Identity, Kind, KindCode, Timestamp};
-use flotilla_schema_sqlite::{stream::Service, Read, StoreError};
+use flotilla_schema::{Kind, KindCode, Timestamp};
+use flotilla_schema_sqlite::{stream::Service, Loaded, Read, StoreError};
 use flotilla_state_machines::{
     machines::{
         awaiting_reply::{AwaitingReply, AwaitingReplySpec},
@@ -89,7 +89,7 @@ impl EngineConvoyRecords {
             let page = read.scan::<Resource<Convoy>>(home, after, PAGE)?;
             for id in page.ids {
                 if let Some(loaded) = read.load::<Resource<Convoy>>(id)? {
-                    match entry(read, loaded.value, &loaded.home, loaded.version)? {
+                    match entry(read, loaded)? {
                         Ok(record) => listing.records.push(record),
                         Err(unreadable) => listing.unreadable.push(unreadable),
                     }
@@ -117,7 +117,7 @@ impl ConvoyRecords for EngineConvoyRecords {
         self.read(&format!("{name} at {home}"), |read| {
             let Some(id) = read.resolve(<Resource<Convoy> as Kind>::CODE, name, &home)? else { return Ok(None) };
             let Some(loaded) = read.load::<Resource<Convoy>>(id)? else { return Ok(None) };
-            record(read, loaded.value, &loaded.home, loaded.version).map(Some)
+            record(read, loaded).map(Some)
         })
     }
 
@@ -128,7 +128,7 @@ impl ConvoyRecords for EngineConvoyRecords {
             let query = ConvoySpec::by_launch(&project, &of.to_owned());
             let Some((id, _)) = read.integer_index_keys_before(&query, &home, i64::MAX, 1)?.first().copied() else { return Ok(None) };
             let Some(loaded) = read.load::<Resource<Convoy>>(id)? else { return Ok(None) };
-            record(read, loaded.value, &loaded.home, loaded.version).map(Some)
+            record(read, loaded).map(Some)
         })
     }
 
@@ -275,21 +275,16 @@ fn stalled(read: &mut Read<'_>, subject: &Address) -> Result<bool, StoreError> {
 
 /// `convoy`, held at `home` at `version`, as its readers take it; one that cannot be read is an
 /// error naming why.
-fn record(read: &mut Read<'_>, convoy: Resource<Convoy>, home: &str, version: u64) -> Result<ConvoyRecord, StoreError> {
-    entry(read, convoy, home, version)?.map_err(|unreadable| StoreError::Stream(unreadable.reason))
+fn record(read: &mut Read<'_>, loaded: Loaded<Resource<Convoy>>) -> Result<ConvoyRecord, StoreError> {
+    entry(read, loaded)?.map_err(|unreadable| StoreError::Stream(unreadable.reason))
 }
 
-/// `convoy`, held at `home` at `version`, as its readers take it, or as unreadable where what it
-/// holds does not read; the store's own failures are errors.
-fn entry(
-    read: &mut Read<'_>,
-    convoy: Resource<Convoy>,
-    home: &str,
-    version: u64,
-) -> Result<Result<ConvoyRecord, UnreadableLaunch>, StoreError> {
+/// The launch `loaded` as its readers take it, or as unreadable where what it holds does not
+/// read; the store's own failures are errors.
+fn entry(read: &mut Read<'_>, loaded: Loaded<Resource<Convoy>>) -> Result<Result<ConvoyRecord, UnreadableLaunch>, StoreError> {
+    let Loaded { id, home, version, value: convoy, .. } = loaded;
+    let home = home.as_str();
     let spec = convoy.spec();
-    let identity = Identity { kind: <Resource<Convoy> as Kind>::CODE, name: convoy.name().to_owned(), home: home.to_owned() };
-    let id = read.resolve(identity.kind, &identity.name, home)?.ok_or(StoreError::NotCreated { identity })?;
     let admitted_at = read.creation_time(id)?.to_datetime();
     let unreadable = |reason: String| UnreadableLaunch {
         name: convoy.name().to_owned(),

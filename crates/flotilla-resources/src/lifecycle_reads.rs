@@ -105,6 +105,12 @@ pub trait LifecycleReads: Send + Sync {
         Err("convoys are not served without the engine".into())
     }
 
+    /// The Vessel and session launches the views join, held once for this port (#3108): every
+    /// view composing from them reads them here. Unavailable where no engine is installed.
+    fn joins(&self) -> Result<&crate::held_joins::HeldJoins, String> {
+        Err("held joins are not served without the engine".into())
+    }
+
     /// The reading of `name` homed at `origin` (a replica's origin root; `None` for this home), or
     /// `None` when the engine holds no such resource: the switch is off, or it was written before.
     ///
@@ -216,6 +222,10 @@ impl LifecycleReads for LateLifecycleReads {
 
     fn convoys(&self) -> Result<&dyn crate::convoy_records::ConvoyRecords, String> {
         self.installed.get().ok_or_else(|| "provisioning lifecycle reads are not installed".to_owned())?.convoys()
+    }
+
+    fn joins(&self) -> Result<&crate::held_joins::HeldJoins, String> {
+        self.installed.get().ok_or_else(|| "provisioning lifecycle reads are not installed".to_owned())?.joins()
     }
 
     fn try_reading(

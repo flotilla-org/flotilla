@@ -259,6 +259,10 @@ impl flotilla_resources::lifecycle_reads::LifecycleReads for DecidedReads {
     fn convoys(&self) -> Result<&dyn flotilla_resources::convoy_records::ConvoyRecords, String> {
         Ok(&*self.convoys)
     }
+
+    fn joins(&self) -> Result<&flotilla_resources::held_joins::HeldJoins, String> {
+        self.reads.joins()
+    }
 }
 
 mod agent_sessions {

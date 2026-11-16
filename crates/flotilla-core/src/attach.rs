@@ -1911,6 +1911,9 @@ mod tests {
                 fn terminals(&self) -> Result<&dyn flotilla_resources::terminal_records::TerminalRecords, String> {
                     self.1.terminals()
                 }
+                fn joins(&self) -> Result<&flotilla_resources::held_joins::HeldJoins, String> {
+                    self.1.joins()
+                }
             }
             let ready = BackingReading("backing", engine.reads());
             let mut held = daemon.attach_resolver();

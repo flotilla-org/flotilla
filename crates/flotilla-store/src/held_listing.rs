@@ -9,6 +9,15 @@ use std::{
 use flotilla_resources::engine_records::{IndexCover, Record};
 use futures::{stream::BoxStream, StreamExt};
 
+/// How a composition of views reads the records they join that the read port does not hold.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum Joins {
+    /// Each joined record by its key: a few views composed.
+    Keyed,
+    /// Each joined kind once, joined in memory: every view composed, as at a fill.
+    Every,
+}
+
 /// The views a listing holds, by its own id for each, under each of their index keys as the
 /// store's query index names them: a selecting query reads only the views it may select.
 pub(crate) struct ViewIndex<Id> {

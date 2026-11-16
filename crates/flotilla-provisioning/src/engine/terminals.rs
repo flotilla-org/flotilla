@@ -6,9 +6,12 @@
 //! it has ended starts the next launch. The TerminalSession controller writes every edge after the
 //! request, and the launch's facts in the transaction that realises it.
 
-use std::sync::{
-    atomic::{AtomicU64, Ordering},
-    Arc,
+use std::{
+    collections::HashMap,
+    sync::{
+        atomic::{AtomicU64, Ordering},
+        Arc,
+    },
 };
 
 use chrono::{DateTime, Utc};
@@ -159,9 +162,32 @@ pub(crate) fn record(read: &mut Read<'_>, view: View<TerminalSessionKind>) -> Re
         Some(id) => read.load::<TerminalLaunchFacts>(id)?.map(|loaded| facts_view(&loaded.value)),
         None => None,
     };
+    Ok(record_with(view, facts))
+}
+
+/// The facts of every launch realised at `home`, by launch: one scan, joined by the caller.
+fn facts_at(read: &mut Read<'_>, home: &str) -> Result<HashMap<String, FactsView>, ReadError> {
+    let mut facts = HashMap::new();
+    let mut after = None;
+    loop {
+        let page = read.scan::<TerminalLaunchFacts>(home, after, 64)?;
+        for id in page.ids {
+            if let Some(loaded) = read.load::<TerminalLaunchFacts>(id)? {
+                facts.insert(loaded.name, facts_view(&loaded.value));
+            }
+        }
+        after = page.next;
+        if after.is_none() {
+            return Ok(facts);
+        }
+    }
+}
+
+/// `view` as a reader sees it, with `facts`, those its launch was realised with.
+fn record_with(view: View<TerminalSessionKind>, facts: Option<FactsView>) -> TerminalRecord {
     let requested_at = view.created;
     let request = &view.request;
-    Ok(TerminalRecord {
+    TerminalRecord {
         environment: request.environment.name.clone(),
         environment_home: request.environment.home.clone(),
         vessel: request.holder.as_ref().and_then(holder_vessel).map(str::to_owned),
@@ -176,7 +202,7 @@ pub(crate) fn record(read: &mut Read<'_>, view: View<TerminalSessionKind>) -> Re
         facts,
         name: view.name,
         home: view.home,
-    })
+    }
 }
 
 /// The [`TerminalRecords`] port over one decided store: this home's sessions through its
@@ -260,7 +286,8 @@ impl EngineTerminals {
         Ok(records)
     }
 
-    fn scan(read: &mut Read<'_>, home: &str) -> Result<Vec<View<TerminalSessionKind>>, ReadError> {
+    /// Every launch at `home`, joined with the facts of that home's launches read in one scan.
+    fn scan(read: &mut Read<'_>, home: &str) -> Result<Vec<TerminalRecord>, ReadError> {
         let mut views = Vec::new();
         let mut after = None;
         loop {
@@ -270,9 +297,28 @@ impl EngineTerminals {
             }
             after = page.next;
             if after.is_none() {
-                return Ok(views);
+                break;
             }
         }
+        let mut facts = facts_at(read, home)?;
+        Ok(views
+            .into_iter()
+            .map(|view| {
+                let launched = facts.remove(&view.name);
+                record_with(view, launched)
+            })
+            .collect())
+    }
+
+    /// The records `scanned` reads, counted as read.
+    fn scanned(
+        &self,
+        what: &str,
+        scanned: impl FnOnce(&mut Read<'_>) -> Result<Vec<TerminalRecord>, ReadError>,
+    ) -> Result<Vec<TerminalRecord>, String> {
+        let records = self.reads.read(scanned).map_err(|error| format!("engine terminal sessions {what}: {error}"))?;
+        self.launches_read.fetch_add(records.len() as u64, Ordering::Relaxed);
+        Ok(records)
     }
 
     /// One try at the launch that serves `request` for its session.
@@ -341,17 +387,17 @@ impl TerminalRecords for EngineTerminals {
     }
 
     fn at(&self, home: &str) -> Result<Vec<TerminalRecord>, String> {
-        self.records(&format!("at {home}"), |read| Self::scan(read, home))
+        self.scanned(&format!("at {home}"), |read| Self::scan(read, home))
     }
 
     fn every(&self) -> Result<Vec<TerminalRecord>, String> {
         let homes = (self.homes)();
-        self.records("at every home", |read| {
-            let mut views = Vec::new();
+        self.scanned("at every home", |read| {
+            let mut records = Vec::new();
             for home in &homes {
-                views.extend(Self::scan(read, home)?);
+                records.extend(Self::scan(read, home)?);
             }
-            Ok(views)
+            Ok(records)
         })
     }
 

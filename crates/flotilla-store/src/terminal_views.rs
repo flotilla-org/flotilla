@@ -19,14 +19,14 @@ use flotilla_protocol::{LifecycleReading, NodeId};
 use flotilla_resources::{
     engine_records::{IndexCover, KindRecords, LogPosition, Record, Since, UnloggedJournal},
     environment_records::{EnvironmentChange, EnvironmentRecord},
+    held_joins::{self, JoinChange, JoinChanges},
     lifecycle_reads::{ChangeCursor, LifecycleReads},
-    terminal_records::{newest_launches, TerminalChange, TerminalHolderView, TerminalRecord, TerminalRecords},
-    vessel_records::VesselChange,
+    terminal_records::{newest_launches, TerminalHolderView, TerminalRecord, TerminalRecords},
     vessel_seats::VesselSeats,
     ReadResourceObject, ResourceError, ResourceObject, ResourceProvenance, TerminalSession, TerminalSessionSpec, TerminalSessionStatus,
 };
 
-use crate::held_listing::{drained, ticks, ViewIndex};
+use crate::held_listing::{drained, ticks, Joins, ViewIndex};
 
 /// Read views of the terminal sessions in one namespace.
 ///
@@ -38,6 +38,8 @@ pub struct TerminalViews {
     namespace: String,
     reads: Arc<dyn LifecycleReads>,
     listing: Arc<tokio::sync::Mutex<Listing>>,
+    /// The measured reads waiting on another read's pass of the listing, which count its reads.
+    waiters: Arc<flotilla_schema::reads::Waiters>,
 }
 
 /// A session at a home, as [`newest_launches`] keys it: its home and its session name.
@@ -142,12 +144,15 @@ struct Dirt {
     vessels: BTreeSet<String>,
 }
 
-/// Cursors over the changes of the records a session's view is composed from. A read port that
-/// serves no environments or vessels joins none, so follows none.
+/// Where the listing reads the changes of the records a session's view is composed from: the held
+/// joins' journal for the session and Vessel launches, and cursors over the rest. A read port that
+/// serves no environments joins none, so follows none.
 struct Cursors {
-    terminals: Box<dyn ChangeCursor<TerminalChange>>,
+    /// The held joins' journal sequence the listing has read through.
+    joins_seen: u64,
+    /// How far the held joins had read the log, at that sequence.
+    joins_position: u64,
     environments: Option<Box<dyn ChangeCursor<EnvironmentChange>>>,
-    vessels: Option<Box<dyn ChangeCursor<VesselChange>>>,
     /// What this home observes is in memory, told as it changes.
     observed: tokio::sync::broadcast::Receiver<String>,
     /// How many observation changes have been read.
@@ -158,11 +163,13 @@ impl Cursors {
     /// Cursors from now on, where `reads` holds a log of its sessions.
     fn start(reads: &dyn LifecycleReads) -> Result<Option<Self>, String> {
         let terminals = reads.terminals()?;
-        let Some(cursor) = terminals.cursor() else { return Ok(None) };
+        if !reads.joins()?.read(reads, |joins| joins.follows())? {
+            return Ok(None);
+        }
         Ok(Some(Self {
-            terminals: cursor,
+            joins_seen: 0,
+            joins_position: 0,
             environments: reads.environments().ok().and_then(|environments| environments.cursor()),
-            vessels: reads.vessels().ok().and_then(|vessels| vessels.cursor()),
             observed: terminals.observations().subscribe(),
             observed_read: 0,
         }))
@@ -170,25 +177,35 @@ impl Cursors {
 
     /// How far the cursors have read: the log, and this home's observations.
     fn position(&self) -> u64 {
-        [self.terminals.position(), self.observed_read]
+        [self.joins_position, self.observed_read]
             .into_iter()
             .chain(self.environments.as_ref().map(|environments| environments.position()))
-            .chain(self.vessels.as_ref().map(|vessels| vessels.position()))
             .fold(0, u64::saturating_add)
     }
 
+    /// Where the listing stands in the held joins once it has composed from them as `joins` holds
+    /// them.
+    fn joined(&mut self, joins: &held_joins::Joins<'_>) {
+        self.joins_seen = joins.sequence();
+        self.joins_position = joins.position();
+    }
+
     /// What changed since the last pass; a change that could not be read marks everything.
-    fn pass(&mut self) -> Dirt {
+    fn pass(&mut self, reads: &dyn LifecycleReads) -> Dirt {
         let mut dirt = Dirt::default();
-        match self.terminals.pass() {
-            Ok(changes) => changes.into_iter().for_each(|change| match change {
-                TerminalChange::Changed { name, home } => {
-                    dirt.terminals.insert((name, home));
+        let joined = reads.joins().and_then(|joins| {
+            joins.read(reads, |joins| {
+                match joins.since(self.joins_seen) {
+                    JoinChanges::Everything => dirt.all = true,
+                    JoinChanges::Changed(changes) => changes.into_iter().for_each(|change| match change {
+                        JoinChange::Terminal { name, home, .. } => drop(dirt.terminals.insert((name.clone(), home.clone()))),
+                        JoinChange::Vessel { name, .. } => drop(dirt.vessels.insert(name.clone())),
+                    }),
                 }
-                TerminalChange::Rescanned => dirt.all = true,
-            }),
-            Err(_) => dirt.all = true,
-        }
+                self.joined(&joins);
+            })
+        });
+        dirt.all |= joined.is_err();
         if let Some(environments) = self.environments.as_mut() {
             match environments.pass() {
                 Ok(changes) => changes.into_iter().for_each(|change| match change {
@@ -196,17 +213,6 @@ impl Cursors {
                         dirt.environments.insert(name);
                     }
                     EnvironmentChange::Rescanned => dirt.all = true,
-                }),
-                Err(_) => dirt.all = true,
-            }
-        }
-        if let Some(vessels) = self.vessels.as_mut() {
-            match vessels.pass() {
-                Ok(changes) => changes.into_iter().for_each(|change| match change {
-                    VesselChange::Changed { name, .. } => {
-                        dirt.vessels.insert(name);
-                    }
-                    VesselChange::Rescanned => dirt.all = true,
                 }),
                 Err(_) => dirt.all = true,
             }
@@ -229,7 +235,7 @@ impl Dirt {
 
 impl TerminalViews {
     pub fn new(namespace: &str, reads: Arc<dyn LifecycleReads>) -> Self {
-        Self { namespace: namespace.to_owned(), reads, listing: Arc::default() }
+        Self { namespace: namespace.to_owned(), reads, listing: Arc::default(), waiters: Arc::default() }
     }
 
     /// Each session's newest launch at every home, as the engine port lists it: this home's
@@ -268,14 +274,26 @@ impl TerminalViews {
             .collect())
     }
 
-    /// The listing, once it has taken in what changed since the last pass.
+    /// The listing, once it has taken in what changed since the last pass. A measured read counts
+    /// the pass it waits on, another read's included.
     async fn passed(&self) -> Result<tokio::sync::MutexGuard<'_, Listing>, ResourceError> {
-        let mut listing = self.listing.lock().await;
+        let waiters = &self.waiters;
+        waiters
+            .wait(async {
+                let mut listing = self.listing.lock().await;
+                waiters.serve(self.pass_listing(&mut listing)).await?;
+                Ok(listing)
+            })
+            .await
+    }
+
+    /// Takes into `listing` what changed since its last pass.
+    async fn pass_listing(&self, listing: &mut Listing) -> Result<(), ResourceError> {
         let held = listing.cursors.take();
         let (cursors, dirt) = self
             .blocking(move |reads| match held {
                 Some(mut cursors) => {
-                    let dirt = cursors.pass();
+                    let dirt = cursors.pass(reads);
                     Ok((Some(cursors), dirt))
                 }
                 // Started before the full read: a change after it is read again at the next pass.
@@ -285,10 +303,27 @@ impl TerminalViews {
         let follows = cursors.is_some();
         listing.cursors = cursors;
         if dirt.all || !follows {
-            let records = self.blocking(|reads| reads.terminals()?.every()).await;
+            let held = listing.cursors.take();
+            let records = self
+                .blocking(move |reads| {
+                    reads.joins()?.read(reads, |joins| {
+                        // Every session is composed from the joins as held: their journal is read
+                        // through there.
+                        let held = held.map(|mut cursors| {
+                            cursors.joined(&joins);
+                            cursors
+                        });
+                        (held, joins.terminals().cloned().collect::<Vec<_>>())
+                    })
+                })
+                .await;
+            let records = records.map(|(held, records)| {
+                listing.cursors = held;
+                records
+            });
             let sessions = match records {
                 // Each view read again keeps its version while it shows the same.
-                Ok(records) => match self.entries(newest_launches(records).into_values().collect()).await {
+                Ok(records) => match self.entries(newest_launches(records).into_values().collect(), Joins::Every).await {
                     Ok(entries) => listing.stamped(entries),
                     Err(error) => Err(error),
                 },
@@ -303,12 +338,12 @@ impl TerminalViews {
                 }
             }
         } else if !dirt.is_clean() || listing.sessions.values().any(|entry| entry.unresolved) {
-            if let Err(error) = self.pass(&mut listing, dirt).await {
+            if let Err(error) = self.pass(listing, dirt).await {
                 listing.cursors = None;
                 return Err(error);
             }
         }
-        Ok(listing)
+        Ok(())
     }
 
     /// Composes again the sessions `dirt` touched in `listing`, and takes in their new launches.
@@ -316,12 +351,9 @@ impl TerminalViews {
         let Dirt { terminals, observed, environments, vessels, .. } = dirt;
         let changed = self
             .blocking(move |reads| {
-                let records = reads.terminals()?;
-                let mut changed = Vec::new();
-                for (name, home) in &terminals {
-                    changed.extend(records.get(name, Some(home))?);
-                }
-                Ok(changed)
+                reads.joins()?.read(reads, |joins| {
+                    terminals.iter().filter_map(|(name, home)| joins.terminal(name, home).cloned()).collect::<Vec<_>>()
+                })
             })
             .await?;
         let here = self.terminals().map_err(ResourceError::other)?.home().to_owned();
@@ -347,17 +379,18 @@ impl TerminalViews {
             records.insert(session, record);
         }
         records.extend(again.into_iter().filter_map(|session| listing.sessions.get(&session).map(|entry| (session, entry.record.clone()))));
-        let entries = self.entries(records.into_values().collect()).await?;
+        let entries = self.entries(records.into_values().collect(), Joins::Keyed).await?;
         let entries = listing.stamped(entries)?;
         listing.extend(entries);
         Ok(())
     }
 
-    /// `records` as entries of the listing: only those listed are composed.
-    async fn entries(&self, records: Vec<TerminalRecord>) -> Result<Vec<(Session, Entry)>, ResourceError> {
+    /// `records` as entries of the listing, their joins read as `joins` says: only those listed
+    /// are composed.
+    async fn entries(&self, records: Vec<TerminalRecord>, joins: Joins) -> Result<Vec<(Session, Entry)>, ResourceError> {
         let (released, shown): (Vec<_>, Vec<_>) = records.into_iter().partition(|record| record.reading == LifecycleReading::Released);
         let here = self.terminals().map_err(ResourceError::other)?.home().to_owned();
-        let views = self.compose(shown.clone()).await?;
+        let views = self.compose_with(shown.clone(), joins).await?;
         let mut entries = Vec::with_capacity(shown.len() + released.len());
         for (record, view) in shown.into_iter().zip(views) {
             let home = match &view.provenance {
@@ -408,11 +441,20 @@ impl TerminalViews {
 
     /// `records` as read views.
     pub async fn compose(&self, records: Vec<TerminalRecord>) -> Result<Vec<ReadResourceObject<TerminalSession>>, ResourceError> {
+        self.compose_with(records, Joins::Keyed).await
+    }
+
+    /// `records` as read views, their joins read as `joins` says.
+    async fn compose_with(
+        &self,
+        records: Vec<TerminalRecord>,
+        joins: Joins,
+    ) -> Result<Vec<ReadResourceObject<TerminalSession>>, ResourceError> {
         if records.is_empty() {
             return Ok(Vec::new());
         }
         let holders = self.holders(&records).await;
-        let environments = self.environments(&records).await;
+        let environments = self.environments(&records, joins).await;
         let terminals = self.reads.terminals().map_err(ResourceError::other)?;
         let here = terminals.home().to_owned();
         Ok(records
@@ -435,12 +477,20 @@ impl TerminalViews {
 
     /// The environments `records` run in, by name and home, as their records read here. One that
     /// cannot be read is left out: its health is unknown, not bad.
-    async fn environments(&self, records: &[TerminalRecord]) -> BTreeMap<(String, String), EnvironmentRecord> {
+    async fn environments(&self, records: &[TerminalRecord], joins: Joins) -> BTreeMap<(String, String), EnvironmentRecord> {
         let wanted: BTreeSet<(String, String)> =
             records.iter().map(|record| (record.environment.clone(), record.environment_home.clone())).collect();
         let read = self
             .blocking(move |reads| {
                 let environments = reads.environments()?;
+                if joins == Joins::Every {
+                    return Ok(environments
+                        .every()?
+                        .into_iter()
+                        .map(|record| ((record.name.clone(), record.home.clone()), record))
+                        .filter(|(key, _)| wanted.contains(key))
+                        .collect());
+                }
                 let mut held = BTreeMap::new();
                 for (name, home) in wanted {
                     match environments.get(&name, Some(&home)) {
@@ -460,9 +510,9 @@ impl TerminalViews {
         })
     }
 
-    /// The holder Vessel launches `records` name: read at the session's home, where a vessel
-    /// usually runs, then at this one, then wherever this store holds it. A launch outliving its
-    /// vessel, or whose vessel cannot be read, reads without its convoy.
+    /// The holder Vessel launches `records` name, as the read port holds them
+    /// ([`held_joins::Joins::holder`]). A launch outliving its vessel, or whose vessel cannot be read, reads
+    /// without its convoy.
     async fn holders(&self, records: &[TerminalRecord]) -> BTreeMap<String, TerminalHolderView> {
         let wanted: BTreeSet<(String, String)> =
             records.iter().filter_map(|record| Some((record.vessel.clone()?, record.home.clone()))).collect();
@@ -471,24 +521,18 @@ impl TerminalViews {
         }
         let read = self
             .blocking(move |reads| {
-                let vessels = reads.vessels()?;
-                let mut holders = BTreeMap::new();
-                for (vessel, home) in wanted {
-                    if holders.contains_key(&vessel) {
-                        continue;
+                reads.joins()?.read(reads, |joins| {
+                    let mut holders = BTreeMap::new();
+                    for (vessel, home) in wanted {
+                        if holders.contains_key(&vessel) {
+                            continue;
+                        }
+                        if let Some(record) = joins.holder(&vessel, &home) {
+                            holders.insert(vessel, record.terminal_holder());
+                        }
                     }
-                    let record = match vessels.get(&vessel, Some(&home))? {
-                        Some(record) => Some(record),
-                        None => match vessels.get(&vessel, None)? {
-                            Some(record) => Some(record),
-                            None => vessels.every()?.into_iter().find(|record| record.name == vessel),
-                        },
-                    };
-                    if let Some(record) = record {
-                        holders.insert(vessel, record.terminal_holder());
-                    }
-                }
-                Ok(holders)
+                    holders
+                })
             })
             .await;
         read.unwrap_or_else(|error| {

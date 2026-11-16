@@ -19,6 +19,7 @@ use flotilla_resources::{
     convoy::admission::AdmissionDocument,
     convoy_records::{ConvoyChange, ConvoyEnd, ConvoyListing, ConvoyMemory, ConvoyNotes, ConvoyRecord, ConvoyRecords, CrewNotes},
     engine_records::KindRecords,
+    held_joins::HeldJoins,
     lifecycle_reads::{ChangeCursor, CursorSince, LifecycleReads, ProvisioningKind},
     promises::{Promise, PromiseKind, PromiseSource, PromiseState},
     terminal_records::{
@@ -393,6 +394,7 @@ struct Reads {
     convoys: Convoys,
     vessels: Vessels,
     terminals: Terminals,
+    joins: HeldJoins,
 }
 
 impl LifecycleReads for Reads {
@@ -411,6 +413,9 @@ impl LifecycleReads for Reads {
     fn convoys(&self) -> Result<&dyn ConvoyRecords, String> {
         Ok(&self.convoys)
     }
+    fn joins(&self) -> Result<&HeldJoins, String> {
+        Ok(&self.joins)
+    }
 }
 
 // Behaviour: a launch reads as a Convoy named by its launch, its work Running on its ready
@@ -421,6 +426,7 @@ impl LifecycleReads for Reads {
 async fn a_launch_reads_with_its_vessels_sessions_and_home_notes() {
     let vessel = ready_vessel("fix-it#1", "work");
     let reads = Arc::new(Reads {
+        joins: HeldJoins::default(),
         convoys: Convoys::new(vec![launch("fix-it#1", HERE), launch("other#1", "home-b")]),
         terminals: Terminals {
             records: vec![
@@ -473,6 +479,7 @@ async fn a_launch_reads_with_its_vessels_sessions_and_home_notes() {
 #[tokio::test]
 async fn the_views_refuse_writes() {
     let reads = Arc::new(Reads {
+        joins: HeldJoins::default(),
         convoys: Convoys::new(vec![launch("fix-it#1", HERE)]),
         terminals: Terminals { records: Vec::new(), observations: TerminalObservations::default() },
         vessels: Vessels { records: Vec::new() },
@@ -491,6 +498,7 @@ async fn the_views_refuse_writes() {
 #[tokio::test]
 async fn a_dropped_read_leaves_its_changes_for_the_next() {
     let reads = Arc::new(Reads {
+        joins: HeldJoins::default(),
         convoys: Convoys::new(vec![launch("fix-it#1", HERE)]),
         terminals: Terminals { records: Vec::new(), observations: TerminalObservations::default() },
         vessels: Vessels { records: Vec::new() },
@@ -518,6 +526,7 @@ async fn a_dropped_read_leaves_its_changes_for_the_next() {
 /// Views over launches `names`, held here, joined with nothing.
 fn views_of(names: &[&str]) -> (Arc<Reads>, ConvoyViews) {
     let reads = Arc::new(Reads {
+        joins: HeldJoins::default(),
         convoys: Convoys::new(names.iter().map(|name| launch(name, HERE)).collect()),
         terminals: Terminals { records: Vec::new(), observations: TerminalObservations::default() },
         vessels: Vessels { records: Vec::new() },
@@ -581,6 +590,7 @@ async fn an_unchanged_launch_keeps_its_version_across_passes() {
 #[tokio::test]
 async fn a_read_dropped_while_the_cursors_pass_keeps_them() {
     let reads = Arc::new(Reads {
+        joins: HeldJoins::default(),
         convoys: Convoys::new(vec![launch("fix-it#1", HERE), launch("other#1", HERE)]),
         terminals: Terminals { records: Vec::new(), observations: TerminalObservations::default() },
         vessels: Vessels { records: Vec::new() },
@@ -614,6 +624,7 @@ async fn a_read_dropped_while_the_cursors_pass_keeps_them() {
 #[tokio::test]
 async fn a_failed_pass_keeps_the_cursors() {
     let reads = Arc::new(Reads {
+        joins: HeldJoins::default(),
         convoys: Convoys::new(vec![launch("fix-it#1", HERE), launch("other#1", HERE)]),
         terminals: Terminals { records: Vec::new(), observations: TerminalObservations::default() },
         vessels: Vessels { records: Vec::new() },
@@ -642,6 +653,7 @@ async fn converted_by_one_read(others: usize) -> (u64, u64) {
     let mut launches: Vec<_> = (0..others).map(|n| launch(&format!("other-{n}#1"), HERE)).collect();
     launches.extend([launch("wanted#1", HERE), launch("wanted#1", "home-b"), launch("remote#1", "home-b")]);
     let reads = Arc::new(Reads {
+        joins: HeldJoins::default(),
         convoys: Convoys::new(launches),
         terminals: Terminals { records: Vec::new(), observations: TerminalObservations::default() },
         vessels: Vessels { records: Vec::new() },
@@ -688,6 +700,7 @@ async fn ensured_queries(others: usize) -> Vec<(usize, u64)> {
         ensured("wanted-b#1", "home-b", "wanted", false),
     ]);
     let reads = Arc::new(Reads {
+        joins: HeldJoins::default(),
         convoys: Convoys::new(launches),
         terminals: Terminals { records: Vec::new(), observations: TerminalObservations::default() },
         vessels: Vessels { records: Vec::new() },
@@ -745,6 +758,7 @@ async fn occupancy_with(others: usize) -> (flotilla_resources::HostOccupancy, u6
     let mut launches: Vec<_> = (0..others).map(|n| placed(&format!("old-{n}#1"), true)).collect();
     launches.extend([placed("live#1", false), placed("tearing#1", true)]);
     let reads = Arc::new(Reads {
+        joins: HeldJoins::default(),
         convoys: Convoys::new(launches),
         terminals: Terminals { records: Vec::new(), observations: TerminalObservations::default() },
         vessels: Vessels { records: Vec::new() },

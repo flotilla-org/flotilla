@@ -2,7 +2,7 @@
 //! a number that does not grow with the unrelated records held.
 
 use std::{
-    collections::BTreeSet,
+    collections::{BTreeMap, BTreeSet},
     sync::{Arc, OnceLock},
     time::Duration,
 };
@@ -568,25 +568,47 @@ async fn a_controller_pass_counts_its_reads_by_kind_and_shape() {
     assert_eq!(listings[0], listings[1], "the watch lists the kind as often whatever the convoys held");
 }
 
-/// What each of a scoped fleet listing's selecting queries read, by kind, with `others` convoys
-/// of another project each running a coder.
-async fn scoped_query_reads(others: usize) -> Vec<flotilla_store::load_metrics::ReadCounts> {
-    use flotilla_resources::{terminal_records::AgentLaunch, TerminalSession, CONVOY_LABEL};
-    use flotilla_store::{load_metrics::measure, StoreQuery, TerminalViews};
+/// One home's convoys, each running a coder in a ready vessel, with the Convoy and TerminalSession
+/// views installed on `backend`.
+struct CrewedConvoys {
+    store: OtherHome,
+    engine: EngineFixture,
+    convoys: EngineConvoysHome,
+    backend: ResourceBackend,
+    /// The first convoy's launch and its coder's session.
+    target: (String, String),
+    /// The launch of the first convoy's coder's session.
+    target_session: String,
+}
+
+/// A target convoy of project "app" and `others` of project "other", each with a coder: all in
+/// one environment, or each in an environment of its own when `own_environments`.
+async fn crewed_convoys(others: usize, own_environments: bool) -> CrewedConvoys {
+    use flotilla_resources::terminal_records::AgentLaunch;
+    use flotilla_store::TerminalViews;
 
     let store = OtherHome::open("home");
     let engine = EngineFixture::over_service(store.service());
     let backend = ResourceBackend::new(InMemoryBackend::default());
     let convoys = EngineConvoysHome::over(store.service(), NAMESPACE, &backend, Arc::new(SystemClock), engine.reads());
     backend.install_engine_records(Arc::new(TerminalViews::new(NAMESPACE, Arc::clone(convoys.reads()))));
+    let host_direct = EnvironmentSpec {
+        host_direct: Some(HostDirectEnvironmentSpec { host_ref: "host".into(), repo_default_dir: "/repo".into() }),
+        ..Default::default()
+    };
     let mut target = None;
+    let mut target_session = None;
     for n in 0..=others {
         let project = if n == 0 { "app" } else { "other" };
         let spec = ConvoySpec::builder().workflow_ref("workflow".into()).project_ref(project.into()).build();
         let launch = convoys.launch(convoy(NAMESPACE, &format!("convoy-{n}"), spec, single_agent("coder"))).await;
         let vessel = engine.vessels.request(&launch, "work", store.home());
-        engine.vessels.ready(&vessel, "env");
-        let session = engine.terminals.request(&TerminalsFixture::agent(&vessel, "coder", "env"));
+        let environment = if own_environments { format!("env-{n}") } else { "env".to_owned() };
+        if own_environments || n == 0 {
+            engine.environments.request(&environment, &host_direct, Some(&vessel));
+        }
+        engine.vessels.ready(&vessel, &environment);
+        let session = engine.terminals.request(&TerminalsFixture::agent(&vessel, "coder", &environment));
         let facts = TerminalLaunchFacts {
             agent: Some(AgentLaunch { adapter: "codex".into(), model: None, stance: "test".into() }),
             ..TerminalLaunchFacts::default()
@@ -594,9 +616,21 @@ async fn scoped_query_reads(others: usize) -> Vec<flotilla_store::load_metrics::
         engine.terminals.ready(&session, &format!("pool-{n}"), &facts);
         if n == 0 {
             target = Some((launch, engine.terminals.record(&session).session_name().to_owned()));
+            target_session = Some(session);
         }
     }
-    let (launch, session) = target.expect("the target convoy");
+    let (target, target_session) = (target.expect("the target convoy"), target_session.expect("the target's session"));
+    CrewedConvoys { store, engine, convoys, backend, target, target_session }
+}
+
+/// What each of a scoped fleet listing's selecting queries read, by kind, with `others` convoys
+/// of another project each running a coder.
+async fn scoped_query_reads(others: usize) -> Vec<flotilla_store::load_metrics::ReadCounts> {
+    use flotilla_resources::{TerminalSession, CONVOY_LABEL};
+    use flotilla_store::{load_metrics::measure, StoreQuery};
+
+    let CrewedConvoys { store: _store, engine: _engine, convoys, backend, target: (launch, session), .. } =
+        crewed_convoys(others, false).await;
     // The views are filled once, at their first read, as a running daemon's already are.
     convoys.settled().await;
     let sessions = backend.clone().using::<TerminalSession>(NAMESPACE);
@@ -660,4 +694,91 @@ async fn scoped_queries_read_the_scopes_rows() {
         }
     }
     assert_eq!(scoped_query_reads(200).await, small, "the reads do not grow with other convoys and sessions");
+}
+
+/// What a daemon's first fill of the Convoy and TerminalSession views reads with `convoys`
+/// crewed convoys held: a read port opened afresh over the same store, as at a start, the views
+/// installed over it and each read once. The Convoy views fill on their own task, which the read
+/// waits on.
+async fn first_fill_reads(convoys: usize, own_environments: bool) -> flotilla_store::load_metrics::ReadCounts {
+    use flotilla_resources::TerminalSession;
+    use flotilla_store::{load_metrics::measure, TerminalViews};
+
+    let crewed = crewed_convoys(convoys - 1, own_environments).await;
+    crewed.convoys.settled().await;
+    let restarted = EngineFixture::over_service(crewed.store.service());
+    let started = ResourceBackend::new(InMemoryBackend::default());
+    let ((), counts) = measure(async {
+        let home = EngineConvoysHome::over(crewed.store.service(), NAMESPACE, &started, Arc::new(SystemClock), restarted.reads());
+        started.install_engine_records(Arc::new(TerminalViews::new(NAMESPACE, Arc::clone(home.reads()))));
+        let listed = started.clone().using::<Convoy>(NAMESPACE).list().await.expect("the convoy views");
+        assert_eq!(listed.items.len(), convoys);
+        let listed = started.clone().using::<TerminalSession>(NAMESPACE).list().await.expect("the session views");
+        assert_eq!(listed.items.len(), convoys);
+    })
+    .await;
+    counts
+}
+
+/// The read calls in `reads`, by kind: keyed, indexed and whole-kind reads, not the rows they read.
+fn read_calls(reads: &flotilla_store::load_metrics::ReadCounts) -> BTreeMap<String, u64> {
+    reads.iter().map(|(kind, counts)| (kind.clone(), counts.keyed + counts.index + counts.whole_kind)).collect()
+}
+
+// Behaviour: a start's first fill of the Convoy and TerminalSession views reads each Vessel and
+// session launch, and each launch's facts, once for both views: one read of each kind, joined in
+// memory, so the read calls do not grow with the convoys held while the rows read do, one each.
+// The environments the sessions run in are read once too, shared or each its own.
+#[tokio::test]
+async fn a_first_fill_reads_each_joined_row_once() {
+    for own_environments in [false, true] {
+        let (small, large) = (first_fill_reads(5, own_environments).await, first_fill_reads(40, own_environments).await);
+        for (n, reads) in [(5, &small), (40, &large)] {
+            for kind in ["Vessel", "TerminalSession", "TerminalLaunchFacts"] {
+                let counts = reads.get(kind).copied().unwrap_or_default();
+                assert_eq!((counts.keyed, counts.index, counts.whole_kind), (0, 0, 1), "{kind} is read in one call: {reads:#?}");
+                assert_eq!((counts.rows, counts.decoded), (n, n), "each {kind} row is read and decoded once: {reads:#?}");
+            }
+            let environments = if own_environments { n } else { 1 };
+            let counts = reads.get("Environment").copied().unwrap_or_default();
+            assert_eq!((counts.keyed, counts.index, counts.whole_kind), (0, 0, 1), "Environment is read in one call: {reads:#?}");
+            assert_eq!((counts.rows, counts.decoded), (environments, environments), "each Environment once: {reads:#?}");
+            assert_eq!(
+                reads.get("EnvironmentLaunchFacts").map_or(0, |counts| counts.keyed),
+                0,
+                "no environment's facts by key: {reads:#?}"
+            );
+        }
+        // The open stall records are still read by subject, per convoy (#3108 first-fill, open).
+        let calls = |reads| {
+            let mut calls = read_calls(reads);
+            calls.remove("AwaitingReply");
+            calls
+        };
+        assert_eq!(calls(&large), calls(&small), "the fill's read calls do not grow with the convoys held");
+    }
+}
+
+// Behaviour: once the views are filled, a session launch's change is read once for both the
+// Convoy and the TerminalSession views, whichever passes first: one keyed get of the launch, and
+// none of the Vessel launches it is joined to.
+#[tokio::test]
+async fn a_change_is_read_once_for_both_views() {
+    use flotilla_resources::TerminalSession;
+
+    let crewed = crewed_convoys(4, false).await;
+    let convoys = crewed.backend.clone().using::<Convoy>(NAMESPACE);
+    let sessions = crewed.backend.clone().using::<TerminalSession>(NAMESPACE);
+    convoys.list().await.expect("fill the convoy views");
+    sessions.list().await.expect("fill the session views");
+    let before = crewed.convoys.keyed_gets();
+
+    crewed.engine.terminals.exited(&crewed.target_session, "done");
+    let listed = sessions.list().await.expect("the session views");
+    convoys.list().await.expect("the convoy views");
+
+    let exited = listed.items.iter().find(|session| session.metadata.name == crewed.target.1).expect("the target's session");
+    assert!(exited.status.as_ref().is_some_and(|status| status.stopped_at.is_some()), "the views show the change: {exited:?}");
+    let gets = crewed.convoys.keyed_gets() - before;
+    assert_eq!((gets.terminals, gets.vessels), (1, 0), "the change is read once, its vessel not at all: {gets:?}");
 }

@@ -70,6 +70,7 @@ pub mod field_ownership;
 mod fleet_designation;
 mod forge;
 mod fulfilment_kind;
+pub mod held_joins;
 #[doc(hidden)]
 pub mod host;
 pub mod image_build_records;

@@ -15,6 +15,7 @@ use flotilla_resources::{
     clone_records::CloneRecords,
     convoy_records::{ConvoyChange, ConvoyListing, ConvoyMemory, ConvoyRecord, ConvoyRecords},
     environment_records::{EnvironmentChange, EnvironmentObservations, EnvironmentRecord, EnvironmentRecords},
+    held_joins::HeldJoins,
     image_build_records::ImageBuildRecords,
     lifecycle_reads::{ChangeCursor, LifecycleReads, ProvisioningKind},
     terminal_records::{TerminalChange, TerminalLaunchRequest, TerminalObservations, TerminalRecord, TerminalRecords, TerminalRenewal},
@@ -81,6 +82,7 @@ pub(crate) struct WithConvoys {
     convoys: CountedConvoys,
     environments: CountedEnvironments,
     terminals: CountedTerminals,
+    joins: HeldJoins,
 }
 
 impl WithConvoys {
@@ -90,6 +92,7 @@ impl WithConvoys {
             convoys: CountedConvoys { records, meter: Arc::clone(&meter) },
             environments: CountedEnvironments { reads: Arc::clone(&reads), meter: Arc::clone(&meter) },
             terminals: CountedTerminals { reads: Arc::clone(&reads), meter },
+            joins: HeldJoins::default(),
             reads,
         }
     }
@@ -138,6 +141,11 @@ impl LifecycleReads for WithConvoys {
 
     fn agent_sessions(&self) -> Result<&dyn AgentSessionReads, String> {
         self.reads.agent_sessions()
+    }
+
+    /// Its own, so what fills them is read through the counted ports.
+    fn joins(&self) -> Result<&HeldJoins, String> {
+        Ok(&self.joins)
     }
 }
 

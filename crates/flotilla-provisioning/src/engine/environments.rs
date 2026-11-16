@@ -2,7 +2,10 @@
 //! request shows its readers and providers, and the [`EnvironmentRecords`] port over the decided
 //! store.
 
-use std::{collections::BTreeMap, sync::Arc};
+use std::{
+    collections::{BTreeMap, HashMap},
+    sync::Arc,
+};
 
 use flotilla_protocol::ConfiguredResourceLimits;
 use flotilla_resources::{
@@ -192,9 +195,32 @@ fn stored_facts(read: &mut Read<'_>, name: &str, home: &str) -> Result<Option<La
     Ok(read.load::<EnvironmentLaunchFacts>(id)?.map(|loaded| facts_of(&loaded.value)))
 }
 
+/// The facts of every launch realised at `home`, by launch: one scan, joined by the caller.
+fn facts_at(read: &mut Read<'_>, home: &str) -> Result<HashMap<String, LaunchFacts>, ReadError> {
+    let mut facts = HashMap::new();
+    let mut after = None;
+    loop {
+        let page = read.scan::<EnvironmentLaunchFacts>(home, after, 64)?;
+        for id in page.ids {
+            if let Some(loaded) = read.load::<EnvironmentLaunchFacts>(id)? {
+                facts.insert(loaded.name, facts_of(&loaded.value));
+            }
+        }
+        after = page.next;
+        if after.is_none() {
+            return Ok(facts);
+        }
+    }
+}
+
 /// `view` as a reader sees it, with its launch's facts.
 fn record(read: &mut Read<'_>, view: View<EnvironmentKind>) -> Result<EnvironmentRecord, ReadError> {
     let launch = stored_facts(read, &view.name, &view.home)?;
+    record_with(view, launch)
+}
+
+/// `view` as a reader sees it, with `launch`, the facts its launch was realised with.
+fn record_with(view: View<EnvironmentKind>, launch: Option<LaunchFacts>) -> Result<EnvironmentRecord, ReadError> {
     let spec = spec_of(&view.request).map_err(ReadError)?;
     let vessel = view.request.holder.as_ref().and_then(|holder| holder.0.strip_prefix("vessel:")).map(str::to_owned);
     let requested_at = view.created;
@@ -337,18 +363,23 @@ impl EnvironmentRecords for EngineEnvironments {
             .read(|read| {
                 let mut records = Vec::new();
                 for home in &homes {
+                    let mut views = Vec::new();
                     let mut after = None;
                     loop {
                         let page = read.scan::<Resource<Environment>>(home, after, 64)?;
                         for id in page.ids {
-                            if let Some(view) = view::<EnvironmentKind>(read, id)? {
-                                records.push(record(read, view)?);
-                            }
+                            views.extend(view::<EnvironmentKind>(read, id)?);
                         }
                         after = page.next;
                         if after.is_none() {
                             break;
                         }
+                    }
+                    // The home's launch facts in one scan, joined here.
+                    let mut facts = facts_at(read, home)?;
+                    for view in views {
+                        let launch = facts.remove(&view.name);
+                        records.push(record_with(view, launch)?);
                     }
                 }
                 Ok(records)

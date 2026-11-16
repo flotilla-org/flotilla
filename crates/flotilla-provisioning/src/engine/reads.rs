@@ -155,6 +155,8 @@ pub struct LifecycleReadPort {
     terminals: Option<Arc<dyn flotilla_resources::terminal_records::TerminalRecords>>,
     vessels: Option<Arc<dyn flotilla_resources::vessel_records::VesselRecords>>,
     convoys: Option<Arc<dyn flotilla_resources::convoy_records::ConvoyRecords>>,
+    /// The Vessel and session launches its views join, held once.
+    joins: flotilla_resources::held_joins::HeldJoins,
 }
 
 impl LifecycleReadPort {
@@ -170,6 +172,7 @@ impl LifecycleReadPort {
             terminals: None,
             vessels: None,
             convoys: None,
+            joins: Default::default(),
         }
     }
 
@@ -257,6 +260,10 @@ impl flotilla_resources::lifecycle_reads::LifecycleReads for LifecycleReadPort {
 
     fn convoys(&self) -> Result<&dyn flotilla_resources::convoy_records::ConvoyRecords, String> {
         self.convoys.as_deref().ok_or_else(|| "this read port serves no convoys".to_owned())
+    }
+
+    fn joins(&self) -> Result<&flotilla_resources::held_joins::HeldJoins, String> {
+        Ok(&self.joins)
     }
 
     fn try_reading(

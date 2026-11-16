@@ -105,6 +105,10 @@ impl LifecycleReads for Held {
     fn convoys(&self) -> Result<&dyn ConvoyRecords, String> {
         self.reads.convoys()
     }
+
+    fn joins(&self) -> Result<&flotilla_resources::held_joins::HeldJoins, String> {
+        self.reads.joins()
+    }
 }
 
 /// Requests session `name` at `daemon`'s [`engine`] as old TerminalSession `spec` describes it,
