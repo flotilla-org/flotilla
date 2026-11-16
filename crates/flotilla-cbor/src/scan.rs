@@ -26,6 +26,17 @@ pub(crate) fn scan(bytes: &[u8], limits: &Limits) -> Result<(), Error> {
     Ok(())
 }
 
+/// The length of the data item `bytes` start with, or `None` while it is
+/// still arriving.
+pub(crate) fn item_len(bytes: &[u8], limits: &Limits) -> Result<Option<usize>, Error> {
+    let mut scanner = Scanner { bytes, pos: 0, limits, max_depth: limits.max_depth.min(MAX_DEPTH) };
+    match scanner.item(0) {
+        Ok(()) => Ok(Some(scanner.pos)),
+        Err(error) if error.kind() == ErrorKind::Truncated => Ok(None),
+        Err(error) => Err(error),
+    }
+}
+
 fn over(kind: ErrorKind, count: usize, limit: usize) -> Error {
     Error::detail(kind, format!("{count}, limit {limit}"))
 }

@@ -12,8 +12,8 @@ pub use rigging_http_client::{HttpClient, ReqwestHttpClient};
 pub use rigging_process::run;
 pub use rigging_process::{
     available_space, command_channel_label, command_channel_label_with, command_timeout_message, default_channel_label, http_channel_label,
-    http_channel_label_with, probe, rename_command_timeout, scan_cache, ChannelLabel, ChannelLabeler, ChannelRequest, CommandOutput,
-    CommandProcess, CommandRunner, DefaultLabeler, EnvVars, ProcessEnvVars, TaskId, REPLAY_LABELS_ENABLED,
+    http_channel_label_with, probe, rename_command_timeout, scan_cache, ChannelLabel, ChannelLabeler, ChannelRequest, CommandLines,
+    CommandOutput, CommandProcess, CommandRunner, DefaultLabeler, EnvVars, ProcessEnvVars, TaskId, REPLAY_LABELS_ENABLED,
 };
 use sha2::{Digest, Sha256};
 use std::path::Path;

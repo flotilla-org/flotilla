@@ -18,6 +18,9 @@ futures-util = { version = "0.3", features = ["channel", "io", "sink"] }
 slab = "0.4"
 digest = { version = "0.10", features = ["mac", "oid", "std"] }
 generic-array = { version = "0.14", default-features = false, features = ["more_lengths", "zeroize"] }
+# drydock's websocket transport: tungstenite takes rand 0.10 (getrandom 0.4) and sha1 0.11 (hybrid-array, typenum const generics).
+getrandom04 = { package = "getrandom", version = "0.4", features = ["std", "sys_rng"] }
+typenum = { version = "1", features = ["const-generics"] }
 memchr = { version = "2" }
 serde = { version = "1", features = ["alloc", "derive"] }
 serde_core = { version = "1", features = ["alloc"] }
