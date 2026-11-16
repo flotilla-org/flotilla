@@ -17,7 +17,7 @@ use chrono::{DateTime, TimeZone, Utc};
 use flotilla_protocol::{LifecycleReading, PrincipalRef};
 use flotilla_resources::{
     convoy::admission::AdmissionDocument,
-    convoy_records::{ConvoyChange, ConvoyListing, ConvoyMemory, ConvoyNotes, ConvoyRecord, ConvoyRecords, CrewNotes},
+    convoy_records::{ConvoyChange, ConvoyEnd, ConvoyListing, ConvoyMemory, ConvoyNotes, ConvoyRecord, ConvoyRecords, CrewNotes},
     engine_records::KindRecords,
     lifecycle_reads::{ChangeCursor, CursorSince, LifecycleReads, ProvisioningKind},
     promises::{Promise, PromiseKind, PromiseSource, PromiseState},
@@ -26,12 +26,14 @@ use flotilla_resources::{
     },
     vessel_records::{VesselChange, VesselLaunchRequest, VesselRecord, VesselRecords, VesselStep},
     workflow_template::{CrewSource, CrewSpec, Selector, VesselRequirement},
-    ConvoyAttention, ConvoyPhase, CrewWorkPhase, WorkPhase, WorkflowSnapshot,
+    Convoy, ConvoyAttention, ConvoyPhase, CrewWorkPhase, WorkPhase, WorkflowSnapshot,
 };
 use flotilla_store::{
+    live_convoys_query,
     load_metrics::{measure, ReadCounts},
-    ConvoyViews,
+    ConvoyViews, EnginePort, ResourceBackend, StoreQuery,
 };
+use flotilla_store_memory::InMemoryBackend;
 
 const HERE: &str = "home-a";
 
@@ -662,5 +664,58 @@ async fn a_read_by_name_converts_only_that_launch() {
     let small = converted_by_one_read(10).await;
     let large = converted_by_one_read(400).await;
     assert_eq!(small, (2, 1), "the copies convert both homes' launches; a remote get converts one");
+    assert_eq!(large, small, "the cost does not grow with the launches held");
+}
+
+/// `name` held at `home`, ensured from `ensure`, and ended when `ended`.
+fn ensured(name: &str, home: &str, ensure: &str, ended: bool) -> ConvoyRecord {
+    let mut record = launch(name, home);
+    record.admission.provenance.insert(flotilla_resources::ENSURED_FROM_ANNOTATION.into(), ensure.into());
+    record.ended = ended.then(|| (ConvoyEnd::Delivered { disposition: "merged".into() }, at(200)));
+    record
+}
+
+/// The launches a standing role's queries select, and the views each converted, with `others`
+/// unrelated launches held: its live generations here and at every home, and its generations here.
+async fn ensured_queries(others: usize) -> Vec<(usize, u64)> {
+    let mut launches: Vec<_> = (0..others).map(|n| ensured(&format!("other-{n}#1"), HERE, "other", n % 2 == 0)).collect();
+    launches.extend([
+        ensured("wanted#1", HERE, "wanted", true),
+        ensured("wanted#2", HERE, "wanted", false),
+        ensured("wanted-b#1", "home-b", "wanted", false),
+    ]);
+    let reads = Arc::new(Reads {
+        convoys: Convoys::new(launches),
+        terminals: Terminals { records: Vec::new(), observations: TerminalObservations::default() },
+        vessels: Vessels { records: Vec::new() },
+    });
+    let backend = ResourceBackend::new(InMemoryBackend::default());
+    backend.serve_engine_in("flotilla");
+    Arc::new(ConvoyViews::new("flotilla", reads)).install(&backend);
+    backend.using::<Convoy>("flotilla").list().await.expect("the views fill");
+
+    let field = format!("metadata.annotations.\"{}\"", flotilla_resources::ENSURED_FROM_ANNOTATION);
+    let live = |everywhere: bool| StoreQuery {
+        fields: BTreeMap::from([(field.clone(), "wanted".to_owned())]),
+        include_replicas: everywhere,
+        ..live_convoys_query()
+    };
+    let generations = StoreQuery { fields: BTreeMap::from([(field.clone(), "wanted".to_owned())]), ..StoreQuery::default() };
+    let mut selected = Vec::new();
+    for query in [live(false), live(true), generations] {
+        let (rows, reads) = measure(backend.query_declared::<Convoy>("flotilla", &query)).await;
+        let converted = reads.get("Convoy").map_or(0, |counts| counts.converted);
+        selected.push((rows.expect("query").items.len(), converted));
+    }
+    selected
+}
+
+// Behaviour (#3108): a query selecting convoys by an annotation, as a standing role's passes read
+// its generations, converts only the launches it may select, however many other launches are held.
+#[tokio::test]
+async fn a_selecting_query_converts_only_the_launches_it_selects() {
+    let small = ensured_queries(10).await;
+    let large = ensured_queries(400).await;
+    assert_eq!(small, [(1, 3), (2, 3), (2, 3)], "live here, live everywhere, generations here; each converts the role's three launches");
     assert_eq!(large, small, "the cost does not grow with the launches held");
 }

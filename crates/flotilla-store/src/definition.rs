@@ -103,8 +103,9 @@ impl<T: Resource> DefinitionResolver<T> {
         Some(self.read_all(&*records).await)
     }
 
-    /// [`Self::engine_reads`] for `query`: a query for one receiver's open messages reads them
-    /// through the port's index when it keeps one, and every other reads them all.
+    /// [`Self::engine_reads`] for `query`: a query for one receiver's open messages, or one whose
+    /// rows each hold one of a few index keys, reads them through the port's index when it keeps
+    /// one, and every other reads them all.
     pub(crate) async fn engine_reads_for(&self, query: &crate::StoreQuery) -> Option<Result<Vec<ReadResourceObject<T>>, ResourceError>> {
         let records = self.records()?;
         if !self.holds_engine_records() {
@@ -113,6 +114,11 @@ impl<T: Resource> DefinitionResolver<T> {
         if let Some(receiver) = query.message.as_ref().and_then(crate::MessageQuery::open_receiver) {
             if let Some(open) = port_reads::open_to(&*records, receiver).await {
                 return Some(open.map_err(ResourceError::other).and_then(|open| self.reads(&records.home(), open, None)));
+            }
+        }
+        if let Some(keys) = query.covering_keys() {
+            if let Some(held) = port_reads::holding_any(&*records, &keys).await {
+                return Some(held.map_err(ResourceError::other).and_then(|held| self.reads(&records.home(), held, None)));
             }
         }
         Some(self.read_all(&*records).await)

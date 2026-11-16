@@ -71,3 +71,12 @@ pub(crate) async fn open_to<R: Resource>(records: &dyn KindRecords<R>, receiver:
     let open = records.open_to(receiver).await?;
     Some(counted(ReadShape::Index, open))
 }
+
+/// Every home's record holding one of `keys`, where the port keeps them indexed.
+pub(crate) async fn holding_any<R: Resource>(
+    records: &dyn KindRecords<R>,
+    keys: &std::collections::BTreeSet<(String, String)>,
+) -> Option<Result<Vec<Record<R>>, String>> {
+    let held = records.holding_any(keys).await?;
+    Some(counted(ReadShape::Index, held))
+}

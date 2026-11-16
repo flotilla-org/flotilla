@@ -217,6 +217,12 @@ pub trait KindRecords<R: crate::Resource>: Send + Sync + std::fmt::Debug {
     async fn open_to(&self, _receiver: &str) -> Option<Result<Vec<Record<R>>, String>> {
         None
     }
+    /// Every home's record holding any of `keys`, each a `(key, value)` as the store's query index
+    /// names a label or declared field, through the port's own index; `None` when the port keeps
+    /// none, and readers filter [`KindRecords::sources`]. A reader still applies its whole query.
+    async fn holding_any(&self, _keys: &std::collections::BTreeSet<(String, String)>) -> Option<Result<Vec<Record<R>>, String>> {
+        None
+    }
     /// Writes this home's record `name` from its metadata and spec: created, or replaced, keeping
     /// its status. Stamps the kind does not keep are not kept.
     async fn apply(

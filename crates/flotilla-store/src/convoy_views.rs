@@ -75,6 +75,45 @@ struct HeldViews {
     unreadable: BTreeMap<(String, String), u64>,
     /// The launches whose view changed, in this run: what a reading resumes from.
     changed: UnloggedJournal,
+    /// The views held by each index key their labels and declared fields give, as the store's
+    /// query index names them: a selecting query reads only the views it may select.
+    index: ViewIndex,
+}
+
+/// The views held, by `(home, launch)`, under each of their index keys.
+#[derive(Default)]
+struct ViewIndex {
+    entries: BTreeMap<(String, String), BTreeSet<(String, String)>>,
+    keys: BTreeMap<(String, String), Vec<(String, String)>>,
+}
+
+impl ViewIndex {
+    /// Indexes `view` as `launch`, in place of what `launch` showed before.
+    fn set(&mut self, launch: &(String, String), view: &ResourceObject<Convoy>) -> Result<(), String> {
+        self.remove(launch);
+        let keys = crate::object_index_keys(view).map_err(|error| error.to_string())?;
+        for key in &keys {
+            self.entries.entry(key.clone()).or_default().insert(launch.clone());
+        }
+        self.keys.insert(launch.clone(), keys);
+        Ok(())
+    }
+
+    fn remove(&mut self, launch: &(String, String)) {
+        for key in self.keys.remove(launch).into_iter().flatten() {
+            if let Some(launches) = self.entries.get_mut(&key) {
+                launches.remove(launch);
+                if launches.is_empty() {
+                    self.entries.remove(&key);
+                }
+            }
+        }
+    }
+
+    /// The launches holding any of `keys`.
+    fn holding_any(&self, keys: &BTreeSet<(String, String)>) -> BTreeSet<(String, String)> {
+        keys.iter().filter_map(|key| self.entries.get(key)).flatten().cloned().collect()
+    }
 }
 
 /// A launch's view and the version it is handed out at.
@@ -234,6 +273,7 @@ impl ConvoyViews {
                 refill_owed: false,
                 unreadable: BTreeMap::new(),
                 changed: UnloggedJournal::default(),
+                index: ViewIndex::default(),
             };
             self.refill(&mut held).await?;
             *state = Some(held);
@@ -533,6 +573,23 @@ impl KindRecords<Convoy> for ConvoyViews {
         self.engine_copies(name).await
     }
 
+    /// The views holding any of `keys`, from the views' index: only those are converted.
+    async fn holding_any(&self, keys: &BTreeSet<(String, String)>) -> Option<Result<Vec<Record<Convoy>>, String>> {
+        let keys = keys.clone();
+        let held = self.with_held(move |held| {
+            held.index
+                .holding_any(&keys)
+                .into_iter()
+                .filter_map(|launch| Some((launch.0.clone(), held.views.get(&launch)?.clone())))
+                .collect::<Vec<_>>()
+        });
+        Some(
+            held.await
+                .map_err(|error| error.to_string())
+                .map(|held| held.into_iter().map(|(home, held)| view_record(held, home)).collect()),
+        )
+    }
+
     async fn positioned(&self) -> Result<(Vec<Record<Convoy>>, LogPosition), String> {
         let (held, position) = self
             .with_held(|held| (held.views.iter().map(|((home, _), held)| (home.clone(), held.clone())).collect::<Vec<_>>(), held.read()))
@@ -636,6 +693,7 @@ impl HeldViews {
             let version = crate::held_listing::version(held.map(|held| held.version), same, position)?;
             if !same {
                 self.changed.record([key.1.clone()]);
+                self.index.set(&key, &view.object)?;
             }
             self.views.insert(key, HeldView { view, version });
         }
@@ -645,6 +703,7 @@ impl HeldViews {
     fn remove(&mut self, key: &(String, String)) {
         if self.views.remove(key).is_some() {
             self.changed.record([key.1.clone()]);
+            self.index.remove(key);
         }
         self.unreadable.remove(key);
     }

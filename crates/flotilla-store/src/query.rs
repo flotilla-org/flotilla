@@ -208,6 +208,32 @@ impl StoreQuery {
             crate::ReadOperation::List
         }
     }
+    /// Index keys, as [`QueryIndex`] names them, of which every row the query selects holds at
+    /// least one: an equality on a label or field, one field's values, a missing or present
+    /// field, or each alternative's keys. `None` when the query selects by nothing else, and
+    /// only a read of every row answers it.
+    pub(crate) fn covering_keys(&self) -> Option<BTreeSet<(String, String)>> {
+        if let Some((key, value)) = self.labels.iter().next() {
+            return Some(BTreeSet::from([(format!("label:{key}"), value.clone())]));
+        }
+        if let Some((path, value)) = self.fields.iter().next() {
+            return Some(BTreeSet::from([(format!("field:{path}"), value.clone())]));
+        }
+        if let Some((path, values)) = self.field_values.iter().next() {
+            return Some(values.iter().map(|value| (format!("field:{path}"), value.clone())).collect());
+        }
+        if let Some(path) = self.missing_fields.iter().next() {
+            return Some(BTreeSet::from([(format!("missing:{path}"), String::new())]));
+        }
+        if let Some(path) = self.present.first() {
+            return Some(BTreeSet::from([(format!("present:{path}"), String::new())]));
+        }
+        let alternatives = self.any_of.as_ref()?;
+        alternatives.iter().map(StoreQuery::covering_keys).try_fold(BTreeSet::new(), |mut keys, covered| {
+            keys.extend(covered?);
+            Some(keys)
+        })
+    }
     fn validate_at(&self, kind: ResourceKind, depth: usize) -> Result<(), ResourceError> {
         if self.all_sources_for_matches
             && (kind.replication != crate::ReplicationClass::Definitions
