@@ -315,7 +315,7 @@ impl ConvoyAdmission {
         if let Err(error) = snapshot.insert::<Repository>(&namespace, repositories) {
             return (Vec::new(), vec![error.to_string()]);
         }
-        self.reads(ResourceBackend::new(snapshot)).repository_change_request_candidates(repository_keys).await
+        self.reads(snapshot.into_backend()).repository_change_request_candidates(repository_keys).await
     }
 
     pub async fn resolve_convoy_change_request(
@@ -1014,7 +1014,7 @@ impl ConvoyAdmission {
         if self.brief_artifact_writer.read().await.is_none()
             || !workflow.vessels.iter().flat_map(|vessel| &vessel.crew).any(|crew| matches!(crew.source, CrewSource::Agent { .. }))
         {
-            return Ok(ResourceBackend::new(flotilla_store::ViewSnapshot::default()));
+            return Ok(flotilla_store::ViewSnapshot::default().into_backend());
         }
         let mut snapshot = flotilla_store::RequestSnapshot::new(&self.backend, namespace)?;
         let names = spec
@@ -5205,7 +5205,7 @@ mod tests {
                     let query = fixture.owner.brief_query("flotilla", "target", &spec, &workflow, &snapshot).await.unwrap().unwrap();
                     let inventory = fixture.backend.query_declared::<ResourceConvoy>("flotilla", &query).await.unwrap().items;
                     // Incomplete prepared evidence must refuse, never fall back to native reads.
-                    let missing = ResourceBackend::new(flotilla_store::ViewSnapshot::default());
+                    let missing = flotilla_store::ViewSnapshot::default().into_backend();
                     let error = fixture
                         .owner
                         .write_admission_briefs_from_inventory(

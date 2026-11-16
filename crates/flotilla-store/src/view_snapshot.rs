@@ -27,6 +27,10 @@ impl ViewSnapshot {
     pub fn new(root: Option<NodeId>) -> Self {
         Self { root, ..Self::default() }
     }
+    /// The backend serving what the snapshot holds, read-only.
+    pub fn into_backend(self) -> crate::ResourceBackend {
+        crate::ResourceBackend::new(self)
+    }
     pub fn insert<T: Resource>(&mut self, namespace: &str, listed: ReadResourceList<T>) -> Result<(), ResourceError> {
         let mut index = crate::QueryIndex::default();
         let mut items = BTreeMap::new();
@@ -372,7 +376,7 @@ mod tests {
             }
             let mut snapshot = ViewSnapshot::new(Some(NodeId::new("home")));
             snapshot.insert("test", ReadResourceList { items }).unwrap();
-            let backend = crate::ResourceBackend::new(snapshot);
+            let backend = snapshot.into_backend();
             let reads = backend.including_replicas::<Issue>("test");
             let copies = reads.get_all("subject").await.unwrap();
             assert_eq!(copies.items.len(), 2);

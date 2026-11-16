@@ -670,7 +670,7 @@ impl ReconcilerWake {
         // their reads come from the same request snapshot of the watched kinds.
         views.defaults.insert_snapshot(namespace, &mut snapshot).await.map_err(|error| error.to_string())?;
         views.fleet.insert_snapshot(namespace, &mut snapshot).await.map_err(|error| error.to_string())?;
-        let read_backend = flotilla_store::ResourceBackend::from_arc(std::sync::Arc::new(snapshot));
+        let read_backend = snapshot.into_backend();
         let receivers = flotilla_messaging::MessageReceiverSnapshot::load_from_shared_observations(
             &read_backend,
             namespace,
