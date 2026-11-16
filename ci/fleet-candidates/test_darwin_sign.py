@@ -71,12 +71,13 @@ class DarwinSignTests(unittest.TestCase):
         directory_link.symlink_to(self.root, target_is_directory=True)
         with self.assertRaisesRegex(self.signer.SigningError, 'directory'):
             self.signer.validate_private_key(directory_link / self.key.name)
-        metadata = list(self.root.stat())
+        metadata = list(self.root.lstat())
         metadata[4] = os.geteuid() + 1
-        original_stat = Path.stat
-        def stat_path(path, **kwargs):
-            return os.stat_result(metadata) if path == self.root else original_stat(path, **kwargs)
-        with patch.object(Path, 'stat', stat_path):
+        original_lstat = Path.lstat
+        def lstat_path(path):
+            return os.stat_result(metadata) if path == self.root else original_lstat(path)
+        # validate_private_key reads the directory with lstat, which no longer goes through Path.stat from Python 3.14.
+        with patch.object(Path, 'lstat', lstat_path):
             with self.assertRaisesRegex(self.signer.SigningError, 'directory'):
                 self.signer.validate_private_key(self.key)
 
