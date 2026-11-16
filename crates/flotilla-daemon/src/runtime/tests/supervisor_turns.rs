@@ -8,7 +8,7 @@ use flotilla_store_testkit::{ReadCountsBackendExt, ReadOperation};
 #[tokio::test]
 async fn startup_runs_one_pass_and_watches_drive_the_rest() {
     let temp = tempfile::tempdir().expect("config");
-    fs::write(temp.path().join("daemon.toml"), "machine_id = \"legacy-adoption-test\"\n").expect("daemon config");
+    fs::write(temp.path().join("daemon.toml"), "machine_id = \"supervisor-turns-test\"\n").expect("daemon config");
     let backend = ResourceBackend::new(flotilla_store_memory::InMemoryBackend::default()).with_read_counts();
     let daemon = daemon_with_backend(Vec::new(), Arc::new(ConfigStore::with_base(temp.path())), backend.clone()).await;
     tokio::time::pause();

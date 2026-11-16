@@ -292,7 +292,7 @@ fn crew_brief_repo_roots(
     roots
 }
 
-// Legacy queues and pending follow-ups on terminal convoys are ignored (#3430),
+// Pending follow-ups on terminal convoys are ignored (#3430),
 // including when a name is selected. No name means all live convoys in the namespace.
 fn convoy_names_query(name: Option<&str>, include_replicas: bool) -> StoreQuery {
     let mut query = flotilla_store::live_convoys_query();

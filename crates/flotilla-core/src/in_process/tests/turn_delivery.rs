@@ -280,11 +280,11 @@ async fn controller_turn_has_a_creatable_system_reply() {
     let request = flotilla_crew::leaf_engine::CrewTurnIntent::builder()
         .namespace("flotilla".into())
         .convoy(probe.convoy.clone())
-        .source("legacy".into())
+        .source("controller".into())
         .vessel("work".into())
         .role("coder".into())
-        .brief("legacy controller turn".into())
-        .subject_revision("legacy-head".into())
+        .brief("controller turn".into())
+        .subject_revision("controller-head".into())
         .sender(flotilla_crew::leaf_engine::Party::fleet("turn-rules"))
         .build();
     let admission = daemon.crew.deliver_turn(&request).await.expect("controller intent");
@@ -296,7 +296,7 @@ async fn controller_turn_has_a_creatable_system_reply() {
         .expect("receiver intent");
     let crew = crew_inbox(&probe.convoy);
     let reply = serde_json::json!({
-        "apiVersion":"flotilla.work/v1", "kind":"Message", "metadata":{"name":"legacy-reply"},
+        "apiVersion":"flotilla.work/v1", "kind":"Message", "metadata":{"name":"controller-reply"},
         "spec":{"sender":crew,"inbox":"fleet:lab/role:turn-rules","relation":"peer",
                 "body":"acknowledged","in_reply_to":original.metadata.name}
     });
@@ -306,7 +306,7 @@ async fn controller_turn_has_a_creatable_system_reply() {
     );
     assert_eq!(original.spec.sender, "system:turn-rules");
     daemon.apply_intent_document("flotilla", reply).await.expect("create correlated system reply");
-    assert!(backend.using::<Message>("flotilla").get("legacy-reply").await.is_ok());
+    assert!(backend.using::<Message>("flotilla").get("controller-reply").await.is_ok());
 }
 
 /// The Message rows loaded and converted in routing a crew's reply to turn rules, with `count`

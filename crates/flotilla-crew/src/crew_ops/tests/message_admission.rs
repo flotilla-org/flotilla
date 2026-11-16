@@ -349,7 +349,7 @@ async fn fresh_idle_admission_keeps_delivery_evidence_receiver_owned() {
             observation.delivery_unconfirmed_since = unconfirmed.then_some(now);
         });
         let sessions = backend.using::<ResourceTerminalSession>("flotilla");
-        let status = sessions.get("session").await.expect("fresh idle with legacy obligations").status;
+        let status = sessions.get("session").await.expect("freshly idle session").status;
         assert_eq!(status.as_ref().map(|status| status.phase), Some(ResourceTerminalSessionPhase::Running));
         crew.resume("flotilla", &held.launch, "next admitted brief", None, None).await.expect("admit at idle boundary");
         assert_eq!(sessions.get("session").await.expect("unchanged receiver evidence").status, status);
