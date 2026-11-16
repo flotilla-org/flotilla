@@ -10,6 +10,7 @@ publish = false
 [target.'cfg(not(target_arch = "wasm32"))'.dependencies]
 digest = { version = "0.10", features = ["mac", "oid", "std"] }
 generic-array = { version = "0.14", default-features = false, features = ["more_lengths", "zeroize"] }
+typenum = { version = "1", features = ["const-generics"] }
 hmac = { version = "0.12", default-features = false, features = ["reset"] }
 subtle = { version = "2" }
 zeroize = { version = "1", features = ["derive"] }

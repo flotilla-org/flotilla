@@ -10,7 +10,9 @@ publish = false
 [target.'cfg(not(target_arch = "wasm32"))'.dependencies]
 bitflags = { version = "2", default-features = false, features = ["std"] }
 once_cell = { version = "1", features = ["std", "critical-section", "portable-atomic", "race"] }
-rustix = { version = "1", features = ["fs", "process", "stdio", "system", "termios"] }
+rustix = { version = "1", features = ["event", "fs", "process", "stdio", "system", "termios"] }
+# tempfile on drydock's graph takes getrandom 0.4.
+getrandom04 = { package = "getrandom", version = "0.4", features = ["std", "sys_rng"] }
 
 [target.'cfg(target_os = "linux")'.dependencies]
 linux-raw-sys = { version = "0.12", default-features = false, features = ["auxvec", "elf", "errno", "general", "ioctl", "no_std", "prctl", "system"] }

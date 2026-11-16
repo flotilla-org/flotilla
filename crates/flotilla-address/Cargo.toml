@@ -25,6 +25,7 @@ workspace = true
 # `serde_json` appears again here only to select `alloc`, `float_roundtrip` and `raw_value` like the base layer.
 [target.'cfg(not(target_arch = "wasm32"))'.dependencies]
 generic-array = { version = "0.14", default-features = false, features = ["more_lengths", "zeroize"] }
+typenum = { version = "1", features = ["const-generics"] }
 zeroize = { version = "1", features = ["derive"] }
 memchr = { version = "2" }
 serde_core = { version = "1", features = ["alloc"] }

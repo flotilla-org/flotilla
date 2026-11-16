@@ -235,3 +235,21 @@ fn mutated_input_is_rejected_or_decodes() {
         }
     }
 }
+
+#[test]
+fn a_sequence_splits_into_items_as_its_bytes_arrive() {
+    let first = to_vec(&offer(), &DEFAULT_LIMITS).unwrap();
+    let second = to_vec(&vec!["two", "items"], &DEFAULT_LIMITS).unwrap();
+    let sequence = [first.clone(), second.clone()].concat();
+    for cut in 0..first.len() {
+        assert_eq!(item_len(&sequence[..cut], &DEFAULT_LIMITS).unwrap(), None, "cut at {cut}");
+    }
+    assert_eq!(item_len(&sequence, &DEFAULT_LIMITS).unwrap(), Some(first.len()));
+    assert_eq!(item_len(&sequence[first.len()..], &DEFAULT_LIMITS).unwrap(), Some(second.len()));
+    assert_eq!(from_slice::<Setup>(&sequence[..first.len()], &DEFAULT_LIMITS).unwrap(), offer());
+    // A rejected item fails at once, not when the rest arrives.
+    assert_eq!(kind(item_len(&hex("c0"), &DEFAULT_LIMITS)), ErrorKind::Tag);
+    // An item still arriving past the message limit fails rather than buffering on.
+    let text = to_vec(&"a".repeat(2 * SMALL_LIMITS.max_message), &DEFAULT_LIMITS).unwrap();
+    assert_eq!(kind(item_len(&text[..SMALL_LIMITS.max_message + 1], &SMALL_LIMITS)), ErrorKind::MessageLimit);
+}
