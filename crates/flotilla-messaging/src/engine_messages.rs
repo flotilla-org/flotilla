@@ -58,9 +58,9 @@ pub struct AdmittedMessage {
 /// the old store's, unchanged.
 #[async_trait]
 pub trait EngineMessages: Send + Sync {
-    /// Whether `receiver`'s inbox (an old address) holds the message `record`, local or
-    /// replicated, read by its exact identity without loading it.
-    async fn holds(&self, namespace: &str, receiver: &str, record: &str) -> Result<bool, flotilla_resources::ResourceError>;
+    /// Whether `inbox` holds the message `record`, local or replicated, read by its exact identity
+    /// without loading it.
+    async fn holds(&self, inbox: &flotilla_address::Address, record: &str) -> Result<bool, flotilla_resources::ResourceError>;
     /// An old-shaped intent in the engine's terms, its parties and references resolved as
     /// admission resolved them.
     // Goes once every producer builds its intent in the engine's terms (#3108).

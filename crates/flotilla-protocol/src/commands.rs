@@ -1043,8 +1043,9 @@ pub enum CommandAction {
         context: CrewCommandContext,
         target: String,
         message: String,
+        /// What the handoff refers to, each at its revision.
         #[serde(default)]
-        carries: Vec<crate::MessageReference>,
+        carries: Vec<flotilla_address::Reference>,
     },
     CrewPromise {
         context: CrewCommandContext,

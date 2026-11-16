@@ -254,10 +254,15 @@ async fn remote_turn_scenario(closed_watch: Option<ClosedWatch>) {
         .role("coder".to_string())
         .brief("Please continue".to_string())
         .subject_revision("stall-1".to_string())
-        .sender("system:nudge".into())
-        .expectation(MessageExpectation::Outcome {
+        .sender(flotilla_crew::leaf_engine::Party::fleet("nudge"))
+        .expectation(flotilla_messaging::IntentExpectation::Outcome {
             // The outcome names the launch the nudge is for.
-            condition: format!("work/{convoy}/work .crew.coder.phase == Done").parse().expect("nudge outcome"),
+            condition: flotilla_resources::address::leaf_condition(
+                &format!("work/{convoy}/work .crew.coder.phase == Done").parse().expect("nudge outcome"),
+                Some("flotilla"),
+                &[],
+            )
+            .expect("nudge condition"),
         })
         .build();
     // The receiver admits ordinary Message mutations through the real router.

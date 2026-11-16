@@ -6,7 +6,7 @@ use flotilla_address::Address;
 use flotilla_messaging::{Admitted, Intent, SentMessage};
 use flotilla_resources::{MessageSpec, ResourceError};
 
-use crate::crew_ops::{CrewService, Party};
+use crate::{crew_ops::CrewService, leaf_engine::Party};
 
 impl CrewService {
     pub(crate) fn message_primitives(&self) -> Result<std::sync::Arc<dyn flotilla_messaging::EngineMessages>, ResourceError> {
@@ -33,9 +33,9 @@ impl CrewService {
         self.message_primitives()?.sent_messages(namespace, &named).await?.pop().ok_or_else(|| ResourceError::not_found(name))
     }
 
-    /// Whether `receiver`'s inbox holds the Message `name`, local or replicated.
-    pub(crate) async fn holds_message(&self, namespace: &str, receiver: &str, name: &str) -> Result<bool, ResourceError> {
-        self.message_primitives()?.holds(namespace, receiver, name).await
+    /// Whether `inbox` holds the Message `name`, local or replicated.
+    pub(crate) async fn holds_message(&self, inbox: &Address, name: &str) -> Result<bool, ResourceError> {
+        self.message_primitives()?.holds(inbox, name).await
     }
 
     /// Where the Message `name` in `intent`'s inbox stands, local or replicated; `None` when none
@@ -70,18 +70,11 @@ impl CrewService {
         self.message_primitives()?.awaited_reply_from(sender, inbox, about).await
     }
 
-    /// The inbox `party` sends and receives at; a person's is the role they hold in `project`.
+    /// The inbox `party` sends and receives at; a person's is the role they hold in `project`, and
+    /// a fleet role's is read on the FleetDesignation by its name.
     pub(crate) async fn party_inbox(&self, namespace: &str, party: &Party, project: &str) -> Result<Address, String> {
-        match party {
-            Party::Person(principal) => {
-                self.message_primitives().map_err(|error| error.to_string())?.person(namespace, principal, Some(project)).await
-            }
-            Party::Seat { project, convoy, role } => Address::project(project)
-                .map_err(|error| error.to_string())
-                .and_then(|project| flotilla_resources::convoy::engine::seat_address(&project, convoy, role))
-                .map_err(ResourceError::invalid),
-        }
-        .map_err(|error| error.to_string())
+        let messages = self.message_primitives().map_err(|error| error.to_string())?;
+        party.inbox(messages.as_ref(), namespace, project).await
     }
 
     /// The Messages to `seats` still waiting for delivery that a supervisor sent and no fleet role

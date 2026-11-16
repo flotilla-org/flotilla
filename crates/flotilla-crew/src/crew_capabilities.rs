@@ -12,9 +12,8 @@ use flotilla_resources::lifecycle_reads::LifecycleReads;
 use flotilla_resources::terminal_records::{newest_launches, TerminalRecord};
 use flotilla_resources::vessel_records::VesselRecord;
 use flotilla_resources::{
-    message_record_name, vessel_placement_pin, Convoy, EnvironmentMount, EnvironmentMountMode, FulfilmentKind, MessageReference,
-    MessageRelation, MessageSpec, ResourceError, ResourceObject, ResourceRef, TerminalSession, TerminalSessionPhase, TerminalSessionSource,
-    TerminalSessionSpec, Vessel,
+    message_record_name, vessel_placement_pin, Convoy, EnvironmentMount, EnvironmentMountMode, FulfilmentKind, MessageRelation,
+    ResourceError, ResourceObject, TerminalSession, TerminalSessionPhase, TerminalSessionSource, TerminalSessionSpec, Vessel,
 };
 use flotilla_store::{load_metrics::carry, ResourceBackend};
 use sha2::{Digest, Sha256};
@@ -487,16 +486,12 @@ async fn publish_card_revision(
     CardRevision { revision, card, body, supersedes }: CardRevision<'_>,
     tracker: &CapabilityCardTracker,
 ) -> Result<(String, String), String> {
-    let sender = "system:capabilities";
-    let name = message_record_name(receiver, sender, &format!("{}:capabilities@{revision}", session.metadata.name));
-    let subject = MessageReference::ControlRecord {
-        resource: ResourceRef::new("flotilla.work/v1", "TerminalSession", namespace, &session.metadata.name),
-        revision: format!("capabilities@{revision}"),
-    };
+    let name = message_record_name(receiver, "system:capabilities", &format!("{}:capabilities@{revision}", session.metadata.name));
+    let inbox = flotilla_resources::convoy::engine::role_inbox(receiver)?;
     let primitives = tracker.primitives().map_err(|error| error.to_string())?;
     let supersedes = match supersedes {
         // Reaped audit data cannot be a predecessor.
-        Some(name) => primitives.holds(namespace, receiver, &name).await.map_err(|error| error.to_string())?.then_some(name),
+        Some(name) => primitives.holds(&inbox, &name).await.map_err(|error| error.to_string())?.then_some(name),
         None => None,
     };
     // Admission is idempotent. Recover a published revision before trying to supersede it with
@@ -514,16 +509,12 @@ async fn publish_card_revision(
         Some(message) => (message.body, message.supersedes),
         None => (body.to_string(), supersedes),
     };
-    let spec = MessageSpec::builder()
-        .sender(sender.into())
-        .receiver(receiver.to_owned())
-        .relation(MessageRelation::System)
-        .body(body)
-        .references(vec![subject.clone()])
-        .subject(subject)
-        .maybe_supersedes(supersedes)
-        .build();
-    let intent = primitives.intent_of(namespace, &spec).await.map_err(|error| error.to_string())?;
+    // The card is about the seat it is for, at its revision.
+    let sender = primitives.fleet_role(namespace, "capabilities").await.map_err(|error| error.to_string())?;
+    let at = flotilla_address::Revision::new(format!("capabilities@{revision}")).map_err(|error| error.to_string())?;
+    let mut intent = flotilla_messaging::Intent::new(sender, inbox.clone(), MessageRelation::System, body);
+    intent.references = vec![flotilla_messaging::IntentReference::subject(inbox, at)];
+    intent.supersedes = supersedes;
     primitives.admit(&name, &intent).await.map_err(|error| error.to_string())?;
     Ok((name, digest))
 }

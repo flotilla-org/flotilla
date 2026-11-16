@@ -1665,19 +1665,10 @@ impl MessagePrimitives {
         self.view_in(namespace, &roles, inbox, record).await
     }
 
-    /// Whether `receiver`'s inbox (an old address) holds the message `record`, read by its exact
-    /// identity at every followed home without loading it.
-    pub async fn holds(&self, namespace: &str, receiver: &str, record: &str) -> Result<bool, ResourceError> {
-        let roles = self.roles(namespace).await.map_err(ResourceError::invalid)?;
-        // No message is admitted to a receiver that converts to no inbox.
-        let inbox = match (Conversion { roles: &roles, forges: &[], records: &convert::NoRecords }).inbox(receiver) {
-            Ok(inbox) => inbox,
-            Err(error) => {
-                tracing::debug!(%record, %error, "a receiver with no inbox holds no message");
-                return Ok(false);
-            }
-        };
-        Ok(self.locate_in(&inbox, record).map_err(ResourceError::other)?.is_some())
+    /// Whether `inbox` holds the message `record`, read by its exact identity at every followed
+    /// home without loading it.
+    pub fn holds(&self, inbox: &Address, record: &str) -> Result<bool, ResourceError> {
+        Ok(self.locate_in(inbox, record).map_err(ResourceError::other)?.is_some())
     }
 
     /// The message a person names by its old record name, in the old shape: read by its exact
@@ -2032,8 +2023,8 @@ enum SameSubject {
 /// Crew code's port onto this path (`flotilla_messaging::EngineMessages`).
 #[async_trait::async_trait]
 impl flotilla_messaging::EngineMessages for MessagePrimitives {
-    async fn holds(&self, namespace: &str, receiver: &str, record: &str) -> Result<bool, ResourceError> {
-        MessagePrimitives::holds(self, namespace, receiver, record).await
+    async fn holds(&self, inbox: &Address, record: &str) -> Result<bool, ResourceError> {
+        MessagePrimitives::holds(self, inbox, record)
     }
     async fn intent_of(&self, namespace: &str, old: &OldSpec) -> Result<flotilla_messaging::Intent, ResourceError> {
         MessagePrimitives::intent_of(self, namespace, old).await

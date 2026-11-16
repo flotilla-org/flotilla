@@ -20,7 +20,7 @@ use flotilla_store::{load_metrics::carry, off_frame};
 
 use super::sources::freshest_change_request_refs;
 use super::wake::{ConvoyRead, ReconcilerWake};
-use super::{CrewTurnIntent, LeafSubscriptionRow, LeafWatcher, UnableEvidenceKey};
+use super::{CrewTurnIntent, LeafSubscriptionRow, LeafWatcher, Party, UnableEvidenceKey};
 use crate::crew_ops::convoy_message_address;
 
 // Observe lifecycle movement rather than refreshes or failed retry attempts.
@@ -194,14 +194,22 @@ pub(super) fn stall_subject(namespace: &str, convoy: &ResourceObject<Convoy>, co
         .unwrap_or_else(|| convoy_stall_subject(project, &convoy.metadata.name))
 }
 
-pub(super) fn supervision_expectation(rung: StallRung) -> flotilla_resources::MessageExpectation {
+pub(super) fn supervision_expectation(rung: StallRung) -> flotilla_messaging::IntentExpectation {
     // An operator-rung escalation expects nothing: on the engine path the
     // person's acknowledgement settles it (#3938), and their ruling acts on the stall.
     if rung == StallRung::Operator {
-        flotilla_resources::MessageExpectation::None
+        flotilla_messaging::IntentExpectation::Nothing
     } else {
-        flotilla_resources::MessageExpectation::Reply
+        flotilla_messaging::IntentExpectation::Reply
     }
+}
+
+/// A message's reference to `convoy` at the revision it was read at.
+pub(super) fn convoy_reference(convoy: &ResourceObject<Convoy>) -> Result<flotilla_messaging::IntentReference, String> {
+    let address = flotilla_resources::convoy::engine::convoy_reference_address(&convoy.metadata.name, convoy.spec.project_ref.as_deref())?;
+    let revision = flotilla_address::Revision::new(convoy.metadata.resource_version.clone())
+        .map_err(|error| format!("convoy `{}`: {error}", convoy.metadata.name))?;
+    Ok(flotilla_messaging::IntentReference::new(address, revision))
 }
 
 pub(crate) fn supervision_message_source(convoy: &str, index: usize) -> String {
@@ -1647,6 +1655,14 @@ impl ReconcilerWake {
         let obligation = actor_obligation(leaf)?;
         let brief =
             format!("For {role}@{vessel} in {} (resource ref: {}):\n{obligation}", convoy_message_address(convoy), convoy.metadata.name);
+        // A condition or reference that names nothing fails this delivery like any other.
+        let project = convoy.spec.project_ref.as_deref().unwrap_or(namespace);
+        let parts = flotilla_resources::address::leaf_condition(leaf, Some(project), &[])
+            .and_then(|condition| Ok((condition, convoy_reference(convoy)?)));
+        let (condition, reference) = match parts {
+            Ok(parts) => parts,
+            Err(error) => return Ok(Err(error)),
+        };
         let request = CrewTurnIntent::builder()
             .namespace(namespace.to_string())
             .convoy(convoy.metadata.name.clone())
@@ -1655,12 +1671,9 @@ impl ReconcilerWake {
             .role(role.to_owned())
             .brief(brief)
             .subject_revision(now.timestamp_micros().to_string())
-            .sender("system:nudge".into())
-            .expectation(flotilla_resources::MessageExpectation::Outcome { condition: leaf.clone() })
-            .references(vec![flotilla_resources::MessageReference::ControlRecord {
-                resource: flotilla_protocol::ResourceRef::new("flotilla.work/v1", "Convoy", namespace, &convoy.metadata.name),
-                revision: convoy.metadata.resource_version.clone(),
-            }])
+            .sender(Party::fleet("nudge"))
+            .expectation(flotilla_messaging::IntentExpectation::Outcome { condition })
+            .references(vec![reference])
             .build();
         Ok(self.subscriptions.inner.turn_delivery.lock().await.clone().deliver(&request).await.map(|_| ()))
     }
@@ -1723,39 +1736,43 @@ impl ReconcilerWake {
                     .map(|(vessel, role)| format!("{role}@{vessel} in {}", convoy_message_address(convoy)))
                     .unwrap_or_else(|| convoy_message_address(convoy));
                 let brief = format!("Escalated from {from}:\n\n{}", stall_supervision_brief(convoy, &*condition));
-                let delivery = CrewTurnIntent::builder()
-                    .maybe_receiver(match target {
-                        SupervisionTarget::Address { address } => Some(address.clone()),
-                        _ => None,
-                    })
-                    .namespace(namespace.to_string())
-                    .convoy(target_convoy.clone())
-                    .source(supervision_message_source(&convoy.metadata.name, index))
-                    .vessel(target_vessel.clone())
-                    .role(target_role.clone())
-                    .brief(brief)
-                    .subject_revision(condition.began_at.timestamp_micros().to_string())
-                    .sender(
-                        stalled_source_actor(&*condition)
-                            .map(|(vessel, role)| {
-                                crew_role_address(
-                                    convoy.spec.project_ref.as_deref().unwrap_or(namespace),
-                                    &convoy.metadata.name,
-                                    vessel,
-                                    role,
-                                )
-                            })
-                            .unwrap_or_else(|| "system:stall-judge".into()),
-                    )
-                    .relation(flotilla_resources::MessageRelation::Supervisor)
-                    .expectation(supervision_expectation(rung))
-                    .references(vec![flotilla_resources::MessageReference::ControlRecord {
-                        resource: flotilla_protocol::ResourceRef::new("flotilla.work/v1", "Convoy", namespace, &convoy.metadata.name),
-                        revision: convoy.metadata.resource_version.clone(),
-                    }])
-                    .maybe_stall_of((rung != StallRung::Operator).then(|| stall_subject(namespace, convoy, &*condition)))
-                    .build();
-                let admission = match self.subscriptions.inner.turn_delivery.lock().await.clone().deliver(&delivery).await {
+                let receiver = match target {
+                    SupervisionTarget::Address { address } => Party::of_policy_address(address).map(Some),
+                    _ => Ok(None),
+                };
+                // An address or reference that names nothing fails this delivery like any other.
+                let delivery = receiver.and_then(|receiver| Ok((receiver, convoy_reference(convoy)?)));
+                let delivery = delivery.map(|(receiver, convoy_reference)| {
+                    CrewTurnIntent::builder()
+                        .maybe_receiver(receiver)
+                        .namespace(namespace.to_string())
+                        .convoy(target_convoy.clone())
+                        .source(supervision_message_source(&convoy.metadata.name, index))
+                        .vessel(target_vessel.clone())
+                        .role(target_role.clone())
+                        .brief(brief)
+                        .subject_revision(condition.began_at.timestamp_micros().to_string())
+                        .sender(
+                            stalled_source_actor(&*condition)
+                                .map(|(_, role)| Party::Seat {
+                                    project: convoy.spec.project_ref.clone().unwrap_or_else(|| namespace.to_owned()),
+                                    convoy: convoy.metadata.name.clone(),
+                                    role: role.to_owned(),
+                                })
+                                .unwrap_or_else(|| Party::fleet("stall-judge")),
+                        )
+                        .relation(flotilla_resources::MessageRelation::Supervisor)
+                        .expectation(supervision_expectation(rung))
+                        .references(vec![convoy_reference])
+                        .maybe_stall_of((rung != StallRung::Operator).then(|| stall_subject(namespace, convoy, &*condition)))
+                        .build()
+                });
+                let actuator = self.subscriptions.inner.turn_delivery.lock().await.clone();
+                let delivered = match delivery {
+                    Ok(delivery) => actuator.deliver(&delivery).await,
+                    Err(error) => Err(error),
+                };
+                let admission = match delivered {
                     Ok(admission) => admission,
                     Err(error) => {
                         let fell_back = prior.is_none_or(|prior| {

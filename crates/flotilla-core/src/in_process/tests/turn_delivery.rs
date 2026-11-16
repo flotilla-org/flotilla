@@ -36,7 +36,7 @@ async fn fresh_turn_stores_intent_independently_of_boot_brief() {
         .role("coder".to_string())
         .brief("fresh turn".to_string())
         .subject_revision("next-head".to_string())
-        .sender("system:turn-rules".into())
+        .sender(flotilla_crew::leaf_engine::Party::fleet("turn-rules"))
         .build();
     daemon.deliver_standing_turn(&request).await.expect("deliver fresh turn");
     let session = sessions.get("resume-staging-session").await.expect("updated session");
@@ -64,7 +64,7 @@ async fn repeated_standing_turn_does_not_restart_a_lost_session_after_delivery()
         .role("coder".to_string())
         .brief("same turn".to_string())
         .subject_revision("same-head".to_string())
-        .sender("system:turn-rules".into())
+        .sender(flotilla_crew::leaf_engine::Party::fleet("turn-rules"))
         .build();
     daemon.deliver_standing_turn(&request).await.expect("first intent");
     let message = crew_messages(&daemon, "flotilla").await.remove(0);
@@ -159,7 +159,7 @@ async fn turn_delivery_reopens_work_and_stages_credentials_before_queuing_every_
             .role("coder".to_string())
             .brief("rebase the PR".to_string())
             .subject_revision("new-head".to_string())
-            .sender("system:turn-rules".into())
+            .sender(flotilla_crew::leaf_engine::Party::fleet("turn-rules"))
             .build();
         assert!(daemon.deliver_standing_turn(&request).await.is_err(), "failed staging must prevent delivery");
         let after_failure = convoys.get(&convoy).await.expect("convoy after failed staging").status.expect("status");
@@ -269,11 +269,11 @@ fn crew_inbox(convoy: &str) -> String {
     flotilla_resources::convoy::engine::seat_address(&project, convoy, "coder").expect("seat").to_string()
 }
 
-// A system reply to a legacy controller sender is correlated with its receiver
-// intent and has a creatable home on this daemon.
+// A system reply to a controller's turn is correlated with its receiver intent and has a
+// creatable home on this daemon.
 #[tokio::test]
-async fn unknown_controller_sender_has_a_creatable_system_reply() {
-    use flotilla_resources::{CrewMessageSender, Message};
+async fn controller_turn_has_a_creatable_system_reply() {
+    use flotilla_resources::Message;
 
     let (daemon, backend, probe) = resume_staging_fixture().await;
     probe.fail_next.store(false, std::sync::atomic::Ordering::SeqCst);
@@ -285,7 +285,7 @@ async fn unknown_controller_sender_has_a_creatable_system_reply() {
         .role("coder".into())
         .brief("legacy controller turn".into())
         .subject_revision("legacy-head".into())
-        .sender(flotilla_resources::legacy_message_sender(&CrewMessageSender::Unknown).0)
+        .sender(flotilla_crew::leaf_engine::Party::fleet("turn-rules"))
         .build();
     let admission = daemon.crew.deliver_turn(&request).await.expect("controller intent");
     // The crew's reply is spelled as the crew reads the original.
@@ -304,7 +304,6 @@ async fn unknown_controller_sender_has_a_creatable_system_reply() {
         daemon.message_creation_origin("flotilla", &reply).await.expect("correlated system reply has a home"),
         Some(daemon.node_id().clone())
     );
-    // The engine folds the legacy controller sender into turn rules (#3513).
     assert_eq!(original.spec.sender, "system:turn-rules");
     daemon.apply_intent_document("flotilla", reply).await.expect("create correlated system reply");
     assert!(backend.using::<Message>("flotilla").get("legacy-reply").await.is_ok());
@@ -323,7 +322,7 @@ async fn read_by_routing_a_reply(count: usize) -> (u64, u64) {
         .role("coder".into())
         .brief("checks settled".into())
         .subject_revision("head".into())
-        .sender("system:turn-rules".into())
+        .sender(flotilla_crew::leaf_engine::Party::fleet("turn-rules"))
         .build();
     let admission = daemon.crew.deliver_turn(&request).await.expect("turn");
     let primitives = super::support::install_engine_messages(&daemon);

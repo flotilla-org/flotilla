@@ -8,8 +8,8 @@ use chrono::Utc;
 use flotilla_protocol::ResourceRef;
 use flotilla_resources::terminal_records::TerminalRecords as _;
 use flotilla_resources::{
-    Convoy as ResourceConvoy, ConvoyStatusPatch, CrewMessageSender, CrewWorkPhase, TerminalAttentionState,
-    TerminalSession as ResourceTerminalSession, TerminalSessionPhase as ResourceTerminalSessionPhase,
+    Convoy as ResourceConvoy, ConvoyStatusPatch, CrewWorkPhase, TerminalAttentionState, TerminalSession as ResourceTerminalSession,
+    TerminalSessionPhase as ResourceTerminalSessionPhase,
 };
 use flotilla_store::note_convoy;
 
@@ -18,15 +18,11 @@ use crate::ports::WorkCredentialReconciler;
 
 #[tokio::test]
 async fn turn_admission_returns_the_canonical_suppressed_message() {
-    use flotilla_resources::{Message, MessageExpectation, MessageReference};
+    use flotilla_resources::Message;
 
-    use crate::leaf_engine::CrewTurnIntent;
+    use crate::leaf_engine::{CrewTurnIntent, Party};
     let (crew, backend, probe, held) = fixture(CrewWorkPhase::Working).await;
     probe.fail.store(false, Ordering::SeqCst);
-    let reference = MessageReference::ControlRecord {
-        resource: ResourceRef::new("flotilla.work/v1", "Convoy", "flotilla", held.launch.clone()),
-        revision: "revision".into(),
-    };
     let request = CrewTurnIntent::builder()
         .namespace("flotilla".into())
         .convoy(held.launch.clone())
@@ -35,10 +31,9 @@ async fn turn_admission_returns_the_canonical_suppressed_message() {
         .role("coder".into())
         .brief("reply to this subject".into())
         .subject_revision("revision".into())
-        .sender("system:turn-rules".into())
-        .references(vec![reference.clone()])
-        .message_subject(reference)
-        .expectation(MessageExpectation::Reply)
+        .sender(Party::fleet("turn-rules"))
+        .references(vec![super::convoy_subject(&held.launch, "revision")])
+        .expectation(flotilla_messaging::IntentExpectation::Reply)
         .build();
     let first = crew.deliver_turn(&request).await.expect("first admission");
     let coder = flotilla_resources::crew_role_address("flotilla", &held.launch, "work", "coder");
@@ -83,7 +78,7 @@ async fn follow_up_reference_releases_from_message_evidence() {
 /// The Message rows loaded and converted while one turn about the convoy is delivered to a coder
 /// whose inbox holds `count` open messages about nothing.
 async fn read_by_one_turn(count: usize) -> (u64, u64) {
-    use flotilla_resources::{MessageReference, MessageRelation, MessageSpec};
+    use flotilla_resources::{MessageRelation, MessageSpec};
 
     use crate::leaf_engine::CrewTurnIntent;
     let (crew, _backend, probe, held) = fixture(CrewWorkPhase::Working).await;
@@ -99,10 +94,6 @@ async fn read_by_one_turn(count: usize) -> (u64, u64) {
             .build();
         primitives.admit_old("flotilla", &format!("open-{index}"), &intent).await.expect("admit an open message");
     }
-    let reference = MessageReference::ControlRecord {
-        resource: ResourceRef::new("flotilla.work/v1", "Convoy", "flotilla", held.launch.clone()),
-        revision: "revision".into(),
-    };
     let request = CrewTurnIntent::builder()
         .namespace("flotilla".into())
         .convoy(held.launch.clone())
@@ -111,9 +102,8 @@ async fn read_by_one_turn(count: usize) -> (u64, u64) {
         .role("coder".into())
         .brief("about the convoy".into())
         .subject_revision("revision".into())
-        .sender("system:turn-rules".into())
-        .references(vec![reference.clone()])
-        .message_subject(reference)
+        .sender(crate::leaf_engine::Party::fleet("turn-rules"))
+        .references(vec![super::convoy_subject(&held.launch, "revision")])
         .build();
     let (admission, reads) = flotilla_store::load_metrics::measure(crew.deliver_turn(&request)).await;
     assert!(admission.expect("deliver the turn").new_turn, "nothing open supersedes the turn");
@@ -234,10 +224,9 @@ async fn remote_suppression_restores_workflow_before_replication() {
         .role("coder".into())
         .brief("duplicate request".into())
         .subject_revision("revision".into())
-        .sender("system:turn-rules".into())
-        .references(vec![subject.clone()])
-        .message_subject(subject)
-        .expectation(MessageExpectation::Reply)
+        .sender(crate::leaf_engine::Party::fleet("turn-rules"))
+        .references(vec![super::convoy_subject(&held.launch, "revision")])
+        .expectation(flotilla_messaging::IntentExpectation::Reply)
         .build();
     let admission = crew.deliver_turn(&request).await.unwrap();
     assert!(!admission.new_turn);
@@ -269,10 +258,12 @@ async fn turn_admission_errors_restore_the_owned_activation() {
         async fn reconcile(&self, namespace: &str, environment: &str) -> Result<(), String> {
             self.probe.reconcile(namespace, environment).await?;
             let receiver = self.receiver.as_str();
-            let sender = "system:legacy";
-            let name = flotilla_resources::message_record_name(receiver, sender, "turn-delivery:failure:failure-head");
+            // The turn's name: its producer key, from the turn-rules role to the coder's inbox.
+            let inbox = self.primitives.inbox_for(namespace, receiver).await?;
+            let turn_rules = self.primitives.inbox_for(namespace, "system:turn-rules").await?;
+            let name = flotilla_resources::message_record_name(inbox.as_str(), turn_rules.as_str(), "turn-delivery:failure:failure-head");
             let spec = flotilla_resources::MessageSpec::builder()
-                .sender(sender.into())
+                .sender("system:legacy".into())
                 .receiver(receiver.into())
                 .relation(flotilla_resources::MessageRelation::System)
                 .body("concurrent intent".into())
@@ -297,7 +288,7 @@ async fn turn_admission_errors_restore_the_owned_activation() {
         .role("coder".into())
         .subject_revision("failure-head".into())
         .brief("continue".into())
-        .sender(flotilla_resources::legacy_message_sender(&CrewMessageSender::Unknown).0)
+        .sender(crate::leaf_engine::Party::fleet("turn-rules"))
         .build();
     let error = crew.deliver_turn(&request).await.expect_err("durable admission fails");
     assert!(error.contains("different intent"), "{error}");

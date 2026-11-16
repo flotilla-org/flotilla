@@ -727,8 +727,9 @@ async fn replicated_governor_receives_stall_in_one_pass() {
     assert_eq!(requests.len(), 1, "remote governor must receive its escalation");
     assert_eq!(requests[0].convoy, governor);
     // Escalations retain the fully-qualified source crew, including its convoy.
-    assert_eq!(requests[0].sender, case.coder());
-    assert_eq!(requests[0].expectation, flotilla_resources::MessageExpectation::Reply);
+    let coder = super::super::Party::Seat { project: "wheelhouse".into(), convoy: case.work.clone(), role: "coder".into() };
+    assert_eq!(requests[0].sender, coder);
+    assert_eq!(requests[0].expectation, flotilla_messaging::IntentExpectation::Reply);
 }
 
 // ProjectCrew requires project scope; a missing ref must be diagnostic,
@@ -1114,28 +1115,27 @@ async fn leaf_engine_steady_state_reconcile_reads_no_store() {
 // when the crew repeats its report and the judge restarts between passes.
 async fn stall_message_scenario(repeat_report: bool, restart: bool) {
     use flotilla_engine_messages_testkit::{designate_fleet, EngineMessagesHome};
-    use flotilla_resources::{MessageSpec, StallReason};
+    use flotilla_resources::StallReason;
     struct InboxDelivery(EngineMessagesHome);
     // Boundary stand-in for turn delivery; persist through the real Message path.
     #[async_trait]
     impl TurnDeliveryActuator for InboxDelivery {
         async fn deliver(&self, request: &CrewTurnIntent) -> Result<CrewTurnAdmission, String> {
-            let receiver =
-                request.receiver.clone().unwrap_or_else(|| format!("wheelhouse/{}/{}/{}", request.convoy, request.vessel, request.role,));
+            let receiver = request.receiver.clone().unwrap_or_else(|| super::super::Party::Seat {
+                project: "wheelhouse".into(),
+                convoy: request.convoy.clone(),
+                role: request.role.clone(),
+            });
+            let messages: &dyn flotilla_messaging::EngineMessages = self.0.primitives().as_ref();
+            let inbox = receiver.inbox(messages, "flotilla", "wheelhouse").await?;
+            let sender = request.sender.inbox(messages, "flotilla", "wheelhouse").await?;
             let name = flotilla_resources::message_record_name(
-                &receiver,
-                &request.sender,
+                inbox.as_str(),
+                sender.as_str(),
                 &turn_message_producer_key(&request.source, &request.subject_revision),
             );
-            let spec = MessageSpec::builder()
-                .sender(request.sender.clone())
-                .receiver(receiver)
-                .body(request.brief.clone())
-                .relation(request.relation)
-                .references(request.references.clone())
-                .expectation(request.expectation.clone())
-                .build();
-            let object = self.0.primitives().admit_old("flotilla", &name, &spec).await.map_err(|error| error.to_string())?;
+            let intent = crate::crew_ops::turn_intent(request, sender, inbox);
+            let object = messages.admit(&name, &intent).await.map_err(|error| error.to_string())?;
             Ok(CrewTurnAdmission {
                 new_turn: true,
                 rung: TurnDeliveryRung::WarmSession,
@@ -1578,6 +1578,6 @@ async fn supervision_records_have_a_subject_and_operator_notices_expect_nothing(
     let launch = flotilla_resources::convoy::engine::launch_address(&flotilla_address::Address::project("wheelhouse").unwrap(), &case.work)
         .expect("a launch address");
     assert_eq!(super::super::stalls::stall_subject("flotilla", &source, &condition), launch.to_string());
-    assert_eq!(super::super::stalls::supervision_expectation(StallRung::Operator), flotilla_resources::MessageExpectation::None);
-    assert_eq!(super::super::stalls::supervision_expectation(StallRung::Governor), flotilla_resources::MessageExpectation::Reply);
+    assert_eq!(super::super::stalls::supervision_expectation(StallRung::Operator), flotilla_messaging::IntentExpectation::Nothing);
+    assert_eq!(super::super::stalls::supervision_expectation(StallRung::Governor), flotilla_messaging::IntentExpectation::Reply);
 }

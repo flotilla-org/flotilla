@@ -602,9 +602,8 @@ async fn issue_turn_delivery_fires_once_for_changed_issue() {
     .expect("observed issue change wakes turn delivery");
     table.deliver_turn(subscription_id, launch, "issue", &rule, &leaf).await.expect("duplicate issue event");
     assert_eq!(actuator.requests.lock().expect("requests").len(), 1);
-    let subject = actuator.requests.lock().expect("requests")[0].message_subject.clone().expect("issue subject");
-    assert!(matches!(subject, flotilla_resources::MessageReference::Issue { number: 2052, revision, .. }
-        if revision == changed_at.to_rfc3339()));
+    let subject = super::turn_subject(&actuator.requests.lock().expect("requests")[0]);
+    assert_eq!(subject, (flotilla_address::Kind::Issue, "2052".to_owned(), changed_at.to_rfc3339()));
     let brief = actuator.requests.lock().expect("requests")[0].brief.clone();
     assert!(brief.contains("Target crew: `work/coder`"));
     // The kept ledger promise's artifact record, not the reference the coder submitted.
@@ -945,13 +944,11 @@ impl ReplicaTurnSource {
     }
 
     // A delivered message must identify the observed subject revision.
-    fn assert_message_subject(&self, subject: flotilla_resources::MessageReference, observed_at: DateTime<Utc>) {
+    fn assert_message_subject(&self, subject: (flotilla_address::Kind, String, String), observed_at: DateTime<Utc>) {
         if self.is_issue() {
-            assert!(matches!(subject, flotilla_resources::MessageReference::Issue { number: 3556, revision, .. }
-                if revision == observed_at.to_rfc3339()));
+            assert_eq!(subject, (flotilla_address::Kind::Issue, "3556".to_owned(), observed_at.to_rfc3339()));
         } else {
-            assert!(matches!(subject, flotilla_resources::MessageReference::ChangeRequest { number: 3556, revision, .. }
-                if revision == "head"));
+            assert_eq!(subject, (flotilla_address::Kind::ChangeRequest, "3556".to_owned(), "head".to_owned()));
         }
     }
 }
@@ -1059,7 +1056,7 @@ async fn replica_status_turn_delivery() {
                 .unwrap_or_else(|| panic!("replica triggers {source} rule"));
                 table.fire(id, firing.clone()).await;
                 assert_eq!(actuator.requests.lock().unwrap().len(), 1, "{source} must deliver from replica status");
-                let subject = actuator.requests.lock().unwrap()[0].message_subject.clone().unwrap();
+                let subject = super::turn_subject(&actuator.requests.lock().unwrap()[0]);
                 case.assert_message_subject(subject, observed_at);
                 table.fire(id, firing).await;
                 assert_eq!(actuator.requests.lock().unwrap().len(), 1, "duplicate {source} is idempotent");

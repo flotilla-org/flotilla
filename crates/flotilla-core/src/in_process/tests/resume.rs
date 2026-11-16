@@ -226,7 +226,9 @@ async fn declared_access_stall_routes_to_project_governor_and_resumes() {
         let requests = supervision.requests.lock().expect("supervision requests");
         let escalation = requests.iter().find(|request| request.vessel == "watch").expect("governor escalation");
         // #2592: the supervisor must identify the convoy and act on the exact stalled crew.
-        assert_eq!(escalation.sender, format!("project/{}/work/coder", probe.convoy));
+        let coder =
+            flotilla_crew::leaf_engine::Party::Seat { project: "project".into(), convoy: probe.convoy.clone(), role: "coder".into() };
+        assert_eq!(escalation.sender, coder);
         assert_eq!(escalation.relation, flotilla_resources::MessageRelation::Supervisor);
         let framed = &escalation.brief;
         assert!(framed.starts_with("Escalated from coder@work in graphql-budget@project:"));

@@ -1288,7 +1288,7 @@ struct Turns {
 
 #[async_trait]
 impl flotilla_messaging::EngineMessages for Turns {
-    async fn holds(&self, _: &str, _: &str, _: &str) -> Result<bool, flotilla_resources::ResourceError> {
+    async fn holds(&self, _: &flotilla_address::Address, _: &str) -> Result<bool, flotilla_resources::ResourceError> {
         unreachable!("the convoy reconciler reads no message by name")
     }
     async fn intent_of(

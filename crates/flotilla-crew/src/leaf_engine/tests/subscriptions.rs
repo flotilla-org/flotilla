@@ -268,8 +268,9 @@ async fn missing_resumed_session_does_not_suppress_supervision_forever() {
     );
     assert_eq!(requests[0].convoy, governor);
     // Escalations retain the fully-qualified source crew, including its convoy.
-    assert_eq!(requests[0].sender, format!("wheelhouse/{}/work/coder", case.work));
-    assert_eq!(requests[0].expectation, flotilla_resources::MessageExpectation::Reply);
+    let coder = super::super::Party::Seat { project: "wheelhouse".into(), convoy: case.work.clone(), role: "coder".into() };
+    assert_eq!(requests[0].sender, coder);
+    assert_eq!(requests[0].expectation, flotilla_messaging::IntentExpectation::Reply);
 }
 
 // Deliberate operator-only or empty policies consume the ladder. Routine

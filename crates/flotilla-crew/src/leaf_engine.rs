@@ -40,7 +40,8 @@ impl IssueObservationSource for UnavailableIssues {
 /// crosses hosts; transport requests are not a wire protocol.
 #[derive(Debug, Clone, PartialEq, Eq, bon::Builder)]
 pub struct CrewTurnIntent {
-    pub receiver: Option<String>,
+    /// Who the turn goes to when it names them; otherwise the crew member `role` of `convoy`.
+    pub receiver: Option<Party>,
     pub namespace: String,
     pub convoy: String,
     pub source: String,
@@ -49,17 +50,74 @@ pub struct CrewTurnIntent {
     pub brief: String,
     pub subject_revision: String,
     pub subject: Option<flotilla_protocol::Subject>,
-    pub sender: String,
+    pub sender: Party,
     #[builder(default = flotilla_resources::MessageRelation::System)]
     pub relation: flotilla_resources::MessageRelation,
+    /// What the turn refers to; at most one is its subject.
     #[builder(default)]
-    pub references: Vec<flotilla_resources::MessageReference>,
-    pub message_subject: Option<flotilla_resources::MessageReference>,
-    pub delivery_condition: Option<Leaf>,
+    pub references: Vec<flotilla_messaging::IntentReference>,
+    pub delivery_condition: Option<flotilla_address::Condition>,
     #[builder(default)]
-    pub expectation: flotilla_resources::MessageExpectation,
+    pub expectation: flotilla_messaging::IntentExpectation,
     /// The stalled crew role or canonical convoy address this supervision is about.
     pub stall_of: Option<String>,
+}
+
+/// One end of a crew message: whom it is from or to.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Party {
+    /// A person, by their principal's name: they send and receive as the role they hold in the
+    /// project the message concerns.
+    Person(String),
+    /// A crew member: role `role` of convoy `convoy` in `project`.
+    Seat { project: String, convoy: String, role: String },
+    /// A fleet role, by name: read on the FleetDesignation where the message is sent.
+    Fleet(String),
+    /// An inbox already named.
+    Inbox(flotilla_address::Address),
+}
+
+impl Party {
+    /// A fleet role, by name.
+    pub fn fleet(role: &str) -> Self {
+        Self::Fleet(role.to_owned())
+    }
+
+    /// The party a supervision policy's address names: a person by `principal:<name>`, else the
+    /// role inbox a crew role address names.
+    pub fn of_policy_address(address: &str) -> Result<Self, String> {
+        match address.strip_prefix("principal:") {
+            Some(principal) => Ok(Self::Person(principal.to_owned())),
+            None => flotilla_resources::convoy::engine::role_inbox(address).map(Self::Inbox),
+        }
+    }
+
+    /// The inbox this party sends and receives at, read through `messages` in `namespace`; a
+    /// person's is the role they hold in `project`, and a fleet role's is read on the
+    /// FleetDesignation by its name.
+    pub async fn inbox(
+        &self,
+        messages: &dyn flotilla_messaging::EngineMessages,
+        namespace: &str,
+        project: &str,
+    ) -> Result<flotilla_address::Address, String> {
+        match self {
+            Self::Person(principal) => messages.person(namespace, principal, Some(project)).await.map_err(|error| error.to_string()),
+            Self::Fleet(role) => messages.fleet_role(namespace, role).await.map_err(|error| error.to_string()),
+            Self::Seat { project, convoy, role } => flotilla_address::Address::project(project)
+                .map_err(|error| error.to_string())
+                .and_then(|project| flotilla_resources::convoy::engine::seat_address(&project, convoy, role)),
+            Self::Inbox(inbox) => Ok(inbox.clone()),
+        }
+    }
+
+    /// The person who sends as this party, when one does: admission traces them.
+    pub fn principal(&self) -> Option<String> {
+        match self {
+            Self::Person(principal) => Some(principal.clone()),
+            _ => None,
+        }
+    }
 }
 
 /// Canonical receiver admission is a workflow latch, not a delivery receipt.

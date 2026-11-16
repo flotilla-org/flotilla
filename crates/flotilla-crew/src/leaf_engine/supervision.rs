@@ -156,7 +156,7 @@ impl super::LeafSubscriptionTable {
         &self,
         namespace: &str,
         convoy: &ResourceObject<Convoy>,
-        sender: &str,
+        (sender, party): (&str, &super::Party),
         message: &str,
         source_vessel: &str,
         source_role: &str,
@@ -202,16 +202,17 @@ impl super::LeafSubscriptionTable {
             {
                 continue;
             }
-            let receiver = match target {
-                SupervisionTarget::Address { address } => address.clone(),
-                _ => {
-                    let target_project = convoys
-                        .iter()
-                        .find(|candidate| candidate.object.metadata.name == target_convoy)
-                        .and_then(|candidate| candidate.object.spec.project_ref.as_deref())
-                        .unwrap_or(namespace);
-                    crew_role_address(target_project, &target_convoy, &vessel, &role)
-                }
+            let target_project = convoys
+                .iter()
+                .find(|candidate| candidate.object.metadata.name == target_convoy)
+                .and_then(|candidate| candidate.object.spec.project_ref.as_deref())
+                .unwrap_or(namespace);
+            let (receiver, addressed) = match target {
+                SupervisionTarget::Address { address } => (address.clone(), super::Party::of_policy_address(address)?),
+                _ => (
+                    crew_role_address(target_project, &target_convoy, &vessel, &role),
+                    super::Party::Seat { project: target_project.to_owned(), convoy: target_convoy.clone(), role: role.clone() },
+                ),
             };
             // A declared crew state is not a receiver binding. Turn admission
             // can queue an unbound role, so check the binding before calling it.
@@ -228,7 +229,7 @@ impl super::LeafSubscriptionTable {
                 }
             }
             let intent = super::CrewTurnIntent::builder()
-                .receiver(receiver.clone())
+                .receiver(addressed)
                 .namespace(namespace.to_string())
                 .convoy(target_convoy.clone())
                 .source(super::stalls::supervision_message_source(&convoy.metadata.name, index))
@@ -236,13 +237,10 @@ impl super::LeafSubscriptionTable {
                 .role(role.clone())
                 .brief(format!("Escalated by {sender}: {message}\n\n{}", super::stalls::stall_supervision_brief(convoy, stalled)))
                 .subject_revision(stalled.began_at.timestamp_micros().to_string())
-                .sender(sender.to_string())
+                .sender(party.clone())
                 .relation(flotilla_resources::MessageRelation::Supervisor)
                 .expectation(super::stalls::supervision_expectation(rung))
-                .references(vec![flotilla_resources::MessageReference::ControlRecord {
-                    resource: flotilla_protocol::ResourceRef::new("flotilla.work/v1", "Convoy", namespace, &convoy.metadata.name),
-                    revision: convoy.metadata.resource_version.clone(),
-                }])
+                .references(vec![super::stalls::convoy_reference(convoy)?])
                 .maybe_stall_of((rung != StallRung::Operator).then(|| super::stalls::stall_subject(namespace, convoy, stalled)))
                 .build();
             let actuator = self.inner.turn_delivery.lock().await.clone();

@@ -12,11 +12,11 @@
 use chrono::{DateTime, Utc};
 use flotilla_address::{Address, Condition, Kind, Revision};
 use flotilla_messaging::{Intent, IntentExpectation, IntentReference};
-use flotilla_protocol::{Leaf, LeafAddress, LeafOperator};
+use flotilla_protocol::Leaf;
 use flotilla_resources::{
-    address::{leaf_address, stored_change_request_address, stored_issue_address, stored_repository_address},
-    convoy::engine::{launch_address, split_launch},
-    convoy_of_segment, ForgeSpec, MessageExpectation, MessageReference, MessageRelation, MessageSpec as OldSpec,
+    address::{leaf_condition, stored_change_request_address, stored_issue_address, stored_repository_address},
+    convoy::engine::role_inbox,
+    ForgeSpec, MessageExpectation, MessageReference, MessageRelation, MessageSpec as OldSpec,
 };
 use flotilla_state_machines::machines::message::{MessageBody, MessageRef, MessageReference as Reference, MessageSpec, Relation};
 
@@ -90,21 +90,7 @@ impl Conversion<'_> {
         if receiver.starts_with("topic:") {
             return Err(format!("`{receiver}` is a topic; resolve its subscriber's role first"));
         }
-        let refused = |error: flotilla_address::Error| format!("`{receiver}`: {error}");
-        match receiver.split('/').collect::<Vec<_>>().as_slice() {
-            [project, segment, _vessel, role] => {
-                let project = Address::project(project).map_err(refused)?;
-                // The segment escapes the convoy's name; a standing role's launch is named by its own address.
-                let convoy = convoy_of_segment(segment);
-                let launch = match split_launch(&convoy) {
-                    Some(_) => launch_address(&project, &convoy).map_err(|error| format!("`{receiver}`: {error}"))?,
-                    None => project.child(Kind::Convoy, &convoy).map_err(refused)?,
-                };
-                launch.child(Kind::Role, role).map_err(refused)
-            }
-            [project, role] => Address::project(project).and_then(|project| project.child(Kind::Role, role)).map_err(refused),
-            _ => Err(format!("`{receiver}` is not a role address")),
-        }
+        role_inbox(receiver)
     }
 
     /// A person's role in `project`, or under the fleet with no project. A
@@ -189,38 +175,7 @@ impl Conversion<'_> {
     /// (ADR 0066 §8): `work/C/V .crew.R.<path>` is `project:P/convoy:C/role:R .<path>`,
     /// under `project` when the receiver's project is known.
     pub fn condition(&self, leaf: &Leaf, project: Option<&str>) -> Result<Condition, String> {
-        let refused = |reason: String| format!("condition `{leaf}`: {reason}");
-        let (address, path) = match &leaf.address {
-            LeafAddress::Work { convoy, .. } => {
-                let path = leaf.field_path.strip_prefix(".crew.").ok_or_else(|| refused("a work leaf names a crew role's field".into()))?;
-                let (role, rest) = path.split_once('.').ok_or_else(|| refused("a crew field names a role and a field".into()))?;
-                let convoy = match project {
-                    Some(project) => Address::project(project).and_then(|project| project.child(Kind::Convoy, convoy)),
-                    None => Address::convoy(convoy),
-                };
-                let role = convoy.and_then(|convoy| convoy.child(Kind::Role, role)).map_err(|error| refused(error.to_string()))?;
-                (role, format!(".{rest}"))
-            }
-            other => {
-                let address = leaf_address(other, self.forges).map_err(refused)?;
-                (address, leaf.field_path.clone())
-            }
-        };
-        let path = if path.starts_with('.') { path } else { format!(".{path}") };
-        let operator = match leaf.operator {
-            LeafOperator::Equal => "==",
-            LeafOperator::NotEqual => "!=",
-            LeafOperator::LessThan => "<",
-            LeafOperator::LessThanOrEqual => "<=",
-            LeafOperator::GreaterThan => ">",
-            LeafOperator::GreaterThanOrEqual => ">=",
-        };
-        let literal = serde_json::to_string(&leaf.literal).expect("a string serializes");
-        let lenient = format!("{address} {path} {operator} {literal}");
-        let condition: Condition =
-            Condition::resolve(&lenient, &flotilla_address::BuiltinForges).map_err(|error| refused(error.to_string()))?;
-        // The canonical print is the stored identity; refuse anything the strict parser reads otherwise.
-        condition.to_string().parse::<Condition>().map_err(|error| refused(error.to_string()))
+        leaf_condition(leaf, project, self.forges)
     }
 
     /// An old reference as an ADR 0066 reference at its revision.
@@ -324,6 +279,8 @@ pub fn timestamp(at: &DateTime<Utc>) -> flotilla_schema::Timestamp {
 
 #[cfg(test)]
 mod tests {
+    use flotilla_resources::convoy::engine::launch_address;
+
     use super::*;
 
     fn conversion(roles: &FleetRoles) -> Conversion<'_> {

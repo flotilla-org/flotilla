@@ -10,7 +10,7 @@
 
 pub use flotilla_address::{record_name, Address, Kind as AddressKind, GITHUB_FORGE_ID};
 use flotilla_address::{Forge as AddressForge, ForgeKind as AddressForgeKind, ForgeLookup, GITHUB_HOSTS};
-use flotilla_protocol::{IssueRef, IssueSource, LeafAddress, Subject, SubjectKind};
+use flotilla_protocol::{IssueRef, IssueSource, Leaf, LeafAddress, LeafOperator, Subject, SubjectKind};
 
 use crate::{canonicalize_repo_url, normalize_issue_source, ForgeKind, ForgeSpec};
 
@@ -168,6 +168,41 @@ pub fn leaf_address(leaf: &LeafAddress, forges: &[ForgeSpec]) -> Result<Address,
         LeafAddress::Convoy { name } => Address::convoy(name).map_err(refused),
         LeafAddress::Vessel { .. } | LeafAddress::Work { .. } => Err(format!("leaf address {leaf:?} has no address")),
     }
+}
+
+/// A leaf as an ADR 0066 condition. A crew's progress addresses its role (ADR 0066 §8):
+/// `work/C/V .crew.R.<path>` is `project:P/convoy:C/role:R .<path>`, under `project` when the
+/// receiver's project is known.
+pub fn leaf_condition(leaf: &Leaf, project: Option<&str>, forges: &[ForgeSpec]) -> Result<flotilla_address::Condition, String> {
+    let refused = |reason: String| format!("condition `{leaf}`: {reason}");
+    let (address, path) = match &leaf.address {
+        LeafAddress::Work { convoy, .. } => {
+            let path = leaf.field_path.strip_prefix(".crew.").ok_or_else(|| refused("a work leaf names a crew role's field".into()))?;
+            let (role, rest) = path.split_once('.').ok_or_else(|| refused("a crew field names a role and a field".into()))?;
+            let convoy = match project {
+                Some(project) => Address::project(project).and_then(|project| project.child(AddressKind::Convoy, convoy)),
+                None => Address::convoy(convoy),
+            };
+            let role = convoy.and_then(|convoy| convoy.child(AddressKind::Role, role)).map_err(|error| refused(error.to_string()))?;
+            (role, format!(".{rest}"))
+        }
+        other => (leaf_address(other, forges).map_err(refused)?, leaf.field_path.clone()),
+    };
+    let path = if path.starts_with('.') { path } else { format!(".{path}") };
+    let operator = match leaf.operator {
+        LeafOperator::Equal => "==",
+        LeafOperator::NotEqual => "!=",
+        LeafOperator::LessThan => "<",
+        LeafOperator::LessThanOrEqual => "<=",
+        LeafOperator::GreaterThan => ">",
+        LeafOperator::GreaterThanOrEqual => ">=",
+    };
+    let literal = serde_json::to_string(&leaf.literal).expect("a string serializes");
+    let lenient = format!("{address} {path} {operator} {literal}");
+    let condition =
+        flotilla_address::Condition::resolve(&lenient, &flotilla_address::BuiltinForges).map_err(|error| refused(error.to_string()))?;
+    // The canonical print is the stored identity; refuse anything the strict parser reads otherwise.
+    condition.to_string().parse::<flotilla_address::Condition>().map_err(|error| refused(error.to_string()))
 }
 
 /// An artifact slot: the `kind` artifact about `subject` that `role`

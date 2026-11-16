@@ -183,6 +183,8 @@ mod tests {
         assert_eq!(turn_rules.as_str(), "fleet:fleet/role:turn-rules");
         assert_eq!(roles.role_of(&turn_rules), Some("turn-rules"));
         assert_eq!(roles.system_sender("system:hold"), Some(turn_rules.clone()));
+        // A stored legacy controller sender folds into turn rules (#3513).
+        assert_eq!(roles.system_sender("system:legacy"), Some(turn_rules.clone()));
         assert_eq!(roles.system_sender("system:nudge").map(|a| a.to_string()), Some("fleet:fleet/role:nudge".into()));
         assert_eq!(roles.system_sender("system:unknown"), None);
         assert_eq!(roles.system_sender("principal:alice"), None);

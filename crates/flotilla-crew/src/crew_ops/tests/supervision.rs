@@ -96,12 +96,19 @@ async fn cross_vessel_handoff_case(remote: bool, publication_fails: bool, receiv
         resource: ResourceRef::new("flotilla.work/v1", "Convoy", "flotilla", &launch),
         revision: convoy.metadata.resource_version.clone(),
     };
+    // What the handoff carries, typed: the convoy at its revision, which the view spells as `carry`.
+    let carried = flotilla_address::Reference {
+        address: flotilla_resources::convoy::engine::convoy_reference_address(&launch, Some("flotilla")).expect("convoy address"),
+        revision: flotilla_address::Revision::new(convoy.metadata.resource_version.clone()).expect("revision"),
+    };
     let reviewer = held.receiver("review", "reviewer");
     let short = format!("{launch}/review/reviewer");
     if publication_fails {
         let before = held.convoy(&backend).await.status;
         for _ in 0..repeats {
-            crew.handoff_with_carries(&context, &short, "review this", vec![carry.clone()]).await.expect_err("receiver publication fails");
+            crew.handoff_with_carries(&context, &short, "review this", vec![carried.clone()])
+                .await
+                .expect_err("receiver publication fails");
             assert_eq!(held.convoy(&backend).await.status, before);
             assert!(home.messages.views().await.expect("inbox").is_empty());
         }
@@ -109,7 +116,7 @@ async fn cross_vessel_handoff_case(remote: bool, publication_fails: bool, receiv
     }
     for index in 0..repeats {
         let target = if index % 2 == 0 { short.as_str() } else { reviewer.as_str() };
-        crew.handoff_with_carries(&context, target, "review this", vec![carry.clone()]).await.expect("handoff");
+        crew.handoff_with_carries(&context, target, "review this", vec![carried.clone()]).await.expect("handoff");
         // The handoff delivers the reviewer its task: it is wanted running, and its vessel starts it.
         assert!(held.convoy(&backend).await.status.expect("status").crew_work["review"]["reviewer"].task_assigned);
         // The crew's view of a local Message spells its receiver by the vessel that holds it.
@@ -403,7 +410,7 @@ fn hold_state_and_single_supervisor_message(tc: hegel::TestCase) {
         let mut request = crate::leaf_engine::CrewTurnIntent::builder()
             .namespace("flotilla".into()).convoy(held.launch.clone()).source("checks-settled".into())
             .vessel("work".into()).role("coder".into()).brief("continue".into())
-            .subject_revision("head-one".into()).sender("system:turn-rules".into()).build();
+            .subject_revision("head-one".into()).sender(crate::leaf_engine::Party::fleet("turn-rules")).build();
         for retry in 0..retries {
             request.subject_revision = format!("head-{retry}");
             crew.execute_turn_delivery_hold(&request, &HoldAct::State, "episode limit").await.expect("hold");
@@ -456,7 +463,7 @@ async fn read_by_a_repeated_hold(count: usize) -> (u64, u64) {
         .role("coder".into())
         .brief("continue".into())
         .subject_revision("head".into())
-        .sender("system:turn-rules".into())
+        .sender(crate::leaf_engine::Party::fleet("turn-rules"))
         .build();
     crew.execute_turn_delivery_hold(&request, &HoldAct::State, "episode limit").await.expect("hold");
     let (held, reads) =
@@ -493,7 +500,7 @@ async fn terminal_convoys_refuse_resume_and_turn_delivery() {
             .role("coder".into())
             .brief("address review".into())
             .subject_revision("head".into())
-            .sender("system:turn-rules".into())
+            .sender(crate::leaf_engine::Party::fleet("turn-rules"))
             .build();
         let error = crew.deliver_turn(&request).await.expect_err("terminal delivery refuses");
         assert!(error.contains("--continue-pr") && error.contains("new generation"), "{error}");
@@ -658,7 +665,7 @@ fn escalation_admission_and_ownership(tc: hegel::TestCase) {
 }
 
 use crate::leaf_engine::{CrewTurnAdmission, CrewTurnIntent, TurnDeliveryActuator};
-use flotilla_resources::{Message, MessageExpectation, MessageRelation, MessageSpec, StallRung, StallSupervisor, SupervisionTarget};
+use flotilla_resources::{Message, MessageExpectation, MessageRelation, StallRung, StallSupervisor, SupervisionTarget};
 // Boundary fake: receiver-home publication may be unreachable. Successful
 // admissions go through the home's Message path, not an accepting mock.
 struct Delivery {
@@ -680,17 +687,12 @@ impl TurnDeliveryActuator for Delivery {
         if !self.reachable {
             return Err("receiver home offline".into());
         }
-        let receiver = request.receiver.as_ref().expect("resolved address");
-        let intent = MessageSpec::builder()
-            .sender(request.sender.clone())
-            .receiver(receiver.clone())
-            .relation(request.relation)
-            .expectation(request.expectation.clone())
-            .references(request.references.clone())
-            .body(request.brief.clone())
-            .build();
-        let name = flotilla_resources::message_record_name(receiver, &request.sender, &request.source);
-        let intent = self.messages.intent_of(&request.namespace, &intent).await.map_err(|error| error.to_string())?;
+        // The fixture's convoy declares no project: a person holds their role in the namespace's.
+        let (messages, namespace) = (self.messages.as_ref(), request.namespace.as_str());
+        let inbox = request.receiver.as_ref().expect("resolved receiver").inbox(messages, namespace, namespace).await?;
+        let sender = request.sender.inbox(messages, namespace, namespace).await?;
+        let name = flotilla_resources::message_record_name(inbox.as_str(), sender.as_str(), &request.source);
+        let intent = crate::crew_ops::turn_intent(request, sender, inbox);
         let record = self.messages.admit(&name, &intent).await.map_err(|error| error.to_string())?;
         let convoys = self.backend.using::<ResourceConvoy>(&request.namespace);
         if request.convoy == self.launch && request.vessel == "work" && request.role == "deputy" {
@@ -995,7 +997,14 @@ async fn escalation_resolution_error_is_not_a_receiver_refusal() {
     let before = held.convoy(&backend).await;
     let error = crew
         .leaf_subscriptions
-        .escalate_stall("flotilla", &before, "principal:operator", "handle this", "work", "coder")
+        .escalate_stall(
+            "flotilla",
+            &before,
+            ("principal:operator", &crate::leaf_engine::Party::Person("operator".into())),
+            "handle this",
+            "work",
+            "coder",
+        )
         .await
         .err()
         .expect("lookup error must not become a typed refusal");

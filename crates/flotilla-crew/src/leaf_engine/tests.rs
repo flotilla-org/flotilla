@@ -1092,12 +1092,13 @@ async fn merged_unclaimed_scenario(repeats: usize, unknown_head: bool, stalled: 
         let current = convoys.get(launch).await.expect("resumed");
         assert_eq!(current.status.as_ref().expect("status").crew_work["work"]["coder"].phase, CrewWorkPhase::Working);
     }
-    let subject = actuator.requests.lock().unwrap()[0].message_subject.clone().unwrap();
+    let (kind, _, revision) = turn_subject(&actuator.requests.lock().unwrap()[0]);
+    assert_eq!(kind, flotilla_address::Kind::ChangeRequest);
     if unknown_head {
-        assert!(matches!(subject, flotilla_resources::MessageReference::ControlRecord { resource, revision }
-            if resource.kind == "ChangeRequest" && !revision.is_empty()));
+        // The change request at its observation record's revision.
+        assert!(!revision.is_empty());
     } else {
-        assert!(matches!(subject, flotilla_resources::MessageReference::ChangeRequest { revision, .. } if revision == "merged-head"));
+        assert_eq!(revision, "merged-head");
     }
     assert!(actuator.requests.lock().expect("requests")[0].brief.contains("PR merged"));
     assert!(actuator.requests.lock().expect("requests")[0].brief.contains("decision ledger"));
@@ -1810,6 +1811,13 @@ fn engine_table(
     LeafSubscriptionTable::new(backend, event_sink, change_requests, home.reads())
         .with_message_path(home.message_path())
         .with_convoy_engine(home.path())
+}
+
+/// A turn's subject: the kind and name of the address its subject reference names, at its
+/// revision.
+fn turn_subject(request: &CrewTurnIntent) -> (flotilla_address::Kind, String, String) {
+    let subject = request.references.iter().rev().find(|reference| reference.subject).expect("the turn names a subject");
+    (subject.address.kind(), subject.address.name().to_owned(), subject.revision.to_string())
 }
 
 mod change_request_authority;

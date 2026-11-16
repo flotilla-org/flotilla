@@ -2121,6 +2121,7 @@ version = "0.1.0"
 dependencies = [
  "bon",
  "clap",
+ "flotilla-address",
  "flotilla-build-features",
  "flotilla-build-features-async",
  "flotilla-build-features-base",
@@ -3491,6 +3492,7 @@ dependencies = [
  "base64 0.22.1",
  "bon",
  "chrono",
+ "flotilla-address",
  "flotilla-build-features",
  "flotilla-build-features-async",
  "flotilla-build-features-base",

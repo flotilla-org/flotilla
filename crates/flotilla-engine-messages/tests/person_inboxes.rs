@@ -101,3 +101,33 @@ async fn person_inboxes_list_no_project_after_the_first_read() {
     }
     assert_eq!(after_a_change[0], after_a_change[1], "a change's reads do not grow with the projects");
 }
+
+// Read cost: a producer resolves its parties on every turn, so a fleet role and a person's role
+// in a project are keyed reads of the designation and of that project, listing neither, at the
+// same cost with 5 or 60 projects declared.
+#[tokio::test]
+async fn a_fleet_role_and_a_persons_role_are_keyed_reads() {
+    let mut costs = Vec::new();
+    for size in [5, 60] {
+        let backend = InMemoryBackend::default().with_read_counts();
+        designate_fleet(&backend, NAMESPACE).await;
+        for n in 0..size {
+            project(&backend, &format!("project-{n}"), Some("owner")).await;
+        }
+        let home = EngineMessagesHome::open("home", NAMESPACE, &backend);
+        let primitives = home.primitives();
+
+        let before = backend.read_snapshot();
+        let turn_rules = primitives.fleet_role(NAMESPACE, "turn-rules").await.expect("fleet role");
+        let owner = primitives.person_role(NAMESPACE, "alice", Some("project-0")).await.expect("person role");
+        let reads = backend.read_snapshot().since(&before);
+        assert_eq!(turn_rules, inbox("fleet:lab/role:turn-rules"));
+        assert_eq!(owner, inbox("project:project-0/role:owner"));
+        for kind in ["FleetDesignation", "Project"] {
+            assert_eq!(reads.calls(kind, ReadOperation::List), 0, "{size} projects: {reads:#?}");
+            assert_eq!(reads.calls(kind, ReadOperation::Query), 0, "{size} projects: {reads:#?}");
+        }
+        costs.push((reads.tally("FleetDesignation", ReadOperation::Get), reads.tally("Project", ReadOperation::Get)));
+    }
+    assert_eq!(costs[0], costs[1], "a party's reads do not grow with the projects");
+}

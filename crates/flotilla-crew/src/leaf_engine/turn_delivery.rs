@@ -5,13 +5,20 @@ use async_trait::async_trait;
 use chrono::{DateTime, Utc};
 use flotilla_protocol::{Leaf, LeafAddress};
 use flotilla_resources::{
-    address::leaf_record_name, evaluate_leaf, expected_change_request_leaves, external_patches, Artifact, ArtifactLeafSubject,
-    ChangeRequest, Convoy, ConvoyAttention, HoldAct, Issue, ObservedChecks, ResourceError, ResourceObject, StatusPatch, TerminalSession,
-    TerminalSessionSource, ThreeValue, TurnDeliveryEpisode, TurnDeliveryOutcome, TurnDeliveryRule, CONVOY_LABEL, ROLE_LABEL, VESSEL_LABEL,
+    address::{artifact_address, leaf_address, leaf_condition, leaf_record_name},
+    evaluate_leaf, expected_change_request_leaves, external_patches, Artifact, ArtifactLeafSubject, ChangeRequest, Convoy, ConvoyAttention,
+    HoldAct, Issue, ObservedChecks, ResourceError, ResourceObject, StatusPatch, TerminalSession, TerminalSessionSource, ThreeValue,
+    TurnDeliveryEpisode, TurnDeliveryOutcome, TurnDeliveryRule, CONVOY_LABEL, ROLE_LABEL, VESSEL_LABEL,
 };
 
 use super::stalls::{is_active_change_request_probe, is_conflict_probe, is_merged_settlement_probe, launch_underway};
-use super::{CrewTurnAdmission, CrewTurnIntent, LeafSubscriptionTable, TurnDeliveryActuator};
+use super::{CrewTurnAdmission, CrewTurnIntent, LeafSubscriptionTable, Party, TurnDeliveryActuator};
+
+/// A turn's subject: `address` at `revision`.
+fn subject_reference(address: flotilla_address::Address, revision: String) -> Result<flotilla_messaging::IntentReference, String> {
+    let revision = flotilla_address::Revision::new(revision).map_err(|error| format!("subject {address}: {error}"))?;
+    Ok(flotilla_messaging::IntentReference::subject(address, revision))
+}
 
 /// Immutable producer key shared by escalation publication and pre-replication replies.
 pub(crate) fn turn_message_producer_key(source: &str, subject_revision: &str) -> String {
@@ -278,7 +285,7 @@ impl LeafSubscriptionTable {
         // update, an artifact's subject); `subject_revision` also names what
         // distinguishes repeat firings at it (an artifact digest).
         let (subject_revision, progress, evidence_at, brief, message_subject) = match &leaf.address {
-            LeafAddress::ChangeRequest { service, scope, number } => {
+            LeafAddress::ChangeRequest { number, .. } => {
                 let record_name = leaf_record_name(&leaf.address, &forges)?;
                 let record = self
                     .inner
@@ -376,21 +383,12 @@ impl LeafSubscriptionTable {
                 } else {
                     head_sha
                 };
-                let subject = cr.head_sha.value.as_ref().map_or_else(
-                    || flotilla_resources::MessageReference::ControlRecord {
-                        resource: flotilla_protocol::ResourceRef::new("flotilla.work/v1", "ChangeRequest", &namespace, &record_name),
-                        revision: record.object.metadata.resource_version.clone(),
-                    },
-                    |head| flotilla_resources::MessageReference::ChangeRequest {
-                        service: service.clone(),
-                        scope: scope.clone(),
-                        number: *number,
-                        revision: head.clone(),
-                    },
-                );
+                // The change request at its head; at its observation's revision while the head is unknown.
+                let at = cr.head_sha.value.clone().unwrap_or_else(|| record.object.metadata.resource_version.clone());
+                let subject = subject_reference(leaf_address(&leaf.address, &forges)?, at)?;
                 (revision.clone(), revision, evidence_at, brief, Some(subject))
             }
-            LeafAddress::Issue { service, scope, number } => {
+            LeafAddress::Issue { .. } => {
                 let record_name = leaf_record_name(&leaf.address, &forges)?;
                 let record = self
                     .inner
@@ -438,12 +436,7 @@ impl LeafSubscriptionTable {
                     revision,
                     evidence_at,
                     brief,
-                    Some(flotilla_resources::MessageReference::Issue {
-                        service: service.clone(),
-                        scope: scope.clone(),
-                        number: *number,
-                        revision: updated_at.to_rfc3339(),
-                    }),
+                    Some(subject_reference(leaf_address(&leaf.address, &forges)?, updated_at.to_rfc3339())?),
                 )
             }
             LeafAddress::Artifact { convoy: artifact_convoy, producer, kind, subject } => {
@@ -519,10 +512,10 @@ impl LeafSubscriptionTable {
                     subject.clone(),
                     evidence_at,
                     brief,
-                    Some(flotilla_resources::MessageReference::Artifact {
-                        resource: flotilla_protocol::ResourceRef::new("flotilla.work/v1", "Artifact", &namespace, &name),
-                        revision: artifact.spec.digest.clone(),
-                    }),
+                    Some(subject_reference(
+                        artifact_address(&artifact.spec.convoy, &artifact.spec.producer, &artifact.spec.kind, &artifact.spec.subject)?,
+                        artifact.spec.digest.clone(),
+                    )?),
                 )
             }
             _ => return Err(DeliveryError::permanent("turn-delivery leaf is not externally observed")),
@@ -572,10 +565,9 @@ impl LeafSubscriptionTable {
                 }),
                 _ => None,
             })
-            .sender("system:turn-rules".into())
-            .references(message_subject.clone().into_iter().collect())
-            .maybe_message_subject(message_subject)
-            .delivery_condition(leaf.clone())
+            .sender(Party::fleet("turn-rules"))
+            .references(message_subject.into_iter().collect())
+            .delivery_condition(leaf_condition(leaf, Some(convoy.spec.project_ref.as_deref().unwrap_or(&namespace)), &forges)?)
             .build();
         let run = status.turn_deliveries.get(source).map_or(0, |delivery| unprogressed_run(&delivery.episodes, &progress));
         let now = Utc::now();

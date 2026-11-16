@@ -8,28 +8,25 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 
 use async_trait::async_trait;
+use chrono::{DateTime, Utc};
 use flotilla_address::Address;
 use flotilla_engine_messages::{
     convert::{Conversion, ReferenceAddresses},
     roles::FleetRoles,
 };
-use flotilla_messaging::Intent;
-use flotilla_resources::{
-    Message, MessageExpectation, MessageReference, MessageSpec, ObjectMeta, ReadResourceObject, ResourceError, ResourceObject,
-    ResourceProvenance,
-};
+use flotilla_messaging::{Intent, IntentExpectation};
+use flotilla_resources::{MessageReference, MessageSpec, ResourceError};
 
 use super::fixture_with_message_path;
-use crate::leaf_engine::CrewTurnIntent;
+use crate::leaf_engine::{CrewTurnIntent, Party};
 use crate::ports::MessagePath;
 use flotilla_messaging::EngineMessages;
 
 /// An engine Message path at "home-a" that admits into memory, fails its
 /// first `failures` record writes, and records what it is asked to end.
 struct RecordingMessages {
-    admitted: Mutex<BTreeMap<String, ResourceObject<Message>>>,
-    /// Each old-shaped intent the port converted, by its conversion: the reads answer from it.
-    converted: Mutex<Vec<(Intent, MessageSpec)>>,
+    /// Each admitted message by its name, with when it was admitted; none is delivered.
+    admitted: Mutex<BTreeMap<String, (Intent, DateTime<Utc>)>>,
     failures: AtomicUsize,
     records: Mutex<Vec<(String, String)>>,
     ended: Mutex<Vec<(Vec<String>, Option<String>)>>,
@@ -55,106 +52,84 @@ impl RecordingMessages {
     fn new(failures: usize) -> Arc<Self> {
         Arc::new(Self {
             admitted: Mutex::default(),
-            converted: Mutex::default(),
             failures: AtomicUsize::new(failures),
             records: Mutex::default(),
             ended: Mutex::default(),
         })
     }
 
-    /// The old-shaped intent `intent` was converted from.
-    fn old(&self, intent: &Intent) -> MessageSpec {
-        let converted = self.converted.lock().expect("converted");
-        converted.iter().rev().find(|(held, _)| held == intent).map(|(_, old)| old.clone()).expect("an intent the port converted")
+    /// The admitted messages in `inbox`, by name, oldest first.
+    fn in_inbox(&self, inbox: &Address) -> Vec<(String, Intent, DateTime<Utc>)> {
+        let admitted = self.admitted.lock().expect("admitted");
+        let mut held = admitted
+            .iter()
+            .filter(|(_, (intent, _))| intent.inbox == *inbox)
+            .map(|(name, (intent, at))| (name.clone(), intent.clone(), *at))
+            .collect::<Vec<_>>();
+        held.sort_by_key(|(_, _, at)| *at);
+        held
     }
 
-    /// The admitted messages to `receivers`; nothing admitted here is delivered.
-    fn admitted_to(&self, receivers: &[String]) -> Vec<ReadResourceObject<Message>> {
-        let admitted = self.admitted.lock().expect("admitted").values().cloned().collect::<Vec<_>>();
-        admitted
-            .into_iter()
-            .filter(|object| receivers.contains(&object.spec.receiver))
-            .map(|object| ReadResourceObject { object, provenance: ResourceProvenance::Local })
-            .collect()
-    }
-}
-
-/// An admitted message as the engine path reads it by name: where it stands, with its body.
-fn sent(object: &ResourceObject<Message>) -> flotilla_messaging::SentMessage {
-    flotilla_messaging::SentMessage {
-        standing: standing(object),
-        body: object.spec.body.clone(),
-        supersedes: object.spec.supersedes.clone(),
+    /// The admitted messages to each of `seats` (crew role addresses), oldest first.
+    fn to_seats(&self, seats: &[String]) -> Vec<(String, String, Intent, DateTime<Utc>)> {
+        let mut held = seats
+            .iter()
+            .filter_map(|seat| Some((seat, flotilla_resources::convoy::engine::role_inbox(seat).ok()?)))
+            .flat_map(|(seat, inbox)| self.in_inbox(&inbox).into_iter().map(move |(name, intent, at)| (seat.clone(), name, intent, at)))
+            .collect::<Vec<_>>();
+        held.sort_by_key(|(_, _, _, at)| *at);
+        held
     }
 }
 
-/// Where an admitted message stands, as the engine path reads it.
-fn standing(object: &ResourceObject<Message>) -> flotilla_messaging::SeatMessage {
-    let status = object.status.as_ref();
+/// An admitted message to `seat` as the engine path reads it by name: where it stands, with its
+/// body.
+fn sent(seat: &str, name: &str, intent: &Intent, at: DateTime<Utc>) -> flotilla_messaging::SentMessage {
+    flotilla_messaging::SentMessage { standing: standing(seat, name, at), body: intent.body.clone(), supersedes: intent.supersedes.clone() }
+}
+
+/// Where an admitted message to `seat` stands: admitted at `at`, never delivered.
+fn standing(seat: &str, name: &str, at: DateTime<Utc>) -> flotilla_messaging::SeatMessage {
     flotilla_messaging::SeatMessage {
-        seat: object.spec.receiver.clone(),
-        name: object.metadata.name.clone(),
-        phase: status.map(|status| status.phase).unwrap_or_default(),
-        reason: status.and_then(|status| status.reason.clone()),
-        accepted_sequence: status.and_then(|status| status.accepted_sequence).unwrap_or_default(),
-        created: object.metadata.creation_timestamp,
-        since: status.map_or(object.metadata.creation_timestamp, |status| status.since),
-        delivered_at: status.and_then(|status| status.resolved_receiver.as_ref()).map(|receiver| receiver.delivered_at),
+        seat: seat.to_owned(),
+        name: name.to_owned(),
+        phase: Default::default(),
+        reason: None,
+        accepted_sequence: 0,
+        created: at,
+        since: at,
+        delivered_at: None,
     }
 }
 
 #[async_trait]
 impl EngineMessages for RecordingMessages {
-    async fn holds(&self, _namespace: &str, receiver: &str, record: &str) -> Result<bool, ResourceError> {
-        Ok(self.admitted.lock().expect("admitted").get(record).is_some_and(|object| object.spec.receiver == receiver))
+    async fn holds(&self, inbox: &Address, record: &str) -> Result<bool, ResourceError> {
+        Ok(self.admitted.lock().expect("admitted").get(record).is_some_and(|(intent, _)| intent.inbox == *inbox))
     }
     async fn intent_of(&self, _namespace: &str, old: &MessageSpec) -> Result<Intent, ResourceError> {
         let roles = FleetRoles::declared("fleet").expect("declared roles");
-        let intent = Conversion { roles: &roles, forges: &[], records: &Named }.intent(old).map_err(ResourceError::invalid)?;
-        self.converted.lock().expect("converted").push((intent.clone(), old.clone()));
-        Ok(intent)
+        Conversion { roles: &roles, forges: &[], records: &Named }.intent(old).map_err(ResourceError::invalid)
     }
     async fn admitted(&self, inbox: &Address, record: &str) -> Result<Option<flotilla_messaging::AdmittedMessage>, ResourceError> {
-        let admitted = self.admitted.lock().expect("admitted").get(record).cloned();
-        let converted = self.converted.lock().expect("converted").clone();
-        let in_inbox = |object: &ResourceObject<Message>| {
-            converted.iter().any(|(intent, old)| intent.inbox == *inbox && old.receiver == object.spec.receiver)
-        };
-        Ok(admitted.filter(in_inbox).map(|object| flotilla_messaging::AdmittedMessage {
-            home: self.home(),
-            superseded_by: object.status.and_then(|status| status.canonical_predecessor).map(|predecessor| predecessor.name),
-        }))
+        let held = self.admitted.lock().expect("admitted").get(record).is_some_and(|(intent, _)| intent.inbox == *inbox);
+        Ok(held.then(|| flotilla_messaging::AdmittedMessage { home: self.home(), superseded_by: None }))
     }
-    async fn open_superseded(&self, intent: &Intent) -> Result<Option<String>, ResourceError> {
-        let intent = &self.old(intent);
-        // A delivered message from the same sender about the same subject, awaiting its answer.
-        Ok(self.admitted_to(std::slice::from_ref(&intent.receiver)).into_iter().find_map(|read| {
-            let held = &read.object;
-            let same = held.spec.sender == intent.sender && intent.subject.is_some() && held.spec.subject == intent.subject;
-            let awaiting = held.status.as_ref().is_some_and(|status| status.phase == flotilla_resources::MessagePhase::Delivered)
-                && held.spec.expectation != flotilla_resources::MessageExpectation::None;
-            (same && awaiting).then(|| held.metadata.name.clone())
-        }))
+    async fn open_superseded(&self, _intent: &Intent) -> Result<Option<String>, ResourceError> {
+        // Nothing admitted here is delivered, so nothing suppresses.
+        Ok(None)
     }
     async fn undelivered_from(&self, intent: &Intent) -> Result<Option<flotilla_messaging::SentMessage>, ResourceError> {
-        let intent = &self.old(intent);
-        let from =
-            self.admitted_to(std::slice::from_ref(&intent.receiver)).into_iter().filter(|read| read.object.spec.sender == intent.sender);
-        Ok(from.max_by_key(|read| read.object.metadata.creation_timestamp).map(|read| sent(&read.object)))
+        let from = self.in_inbox(&intent.inbox).into_iter().rev().find(|(_, held, _)| held.sender == intent.sender);
+        Ok(from.map(|(name, held, at)| sent(&intent.inbox.to_string(), &name, &held, at)))
     }
     async fn awaited_reply_from(&self, sender: &Address, inbox: &Address, about: &[Address]) -> Result<Option<String>, ResourceError> {
-        let converted = self.converted.lock().expect("converted").clone();
-        let admitted = self.admitted.lock().expect("admitted").values().cloned().collect::<Vec<_>>();
-        let awaiting = admitted.into_iter().filter(|object| {
-            converted.iter().any(|(intent, old)| {
-                *old == object.spec
-                    && intent.sender == *sender
-                    && intent.inbox == *inbox
-                    && old.expectation == MessageExpectation::Reply
-                    && intent.references.iter().any(|reference| about.contains(&reference.address))
-            })
+        let awaiting = self.in_inbox(inbox).into_iter().rev().find(|(_, held, _)| {
+            held.sender == *sender
+                && held.expectation == IntentExpectation::Reply
+                && held.references.iter().any(|reference| about.contains(&reference.address))
         });
-        Ok(awaiting.max_by_key(|object| object.metadata.creation_timestamp).map(|object| object.metadata.name))
+        Ok(awaiting.map(|(name, _, _)| name))
     }
     async fn fleet_role(&self, _namespace: &str, role: &str) -> Result<Address, ResourceError> {
         let roles = FleetRoles::declared("fleet").expect("declared roles");
@@ -166,16 +141,11 @@ impl EngineMessages for RecordingMessages {
         conversion.person(&format!("principal:{principal}"), project).map_err(ResourceError::invalid)
     }
     async fn queued_briefs(&self, _namespace: &str, seats: &[String]) -> Result<Vec<flotilla_messaging::SentMessage>, ResourceError> {
-        let mut briefs = self
-            .admitted_to(seats)
-            .into_iter()
-            .filter(|read| {
-                read.object.spec.relation == flotilla_resources::MessageRelation::Supervisor
-                    && !read.object.spec.sender.starts_with("system:")
-            })
-            .collect::<Vec<_>>();
-        briefs.sort_by_key(|read| read.object.metadata.creation_timestamp);
-        Ok(briefs.iter().map(|read| sent(&read.object)).collect())
+        let roles = FleetRoles::declared("fleet").expect("declared roles");
+        let briefs = self.to_seats(seats).into_iter().filter(|(_, _, intent, _)| {
+            intent.relation == flotilla_resources::MessageRelation::Supervisor && roles.role_of(&intent.sender).is_none()
+        });
+        Ok(briefs.map(|(seat, name, intent, at)| sent(&seat, &name, &intent, at)).collect())
     }
     async fn seat_standings(
         &self,
@@ -183,38 +153,24 @@ impl EngineMessages for RecordingMessages {
         receivers: &[String],
         _named: &[(String, String)],
     ) -> Result<Vec<flotilla_messaging::SeatMessage>, ResourceError> {
-        Ok(self.admitted_to(receivers).iter().map(|read| standing(&read.object)).collect())
+        Ok(self.to_seats(receivers).into_iter().map(|(seat, name, _, at)| standing(&seat, &name, at)).collect())
     }
     async fn sent_messages(
         &self,
         _namespace: &str,
         named: &[(String, String)],
     ) -> Result<Vec<flotilla_messaging::SentMessage>, ResourceError> {
-        let admitted = self.admitted.lock().expect("admitted");
         Ok(named
             .iter()
-            .filter_map(|(receiver, name)| admitted.get(name).filter(|object| object.spec.receiver == *receiver))
-            .map(sent)
+            .filter_map(|(seat, name)| {
+                let inbox = flotilla_resources::convoy::engine::role_inbox(seat).ok()?;
+                let (_, intent, at) = self.in_inbox(&inbox).into_iter().find(|(held, _, _)| held == name)?;
+                Some(sent(seat, name, &intent, at))
+            })
             .collect())
     }
     async fn admit(&self, name: &str, intent: &Intent) -> Result<flotilla_messaging::Admitted, ResourceError> {
-        let object = ResourceObject {
-            metadata: ObjectMeta {
-                name: name.to_owned(),
-                namespace: "flotilla".to_owned(),
-                resource_version: String::new(),
-                labels: Default::default(),
-                annotations: Default::default(),
-                owner_references: Vec::new(),
-                finalizers: Vec::new(),
-                deletion_timestamp: None,
-                creation_timestamp: chrono::Utc::now(),
-                merge: None,
-            },
-            spec: self.old(intent),
-            status: None,
-        };
-        self.admitted.lock().expect("admitted").insert(name.to_owned(), object);
+        self.admitted.lock().expect("admitted").entry(name.to_owned()).or_insert_with(|| (intent.clone(), Utc::now()));
         Ok(flotilla_messaging::Admitted { record: name.to_owned(), home: self.home() })
     }
     async fn resolve_in_reply_to(&self, intent: &Intent) -> flotilla_messaging::MessageResolution {
@@ -310,17 +266,18 @@ async fn a_failed_first_record_write_is_written_by_the_repeat() {
     let messages = RecordingMessages::new(1);
     let (crew, _backend, probe, held) = fixture_with_message_path(flotilla_resources::CrewWorkPhase::Done, wired(&messages)).await;
     probe.fail.store(false, Ordering::SeqCst);
+    let seat = |role: &str| Party::Seat { project: "flotilla".into(), convoy: held.launch.clone(), role: role.into() };
     let request = CrewTurnIntent::builder()
         .namespace("flotilla".into())
         .convoy(held.launch.clone())
         .source("ask".into())
         .vessel("work".into())
         .role("coder".into())
-        .receiver(held.receiver("work", "coder"))
+        .receiver(seat("coder"))
         .brief("a question".into())
         .subject_revision("revision".into())
-        .sender(held.receiver("work", "reviewer"))
-        .expectation(MessageExpectation::Reply)
+        .sender(seat("reviewer"))
+        .expectation(IntentExpectation::Reply)
         .build();
     let refused = crew.deliver_turn(&request).await.expect_err("the record failed");
     assert!(refused.contains("awaiting-reply record is not written yet") && refused.contains("the store is busy"), "{refused}");

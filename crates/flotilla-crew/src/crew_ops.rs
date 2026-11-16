@@ -52,7 +52,7 @@ use flotilla_vcs::vcs::CheckoutVcsResolver;
 use crate::crew_capabilities::{credential_references, session_card, CapabilityCardTracker};
 use crate::leaf_engine::{
     crew_role_address, supervision_message_source, turn_message_producer_key, CrewTurnAdmission, CrewTurnIntent, EscalationAdmission,
-    LeafSubscriptionTable, ResourceIntentPublisher, TurnDeliveryActuator,
+    LeafSubscriptionTable, Party, ResourceIntentPublisher, TurnDeliveryActuator,
 };
 use flotilla_resources::crew_attention;
 
@@ -445,8 +445,8 @@ fn ensure_crew_work_is_defined(
 
 /// Who a crew turn addresses (see `CrewService::turn_receiver`).
 enum TurnReceiver {
-    /// A receiver address taken as given.
-    Addressed(String),
+    /// An inbox taken as given, with the receiver spelling its holder is read by when it has one.
+    Addressed(flotilla_address::Address, Option<String>),
     /// A managed subscriber's crew member, resolved from its holder's labels.
     Managed(Box<CrewTurnIntent>),
     /// The request's own convoy crew member.
@@ -505,21 +505,23 @@ struct ResumeDelivery {
     displaced: Option<String>,
 }
 
-/// Who a crew command's message is from.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub enum Party {
-    /// A person, by their principal's name: they send as the role they hold where the message goes.
-    Person(String),
-    /// A crew member: role `role` of convoy `convoy` in `project`.
-    Seat { project: String, convoy: String, role: String },
+/// The message a turn of `request` sends from `sender` to `inbox`.
+pub(crate) fn turn_intent(request: &CrewTurnIntent, sender: flotilla_address::Address, inbox: flotilla_address::Address) -> Intent {
+    let mut intent = Intent::new(sender, inbox, request.relation, request.brief.clone());
+    intent.references = request.references.clone();
+    intent.expectation = request.expectation.clone();
+    intent.delivery_condition = request.delivery_condition.clone();
+    intent.principal = request.sender.principal();
+    intent
 }
 
-/// The person who sends as `party`, when one does: admission traces them.
-fn principal_of(party: &Party) -> Option<String> {
-    match party {
-        Party::Person(principal) => Some(principal.clone()),
-        Party::Seat { .. } => None,
-    }
+/// A turn's record name: its producer key, from its sender to its inbox.
+fn turn_record_name(request: &CrewTurnIntent, intent: &Intent) -> String {
+    flotilla_resources::message_record_name(
+        intent.inbox.as_str(),
+        intent.sender.as_str(),
+        &turn_message_producer_key(&request.source, &request.subject_revision),
+    )
 }
 
 /// The inboxes a message is from and to.
@@ -1308,13 +1310,14 @@ impl CrewService {
         let seat = Party::Seat { project: project.to_owned(), convoy: convoy_name.to_owned(), role: role.to_owned() };
         let parties =
             Parties { from: self.party_inbox(namespace, &party, project).await?, to: self.party_inbox(namespace, &seat, project).await? };
-        let in_reply_to =
-            off_frame(|| self.supervision_reply_to((project, convoy_name), stalled, (&sender, &receiver), &parties, actor_crew_id)).await?;
+        let in_reply_to = off_frame(|| self.supervision_reply_to(&convoy, stalled, &parties, actor_crew_id)).await?;
         let ruling = match action {
             flotilla_protocol::CrewSupervisionAction::Resume => SupervisorRuling::Resume,
             flotilla_protocol::CrewSupervisionAction::Fail => SupervisorRuling::Fail,
             flotilla_protocol::CrewSupervisionAction::Escalate => {
-                match off_frame(|| self.leaf_subscriptions.escalate_stall(namespace, &convoy, &sender, message, vessel, role)).await? {
+                match off_frame(|| self.leaf_subscriptions.escalate_stall(namespace, &convoy, (&sender, &party), message, vessel, role))
+                    .await?
+                {
                     EscalationAdmission::Refused(value) => return Ok(*value),
                     EscalationAdmission::Admitted { receiver, condition } => SupervisorRuling::Escalate { receiver, condition },
                 }
@@ -1330,7 +1333,7 @@ impl CrewService {
             let mut intent =
                 Intent::new(parties.from.clone(), parties.to.clone(), flotilla_resources::MessageRelation::Supervisor, message);
             intent.in_reply_to = in_reply_to.clone();
-            intent.principal = principal_of(&party);
+            intent.principal = party.principal();
             self.publish_message_intent(namespace, &name, &intent).await?;
         }
         match ruling {
@@ -1424,9 +1427,8 @@ impl CrewService {
     /// The escalation a supervision ruling replies to.
     async fn supervision_reply_to(
         &self,
-        (project, convoy_name): (&str, &str),
+        convoy: &ResourceObject<ResourceConvoy>,
         stalled: &flotilla_resources::StalledCondition,
-        (sender, receiver): (&str, &str),
         parties: &Parties,
         actor_crew_id: Option<&str>,
     ) -> Result<Option<String>, String> {
@@ -1439,8 +1441,9 @@ impl CrewService {
             return Ok(linked);
         }
         // The escalation runs the other way: from the crew to this ruling's sender, about the convoy.
-        let convoy = flotilla_resources::convoy::engine::convoy_reference_address(convoy_name, Some(project))?;
-        let found = self.awaited_reply_from(&parties.to, &parties.from, &[convoy]).await.map_err(|error| error.to_string())?;
+        let convoy_name = convoy.metadata.name.as_str();
+        let about = flotilla_resources::convoy::engine::convoy_reference_address(convoy_name, convoy.spec.project_ref.as_deref())?;
+        let found = self.awaited_reply_from(&parties.to, &parties.from, &[about]).await.map_err(|error| error.to_string())?;
         if found.is_some() {
             return Ok(found);
         }
@@ -1450,8 +1453,8 @@ impl CrewService {
         // carried) may name an escalation that was never sent: the ruling then goes unlinked, as
         // a supervisor's ruling never fails for want of its link.
         let name = flotilla_resources::message_record_name(
-            sender,
-            receiver,
+            parties.from.as_str(),
+            parties.to.as_str(),
             &turn_message_producer_key(&supervision_message_source(convoy_name, index), &stalled.began_at.timestamp_micros().to_string()),
         );
         Ok(self.reply_link(parties, &name).await)
@@ -1878,8 +1881,10 @@ impl CrewService {
         requested: &CrewCommandContext,
         target: &str,
         message: &str,
-        carries: Vec<flotilla_resources::MessageReference>,
+        carries: Vec<flotilla_address::Reference>,
     ) -> Result<(), String> {
+        let carries =
+            carries.into_iter().map(|carry| flotilla_messaging::IntentReference::new(carry.address, carry.revision)).collect::<Vec<_>>();
         let context = self.resolve_crew_context(requested).await?;
         let convoys = self.resource_backend.clone().using::<ResourceConvoy>(&context.namespace);
         let convoy = convoys.get(&context.convoy).await.map_err(|err| err.to_string())?;
@@ -1942,7 +1947,7 @@ impl CrewService {
                     .role((target_role).into())
                     .brief(message.into())
                     .subject_revision(uuid::Uuid::new_v4().to_string())
-                    .sender(crew_role_address(project, &context.convoy, &context.vessel, &context.caller_role))
+                    .sender(Party::Seat { project: project.to_owned(), convoy: context.convoy.clone(), role: context.caller_role.clone() })
                     .relation(flotilla_resources::MessageRelation::Peer)
                     .references(carries)
                     .build(),
@@ -1983,13 +1988,14 @@ impl CrewService {
         let project = convoy.spec.project_ref.as_deref().unwrap_or(&context.namespace);
         let sender = crew_role_address(project, &context.convoy, &context.vessel, &context.caller_role);
         let receiver = crew_role_address(project, &context.convoy, &context.vessel, target);
-        let intent = flotilla_resources::MessageSpec::builder()
-            .sender(sender.clone())
-            .receiver(receiver.clone())
-            .relation(flotilla_resources::MessageRelation::Peer)
-            .body(message.to_string())
-            .references(carries)
-            .build();
+        let seat = |role: &str| Party::Seat { project: project.to_owned(), convoy: context.convoy.clone(), role: role.to_owned() };
+        let mut intent = Intent::new(
+            self.party_inbox(&context.namespace, &seat(&context.caller_role), project).await?,
+            self.party_inbox(&context.namespace, &seat(target), project).await?,
+            flotilla_resources::MessageRelation::Peer,
+            message,
+        );
+        intent.references = carries;
         let message_name = flotilla_resources::message_record_name(&receiver, &sender, &format!("handoff:{}", uuid::Uuid::new_v4()));
         let sessions = self.resource_backend.clone().using::<ResourceTerminalSession>(&context.namespace);
         let identity = TerminalSessionIdentity::builder()
@@ -2056,7 +2062,7 @@ impl CrewService {
         let reassign = || engine.reassign(&convoy, &context.vessel, &context.caller_role, target);
         // Admit the turn before reopening its recipient: the reopened crew's
         // derived Done waits on that turn's delivery (#3894).
-        let admitted = self.publish_message_spec(&context.namespace, &message_name, &intent).await?;
+        let admitted = self.publish_message_intent(&context.namespace, &message_name, &intent).await?;
         // Each branch below reuses the admitted turn once its target session is settled.
         let send = || async { Ok::<_, String>(admitted.clone()) };
         // A handoff that fails after its engine turn was admitted withdraws that
@@ -2213,7 +2219,7 @@ impl CrewService {
         }
         .await;
         if let (Err(_), Ok(engine)) = (&handed_off, self.message_primitives()) {
-            if let Err(error) = engine.withdraw(&context.namespace, &intent.receiver, &message_name, &context.convoy).await {
+            if let Err(error) = engine.withdraw(&context.namespace, &receiver, &message_name, &context.convoy).await {
                 tracing::warn!(convoy = %context.convoy, message = %message_name, %error, "a failed handoff's admitted turn was not withdrawn");
             }
         }
@@ -2358,7 +2364,7 @@ impl CrewService {
         let (from, to) = (self.party_inbox(namespace, &party, project).await?, self.party_inbox(namespace, &seat, project).await?);
         let mut intent = Intent::new(from, to, flotilla_resources::MessageRelation::Supervisor, body);
         intent.in_reply_to = in_reply_to;
-        intent.principal = principal_of(&party);
+        intent.principal = party.principal();
         Ok(intent)
     }
 
@@ -2649,23 +2655,33 @@ impl CrewService {
         self.leaf_subscriptions.reconcile_stalls_once(namespace).await
     }
 
-    async fn deliver_addressed_turn(&self, request: &CrewTurnIntent, receiver: &str) -> Result<CrewTurnAdmission, String> {
-        let intent = flotilla_resources::MessageSpec::builder()
-            .sender(request.sender.clone())
-            .receiver(receiver.to_string())
-            .relation(request.relation)
-            .body(request.brief.clone())
-            .references(request.references.clone())
-            .maybe_subject(request.message_subject.clone())
-            .expectation(request.expectation.clone())
-            .maybe_delivery_condition(request.delivery_condition.clone())
-            .build();
-        let intent = self.intent_of(&request.namespace, &intent).await.map_err(|error| error.to_string())?;
-        let name = flotilla_resources::message_record_name(
-            receiver,
-            &request.sender,
-            &turn_message_producer_key(&request.source, &request.subject_revision),
-        );
+    /// The inbox `party` names for a turn of `request`: a person's is the role they hold in the
+    /// project of the turn's convoy.
+    async fn turn_inbox(&self, request: &CrewTurnIntent, party: &Party) -> Result<flotilla_address::Address, String> {
+        let project = match party {
+            Party::Person(_) => {
+                let convoy = self
+                    .resource_backend
+                    .including_replicas::<ResourceConvoy>(&request.namespace)
+                    .get(&request.convoy)
+                    .await
+                    .map_err(|error| error.to_string())?;
+                convoy.object.spec.project_ref.unwrap_or_else(|| request.namespace.clone())
+            }
+            _ => String::new(),
+        };
+        self.party_inbox(&request.namespace, party, &project).await
+    }
+
+    async fn deliver_addressed_turn(
+        &self,
+        request: &CrewTurnIntent,
+        inbox: flotilla_address::Address,
+        spelled: Option<&str>,
+    ) -> Result<CrewTurnAdmission, String> {
+        let sender = self.turn_inbox(request, &request.sender).await?;
+        let intent = turn_intent(request, sender, inbox);
+        let name = turn_record_name(request, &intent);
         if let Some(existing) = self.admitted_message(&intent, &name).await.map_err(|error| error.to_string())? {
             // A repeat records what an earlier send could not (record is idempotent).
             self.record_awaiting(&request.namespace, &name, &intent, Some(existing.home), request.stall_of.as_deref()).await?;
@@ -2680,9 +2696,12 @@ impl CrewService {
                 ),
             });
         }
-        let holder = flotilla_messaging::resolve_message_receiver(&self.resource_backend, &request.namespace, receiver)
-            .await
-            .map_err(|error| error.to_string())?;
+        let holder = match spelled {
+            Some(receiver) => flotilla_messaging::resolve_message_receiver(&self.resource_backend, &request.namespace, receiver)
+                .await
+                .map_err(|error| error.to_string())?,
+            None => None,
+        };
         let publisher = self.resource_intent_publisher.read().expect("resource intent publisher lock").as_ref().and_then(Weak::upgrade);
         let (message, new_turn) = if let Some(publisher) = publisher {
             let (reference, home) =
@@ -2755,7 +2774,9 @@ impl CrewService {
     pub async fn deliver_turn(&self, request: &CrewTurnIntent) -> Result<CrewTurnAdmission, String> {
         let managed_request;
         let request = match off_frame(|| self.turn_receiver(request)).await? {
-            TurnReceiver::Addressed(receiver) => return off_frame(|| self.deliver_addressed_turn(request, &receiver)).await,
+            TurnReceiver::Addressed(inbox, spelled) => {
+                return off_frame(|| self.deliver_addressed_turn(request, inbox, spelled.as_deref())).await
+            }
             TurnReceiver::Managed(resolved) => {
                 managed_request = *resolved;
                 &managed_request
@@ -2773,14 +2794,23 @@ impl CrewService {
     /// or the request's own convoy crew member.
     async fn turn_receiver(&self, request: &CrewTurnIntent) -> Result<TurnReceiver, String> {
         let Some(receiver) = &request.receiver else { return Ok(TurnReceiver::Convoy) };
-        let holder = flotilla_messaging::resolve_message_receiver(&self.resource_backend, &request.namespace, receiver)
+        let inbox = self.turn_inbox(request, receiver).await?;
+        // A person and a fleet role hold no terminal session.
+        let spelled = match receiver {
+            Party::Person(_) | Party::Fleet(_) => None,
+            Party::Seat { .. } | Party::Inbox(_) => flotilla_messaging::inbox_receiver(&self.resource_backend, &request.namespace, &inbox)
+                .await
+                .map_err(|error| error.to_string())?,
+        };
+        let Some(spelled) = spelled else { return Ok(TurnReceiver::Addressed(inbox, None)) };
+        let holder = flotilla_messaging::resolve_message_receiver(&self.resource_backend, &request.namespace, &spelled)
             .await
             .map_err(|error| error.to_string())?;
         if holder.as_ref().is_none_or(|holder| {
-            holder.object.metadata.annotations.get(flotilla_resources::ROLE_ADDRESS_ANNOTATION) == Some(receiver)
+            holder.object.metadata.annotations.get(flotilla_resources::ROLE_ADDRESS_ANNOTATION) == Some(&spelled)
                 || !holder.object.metadata.labels.contains_key(CONVOY_LABEL)
         }) {
-            return Ok(TurnReceiver::Addressed(receiver.clone()));
+            return Ok(TurnReceiver::Addressed(inbox, Some(spelled)));
         }
         // A managed subscriber still needs workflow activation and staged
         // credentials; an externally adopted holder owns its own lifecycle.
@@ -2796,7 +2826,6 @@ impl CrewService {
     /// The turn's message and its receiver's session; the earlier admission instead when the same
     /// intent was already sent or an open message suppresses it.
     async fn prepare_crew_turn(&self, request: &CrewTurnIntent) -> Result<PreparedTurn, String> {
-        use flotilla_resources::MessageSpec;
         let target = self
             .resource_backend
             .including_replicas::<ResourceConvoy>(&request.namespace)
@@ -2810,28 +2839,11 @@ impl CrewService {
         self.ensure_vessel_backing_available(&request.namespace, &request.convoy, &request.vessel).await?;
         let project = convoy.spec.project_ref.as_deref().unwrap_or(&request.namespace);
         let receiver = crew_role_address(project, &request.convoy, &request.vessel, &request.role);
-        let context = flotilla_resources::MessageAddressContext {
-            project: project.to_string(),
-            convoy: request.convoy.clone(),
-            vessel: request.vessel.clone(),
-        };
-        let sender = flotilla_resources::qualify_message_address(&request.sender, &context).map_err(|error| error.to_string())?;
-        let intent = MessageSpec::builder()
-            .sender(sender.clone())
-            .receiver(receiver.clone())
-            .relation(request.relation)
-            .body(request.brief.clone())
-            .references(request.references.clone())
-            .maybe_subject(request.message_subject.clone())
-            .expectation(request.expectation.clone())
-            .maybe_delivery_condition(request.delivery_condition.clone())
-            .build();
-        let intent = self.intent_of(&request.namespace, &intent).await.map_err(|error| error.to_string())?;
-        let name = flotilla_resources::message_record_name(
-            &receiver,
-            &sender,
-            &turn_message_producer_key(&request.source, &request.subject_revision),
-        );
+        let seat = Party::Seat { project: project.to_owned(), convoy: request.convoy.clone(), role: request.role.clone() };
+        let inbox = self.party_inbox(&request.namespace, &seat, project).await?;
+        let sender = self.party_inbox(&request.namespace, &request.sender, project).await?;
+        let intent = turn_intent(request, sender, inbox);
+        let name = turn_record_name(request, &intent);
         let (holder, rung) = off_frame(|| self.turn_receiver_session(request, &receiver)).await?;
         if let Some(admission) = off_frame(|| self.earlier_turn_admission(request, &intent, &name, rung)).await? {
             return Ok(PreparedTurn::Admitted(admission));
@@ -3364,6 +3376,7 @@ impl CrewService {
                     },
                 ]
             });
+        let operator = || Party::Person("operator".into());
         let receiver = policy
             .iter()
             .find_map(|target| match target {
@@ -3376,64 +3389,60 @@ impl CrewService {
                             && crew.contains_key(role)
                             && !(**name == request.vessel && *role == request.role)
                     })
-                    .map(|(vessel, _)| crew_role_address(project, &request.convoy, vessel, role)),
-                // The existing project receiver resolver selects the session for this symbolic role.
-                // Vessel/crew selection belongs to that resolver, not hold delivery.
-                flotilla_resources::SupervisionTarget::ProjectCrew { convoy_role, .. } => Some(format!("{project}/{convoy_role}")),
-                flotilla_resources::SupervisionTarget::Address { address } => Some(address.clone()),
-                flotilla_resources::SupervisionTarget::Operator => Some("principal:operator".into()),
+                    .map(|_| Ok(Party::Seat { project: project.to_owned(), convoy: request.convoy.clone(), role: role.clone() })),
+                // The project role's holder is read where the message is admitted; vessel and crew
+                // selection belong there, not to hold delivery.
+                flotilla_resources::SupervisionTarget::ProjectCrew { convoy_role, .. } => Some(
+                    flotilla_address::Address::project(project)
+                        .and_then(|project| project.child(flotilla_address::Kind::Role, convoy_role))
+                        .map(Party::Inbox)
+                        .map_err(|error| error.to_string()),
+                ),
+                flotilla_resources::SupervisionTarget::Address { address } => Some(Party::of_policy_address(address)),
+                flotilla_resources::SupervisionTarget::Operator => Some(Ok(operator())),
             })
-            .unwrap_or_else(|| "principal:operator".into());
-        let sender = "system:turn-rules";
+            .unwrap_or_else(|| Ok(operator()))?;
+        let receiver = self.party_inbox(&request.namespace, &receiver, project).await?;
+        let sender = self.party_inbox(&request.namespace, &Party::fleet("turn-rules"), project).await?;
         let hold_key =
             format!("{}:{}:{}:{}:{}", request.convoy, request.vessel, request.role, request.source, attention.raised_at.timestamp_micros());
         let mut references = request.references.clone();
-        references.push(flotilla_resources::MessageReference::ControlRecord {
-            resource: ResourceRef::new("flotilla.work/v1", "Convoy", &request.namespace, &request.convoy),
-            revision: convoy.metadata.resource_version.clone(),
-        });
+        let about = flotilla_resources::convoy::engine::convoy_reference_address(&request.convoy, convoy.spec.project_ref.as_deref())?;
+        let revision = flotilla_address::Revision::new(convoy.metadata.resource_version.clone()).map_err(|error| error.to_string())?;
+        references.push(flotilla_messaging::IntentReference::new(about, revision));
+        let hold = |inbox: flotilla_address::Address, body: String| {
+            let mut intent = Intent::new(sender.clone(), inbox, flotilla_resources::MessageRelation::System, body);
+            intent.references = references.clone();
+            intent.delivery_condition = request.delivery_condition.clone();
+            intent
+        };
         // The held crew hears why its wakes stopped, rather than waiting on one
         // that will not come (#3565). Published before the supervisor signal so a
         // retry after a lost acceptance completes both.
-        let crew = crew_role_address(project, &request.convoy, &request.vessel, &request.role);
-        let notice = flotilla_resources::message_record_name("system:hold", sender, &format!("hold-notice:{hold_key}"));
-        let notified = self.holds_message(&request.namespace, &crew, &notice).await.map_err(|error| error.to_string())?;
+        let crew = Party::Seat { project: project.to_owned(), convoy: request.convoy.clone(), role: request.role.clone() };
+        let crew = self.party_inbox(&request.namespace, &crew, project).await?;
+        let notice = flotilla_resources::message_record_name("system:hold", "system:turn-rules", &format!("hold-notice:{hold_key}"));
+        let notified = self.holds_message(&crew, &notice).await.map_err(|error| error.to_string())?;
         if crew != receiver && !notified {
-            let intent = flotilla_resources::MessageSpec::builder()
-                .sender(sender.into())
-                .receiver(crew)
-                .relation(flotilla_resources::MessageRelation::System)
-                .body(format!(
-                    "Automatic `{}` turns for you are held.\n\n{reason}\n\nYou will not be woken for this condition again until its \
-                     subject moves on (for example a new commit on your PR) or `{receiver}` resumes you. Do not wait for that wake: \
-                     carry on with your work, or stall if you are blocked.",
-                    request.source
-                ))
-                .references(references.clone())
-                .maybe_subject(request.message_subject.clone())
-                .maybe_delivery_condition(request.delivery_condition.clone())
-                .build();
-            self.publish_message_spec(&request.namespace, &notice, &intent).await?;
+            let body = format!(
+                "Automatic `{}` turns for you are held.\n\n{reason}\n\nYou will not be woken for this condition again until its \
+                 subject moves on (for example a new commit on your PR) or `{receiver}` resumes you. Do not wait for that wake: \
+                 carry on with your work, or stall if you are blocked.",
+                request.source
+            );
+            self.publish_message_intent(&request.namespace, &notice, &hold(crew, body)).await?;
         }
         // Producer identity follows the persisted hold, independent of receiver changes
         // or new observations racing a lost acceptance response.
-        let name = flotilla_resources::message_record_name("system:hold", sender, &format!("hold:{hold_key}"));
-        if self.holds_message(&request.namespace, &receiver, &name).await.map_err(|error| error.to_string())? {
+        let name = flotilla_resources::message_record_name("system:hold", "system:turn-rules", &format!("hold:{hold_key}"));
+        if self.holds_message(&receiver, &name).await.map_err(|error| error.to_string())? {
             return Ok(());
         }
-        let intent = flotilla_resources::MessageSpec::builder()
-            .sender(sender.into())
-            .receiver(receiver.clone())
-            .relation(flotilla_resources::MessageRelation::System)
-            .body(format!(
-                "Automatic turn delivery is held for {}/{}/{} ({})\n\n{reason}",
-                request.convoy, request.vessel, request.role, request.source
-            ))
-            .references(references)
-            .maybe_subject(request.message_subject.clone())
-            .maybe_delivery_condition(request.delivery_condition.clone())
-            .build();
-        self.publish_message_spec(&request.namespace, &name, &intent).await.map(|_| ())
+        let body = format!(
+            "Automatic turn delivery is held for {}/{}/{} ({})\n\n{reason}",
+            request.convoy, request.vessel, request.role, request.source
+        );
+        self.publish_message_intent(&request.namespace, &name, &hold(receiver, body)).await.map(|_| ())
     }
 
     async fn reconcile_resumed_work_credentials(&self, namespace: &str, environment_ref: &str) -> Result<(), String> {

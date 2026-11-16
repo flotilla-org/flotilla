@@ -257,7 +257,7 @@ async fn standing_governor_on_another_host_receives_a_stalled_crew_turn() {
         .role("governor".to_string())
         .brief("Escalated from coder@work in graphql-budget@flotilla:\n\nSupervise the stalled crew".to_string())
         .subject_revision("stall-1".to_string())
-        .sender("system:stall-judge".into())
+        .sender(flotilla_crew::leaf_engine::Party::fleet("stall-judge"))
         .relation(flotilla_resources::MessageRelation::Supervisor)
         .build();
     // Boundary fake for publication to the owning host; receiver admission

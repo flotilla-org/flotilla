@@ -276,6 +276,20 @@ pub fn seat_address(project: &flotilla_address::Address, convoy: &str, role: &st
     convoy.child(flotilla_address::Kind::Role, role).map_err(|error| error.to_string())
 }
 
+/// The inbox a crew role address names: `P/C/V/R` is the convoy role `project:P/convoy:C/role:R`
+/// (the vessel dropped, the segment's escapes undone), and `P/R` the standing role
+/// `project:P/role:R`.
+pub fn role_inbox(receiver: &str) -> Result<flotilla_address::Address, String> {
+    let project = |project: &str| flotilla_address::Address::project(project).map_err(|error| format!("`{receiver}`: {error}"));
+    match receiver.split('/').collect::<Vec<_>>().as_slice() {
+        [name, segment, _vessel, role] => {
+            seat_address(&project(name)?, &crate::convoy_of_segment(segment), role).map_err(|error| format!("`{receiver}`: {error}"))
+        }
+        [name, role] => project(name)?.child(flotilla_address::Kind::Role, role).map_err(|error| format!("`{receiver}`: {error}")),
+        _ => Err(format!("`{receiver}` is not a role address")),
+    }
+}
+
 /// The convoy records the convoy an address names may be, by name: a standing role's launch
 /// (`project:P/convoy:R#n`, named by its address) first, then the convoy its segment names.
 pub fn convoy_records(address: &flotilla_address::Address) -> Vec<String> {

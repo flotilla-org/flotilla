@@ -218,6 +218,12 @@ fn crew_spec() -> ConvoySpec {
     ConvoySpec::builder().workflow_ref("workflow".into()).role("crew".into()).build()
 }
 
+/// A turn's subject: the fixture's convoy `launch`, admitted in project `flotilla`, at `revision`.
+fn convoy_subject(launch: &str, revision: &str) -> flotilla_messaging::IntentReference {
+    let address = flotilla_resources::convoy::engine::convoy_reference_address(launch, Some("flotilla")).expect("convoy address");
+    flotilla_messaging::IntentReference::subject(address, flotilla_address::Revision::new(revision).expect("revision"))
+}
+
 /// [`fixture`] admitted with the workflow `shape` makes of the fixture's: a convoy's workflow is
 /// frozen when it is admitted.
 async fn shaped_fixture(
