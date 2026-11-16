@@ -101,6 +101,8 @@ struct Script {
     unplannable: BTreeMap<String, ProviderFailure>,
     /// Where holdings are requested and read.
     records: Option<Arc<LifecycleHome<ImageBuildKind, StoreLog>>>,
+    /// While set, a release tells the notify that it runs and waits for a permit.
+    release_gate: Option<(Arc<Notify>, Arc<tokio::sync::Semaphore>)>,
 }
 
 #[derive(Default)]
@@ -129,6 +131,11 @@ impl Actuator<EnvironmentKind> for Scripted {
     }
 
     async fn release(&self, _: &str, request: &EnvironmentRequest, identity: Option<&str>) -> Result<(), ProviderFailure> {
+        let gate = self.script().release_gate.clone();
+        if let Some((releasing, permits)) = gate {
+            releasing.notify_one();
+            permits.acquire().await.expect("permits").forget();
+        }
         self.script().released.push((key(request), identity.map(str::to_owned)));
         Ok(())
     }
@@ -525,6 +532,39 @@ async fn a_pushed_absence_loses_the_resource() {
         .await
         .expect("send");
     world.until("a lost", |world| world.state("a").gone()).await;
+}
+
+// A backing found absent while the controller releases it is the release's own doing: the
+// resource ends released, so what releasing cleans up is cleaned up, not lost (load_driver_smoke's
+// sessions left listed under an ended convoy: the probe saw the release's kill first).
+#[tokio::test]
+async fn an_absence_pushed_while_releasing_ends_the_resource_released() {
+    let mut world = World::open();
+    let (releasing, permits) = (Arc::new(Notify::new()), Arc::new(tokio::sync::Semaphore::new(0)));
+    world.actuator.script().release_gate = Some((Arc::clone(&releasing), Arc::clone(&permits)));
+    world.record("holder-a");
+    world.start();
+    world.request("a");
+    world.request("b");
+    world.until("a and b realised", |world| world.state("a").realised() && world.state("b").realised()).await;
+
+    let reached = releasing.notified();
+    world.record_step("holder-a", Step::Released);
+    reached.await;
+    let backing = world.backing.as_ref().expect("started");
+    backing
+        .send(BackingEvent { name: "a".into(), observed: Backing::Absent { reason: Some("process exited".into()) } })
+        .await
+        .expect("send");
+    // The controller takes pushed facts in order: once b is lost, a's absence has been read.
+    backing.send(BackingEvent { name: "b".into(), observed: Backing::Absent { reason: None } }).await.expect("send");
+    world.until("b lost", |world| world.state("b").gone()).await;
+    permits.add_permits(1);
+
+    world.until("a ended", |world| world.state("a").gone()).await;
+    let LifecycleState::Gone { ending } = world.state("a") else { unreachable!() };
+    assert_eq!(ending, flotilla_state_machines::machines::lifecycle::Ending::Released);
+    assert_eq!(world.actuator.script().released, [("a".to_owned(), Some("id-a".to_owned()))]);
 }
 
 // A pushed broken backing ends the resource as failed, with the reason the provider gave.

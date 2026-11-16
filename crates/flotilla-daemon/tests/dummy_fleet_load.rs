@@ -315,14 +315,25 @@ async fn watch_convoys(backend: &ResourceBackend, view: Arc<HomeView>, admission
                     }
                     admissions.lock().expect("admissions").entry(convoy.metadata.name.clone()).or_insert_with(tokio::time::Instant::now);
                     let state = convoy.status.as_ref().map_or(ConvoyState::Open, |status| state_of(status.phase));
+                    // An ended convoy's progress says why it ended, for an unexpected end's report.
+                    let ending = match convoy.status.as_ref().filter(|_| state.ended()) {
+                        Some(status) => format!(
+                            " message={:?} disposition={:?} work={:?} crew={:?}",
+                            status.message, status.disposition, status.work, status.crew_work
+                        ),
+                        None => String::new(),
+                    };
                     let observation = ConvoyObservation {
                         name: convoy.spec.role.clone(),
                         state,
-                        progress: format!("resource={} {}", convoy.metadata.name, place_of(&convoy)),
+                        progress: format!("resource={} {}{ending}", convoy.metadata.name, place_of(&convoy)),
                         stall: convoy.status.as_ref().and_then(|status| status.stalled.as_ref()).map(|stall| stall.evidence.clone()),
                         expects_stall: false,
                         expected_end: ConvoyState::Delivered,
                     };
+                    if state == ConvoyState::Failed {
+                        println!("convoy_failed {} {}", observation.name, observation.progress);
+                    }
                     {
                         let mut convoys = view.convoys.lock().expect("convoys");
                         if convoys.get(&convoy.spec.role).is_none_or(|(_, previous)| *previous != observation) {
@@ -649,7 +660,16 @@ impl FleetTarget for InProcessFleet {
             }
             for terminal in backend.clone().using::<TerminalSession>(NAMESPACE).list().await.map_err(|e| e.to_string())?.items {
                 if let Some(convoy) = terminal.metadata.labels.get("flotilla.work/convoy").filter(|c| ended.contains(*c)) {
-                    errors.push(format!("{convoy}: session {} remains", terminal.metadata.name));
+                    errors.push(format!(
+                        "{convoy}: session {} remains: phase={:?} message={:?} started={:?} stopped={:?} env={} labels={:?}",
+                        terminal.metadata.name,
+                        terminal.status.as_ref().map(|status| status.phase),
+                        terminal.status.as_ref().and_then(|status| status.message.clone()),
+                        terminal.status.as_ref().and_then(|status| status.started_at),
+                        terminal.status.as_ref().and_then(|status| status.stopped_at),
+                        terminal.spec.env_ref,
+                        terminal.metadata.labels
+                    ));
                 }
             }
             for checkout in backend.using::<Checkout>(NAMESPACE).list().await.map_err(|e| e.to_string())?.items {

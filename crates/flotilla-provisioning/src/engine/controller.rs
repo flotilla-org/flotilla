@@ -313,6 +313,9 @@ pub struct Controller<K: LifecycleKind, A: Actuator<K>> {
     usable: BTreeMap<String, bool>,
     flights: JoinSet<(String, Done)>,
     in_flight: BTreeSet<String>,
+    /// The resources being released: a backing pushed meanwhile, as one found absent, is the
+    /// release's doing, and the release's end, not that push, ends them.
+    releasing: BTreeSet<String>,
     /// The resources whose last release failed: tried again only on a dependency's change or at
     /// their provider's time.
     release_failed: BTreeSet<String>,
@@ -354,6 +357,7 @@ where
             usable: BTreeMap::new(),
             flights: JoinSet::new(),
             in_flight: BTreeSet::new(),
+            releasing: BTreeSet::new(),
             release_failed: BTreeSet::new(),
             retries: BTreeMap::new(),
             holdings: BTreeMap::new(),
@@ -401,6 +405,7 @@ where
                 Some(joined) = self.flights.join_next(), if !self.flights.is_empty() => match joined {
                     Ok((name, done)) => {
                         self.in_flight.remove(&name);
+                        self.releasing.remove(&name);
                         let trigger = if matches!(done, Done::Held(Ok(_))) { Trigger::Held } else { Trigger::Own };
                         // A holding this call named first was not followed while it ran, and one
                         // that was may have changed meanwhile: either way its holdings are read
@@ -423,6 +428,11 @@ where
                     Err(error) => warn!(kind = K::NAME, %error, "controller flight did not finish"),
                 },
                 event = backing.recv() => match event {
+                    // A release kills what it releases, and a probe may see that first: the
+                    // release's end decides.
+                    Some(event) if self.releasing.contains(&event.name) => {
+                        debug!(kind = K::NAME, name = %event.name, observed = ?event.observed, "backing pushed while releasing");
+                    }
                     Some(event) => {
                         self.finish(&event.name, Done::Observed(Ok(event.observed), None)).await;
                         self.evaluate(BTreeMap::from([(event.name, Trigger::Own)])).await;
@@ -610,6 +620,7 @@ where
                 });
             }
             Action::Release { identity } => {
+                self.releasing.insert(owned.clone());
                 self.flights.spawn(async move {
                     let done = Done::Released(actuator.release(&owned, &request, identity.as_deref()).await);
                     (owned, done)
