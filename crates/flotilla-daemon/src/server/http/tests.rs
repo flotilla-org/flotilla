@@ -224,6 +224,35 @@ async fn listed_version(daemon: &Incarnation, path: &str) -> String {
     url::form_urlencoded::byte_serialize(version.as_bytes()).collect()
 }
 
+// #3108: one name's copies carry the kind's position, as a listing does: a watch resumes from it
+// with the change made since as its first event.
+#[tokio::test]
+async fn a_names_copies_carry_a_position_a_watch_resumes_from() {
+    let daemon = Incarnation::new();
+    let deliveries = daemon.backend.using::<AccessDelivery>("flotilla");
+    deliveries.create(&InputMeta::builder().name("before".into()).build(), &delivery("demo")).await.expect("seed delivery");
+    let path = "/apis/flotilla.work/v1/namespaces/flotilla/accessdeliveries";
+    let version = listed_version(&daemon, &format!("{path}/before?allProvenances=true")).await;
+    deliveries.create(&InputMeta::builder().name("after".into()).build(), &delivery("demo")).await.expect("delivery since");
+    let mut request = get(&format!("{path}?watch=true&resourceVersion={version}"));
+    request.extensions_mut().insert(CallerAuth::Socket(None));
+    let response = daemon.router.clone().oneshot(request).await.expect("router");
+    assert_eq!(response.status(), StatusCode::OK, "a resume from the copies' resourceVersion starts");
+    let mut body = response.into_body().into_data_stream();
+    let mut received = Vec::new();
+    while !received.contains(&b'\n') {
+        let chunk = tokio::time::timeout(std::time::Duration::from_secs(5), futures::StreamExt::next(&mut body))
+            .await
+            .expect("watch event in time")
+            .expect("watch open")
+            .expect("watch chunk");
+        received.extend_from_slice(&chunk);
+    }
+    let line = String::from_utf8(received).expect("UTF-8");
+    let first: serde_json::Value = serde_json::from_str(line.lines().next().expect("a line")).expect("one JSON event");
+    assert_eq!((first["type"].as_str(), first["object"]["metadata"]["name"].as_str()), (Some("MODIFIED"), Some("after")));
+}
+
 // #3108: a collection watch resumes from a listing's resourceVersion, with or without the other
 // homes' copies: it sends no snapshot, and its first event is the change made since the listing.
 #[tokio::test]

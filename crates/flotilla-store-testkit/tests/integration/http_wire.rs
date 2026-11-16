@@ -145,7 +145,7 @@ async fn provenance_point_get_requests_only_one_name() {
     let body = serde_json::json!({
         "apiVersion": "flotilla.work/v1",
         "kind": "ConvoyList",
-        "metadata": { "resourceVersion": "overlay" },
+        "metadata": { "resourceVersion": "e1:{\"h\":{\"remote-root\":7}}" },
         "items": [{
             "apiVersion": "flotilla.work/v1",
             "kind": "Convoy",

@@ -1011,9 +1011,10 @@ async fn get_typed_including_replicas<T: Resource>(
 }
 
 async fn get_all_typed<T: Resource>(backend: &ResourceBackend, namespace: &str, name: &str) -> Result<DynamicResourceList, ResourceError> {
+    // Positioned before the copies, as a listing is.
+    let resource_version = replica_list_version::<T>(backend, namespace).await?;
     let listed = backend.including_replicas::<T>(namespace).get_all(name).await?;
-    // A name's copies are not a collection a watch resumes over.
-    dynamic_read_list::<T>(namespace, listed, "overlay".to_owned())
+    dynamic_read_list::<T>(namespace, listed, resource_version)
 }
 
 async fn delete_typed<T: Resource>(backend: &ResourceBackend, namespace: &str, name: &str) -> Result<DynamicResourceDelete, ResourceError> {
@@ -1323,10 +1324,11 @@ async fn watch_typed_including_replicas<T: Resource>(
     })
 }
 
-/// The cursor an include-replicas read of `T` carries: an engine-served kind's position, taken
-/// before the read; for any other kind the overlay sentinel, which no watch resumes from.
+/// The cursor an include-replicas read of `T` carries, taken before the read: an engine-served
+/// kind's position; for any other kind the local store's version, which an include-replicas watch
+/// refuses to resume from.
 async fn replica_list_version<T: Resource>(backend: &ResourceBackend, namespace: &str) -> Result<String, ResourceError> {
-    backend.definitions::<T>(namespace).engine_position().await.unwrap_or_else(|| Ok("overlay".to_owned()))
+    Ok(backend.using::<T>(namespace).current_position().await?.resource_version)
 }
 
 async fn apply_typed<T: Resource>(
