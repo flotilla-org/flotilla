@@ -19,7 +19,8 @@ use flotilla_resources::*;
 use flotilla_store::{
     controller::{LabelMappedWatch, ReconcileOutcome as ControllerReconcileOutcome, Reconciler, SecondaryWatch},
     load_metrics::carry,
-    DefinitionResolver, PreparedSnapshotGarbageCollector, ReplicaReadResolver, TypedResolver,
+    occupancy::host_occupancy,
+    DefinitionResolver, PreparedSnapshotGarbageCollector, ReplicaReadResolver, ResourceBackend, TypedResolver,
 };
 use std::{
     collections::{BTreeMap, BTreeSet},
@@ -36,8 +37,8 @@ pub struct ConvoyReconciler {
     change_requests: Option<ReplicaReadResolver<ChangeRequest>>,
     forges: Option<DefinitionResolver<Forge>>,
     hosts: Option<ReplicaReadResolver<Host>>,
-    /// Every convoy, to count a host's vessels against its cap.
-    convoys: Option<ReplicaReadResolver<Convoy>>,
+    /// The store and namespace whose live convoys and vessels count a host's vessels against its cap.
+    occupancy: Option<(ResourceBackend, String)>,
     change_request_stale_after: std::time::Duration,
     landing_evidence_stale_after: std::time::Duration,
     clock: Arc<dyn Clock>,
@@ -64,7 +65,7 @@ impl ConvoyReconciler {
             change_requests: None,
             forges: None,
             hosts: None,
-            convoys: None,
+            occupancy: None,
             change_request_stale_after: std::time::Duration::from_secs(180),
             landing_evidence_stale_after: std::time::Duration::from_secs(30),
             clock: Arc::new(SystemClock),
@@ -103,8 +104,9 @@ impl ConvoyReconciler {
         self
     }
 
-    pub fn with_convoys(mut self, convoys: ReplicaReadResolver<Convoy>) -> Self {
-        self.convoys = Some(convoys);
+    /// Counts a capped host's vessels from `namespace` of `backend`.
+    pub fn with_occupancy(mut self, backend: ResourceBackend, namespace: &str) -> Self {
+        self.occupancy = Some((backend, namespace.to_owned()));
         self
     }
 
@@ -232,15 +234,11 @@ impl ConvoyReconciler {
         Ok(until)
     }
 
-    /// What `host` holds against its vessel cap, or None without the convoy and vessel reads to
-    /// count it. Every convoy's view carries its admitted workflow, so no template is read.
+    /// What `host` holds against its vessel cap, as admission counts it, or None without the
+    /// store to count it from.
     async fn vessel_occupancy(&self, host: &str) -> Result<Option<HostOccupancy>, ResourceError> {
-        let (Some(convoys), Some(vessels)) = (&self.convoys, &self.vessels) else {
-            return Ok(None);
-        };
-        let convoys = home_copies_first(convoys.list().await?.items);
-        let vessels = home_copies_first(vessels.list().await?.items);
-        Ok(Some(HostOccupancy::count(host, &convoys, &vessels, &BTreeMap::new())))
+        let Some((backend, namespace)) = &self.occupancy else { return Ok(None) };
+        host_occupancy(backend, namespace, host).await.map(Some).map_err(ResourceError::other)
     }
 
     /// Why `obj` waits for capacity on a host its placement chose, if it does: the host is not

@@ -719,3 +719,61 @@ async fn a_selecting_query_converts_only_the_launches_it_selects() {
     assert_eq!(small, [(1, 3), (2, 3), (2, 3)], "live here, live everywhere, generations here; each converts the role's three launches");
     assert_eq!(large, small, "the cost does not grow with the launches held");
 }
+
+/// `name` held here, placed on host `b1`, and ended when `ended`.
+fn placed(name: &str, ended: bool) -> ConvoyRecord {
+    let mut record = launch(name, HERE);
+    record.admission.placement_decision = Some(
+        flotilla_protocol::PlacementDecision::builder()
+            .kind("host-direct-b1".to_owned())
+            .target_host(flotilla_protocol::PlacementTargetHost {
+                reference: flotilla_protocol::CanonicalHostId::resolved("b1"),
+                display_name: "b1".into(),
+            })
+            .build(),
+    );
+    record.ended = ended.then(|| (ConvoyEnd::Delivered { disposition: "merged".into() }, at(200)));
+    record
+}
+
+/// Host `b1`'s occupancy and the launches it converted, with `others` ended launches held besides
+/// a live launch admitted there and an ended launch whose vessel there still tears down.
+async fn occupancy_with(others: usize) -> (flotilla_resources::HostOccupancy, u64) {
+    let mut launches: Vec<_> = (0..others).map(|n| placed(&format!("old-{n}#1"), true)).collect();
+    launches.extend([placed("live#1", false), placed("tearing#1", true)]);
+    let reads = Arc::new(Reads {
+        convoys: Convoys::new(launches),
+        terminals: Terminals { records: Vec::new(), observations: TerminalObservations::default() },
+        vessels: Vessels { records: Vec::new() },
+    });
+    let backend = ResourceBackend::new(InMemoryBackend::default());
+    backend.serve_engine_in("flotilla");
+    Arc::new(ConvoyViews::new("flotilla", reads)).install(&backend);
+    backend.using::<Convoy>("flotilla").list().await.expect("the views fill");
+    // The vessel holds no decision of its own: its ended convoy's places it.
+    let spec = flotilla_resources::VesselSpec {
+        convoy_ref: "tearing#1".into(),
+        vessel_name: "work".into(),
+        fulfilment_kind_ref: "host-direct-b1".into(),
+        adopted_checkout_refs: BTreeMap::new(),
+    };
+    backend
+        .using::<flotilla_resources::Vessel>("flotilla")
+        .create(&flotilla_resources::InputMeta::builder().name("tearing-work".to_owned()).build(), &spec)
+        .await
+        .expect("the vessel is written");
+
+    let (occupancy, reads) = measure(flotilla_store::occupancy::host_occupancy(&backend, "flotilla", "b1")).await;
+    (occupancy.expect("occupancy"), reads.get("Convoy").map_or(0, |counts| counts.converted))
+}
+
+// Behaviour (#3108): a host's occupancy counts the vessels live convoys admitted there and those
+// an ended convoy still holds, converting only those launches, however many ended launches are held.
+#[tokio::test]
+async fn a_hosts_occupancy_converts_only_live_and_vessel_holding_launches() {
+    let (small, converted) = occupancy_with(2).await;
+    assert_eq!((small.placed, small.admitted.clone()), (1, vec![("live#1".to_owned(), 1)]), "the torn-down vessel and the live admission");
+    let (large, converted_large) = occupancy_with(200).await;
+    assert_eq!(large, small);
+    assert_eq!((converted, converted_large), (2, 2), "the live launch and the vessel's ended one, at both sizes");
+}
