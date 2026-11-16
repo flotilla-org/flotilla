@@ -20,7 +20,7 @@ module machine_edges {
     nondet transport = Set("turn", "notify", "mute").oneOf()
     nondet cause = Set("failure", "other").oneOf()
     nondet early = Set(true, false).map(r => Set("failure", "other").map(c => { retryable: r, cause: c })).flatten().oneOf()
-    nondet outcome =Set(L::Succeeded).union(Set(true, false).map(r => L::AttemptFailed({ retryable: r, cause: "failure" }))).oneOf()
+    nondet outcome = Set(L::Succeeded).union(Set(true, false).map(r => L::AttemptFailed({ retryable: r, cause: "failure" }))).oneOf()
     any {
       all { L::request(1), A::unchanged, keepWorld },
       all { A::request(1), L::unchanged, keepWorld },

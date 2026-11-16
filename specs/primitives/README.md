@@ -112,7 +112,9 @@ invariant checks the evidence the rule used. A standing role has no machine: its
 strike run, backoff and hold are derived from its convoy generations
 (ConvoyEnsure B, #3108). The shared lifecycle's Requested carries its
 own attempt history: `GiveUp` needs that history exhausted and its last
-failure to have the cause given up with. A receipt is a consumer's `Receive` edge on its own
+failure to have the cause given up with. `FailedEarly` records a try made
+before its pending retry was due: it replaces that failure's cause without
+counting, and is refused unless a retry is pending. A receipt is a consumer's `Receive` edge on its own
 resource, whose master is the message; the inbox scenario publishes its stream
 row with that edge, so the message reads the receipts about it. Message stays
 abstract over who consumes it: each consumer kind (an agent session, a

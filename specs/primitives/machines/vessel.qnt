@@ -7,7 +7,7 @@ module vessel {
   type State = Waiting(Request) | Leased({ placement: Placement, lifecycle: L::State }) | Gone(Placement)
   type Evidence = { host: int, available: int -> int, waiting: Set[Request], live: int, cap: int, admitted: bool }
   type Event = Place(Evidence) | Realise({ present: bool, matches: bool }) | Release({ complete: bool }) | Vanish({ absent: bool, cause: L::VanishCause })
-    | Attempted(L::AttemptOutcome) | GiveUp({ cause: str })
+    | Attempted(L::AttemptOutcome) | FailedEarly({ retryable: bool, cause: str }) | GiveUp({ cause: str })
   type Refusal = WrongState | NotAdmitted | QuotaExceeded | DoesNotFit | HigherPriorityWaiting | MissingEvidence
   type Next = Moved(State) | Refused(Refusal)
   pure def fits(r: Request, available: int -> int): bool = r.shape.keys().forall(d => available.keys().contains(d) and r.shape.get(d) <= available.get(d))
@@ -25,6 +25,7 @@ module vessel {
         | Release(o) => L::step(v.lifecycle, L::Release({ teardownComplete: o.complete }))
         | Vanish(o) => L::step(v.lifecycle, L::Vanish({ absent: o.absent, cause: o.cause }))
         | Attempted(o) => L::step(v.lifecycle, L::Attempted(o))
+        | FailedEarly(o) => L::step(v.lifecycle, L::FailedEarly(o))
         | GiveUp(o) => L::step(v.lifecycle, L::GiveUp(o))
         | Place(_) => L::Refused(L::WrongState)
       }
