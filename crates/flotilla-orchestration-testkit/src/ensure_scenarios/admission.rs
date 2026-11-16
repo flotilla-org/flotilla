@@ -923,6 +923,8 @@ pub async fn driverless_ensure_home_case(
         meta.annotations.insert("flotilla.work/manifest-source".into(), "project-map".into());
         meta.annotations.insert("flotilla.work/manifest-path".into(), "ensures/quartermaster.yaml".into());
         meta.annotations.insert("flotilla.work/manifest-revision".into(), "rev-1".into());
+        // The root's home writes its copy after the home created the ensure.
+        hosts[acting_home].2.advance(chrono::Duration::seconds(1));
         ensure = ensures.apply(&meta, &ensure.spec).await.expect("declared ensure");
         record_declaring_pass(&hosts[acting_home].0).await;
     }
@@ -952,6 +954,8 @@ pub async fn driverless_ensure_home_case(
             }
             meta.labels.remove(flotilla_resources::MANAGED_BY_LABEL);
         }
+        // Each fixture's clock starts at the same instant: the later copy is written later.
+        peer.2.advance(chrono::Duration::seconds(1));
         backend.definitions::<ConvoyEnsure>("flotilla").apply(&meta, &copy.spec).await.expect("local definition copy does not confer home");
     }
     let mut before = Vec::new();
@@ -966,7 +970,9 @@ pub async fn driverless_ensure_home_case(
         let (daemon, backend, _, _) = hosts[index];
         let result = daemon.reconcile_convoy_ensures_once("flotilla").await;
         if index == acting_home {
-            if refused {
+            // A manifest-declared ensure holds no source commit, so it never admits, on the fleet
+            // or here: in the declared rows the root's home acts by attempting admission.
+            if refused || declared {
                 // The first pass refuses; subsequent passes may wait for backoff.
                 assert!(result.as_ref().map_or(true, |changes| changes.is_empty()), "home refusal/backoff: {result:?}");
             } else {
@@ -983,7 +989,7 @@ pub async fn driverless_ensure_home_case(
         assert!(open_attentions(backend).await.is_empty(), "non-home raises no stall");
         assert!(backend.using::<ResourceConvoy>("flotilla").list().await.expect("convoys").items.is_empty(), "non-home never admits");
     }
-    if refused {
+    if refused || declared {
         // The refusal note is held in memory by the home that attempted admission (#3108).
         for (index, host) in hosts.iter().enumerate() {
             let reading = quartermaster(&host.0).await;
