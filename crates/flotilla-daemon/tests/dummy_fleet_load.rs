@@ -38,7 +38,7 @@
 //! other tests in a shared binary would distort.
 
 use std::{
-    collections::{HashMap, HashSet},
+    collections::{BTreeMap, HashMap, HashSet},
     path::PathBuf,
     sync::{
         atomic::{AtomicU64, Ordering},
@@ -114,9 +114,73 @@ struct InProcessFleet {
     homes: Vec<Home>,
     /// Refuse dispatches once the process holds this much resident memory.
     memory_limit: Option<u64>,
+    calls: Calls,
     _mesh: Option<InMemoryRequestMesh>,
     _dir: tempfile::TempDir,
 }
+
+/// The driver's calls into the target that have not returned, so a run past its
+/// deadline names the call it waits on.
+#[derive(Default)]
+struct Calls {
+    next: AtomicU64,
+    open: Mutex<BTreeMap<u64, (String, std::time::Instant)>>,
+}
+
+struct Call<'a>(&'a Calls, u64);
+
+impl Calls {
+    fn begin(&self, what: String) -> Call<'_> {
+        let id = self.next.fetch_add(1, Ordering::Relaxed);
+        self.open.lock().expect("calls").insert(id, (what, std::time::Instant::now()));
+        Call(self, id)
+    }
+
+    fn describe(&self) -> Vec<String> {
+        self.open.lock().expect("calls").values().map(|(what, at)| format!("{what} for {:.1}s", at.elapsed().as_secs_f64())).collect()
+    }
+}
+
+impl Drop for Call<'_> {
+    fn drop(&mut self) {
+        self.0.open.lock().expect("calls").remove(&self.1);
+    }
+}
+
+/// Fails a run that hangs where the driver's deadline cannot reach it (start-up,
+/// or dropping the fleet and the runtime), naming the phase it hangs in.
+struct Watchdog {
+    phase: Arc<Mutex<&'static str>>,
+    _running: std::sync::mpsc::Sender<()>,
+}
+
+impl Watchdog {
+    fn start(limit: Duration) -> Self {
+        let phase = Arc::new(Mutex::new("start"));
+        let (running, stopped) = std::sync::mpsc::channel::<()>();
+        let watched = Arc::clone(&phase);
+        std::thread::spawn(move || {
+            if let Err(std::sync::mpsc::RecvTimeoutError::Timeout) = stopped.recv_timeout(limit) {
+                eprintln!("still running after {limit:?}, in phase: {}", watched.lock().expect("phase"));
+                std::process::abort();
+            }
+        });
+        Self { phase, _running: running }
+    }
+
+    fn enter(&self, phase: &'static str) {
+        *self.phase.lock().expect("phase") = phase;
+    }
+
+    /// Keeps watching past the test body, through the drops that follow it.
+    fn outlive(self, phase: &'static str) {
+        self.enter(phase);
+        std::mem::forget(self);
+    }
+}
+
+/// How long the report waits on each read it makes of a home.
+const REPORT_READ: Duration = Duration::from_secs(10);
 
 fn state_of(phase: ConvoyPhase) -> ConvoyState {
     match phase {
@@ -424,7 +488,65 @@ impl InProcessFleet {
             .ok()
             .and_then(|gib| gib.parse::<u64>().ok())
             .map(|gib| gib * 1024 * 1024 * 1024);
-        Self { homes: started, memory_limit, _mesh: mesh, _dir: dir }
+        Self { homes: started, memory_limit, calls: Calls::default(), _mesh: mesh, _dir: dir }
+    }
+
+    /// What is still open when a run outlives its deadline: the target calls in
+    /// flight, each unsettled convoy's place and the provider artifacts it holds,
+    /// the messages not yet received and what each controller loop is doing.
+    async fn stuck_report(&self) -> String {
+        let mut lines = vec![format!("target calls in flight: {:?}", self.calls.describe())];
+        for (index, home) in self.homes.iter().enumerate() {
+            lines.push(format!("home {index}: {:?}", home.fleet.snapshot()));
+            let open = home
+                .view
+                .convoys
+                .lock()
+                .expect("convoys")
+                .iter()
+                .filter(|(_, (_, observation))| !observation.state.ended())
+                .map(|(role, (resource, observation))| (role.clone(), resource.clone(), observation.clone()))
+                .collect::<Vec<_>>();
+            for (role, resource, observation) in open {
+                lines.push(format!(
+                    "  open {role}: {} stall={:?} holds {:?}",
+                    observation.progress,
+                    observation.stall,
+                    home.fleet.remaining_for(&resource)
+                ));
+            }
+            let messages = home.daemon.resource_backend().using::<Message>(NAMESPACE);
+            match tokio::time::timeout(REPORT_READ, messages.list()).await {
+                Ok(Ok(list)) => {
+                    let mut unreceived = BTreeMap::<String, u64>::new();
+                    for message in &list.items {
+                        if message.status.as_ref().is_none_or(|status| status.resolved_receiver.is_none()) {
+                            *unreceived.entry(message.spec.receiver.to_string()).or_default() += 1;
+                        }
+                    }
+                    lines.push(format!("  messages: {} listed; not received, by receiver: {unreceived:?}", list.items.len()));
+                }
+                Ok(Err(error)) => lines.push(format!("  messages unreadable: {error}")),
+                Err(_) => lines.push(format!("  messages: the list did not answer within {REPORT_READ:?}")),
+            }
+            let snapshots = home.runtime.controller_metrics.snapshot();
+            for (kind, activity) in home.runtime.controller_metrics.activity() {
+                let Some(loop_) = snapshots.get(&kind) else { continue };
+                lines.push(format!(
+                    "  controller {kind}: wakes={} enqueued={} coalesced={} requeues={} failures={} parked={} queue_peak={} last_wake={:?} busy_for={:?}",
+                    loop_.wakes,
+                    loop_.enqueued,
+                    loop_.enqueued_coalesced,
+                    loop_.requeues,
+                    loop_.failures,
+                    loop_.parked,
+                    loop_.queue_peak,
+                    activity.last_wake,
+                    activity.busy_for
+                ));
+            }
+        }
+        lines.join("\n")
     }
 }
 
@@ -442,6 +564,7 @@ impl FleetTarget for InProcessFleet {
                 return Err(format!("resident memory limit reached ({} MiB)", limit / (1024 * 1024)));
             }
         }
+        let _call = self.calls.begin(format!("dispatch {name}"));
         let home = &self.homes[home];
         let forge = catalog::forge(&catalog_forge_url());
         let action = CommandAction::ConvoyCreate {
@@ -470,6 +593,7 @@ impl FleetTarget for InProcessFleet {
     }
 
     async fn abandon(&self, home: usize, name: &str, reason: &str) -> Result<(), String> {
+        let _call = self.calls.begin(format!("abandon {name}"));
         let home = &self.homes[home];
         let resource = home.view.convoys.lock().expect("convoys").get(name).map(|(resource, _)| resource.clone());
         let resource = resource.ok_or_else(|| format!("convoy {name} is not known"))?;
@@ -491,6 +615,7 @@ impl FleetTarget for InProcessFleet {
     }
 
     async fn audit(&self) -> Result<Vec<String>, String> {
+        let _call = self.calls.begin("audit".into());
         let mut errors = Vec::new();
         for home in &self.homes {
             let snapshot = home.fleet.snapshot();
@@ -608,11 +733,25 @@ async fn load_driver_smoke() {
     // One long-runner task; the integration scenarios exchange several.
     // Production heartbeat and controller resync; the dummy kind, seeded after
     // startup, is probed on the next short pass rather than the production one.
+    let watchdog = Watchdog::start(Duration::from_secs(600));
     let options = RuntimeOptions { fulfilment_probe_interval: Duration::from_millis(200), ..RuntimeOptions::default() };
     let fleet = InProcessFleet::start(1, &dummy_fleet_settings(1), options).await;
     let plan = smoke_plan();
-    let report = flotilla_load_driver::run(&fleet, &plan).await.expect("load report");
+    watchdog.enter("run");
+    // The plan bounds the run (ramp, window, drain); past that, report what is still open.
+    let deadline = plan.max_ramp + plan.window + plan.drain + Duration::from_secs(90);
+    // The run stays alive while the report is taken: dropping it would release what it holds.
+    let run = flotilla_load_driver::run(&fleet, &plan);
+    tokio::pin!(run);
+    let report = match tokio::time::timeout(deadline, &mut run).await {
+        Ok(report) => report.expect("load report"),
+        Err(_) => panic!("the load run outlived {deadline:?}:\n{}", fleet.stuck_report().await),
+    };
+    watchdog.outlive("assertions, then dropping the fleet and the runtime");
     eprintln!("{}", report.markdown());
+    if !report.unfinished.is_empty() {
+        eprintln!("convoys unfinished after the drain:\n{}", fleet.stuck_report().await);
+    }
     assert!(report.ramp.reached, "{:?}", report.ramp);
     assert_eq!(report.dispatch.errors, 0, "{:?}", report.dispatch.error_samples);
     assert!(report.correctness_errors.is_empty(), "{:?}", report.correctness_errors);

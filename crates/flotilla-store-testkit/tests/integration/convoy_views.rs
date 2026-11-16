@@ -136,14 +136,40 @@ impl<C> ChangeCursor<C> for Unchanging {
     }
 }
 
-/// A cursor that passes the changes a test writes into it, each once, each moving it on.
+/// A gate a blocking read waits at while it is closed, telling `reaching` that it waits.
+#[derive(Default)]
+struct Gate {
+    closed: Mutex<bool>,
+    opened: Condvar,
+    reaching: tokio::sync::Notify,
+}
+
+impl Gate {
+    fn set(&self, closed: bool) {
+        *self.closed.lock().expect("gate") = closed;
+        self.opened.notify_all();
+    }
+
+    fn pass(&self) {
+        let closed = self.closed.lock().expect("gate");
+        if *closed {
+            self.reaching.notify_one();
+        }
+        drop(self.opened.wait_while(closed, |closed| *closed).expect("gate"));
+    }
+}
+
+/// A cursor that passes the changes a test writes into it, each once, each moving it on, after
+/// its gate.
 struct Written {
     changes: Arc<Mutex<Vec<ConvoyChange>>>,
     passed: u64,
+    gate: Arc<Gate>,
 }
 
 impl ChangeCursor<ConvoyChange> for Written {
     fn pass(&mut self) -> Result<Vec<ConvoyChange>, String> {
+        self.gate.pass();
         let changes = std::mem::take(&mut *self.changes.lock().expect("written changes"));
         self.passed += changes.len() as u64;
         Ok(changes)
@@ -159,8 +185,12 @@ struct Convoys {
     memory: ConvoyMemory,
     /// How many times a launch's record was read.
     read: AtomicUsize,
+    /// How many times every launch was listed.
+    listed: AtomicUsize,
     /// The changes the cursor passes next; no follower is told of them, so only a read finds them.
     written: Arc<Mutex<Vec<ConvoyChange>>>,
+    /// Where the cursor waits as it passes.
+    passing: Arc<Gate>,
     /// While closed, a launch's record read waits, after it tells `reading`.
     gate: (Mutex<bool>, Condvar),
     reading: tokio::sync::Notify,
@@ -172,7 +202,9 @@ impl Convoys {
             records: Mutex::new(records),
             memory: ConvoyMemory::default(),
             read: AtomicUsize::new(0),
+            listed: AtomicUsize::new(0),
             written: Arc::default(),
+            passing: Arc::default(),
             gate: (Mutex::new(false), Condvar::new()),
             reading: tokio::sync::Notify::new(),
         }
@@ -214,13 +246,14 @@ impl ConvoyRecords for Convoys {
     fn every(&self) -> Result<ConvoyListing, String> {
         let records = self.records();
         self.read.fetch_add(records.len(), Ordering::SeqCst);
+        self.listed.fetch_add(1, Ordering::SeqCst);
         Ok(ConvoyListing { records, unreadable: Vec::new() })
     }
     fn memory(&self) -> &ConvoyMemory {
         &self.memory
     }
     fn cursor(&self) -> Option<Box<dyn ChangeCursor<ConvoyChange>>> {
-        Some(Box::new(Written { changes: Arc::clone(&self.written), passed: 0 }))
+        Some(Box::new(Written { changes: Arc::clone(&self.written), passed: 0, gate: Arc::clone(&self.passing) }))
     }
 }
 
@@ -507,6 +540,40 @@ async fn an_unchanged_launch_keeps_its_version_across_passes() {
         reads.convoys.written.lock().expect("written").push(ConvoyChange::Changed { name: "fix-it#1".into(), home: HERE.into() });
         assert_eq!(versions(&views).await["fix-it#1"], first);
     }
+}
+
+// Behaviour: a read dropped while the cursors pass keeps the cursors and what they passed. The
+// next read composes the change the dropped one's pass named, and later reads go on following the
+// cursors instead of listing every launch on each read (load_driver_smoke's driver dropped reads).
+#[tokio::test]
+async fn a_read_dropped_while_the_cursors_pass_keeps_them() {
+    let reads = Arc::new(Reads {
+        convoys: Convoys::new(vec![launch("fix-it#1", HERE), launch("other#1", HERE)]),
+        terminals: Terminals { records: Vec::new(), observations: TerminalObservations::default() },
+        vessels: Vessels { records: Vec::new() },
+    });
+    let views = ConvoyViews::new("flotilla", reads.clone());
+    views.get("fix-it#1").await.expect("held");
+    let listed = reads.convoys.listed.load(Ordering::SeqCst);
+
+    // The launch's record goes and the cursor names it; a read starts passing the cursors and waits.
+    reads.convoys.passing.set(true);
+    reads.convoys.records.lock().expect("records").retain(|record| record.name != "fix-it#1");
+    reads.convoys.written.lock().expect("written").push(ConvoyChange::Changed { name: "fix-it#1".into(), home: HERE.into() });
+    let reaching = reads.convoys.passing.reaching.notified();
+    let dropped = tokio::spawn({
+        let views = views.clone();
+        async move { views.get("other#1").await.map(drop) }
+    });
+    reaching.await;
+    dropped.abort();
+    assert!(dropped.await.expect_err("dropped").is_cancelled());
+    reads.convoys.passing.set(false);
+
+    assert!(views.get("fix-it#1").await.is_err(), "the next read composes the change the dropped pass named");
+    views.get("other#1").await.expect("read");
+    views.get("other#1").await.expect("read again");
+    assert_eq!(reads.convoys.listed.load(Ordering::SeqCst), listed, "no read lists every launch again");
 }
 
 /// The views converted by a read of one launch by name, with `others` unrelated launches held:

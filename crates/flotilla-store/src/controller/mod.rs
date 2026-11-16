@@ -744,6 +744,7 @@ impl<R: Reconciler> ControllerLoop<R> {
             sender.made_progress();
             if let Some(name) = pending.pop_front() {
                 metrics.wakes.increment();
+                metrics.woke(&name);
                 metrics.queue_peak.observe(pending.len() as u64 + 1);
                 let woke_at = Instant::now();
                 metrics.queue_wait.record(sender.start(&name));

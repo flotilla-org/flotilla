@@ -183,6 +183,7 @@ impl MessageDelivery {
         let mut failures = 0_u32;
         loop {
             metrics.wakes.increment();
+            metrics.woke("pass");
             metrics.queue_peak.observe(1);
             let started = tokio::time::Instant::now();
             let result = {

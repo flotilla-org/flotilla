@@ -308,6 +308,17 @@ pub struct ControllerLoadMetrics {
     pub parked: Gauge,
     /// Objects a pass left out because a record they are read with is missing.
     pub skipped: Counter,
+    /// The object the loop last took from its queue, and when.
+    last_wake: Mutex<Option<(String, tokio::time::Instant)>>,
+}
+
+/// What one controller loop is doing now.
+#[derive(Debug, Clone)]
+pub struct ControllerActivity {
+    /// The object the loop last woke for, and how long ago.
+    pub last_wake: Option<(String, Duration)>,
+    /// How long the loop has been in its current pass, when it is in one.
+    pub busy_for: Option<Duration>,
 }
 
 #[derive(Debug, Default)]
@@ -334,6 +345,17 @@ impl ControllerLoadMetrics {
         assert!(busy.active.is_none(), "one loop per controller metrics object");
         busy.active = Some(tokio::time::Instant::now());
         ControllerBusyGuard(self)
+    }
+
+    /// Records the object a wake takes from the queue.
+    pub fn woke(&self, name: &str) {
+        *self.last_wake.lock().unwrap_or_else(std::sync::PoisonError::into_inner) = Some((name.to_owned(), tokio::time::Instant::now()));
+    }
+
+    pub fn activity(&self) -> ControllerActivity {
+        let busy_for = self.busy.lock().expect("busy time").active.map(|at| at.elapsed());
+        let last_wake = self.last_wake.lock().unwrap_or_else(std::sync::PoisonError::into_inner).clone();
+        ControllerActivity { last_wake: last_wake.map(|(name, at)| (name, at.elapsed())), busy_for }
     }
 
     fn busy_micros(&self) -> u64 {
@@ -422,6 +444,11 @@ impl ControllerMetricsRegistry {
     pub fn snapshot(&self) -> BTreeMap<String, ControllerLoadSnapshot> {
         let kinds = self.kinds.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
         kinds.iter().map(|(kind, metrics)| (kind.clone(), metrics.snapshot())).collect()
+    }
+
+    pub fn activity(&self) -> BTreeMap<String, ControllerActivity> {
+        let kinds = self.kinds.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        kinds.iter().map(|(kind, metrics)| (kind.clone(), metrics.activity())).collect()
     }
 }
 

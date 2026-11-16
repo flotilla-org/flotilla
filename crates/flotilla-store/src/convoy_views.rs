@@ -56,12 +56,15 @@ struct HeldViews {
     views: BTreeMap<(String, String), HeldView>,
     /// Where the next read takes the records' changes from; none where no log is held, and each
     /// read then reads every launch afresh.
-    cursors: Option<Cursors>,
+    following: Option<Arc<Mutex<Following>>>,
     /// This home's note changes not yet read into the views.
     notes: tokio::sync::broadcast::Receiver<String>,
     /// How many note changes have been read, missed ones counted: with the cursors' positions,
     /// how far the views have read.
     notes_read: u64,
+    /// How far the cursors had read the log at the pass whose launches were last taken into
+    /// `owed`.
+    cursors_read: u64,
     /// The launches the cursors have passed whose views are not yet composed again. A read
     /// dropped while it composes leaves them here for the next, since the cursors will not name
     /// them again.
@@ -77,6 +80,19 @@ struct HeldViews {
 struct HeldView {
     view: ReadResourceObject<Convoy>,
     version: u64,
+}
+
+/// The cursors and what they have passed, shared with the blocking read that passes them: a read
+/// dropped while the cursors pass leaves both here for the next, instead of losing the cursors,
+/// after which every read would read every launch again, or the launches they named.
+struct Following {
+    cursors: Cursors,
+    /// How far the cursors had read the log at their last pass, read under the same lock.
+    through: u64,
+    /// Launches passed and not yet owed by the views.
+    passed: BTreeSet<(String, String)>,
+    /// The cursors could not tell what changed: every launch is read again.
+    rescanned: bool,
 }
 
 /// Cursors over the changes of the records a convoy's view is composed from.
@@ -203,11 +219,15 @@ impl ConvoyViews {
             let wakes = self.wakes()?;
             let notes = self.convoys().map_err(ResourceError::other)?.memory().subscribe();
             let cursors = self.blocking(Cursors::start).await?;
+            let cursors_read = cursors.as_ref().map_or(0, Cursors::position);
             let mut held = HeldViews {
                 views: BTreeMap::new(),
-                cursors,
+                following: cursors.map(|cursors| {
+                    Arc::new(Mutex::new(Following { cursors, through: cursors_read, passed: BTreeSet::new(), rescanned: false }))
+                }),
                 notes,
                 notes_read: 0,
+                cursors_read,
                 owed: BTreeSet::new(),
                 refill_owed: false,
                 unreadable: BTreeMap::new(),
@@ -262,16 +282,39 @@ impl ConvoyViews {
     /// this home's notes.
     async fn pass(&self, held: &mut HeldViews) -> Result<(), ResourceError> {
         use tokio::sync::broadcast::error::TryRecvError;
-        let Some(mut cursors) = held.cursors.take() else { return self.refill(held).await };
-        let (cursors, launches) = self
+        let Some(following) = held.following.clone() else { return self.refill(held).await };
+        let passing = Arc::clone(&following);
+        // A failed pass still moved the cursors: the views take how far they read before failing.
+        let failed = self
             .blocking(move |reads| {
-                let launches = cursors.pass(reads);
-                Ok((cursors, launches))
+                let mut following = passing.lock().unwrap_or_else(PoisonError::into_inner);
+                let passed = following.cursors.pass(reads);
+                following.through = following.cursors.position();
+                Ok(match passed {
+                    Ok(Some(launches)) => {
+                        following.passed.extend(launches);
+                        None
+                    }
+                    Ok(None) => {
+                        following.rescanned = true;
+                        None
+                    }
+                    Err(error) => Some(error),
+                })
             })
             .await?;
-        held.cursors = Some(cursors);
-        let Some(launches) = launches.map_err(ResourceError::other)? else { return self.refill(held).await };
-        held.owed.extend(launches);
+        let (passed, through, rescanned) = {
+            let mut following = following.lock().unwrap_or_else(PoisonError::into_inner);
+            (std::mem::take(&mut following.passed), following.through, std::mem::take(&mut following.rescanned))
+        };
+        held.owed.extend(passed);
+        held.cursors_read = through;
+        if let Some(error) = failed {
+            return Err(ResourceError::other(error));
+        }
+        if rescanned {
+            return self.refill(held).await;
+        }
         let here = self.convoys().map_err(ResourceError::other)?.home().to_owned();
         loop {
             match held.notes.try_recv() {
@@ -532,7 +575,7 @@ struct Composed {
 impl HeldViews {
     /// How far the views have read: the log, by their cursors, and this home's notes.
     fn position(&self) -> u64 {
-        self.cursors.as_ref().map_or(0, Cursors::position).saturating_add(self.notes_read)
+        self.cursors_read.saturating_add(self.notes_read)
     }
 
     /// Holds each of `composed`, keeping the version of a view that shows what its held one shows:

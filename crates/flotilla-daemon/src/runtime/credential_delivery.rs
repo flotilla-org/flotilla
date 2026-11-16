@@ -224,6 +224,7 @@ impl CredentialDelivery {
                 () = self.events.wake.notified() => {}
                 Some(request) = requests.recv() => {
                     metrics.wakes.increment();
+                    metrics.woke(&request.environment);
                     let _busy = metrics.busy();
                     self.failures.remove(&request.environment);
                     let result = self.deliver(Some(&BTreeSet::from([request.environment.clone()])), false).await;
@@ -238,6 +239,7 @@ impl CredentialDelivery {
                 Some(_) = sources.join_next(), if !sources.is_empty() => { continue; }
             }
             metrics.wakes.increment();
+            metrics.woke("pass");
             let started = tokio::time::Instant::now();
             {
                 let _busy = metrics.busy();
