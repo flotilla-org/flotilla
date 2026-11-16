@@ -3710,6 +3710,7 @@ dependencies = [
  "flotilla-protocol",
  "flotilla-resources",
  "flotilla-store-testkit",
+ "flotilla-verbs",
  "futures",
  "hegeltest",
  "indexmap",

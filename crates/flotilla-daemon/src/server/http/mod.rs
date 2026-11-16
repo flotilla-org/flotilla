@@ -50,7 +50,7 @@ use resource_api::Reply;
 use rigging_http_serve::Caller;
 
 use crate::server::{
-    tables::{Catalog, DerivedSet, QueryFeed},
+    tables::{Catalog, DerivedSet, QueryFeed, SubjectTables},
     verbs::{self, Verbs},
 };
 
@@ -86,9 +86,15 @@ pub(in crate::server) struct HttpRouter {
     hooks: HookEndpoint,
     /// Where `GET /` sends a browser (`[web] link_prefix`); unset means the fleet default.
     link_prefix: Option<String>,
-    /// The verb route's verbs; the registered verbs over `backend` and `daemon` unless a test
-    /// supplies its own. Building the router hands them to the route.
+    /// The registered verbs and subject tables; the composition root's
+    /// (`runtime::verb_registry`) unless a test supplies its own.
+    registry: Option<flotilla_verbs::VerbRegistry>,
+    /// The verb route's verbs; the registry's verbs over the stores unless a test supplies its
+    /// own. Building the router hands them to the route.
     verbs: Option<Arc<Verbs>>,
+    /// The registry's subject tables, filled in when the router is built.
+    #[builder(skip)]
+    subjects: SubjectTables,
     /// Tables derived from code (`verbs`), filled in when the router is built.
     #[builder(skip)]
     derived: Vec<Arc<DerivedSet>>,
@@ -137,7 +143,9 @@ impl HttpRouter {
             tcp_origin,
             hooks: HookEndpoint::default(),
             link_prefix: None,
+            registry: None,
             verbs: None,
+            subjects: SubjectTables::default(),
             derived: Vec::new(),
             incarnation: uuid::Uuid::new_v4().to_string(),
         }
@@ -149,6 +157,7 @@ impl HttpRouter {
         Catalog {
             backend: self.backend.clone(),
             service: table_api::store(self),
+            subjects: self.subjects.clone(),
             derived: self.derived.clone(),
             queries: queries.or_else(|| self.daemon.as_ref().map(|daemon| QueryFeed::new(Arc::clone(daemon), self.incarnation.clone()))),
             incarnation: self.incarnation.clone(),
@@ -182,9 +191,14 @@ impl HttpRouter {
     }
 
     pub(in crate::server) fn into_router(mut self) -> Router {
+        let registry = self.registry.take().unwrap_or_else(|| {
+            crate::runtime::verb_registry(self.daemon.clone()).expect("each native verb and subject table is registered once")
+        });
+        self.subjects = SubjectTables::new(registry.subjects());
         let verbs = self.verbs.take().unwrap_or_else(|| {
-            let registry = crate::runtime::verb_registry(self.daemon.clone()).expect("each native verb is registered once");
-            Arc::new(verbs::serve(registry, Arc::new(verbs::subjects::ResourceSubjects::new(self.backend.clone()))))
+            let stores = Catalog::stores(self.backend.clone(), table_api::store(&self), self.subjects.clone(), self.incarnation.clone());
+            let subjects = verbs::subjects::StoredSubjects::new(stores);
+            Arc::new(verbs::serve(registry, Arc::new(subjects)))
         });
         self.derived = vec![Arc::new(verbs.tables())];
         let router = Router::new()

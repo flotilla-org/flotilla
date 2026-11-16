@@ -981,7 +981,10 @@ async fn messages_filter_under_a_convoy_address() {
 // always projected, and filterable with `under`; each row's address resolves to that convoy.
 #[tokio::test]
 async fn convoy_rows_name_their_subject_by_address() {
-    use crate::server::verbs::{catalog::Subjects, subjects::ResourceSubjects};
+    use crate::server::{
+        tables::{Catalog, SubjectTables},
+        verbs::{catalog::Subjects, subjects::StoredSubjects},
+    };
     let backend = ResourceBackend::new(InMemoryBackend::default());
     let convoys = backend.using::<Convoy>("test");
     // As admission labels them: a convoy without a project carries an empty project label.
@@ -1010,7 +1013,7 @@ async fn convoy_rows_name_their_subject_by_address() {
             (json!("convoy-3"), json!("convoy:convoy-3")),
         ]
     );
-    let subjects = ResourceSubjects::new(backend);
+    let subjects = StoredSubjects::new(Catalog::stores(backend, None, SubjectTables::registered(), "test".into()));
     for row in &all {
         let address: flotilla_schema::Address = row["address"].as_str().unwrap().parse().unwrap();
         let resolved = subjects.row("test", &address).await.unwrap().expect("the row's address names a convoy");

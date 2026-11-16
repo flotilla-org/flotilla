@@ -3,13 +3,13 @@
 use std::sync::Arc;
 
 use async_trait::async_trait;
-use flotilla_verbs::{Call, DuplicateVerb, NativeVerb, Picks, Presentation, Verb, VerbRegistry};
+use flotilla_verbs::{Call, Duplicate, NativeVerb, Picks, Presentation, Verb, VerbRegistry};
 use serde_json::Value;
 
 use crate::projections_actions::ProjectionsActionPort;
 
 /// Registers this crate's verbs, each over `port`.
-pub fn register_verbs(registry: &mut VerbRegistry, port: Arc<dyn ProjectionsActionPort>) -> Result<(), DuplicateVerb> {
+pub fn register_verbs(registry: &mut VerbRegistry, port: Arc<dyn ProjectionsActionPort>) -> Result<(), Duplicate> {
     registry.register(
         ExplainConvoy { port },
         Presentation {
