@@ -11,7 +11,6 @@ use async_trait::async_trait;
 use flotilla_resources::{
     Message, MessageExpectation, MessageSpec, ObjectMeta, ReadResourceObject, ResourceError, ResourceObject, ResourceProvenance,
 };
-use flotilla_store::ResourceBackend;
 
 use super::fixture_with_message_path;
 use crate::leaf_engine::CrewTurnIntent;
@@ -21,7 +20,6 @@ use flotilla_messaging::EngineMessages;
 /// An engine Message path at "home-a" that admits into memory, fails its
 /// first `failures` record writes, and records what it is asked to end.
 struct RecordingMessages {
-    backend: ResourceBackend,
     admitted: Mutex<BTreeMap<String, ResourceObject<Message>>>,
     failures: AtomicUsize,
     records: Mutex<Vec<(String, String)>>,
@@ -29,9 +27,8 @@ struct RecordingMessages {
 }
 
 impl RecordingMessages {
-    fn new(backend: ResourceBackend, failures: usize) -> Arc<Self> {
+    fn new(failures: usize) -> Arc<Self> {
         Arc::new(Self {
-            backend,
             admitted: Mutex::default(),
             failures: AtomicUsize::new(failures),
             records: Mutex::default(),
@@ -197,7 +194,32 @@ impl EngineMessages for RecordingMessages {
         Ok(Box::pin(futures::stream::pending()))
     }
     fn charter_notices(self: Arc<Self>, namespace: &str) -> Box<dyn flotilla_messaging::CharterNotices> {
-        Box::new(flotilla_messaging::MessageInbox::new(self.backend.clone(), namespace))
+        Box::new(NoCharterNotices(namespace.to_owned()))
+    }
+}
+
+/// These tests apply no charter revision, so no pass reaches a notice: one refuses.
+struct NoCharterNotices(String);
+
+#[async_trait::async_trait]
+impl flotilla_messaging::CharterNotices for NoCharterNotices {
+    fn namespace(&self) -> &str {
+        &self.0
+    }
+    fn pass(&self) -> Arc<tokio::sync::Mutex<()>> {
+        Arc::default()
+    }
+    fn admission(&self) -> Arc<tokio::sync::Mutex<()>> {
+        Arc::default()
+    }
+    async fn existing(&self, _: &str, _: &str, _: chrono::DateTime<chrono::Utc>) -> Result<bool, ResourceError> {
+        Err(ResourceError::invalid("these tests admit no charter notice"))
+    }
+    async fn open_charter_notice(&self, _: &str, _: &str) -> Result<Option<String>, ResourceError> {
+        Err(ResourceError::invalid("these tests admit no charter notice"))
+    }
+    async fn admit(&self, _: &str, _: &flotilla_resources::MessageSpec, _: chrono::DateTime<chrono::Utc>) -> Result<(), ResourceError> {
+        Err(ResourceError::invalid("these tests admit no charter notice"))
     }
 }
 
@@ -213,8 +235,7 @@ fn wired(messages: &Arc<RecordingMessages>) -> MessagePath {
 // the record, without admitting the message again.
 #[tokio::test]
 async fn a_failed_first_record_write_is_written_by_the_repeat() {
-    let backend = ResourceBackend::new(flotilla_store_memory::InMemoryBackend::default());
-    let messages = RecordingMessages::new(backend, 1);
+    let messages = RecordingMessages::new(1);
     let (crew, _backend, probe, held) = fixture_with_message_path(flotilla_resources::CrewWorkPhase::Done, wired(&messages)).await;
     probe.fail.store(false, Ordering::SeqCst);
     let request = CrewTurnIntent::builder()
@@ -245,8 +266,7 @@ async fn a_failed_first_record_write_is_written_by_the_repeat() {
 // Operator stalls have no engine records: cleanup includes both the convoy and its crew.
 #[tokio::test]
 async fn the_stall_reconciler_ends_records_of_subjects_not_stalled() {
-    let backend = ResourceBackend::new(flotilla_store_memory::InMemoryBackend::default());
-    let messages = RecordingMessages::new(backend, 0);
+    let messages = RecordingMessages::new(0);
     let (crew, _backend, _probe, held) = fixture_with_message_path(flotilla_resources::CrewWorkPhase::Working, wired(&messages)).await;
     crew.reconcile_crew_stalls_once("flotilla").await.expect("one pass");
     let project = flotilla_address::Address::project("flotilla").expect("project address");

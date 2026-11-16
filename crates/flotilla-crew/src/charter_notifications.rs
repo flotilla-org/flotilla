@@ -92,9 +92,11 @@ mod tests {
     use std::collections::BTreeMap;
 
     use chrono::Utc;
-    use flotilla_messaging::{reconcile_charter_notifications_with_renderer, MessageInbox};
+    use flotilla_engine_messages::{view::body_text, EngineCharterNotices};
+    use flotilla_engine_messages_testkit::{designate_fleet, EngineMessagesHome};
+    use flotilla_messaging::{reconcile_charter_notifications_with_receivers, MessageReceiverSnapshot};
     use flotilla_resources::{
-        Convoy, ConvoySpec, ConvoyStatus, CrewSpec, InputMeta, Message, Project, ProjectSpec, RoleDefinition, Selector, TerminalBrief,
+        Convoy, ConvoySpec, ConvoyStatus, CrewSpec, InputMeta, Project, ProjectSpec, RoleDefinition, Selector, TerminalBrief,
         TerminalCrewContext, TerminalSession, TerminalSessionSpec, VesselRequirement, WorkflowSnapshot, CONVOY_LABEL, ROLE_LABEL,
     };
 
@@ -105,6 +107,9 @@ mod tests {
     #[tokio::test]
     async fn latest_charter_message_renders_the_live_role_template() {
         let backend = ResourceBackend::new(InMemoryBackend::default());
+        designate_fleet(&backend, "flotilla").await;
+        let home = EngineMessagesHome::open("home", "flotilla", &backend);
+        let primitives = home.primitives();
         let config_dir = tempfile::tempdir().expect("config");
         let renderer = LiveCharterBriefRenderer::new(backend.clone(), Arc::new(ConfigStore::with_base(config_dir.path())));
         let projects = backend.definitions::<Project>("flotilla");
@@ -187,7 +192,7 @@ mod tests {
             )
             .await
             .expect("holder");
-        let inbox = MessageInbox::new(backend.clone(), "flotilla");
+        let notices = EngineCharterNotices { primitives: Arc::clone(primitives), namespace: "flotilla".into() };
         for (revision, template) in [
             ("first", "Old {{ role }}"),
             ("second", "Newest {{ role }} {% for member in members %}{{ member.role }}={{ member.state }} {% endfor %}"),
@@ -198,18 +203,26 @@ mod tests {
             let mut spec = project.spec;
             spec.role_definitions.insert("guide".into(), RoleDefinition { brief_template: Some(template.into()), ..Default::default() });
             projects.apply(&meta, &spec).await.expect("applied revision");
-            reconcile_charter_notifications_with_renderer(&inbox, &renderer, Utc::now()).await.expect("render notification");
+            let receivers = MessageReceiverSnapshot::load(&backend, "flotilla").await.expect("receivers");
+            let listed = backend.including_replicas::<Project>("flotilla").list().await.expect("projects");
+            reconcile_charter_notifications_with_receivers(&notices, &renderer, Utc::now(), &backend, &receivers, &listed)
+                .await
+                .expect("render notification");
         }
-        let messages = backend.using::<Message>("flotilla").list().await.expect("messages");
-        let pending: Vec<_> =
-            messages.items.iter().filter(|message| !message.status.as_ref().expect("status").phase.is_terminal()).collect();
+        let inbox = primitives.inbox_for("flotilla", "root/guide/work/guide").await.expect("the guide's inbox");
+        let pending: Vec<_> = primitives
+            .open_in(&inbox)
+            .expect("open messages")
+            .into_iter()
+            .map(|(_, message)| body_text(message.spec().body.value()))
+            .collect();
         assert_eq!(pending.len(), 1);
-        assert!(pending[0].spec.body.contains("Newest guide"));
-        assert!(pending[0].spec.body.contains("watch=active"));
-        assert!(pending[0].spec.body.contains("guide=active"));
-        assert!(pending[0].spec.body.contains("checker=latent"));
-        assert!(pending[0].spec.body.contains("charter@second"));
-        assert!(!pending[0].spec.body.contains("Old guide"));
+        assert!(pending[0].contains("Newest guide"));
+        assert!(pending[0].contains("watch=active"));
+        assert!(pending[0].contains("guide=active"));
+        assert!(pending[0].contains("checker=latent"));
+        assert!(pending[0].contains("charter@second"));
+        assert!(!pending[0].contains("Old guide"));
         assert_eq!(backend.using::<TerminalSession>("flotilla").get("guide-terminal").await.expect("holder").spec, holder_spec);
     }
 }

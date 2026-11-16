@@ -326,45 +326,14 @@ impl CharterBriefRenderer for CharterProseRenderer {
     }
 }
 
-/// Applied revisions generate receiver-homed notifications. Deterministic IDs
-/// make a restart idempotent; ordinary subject supersession coalesces revisions
-/// until the holder reaches a turn boundary.
-pub async fn reconcile_charter_notifications(inbox: &crate::MessageInbox, now: chrono::DateTime<chrono::Utc>) -> Result<(), ResourceError> {
-    reconcile_charter_notifications_with_renderer(inbox, &CharterProseRenderer, now).await
-}
-
-pub async fn reconcile_charter_notifications_with_renderer(
-    inbox: &crate::MessageInbox,
-    renderer: &dyn CharterBriefRenderer,
-    now: chrono::DateTime<chrono::Utc>,
-) -> Result<(), ResourceError> {
-    reconcile_charter_notifications_with_view(inbox, renderer, now, &inbox.backend).await
-}
-
-/// Use watch-maintained reads for charter routing while retaining the durable
-/// inbox for admission and writes.
-pub async fn reconcile_charter_notifications_with_view(
-    inbox: &crate::MessageInbox,
-    renderer: &dyn CharterBriefRenderer,
-    now: chrono::DateTime<chrono::Utc>,
-    backend: &ResourceBackend,
-) -> Result<(), ResourceError> {
-    let _charter_pass = inbox.charter_notifications.lock().await;
-    let receivers = MessageReceiverSnapshot::load(backend, &inbox.namespace).await?;
-    let projects = backend.definitions::<Project>(&inbox.namespace).list().await?;
-    reconcile_charter_notifications_from_receivers(inbox, renderer, now, backend, &receivers, projects.iter().collect()).await
-}
-
-/// Reuse shared receiver evidence already frozen by the leaf engine.
-/// Where charter notifications are admitted (#3317): the old store's inbox,
-/// or the engine's behind the `[primitives]` switch. One pass at a time;
+/// Where charter notifications are admitted (#3317): the engine's inbox. One pass at a time;
 /// admission and predecessor selection hold [`CharterNotices::admission`].
 #[async_trait::async_trait]
 pub trait CharterNotices: Send + Sync {
     fn namespace(&self) -> &str;
     fn pass(&self) -> std::sync::Arc<tokio::sync::Mutex<()>>;
     fn admission(&self) -> std::sync::Arc<tokio::sync::Mutex<()>>;
-    /// Whether `name`, sent to `receiver`, exists, repairing one stored without admission.
+    /// Whether `name`, sent to `receiver`, exists.
     async fn existing(&self, receiver: &str, name: &str, now: chrono::DateTime<chrono::Utc>) -> Result<bool, ResourceError>;
     /// The newest open charter notification to `receiver` about `project`, which the next one
     /// supersedes: its name.
@@ -372,32 +341,9 @@ pub trait CharterNotices: Send + Sync {
     async fn admit(&self, name: &str, spec: &crate::MessageSpec, now: chrono::DateTime<chrono::Utc>) -> Result<(), ResourceError>;
 }
 
-#[async_trait::async_trait]
-impl CharterNotices for crate::MessageInbox {
-    fn namespace(&self) -> &str {
-        &self.namespace
-    }
-    fn pass(&self) -> std::sync::Arc<tokio::sync::Mutex<()>> {
-        std::sync::Arc::clone(&self.charter_notifications)
-    }
-    fn admission(&self) -> std::sync::Arc<tokio::sync::Mutex<()>> {
-        std::sync::Arc::clone(&self.admission)
-    }
-    async fn existing(&self, _: &str, name: &str, now: chrono::DateTime<chrono::Utc>) -> Result<bool, ResourceError> {
-        repair_existing_charter_notification(self, name, now).await
-    }
-    async fn open_charter_notice(&self, receiver: &str, project: &str) -> Result<Option<String>, ResourceError> {
-        use crate::MessageReference;
-        let open = self.messages.query(&crate::MessageQuery::Active { receiver: Some(receiver.to_owned()) }).await?;
-        Ok(open.into_iter().filter(|message| message.spec.sender == FLEET_STORE_SENDER && message.spec.subject.as_ref().is_some_and(|subject| {
-                matches!(subject, MessageReference::ControlRecord { resource, .. } if resource.kind == "Project" && resource.namespace == self.namespace && resource.name == project)
-            })).max_by(|a, b| (a.metadata.creation_timestamp, &a.metadata.name).cmp(&(b.metadata.creation_timestamp, &b.metadata.name))).map(|message| message.metadata.name))
-    }
-    async fn admit(&self, name: &str, spec: &crate::MessageSpec, now: chrono::DateTime<chrono::Utc>) -> Result<(), ResourceError> {
-        self.accept_locked(&crate::InputMeta::builder().name(name.to_owned()).build(), spec, now).await.map(|_| ())
-    }
-}
-
+/// Applied revisions generate receiver-homed notifications. Deterministic IDs make a restart
+/// idempotent; ordinary subject supersession coalesces revisions until the holder reaches a turn
+/// boundary. Reuses the receiver evidence the leaf engine already holds.
 pub async fn reconcile_charter_notifications_with_receivers(
     inbox: &dyn CharterNotices,
     renderer: &dyn CharterBriefRenderer,
@@ -529,23 +475,4 @@ async fn reconcile_charter_notifications_from_receivers(
         inbox.admit(&name, &spec, now).await?;
     }
     Ok(())
-}
-
-// Caller owns the admission lock. A concurrent/restarted pass uses the stored
-// intent, even if rendering live contacts would now produce different prose.
-async fn repair_existing_charter_notification(
-    inbox: &crate::MessageInbox,
-    name: &str,
-    now: chrono::DateTime<chrono::Utc>,
-) -> Result<bool, ResourceError> {
-    match inbox.messages.get(name).await {
-        Ok(existing) => {
-            if existing.status.is_none() {
-                inbox.accept_locked(&crate::InputMeta::from(&existing.metadata), &existing.spec, now).await?;
-            }
-            Ok(true)
-        }
-        Err(ResourceError::NotFound { .. }) => Ok(false),
-        Err(error) => Err(error),
-    }
 }

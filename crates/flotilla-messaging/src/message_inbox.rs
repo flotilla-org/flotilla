@@ -33,18 +33,11 @@ pub struct MessageInbox {
     pub(crate) namespace: String,
     pub(crate) messages: TypedResolver<Message>,
     pub(crate) admission: Arc<Mutex<()>>,
-    pub(crate) charter_notifications: Arc<Mutex<()>>,
 }
 
 impl MessageInbox {
     pub fn new(backend: ResourceBackend, namespace: &str) -> Self {
-        Self {
-            messages: backend.using::<Message>(namespace),
-            backend,
-            namespace: namespace.into(),
-            admission: Arc::new(Mutex::new(())),
-            charter_notifications: Arc::new(Mutex::new(())),
-        }
+        Self { messages: backend.using::<Message>(namespace), backend, namespace: namespace.into(), admission: Arc::new(Mutex::new(())) }
     }
 
     /// Qualify relative addresses with the sender's explicit creation context.

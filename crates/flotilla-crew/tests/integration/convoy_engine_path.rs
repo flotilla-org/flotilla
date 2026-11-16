@@ -1259,7 +1259,6 @@ async fn a_convoy_failing_before_its_first_note_is_woken_by_any_change_request()
 /// The engine Message path's one answer the hold reads: until when the crew's
 /// undelivered turn holds delivery. The convoy reconciler asks it nothing else.
 struct Turns {
-    backend: ResourceBackend,
     held_until: Option<chrono::DateTime<chrono::Utc>>,
 }
 
@@ -1369,7 +1368,37 @@ impl flotilla_messaging::EngineMessages for Turns {
         Ok(Box::pin(futures::stream::pending()))
     }
     fn charter_notices(self: Arc<Self>, namespace: &str) -> Box<dyn flotilla_messaging::CharterNotices> {
-        Box::new(flotilla_messaging::MessageInbox::new(self.backend.clone(), namespace))
+        Box::new(NoCharterNotices(namespace.to_owned()))
+    }
+}
+
+/// These tests apply no charter revision, so no pass reaches a notice: one refuses.
+struct NoCharterNotices(String);
+
+#[async_trait::async_trait]
+impl flotilla_messaging::CharterNotices for NoCharterNotices {
+    fn namespace(&self) -> &str {
+        &self.0
+    }
+    fn pass(&self) -> Arc<tokio::sync::Mutex<()>> {
+        Arc::default()
+    }
+    fn admission(&self) -> Arc<tokio::sync::Mutex<()>> {
+        Arc::default()
+    }
+    async fn existing(&self, _: &str, _: &str, _: chrono::DateTime<chrono::Utc>) -> Result<bool, flotilla_resources::ResourceError> {
+        Err(flotilla_resources::ResourceError::invalid("these tests admit no charter notice"))
+    }
+    async fn open_charter_notice(&self, _: &str, _: &str) -> Result<Option<String>, flotilla_resources::ResourceError> {
+        Err(flotilla_resources::ResourceError::invalid("these tests admit no charter notice"))
+    }
+    async fn admit(
+        &self,
+        _: &str,
+        _: &flotilla_resources::MessageSpec,
+        _: chrono::DateTime<chrono::Utc>,
+    ) -> Result<(), flotilla_resources::ResourceError> {
+        Err(flotilla_resources::ResourceError::invalid("these tests admit no charter notice"))
     }
 }
 
@@ -1404,7 +1433,7 @@ async fn an_undelivered_turn_holds_delivery() {
         }
         let messages: flotilla_crew::ports::MessagePath = Arc::new(OnceLock::new());
         let held_until = awaiting.then(|| chrono::Utc::now() + chrono::Duration::minutes(5));
-        let turns: Arc<dyn flotilla_messaging::EngineMessages> = Arc::new(Turns { backend: backend.clone(), held_until });
+        let turns: Arc<dyn flotilla_messaging::EngineMessages> = Arc::new(Turns { held_until });
         assert!(messages.set(turns).is_ok());
         let engine = Arc::new(Recording { holds: true, ..Default::default() });
         let reconciler = reconciler_reading(&backend, Arc::clone(&engine), fixture.reads.clone()).with_messages(messages);
