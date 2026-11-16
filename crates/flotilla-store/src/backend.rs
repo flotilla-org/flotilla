@@ -1200,7 +1200,8 @@ mod tests {
     }
 
     // Behaviour (#3108 R3): a typed read of an engine kind through its resolver hands over the
-    // port's records as they are: a get and a list encode nothing.
+    // port's records as they are: a get and a list encode nothing, and a declared query encodes
+    // only the paths it selects by.
     #[tokio::test]
     async fn a_typed_read_of_an_engine_kind_encodes_nothing() {
         let backend = crate::test_store::memory_backend();
@@ -1220,5 +1221,11 @@ mod tests {
         assert_eq!(resolver.get("one").await.expect("get").spec.0, "value");
         assert_eq!(resolver.list().await.expect("list").items.len(), 1);
         assert_eq!(ENCODED.with(std::cell::Cell::get), 0, "a typed read encodes no spec");
+
+        // A declared query reads only the paths it selects by: none of them in the spec.
+        let query = crate::StoreQuery { fields: BTreeMap::from([("metadata.name".to_owned(), "one".to_owned())]), ..Default::default() };
+        let selected = resolver.query_declared(&query).await.expect("query").items;
+        assert_eq!(selected.iter().map(|read| read.object.metadata.name.as_str()).collect::<Vec<_>>(), ["one"]);
+        assert_eq!(ENCODED.with(std::cell::Cell::get), 0, "a declared query encodes no spec");
     }
 }

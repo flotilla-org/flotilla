@@ -59,6 +59,8 @@ pub use view_snapshot::*;
 
 pub mod query;
 pub use query::*;
+mod object_index;
+pub use object_index::object_index_keys;
 mod store;
 pub use store::*;
 mod uncomposed_records;

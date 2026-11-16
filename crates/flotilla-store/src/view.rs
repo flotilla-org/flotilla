@@ -176,9 +176,8 @@ impl<T: Resource> ViewState<T> {
             Arc::make_mut(snapshot).index = Arc::new(QueryIndex::default());
         }
         if let Some(object) = merged.into_iter().next() {
-            let value = serde_json::to_value(object.to_k8s_object()).map_err(|error| ResourceError::decode(error.to_string()))?;
+            Arc::make_mut(index).update_object(&key, Some(&object))?;
             let item = ReadResourceObject { object, provenance: ResourceProvenance::Local };
-            Arc::make_mut(index).update(&key, Some(&value));
             if let Some(snapshot) = &mut self.snapshot {
                 let serialized = serialize_read(&item)?;
                 let snapshot = Arc::make_mut(snapshot);
@@ -247,8 +246,7 @@ impl<T: Resource> ViewState<T> {
         match event {
             ReadWatchEvent::Added(item) | ReadWatchEvent::Modified(item) => {
                 let key = Self::key(&item.object.metadata.namespace, &item.object.metadata.name, &item.provenance);
-                let value = serde_json::to_value(item.object.to_k8s_object()).map_err(|error| ResourceError::decode(error.to_string()))?;
-                Arc::make_mut(&mut self.index).update(&key, Some(&value));
+                Arc::make_mut(&mut self.index).update_object(&key, Some(&item.object))?;
                 if let Some(snapshot) = self.snapshot.as_mut().filter(|_| snapshots_source_rows) {
                     let serialized = serialize_read(&item)?;
                     let snapshot = Arc::make_mut(snapshot);

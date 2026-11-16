@@ -46,8 +46,19 @@ define_resource!(
         "status.subjects.*.subject",
         "spec.repositories.*.repo_ref",
         "metadata.annotations.\"flotilla.work/ensured-from\"",
-    ]
+    ],
+    indexed_values = legacy_subjects
 );
+
+/// Stored N-generation Convoy specs may still carry legacy issues and a bound request: the
+/// subject path indexes the subjects they declare, without rewriting the stored body.
+fn legacy_subjects(spec: &ConvoySpec, path: &str) -> Option<Vec<String>> {
+    if path != "spec.subjects.*.subject" || (spec.change_request.is_none() && spec.issues.is_empty()) {
+        return None;
+    }
+    let subjects = spec.declared_subjects().ok()?;
+    Some(subjects.into_iter().filter_map(|entry| serde_json::to_value(entry.subject).ok()).map(|subject| subject.to_string()).collect())
+}
 
 /// The frozen admission decision is a creation input, like the prepared snapshots.
 /// Keeping it in metadata lets every authoritative backend seed the existing

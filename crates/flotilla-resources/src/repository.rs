@@ -13,8 +13,31 @@ define_resource!(
     RepositoryStatusPatch,
     replication = crate::ReplicationClass::ConvergentFacts,
     validate_spec_update = validate_repository_spec_update,
-    queryable = &["metadata.name", "metadata.annotations.\"flotilla.work/verification-command-project\"", "spec.catalog_targets.*"]
+    queryable = &["metadata.name", "metadata.annotations.\"flotilla.work/verification-command-project\"", "spec.catalog_targets.*"],
+    indexed_values = catalog_targets
 );
+
+/// Catalog aliases are a virtual indexed projection of the immutable repository identity; the
+/// spec keeps its stored shape.
+fn catalog_targets(spec: &RepositorySpec, path: &str) -> Option<Vec<String>> {
+    if path != "spec.catalog_targets.*" {
+        return None;
+    }
+    let mut targets = BTreeSet::from([spec.leaf_slug(), spec.catalog_slug()]);
+    match spec.identity() {
+        RepositoryIdentity::Forge { owner, repo_name, .. } => {
+            targets.insert(format!("{owner}/{repo_name}"));
+        }
+        RepositoryIdentity::Remote { canonical_remote } => {
+            targets.insert(crate::descriptive_repo_slug(canonical_remote));
+            if let Some(forge) = spec.forge() {
+                targets.insert(forge.repository.clone());
+            }
+        }
+        RepositoryIdentity::Local { .. } => {}
+    }
+    Some(targets.into_iter().collect())
+}
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]

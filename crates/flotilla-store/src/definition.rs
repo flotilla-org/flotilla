@@ -756,11 +756,10 @@ pub(crate) fn select_reads<T: Resource>(
     let mut index = crate::QueryIndex::default();
     let mut messages = BTreeSet::new();
     for read in &reads {
-        let value = serde_json::to_value(read.object.to_k8s_object()).map_err(|error| ResourceError::decode(error.to_string()))?;
-        if query.message.as_ref().is_none_or(|message| message.selects(&value)) {
+        if query.message.as_ref().map_or(Ok(true), |message| message.selects(&read.object))? {
             messages.insert(read.object.metadata.name.clone());
         }
-        index.update(&read.object.metadata.name, Some(&value));
+        index.update_object(&read.object.metadata.name, Some(&read.object))?;
     }
     let selected = index.names(query);
     Ok(reads
@@ -843,10 +842,7 @@ fn clone_read<T: Resource>(read: &ReadResourceObject<T>) -> ReadResourceObject<T
 fn select<T: Resource>(objects: Vec<ResourceObject<T>>, query: &crate::StoreQuery) -> Result<Vec<ResourceObject<T>>, ResourceError> {
     let mut index = crate::QueryIndex::default();
     for object in &objects {
-        index.update(
-            &object.metadata.name,
-            Some(&serde_json::to_value(object.to_k8s_object()).map_err(|error| ResourceError::decode(error.to_string()))?),
-        );
+        index.update_object(&object.metadata.name, Some(object))?;
     }
     let selected = index.names(query);
     Ok(objects.into_iter().filter(|object| selected.contains(&object.metadata.name)).collect())

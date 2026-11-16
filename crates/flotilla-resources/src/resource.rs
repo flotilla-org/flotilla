@@ -12,7 +12,7 @@ use crate::{
 };
 
 macro_rules! define_resource {
-    ($name:ident, $plural:literal, $spec:ty, $status:ty, $patch:ty, replication = $replication:expr $(, initial_status = $initializer:path)? $(, canonicalize_spec = $canonicalizer:path)?, queryable = $fields:expr) => {
+    ($name:ident, $plural:literal, $spec:ty, $status:ty, $patch:ty, replication = $replication:expr $(, initial_status = $initializer:path)? $(, canonicalize_spec = $canonicalizer:path)?, queryable = $fields:expr $(, indexed_values = $indexer:path)?) => {
         #[derive(Debug, Clone, Copy, PartialEq, Eq)]
         pub struct $name;
 
@@ -33,9 +33,13 @@ macro_rules! define_resource {
             $(fn initial_status(meta: &$crate::InputMeta) -> Result<Option<Self::Status>, $crate::ResourceError> {
                 $initializer(meta)
             })?
+
+            $(fn indexed_values(spec: &Self::Spec, path: &str) -> Option<Vec<String>> {
+                $indexer(spec, path)
+            })?
         }
     };
-    ($name:ident, $plural:literal, $spec:ty, $status:ty, $patch:ty, replication = $replication:expr, validate_spec_update = $validator:path, queryable = $fields:expr) => {
+    ($name:ident, $plural:literal, $spec:ty, $status:ty, $patch:ty, replication = $replication:expr, validate_spec_update = $validator:path, queryable = $fields:expr $(, indexed_values = $indexer:path)?) => {
         #[derive(Debug, Clone, Copy, PartialEq, Eq)]
         pub struct $name;
 
@@ -52,6 +56,10 @@ macro_rules! define_resource {
             fn validate_spec_update(current: &Self::Spec, requested: &Self::Spec) -> Result<(), $crate::ResourceError> {
                 $validator(current, requested)
             }
+
+            $(fn indexed_values(spec: &Self::Spec, path: &str) -> Option<Vec<String>> {
+                $indexer(spec, path)
+            })?
         }
     };
     ($name:ident, $plural:literal, $spec:ty, $status:ty, $patch:ty, replication = $replication:expr, validate_spec_update = $validator:path) => {
@@ -237,6 +245,12 @@ pub trait Resource: Send + Sync + 'static {
     /// canonical writes and no-op comparisons. The default moves the spec intact.
     fn canonicalize_spec<'a>(_labels: &BTreeMap<String, String>, spec: Cow<'a, Self::Spec>) -> Result<Cow<'a, Self::Spec>, ResourceError> {
         Ok(spec)
+    }
+
+    /// The values the declared query path `path` indexes for `spec` when they are derived from
+    /// it rather than held at the path; `None` indexes what the path holds.
+    fn indexed_values(_spec: &Self::Spec, _path: &str) -> Option<Vec<String>> {
+        None
     }
 
     fn validate_spec(_meta: &InputMeta, _spec: &Self::Spec) -> Result<(), ResourceError> {
@@ -458,6 +472,18 @@ impl<T: Resource> ResourceObject<T> {
         Ok(current == requested)
     }
 
+    /// The object in its resource document shape, borrowed: serializes as
+    /// [`to_k8s_object`](Self::to_k8s_object) does, without cloning it.
+    pub fn as_k8s(&self) -> K8sResourceObjectRef<'_, T> {
+        K8sResourceObjectRef {
+            api_version: Cow::Owned(api_version(T::API_PATHS)),
+            kind: T::API_PATHS.kind,
+            metadata: (&self.metadata).into(),
+            spec: &self.spec,
+            status: self.status.as_ref(),
+        }
+    }
+
     pub fn to_k8s_object(&self) -> K8sResourceObject<T> {
         K8sResourceObject {
             api_version: api_version(T::API_PATHS),
@@ -492,7 +518,7 @@ pub fn api_version(paths: ApiPaths) -> String {
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
 pub struct K8sObjectMeta {
     pub name: String,
     pub namespace: String,
@@ -501,18 +527,88 @@ pub struct K8sObjectMeta {
     #[serde(default)]
     pub labels: BTreeMap<String, String>,
     #[serde(default)]
-    #[serde(deserialize_with = "decode_annotations", serialize_with = "encode_annotations")]
+    #[serde(deserialize_with = "decode_annotations")]
     pub annotations: BTreeMap<String, String>,
-    #[serde(default, rename = "ownerReferences", skip_serializing_if = "Vec::is_empty")]
+    #[serde(default, rename = "ownerReferences")]
     pub owner_references: Vec<OwnerReference>,
-    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    #[serde(default)]
     pub finalizers: Vec<String>,
-    #[serde(default, rename = "deletionTimestamp", skip_serializing_if = "Option::is_none")]
+    #[serde(default, rename = "deletionTimestamp")]
     pub deletion_timestamp: Option<DateTime<Utc>>,
     #[serde(rename = "creationTimestamp")]
     pub creation_timestamp: DateTime<Utc>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[serde(default)]
     pub merge: Option<MergeMetadata>,
+}
+
+impl Serialize for K8sObjectMeta {
+    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        K8sObjectMetaRef::from(self).serialize(serializer)
+    }
+}
+
+impl<'a> From<&'a K8sObjectMeta> for K8sObjectMetaRef<'a> {
+    fn from(value: &'a K8sObjectMeta) -> Self {
+        Self {
+            name: &value.name,
+            namespace: &value.namespace,
+            resource_version: &value.resource_version,
+            labels: &value.labels,
+            annotations: &value.annotations,
+            owner_references: &value.owner_references,
+            finalizers: &value.finalizers,
+            deletion_timestamp: value.deletion_timestamp,
+            creation_timestamp: value.creation_timestamp,
+            merge: value.merge.as_ref(),
+        }
+    }
+}
+
+/// [`K8sObjectMeta`]'s document shape over borrowed metadata, which both serialize.
+#[derive(Serialize)]
+struct K8sObjectMetaRef<'a> {
+    name: &'a str,
+    namespace: &'a str,
+    #[serde(rename = "resourceVersion")]
+    resource_version: &'a str,
+    labels: &'a BTreeMap<String, String>,
+    #[serde(serialize_with = "encode_borrowed_annotations")]
+    annotations: &'a BTreeMap<String, String>,
+    #[serde(rename = "ownerReferences", skip_serializing_if = "is_empty")]
+    owner_references: &'a [OwnerReference],
+    #[serde(skip_serializing_if = "is_empty")]
+    finalizers: &'a [String],
+    #[serde(rename = "deletionTimestamp", skip_serializing_if = "Option::is_none")]
+    deletion_timestamp: Option<DateTime<Utc>>,
+    #[serde(rename = "creationTimestamp")]
+    creation_timestamp: DateTime<Utc>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    merge: Option<&'a MergeMetadata>,
+}
+
+impl<'a> From<&'a ObjectMeta> for K8sObjectMetaRef<'a> {
+    fn from(value: &'a ObjectMeta) -> Self {
+        Self {
+            name: &value.name,
+            namespace: &value.namespace,
+            resource_version: &value.resource_version,
+            labels: &value.labels,
+            annotations: &value.annotations,
+            owner_references: &value.owner_references,
+            finalizers: &value.finalizers,
+            deletion_timestamp: value.deletion_timestamp,
+            creation_timestamp: value.creation_timestamp,
+            merge: value.merge.as_ref(),
+        }
+    }
+}
+
+fn is_empty<T>(items: &&[T]) -> bool {
+    items.is_empty()
+}
+
+fn encode_borrowed_annotations<S: serde::Serializer>(annotations: &&BTreeMap<String, String>, encoder: S) -> Result<S::Ok, S::Error> {
+    encode_annotations(annotations, encoder)
 }
 
 impl From<&ObjectMeta> for K8sObjectMeta {
@@ -549,19 +645,43 @@ impl From<K8sObjectMeta> for ObjectMeta {
     }
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(bound(
-    serialize = "T::Spec: Serialize, T::Status: Serialize",
-    deserialize = "T::Spec: DeserializeOwned, T::Status: DeserializeOwned"
-))]
+#[derive(Debug, Clone, Deserialize)]
+#[serde(bound(deserialize = "T::Spec: DeserializeOwned, T::Status: DeserializeOwned"))]
 pub struct K8sResourceObject<T: Resource> {
     #[serde(rename = "apiVersion")]
     pub api_version: String,
     pub kind: String,
     pub metadata: K8sObjectMeta,
     pub spec: T::Spec,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[serde(default)]
     pub status: Option<T::Status>,
+}
+
+impl<T: Resource> Serialize for K8sResourceObject<T> {
+    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        K8sResourceObjectRef::<T> {
+            api_version: Cow::Borrowed(&self.api_version),
+            kind: &self.kind,
+            metadata: (&self.metadata).into(),
+            spec: &self.spec,
+            status: self.status.as_ref(),
+        }
+        .serialize(serializer)
+    }
+}
+
+/// A resource's document shape over borrowed parts: what [`K8sResourceObject`] serializes, and
+/// what [`ResourceObject::as_k8s`] serializes without cloning the object.
+#[derive(Serialize)]
+#[serde(bound(serialize = ""))]
+pub struct K8sResourceObjectRef<'a, T: Resource> {
+    #[serde(rename = "apiVersion")]
+    api_version: Cow<'a, str>,
+    kind: &'a str,
+    metadata: K8sObjectMetaRef<'a>,
+    spec: &'a T::Spec,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    status: Option<&'a T::Status>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]

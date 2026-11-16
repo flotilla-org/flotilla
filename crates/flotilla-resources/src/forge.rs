@@ -18,6 +18,21 @@ impl Resource for Forge {
 
     const QUERYABLE_FIELDS: &'static [&'static str] = &["metadata.name", "spec.remote_hosts.*"];
 
+    /// Forge remote matching is case-insensitive over declared aliases, SSH aliases and the
+    /// canonical HTTPS host: the remote-host path indexes that same inventory.
+    fn indexed_values(spec: &ForgeSpec, path: &str) -> Option<Vec<String>> {
+        (path == "spec.remote_hosts.*").then(|| {
+            spec.hosts
+                .iter()
+                .map(|host| host.to_ascii_lowercase())
+                .chain(std::iter::once(spec.git_ssh_host.to_ascii_lowercase()))
+                .chain(spec.https_url.split_once("://").and_then(|(_, rest)| rest.split('/').next()).map(str::to_ascii_lowercase))
+                .collect::<BTreeSet<_>>()
+                .into_iter()
+                .collect()
+        })
+    }
+
     const VALIDATE_NAMESPACE_SPEC: bool = true;
 
     fn validate_spec_with_siblings(spec: &Self::Spec, siblings: &[Self::Spec]) -> Result<(), ResourceError> {
