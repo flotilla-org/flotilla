@@ -591,16 +591,17 @@ impl EngineManifestRoots {
                     .get(&(home.clone(), root.name().to_owned()))
                     .copied()
                     .ok_or_else(|| format!("{ROOT_KIND} {} at {home} has no creation time", root.name()))?;
-                Ok(flotilla_resources::engine_records::EngineObject {
+                flotilla_resources::engine_records::Record::<flotilla_resources::ManifestRoot> {
                     name: view.name,
                     home,
                     version: root.version().0,
                     created_at,
                     labels: BTreeMap::new(),
                     annotations: BTreeMap::new(),
-                    spec: serde_json::to_value(&view.spec).map_err(|error| error.to_string())?,
-                    status: Some(serde_json::to_value(&view.status).map_err(|error| error.to_string())?),
-                })
+                    spec: view.spec,
+                    status: Some(view.status),
+                }
+                .engine_object()
             })
             .collect()
     }

@@ -10,8 +10,8 @@ use std::{
 
 use flotilla_engine_store::watch::EngineWatch;
 use flotilla_resources::{
-    engine_records::{EngineObject, EngineRecords},
-    Message as OldMessage, MessageSpec as OldSpec, ReadResourceObject, ResourceProvenance,
+    engine_records::{decode_spec, EngineObject, EngineRecords, Record},
+    Message as OldMessage, ReadResourceObject, ResourceProvenance,
 };
 use flotilla_schema::Kind as _;
 use flotilla_state_machines::{machines::message::Message, Resource};
@@ -43,16 +43,17 @@ impl MessageRecords {
             ResourceProvenance::Replica { origin_root, .. } => origin_root.to_string(),
         };
         let metadata = read.object.metadata;
-        Ok(EngineObject {
+        Record::<OldMessage> {
             name: metadata.name,
             home,
             version: metadata.resource_version.parse().map_err(|error| format!("message version: {error}"))?,
             created_at: metadata.creation_timestamp,
             labels: metadata.labels,
             annotations: metadata.annotations,
-            spec: serde_json::to_value(&read.object.spec).map_err(|error| error.to_string())?,
-            status: read.object.status.map(|status| serde_json::to_value(&status)).transpose().map_err(|error| error.to_string())?,
-        })
+            spec: read.object.spec,
+            status: read.object.status,
+        }
+        .engine_object()
     }
 }
 
@@ -113,7 +114,7 @@ impl EngineRecords for MessageRecords {
         spec: serde_json::Value,
     ) -> Result<EngineObject, String> {
         let namespace = self.namespace();
-        let spec: OldSpec = serde_json::from_value(spec).map_err(|error| format!("Message spec: {error}"))?;
+        let spec = decode_spec::<OldMessage>(name, spec)?;
         let (id, _) = self.primitives.admit_at(&namespace, name, &spec).await.map_err(|error| error.to_string())?;
         let view = self.primitives.verb_get(&namespace, &id).map_err(|error| error.to_string())?;
         self.object(view.ok_or_else(|| format!("Message {name} is not readable after its admission"))?)

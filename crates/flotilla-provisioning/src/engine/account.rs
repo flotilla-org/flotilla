@@ -26,7 +26,7 @@ use flotilla_resources::account_access::{
     BindingState as OldState, EpochEntry, GrantName, GrantScope, PendingBinding, ProvisionRecord, ProvisionWrite, ACCOUNT_BINDING_LABEL,
     ACCOUNT_CREDENTIAL_LABEL,
 };
-use flotilla_resources::engine_records::{EngineObject, EngineRecords};
+use flotilla_resources::engine_records::{decode_spec, EngineObject, EngineRecords, Record};
 use flotilla_resources::CONVOY_LABEL;
 use flotilla_schema::{CreatedAt, Identity, Kind, KindCode, NewChange, Ref, State, Timestamp};
 use flotilla_schema_sqlite::{stream::Service, Read, StoreError};
@@ -775,16 +775,17 @@ fn binding_object(binding: &Resource<AccountBinding>, home: &str, created: &Crea
         (ACCOUNT_CREDENTIAL_LABEL.to_owned(), record.spec.credential.0.clone()),
     ]);
     labels.extend(convoy_of(binding).map(|convoy| (CONVOY_LABEL.to_owned(), convoy)));
-    Ok(EngineObject {
+    Record::<flotilla_resources::AccountBinding> {
         name: record.name,
         home: record.home,
         version: binding.version().0,
         created_at,
         labels,
         annotations: BTreeMap::new(),
-        spec: serde_json::to_value(&record.spec).map_err(|error| error.to_string())?,
+        spec: record.spec,
         status: None,
-    })
+    }
+    .engine_object()
 }
 
 /// When the held record `name` of `kind` at `home` was created.
@@ -800,16 +801,17 @@ fn provision_object(provision: &Plain<ProvisionSpec>, bindings: &Bindings, creat
     let mut labels = BTreeMap::from([(ACCOUNT_BINDING_LABEL.to_owned(), record.spec.binding.name.clone())]);
     let binding = bindings.get(&(record.spec.binding.home.clone(), record.spec.binding.name.clone()));
     labels.extend(binding.and_then(convoy_of).map(|convoy| (CONVOY_LABEL.to_owned(), convoy)));
-    Ok(EngineObject {
+    Record::<flotilla_resources::AccountProvision> {
         name: record.name,
         home: record.home,
         version: provision.version,
         created_at,
         labels,
         annotations: BTreeMap::new(),
-        spec: serde_json::to_value(&record.spec).map_err(|error| error.to_string())?,
+        spec: record.spec,
         status: None,
-    })
+    }
+    .engine_object()
 }
 
 impl EngineAccounts {
@@ -901,7 +903,7 @@ impl EngineRecords for EngineAccounts {
         if kind != PROVISION_KIND {
             return Err(binding_refusal(kind, name));
         }
-        let spec: AccountProvisionSpec = serde_json::from_value(spec).map_err(|error| format!("decode {kind} spec: {error}"))?;
+        let spec = decode_spec::<flotilla_resources::AccountProvision>(name, spec)?;
         let convoy = labels.get(CONVOY_LABEL).map(String::as_str).unwrap_or_default();
         self.record_provision("", name, convoy, &spec, true).await?;
         let written = self.named(kind, name)?.into_iter().find(|object| object.home == self.home);

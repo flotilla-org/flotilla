@@ -23,9 +23,9 @@ use flotilla_engine_store::{
 };
 use flotilla_resources::{
     definitions::{origin, stamp, DefinitionOrigin, DEFINITION_KINDS},
-    engine_records::{EngineObject, EngineRecords},
-    ConvoyEnsureSpec, CredentialGrantSpec, CredentialSpecSpec, CrewDefaultsSpec, FleetDesignationSpec, ForgeSpec, ImageLayerResourceSpec,
-    WorkflowTemplateSpec,
+    engine_records::{decode_spec, EngineObject, EngineRecords, Record},
+    ConvoyEnsure, CredentialGrant, CredentialSpec, CrewDefaults, FleetDesignation, Forge, ImageLayer, ImageLayerResourceSpec, Resource,
+    WorkflowTemplate,
 };
 use flotilla_schema::{Identity, Kind, KindCode, NewChange, Timestamp};
 use flotilla_schema_sqlite::{stream::Service, Read, ResourceId, StoreError};
@@ -50,74 +50,71 @@ const WRITE_ATTEMPTS: usize = 3;
 /// The writer of a delete, which names no origin: the port deletes what its callers remove.
 const WRITER: &str = "definition-records";
 
-/// A definition kind as the port serves it: its resource kind's serde spec in and out.
+/// A definition kind as the port serves it: its resource kind's spec in and out.
 trait Definition: Kind + PartialEq + Sized {
+    /// The resource kind it is served as.
+    type Resource: Resource;
     /// The resource kind's name.
-    const NAME: &'static str;
-    fn build(project: Option<String>, spec: Value) -> Result<Self, String>;
+    const NAME: &'static str = <Self::Resource as Resource>::API_PATHS.kind;
+    fn build(project: Option<String>, spec: SpecOf<Self>) -> Result<Self, String>;
     /// The project a record was materialised for: a workflow template's `project` column.
     fn project(&self) -> Option<&str> {
         None
     }
-    fn spec(&self) -> Result<Value, String>;
+    fn spec(&self) -> SpecOf<Self>;
 }
 
-fn decode<S: serde::de::DeserializeOwned>(kind: &str, spec: Value) -> Result<S, String> {
-    serde_json::from_value(spec).map_err(|error| format!("{kind} spec: {error}"))
-}
-
-fn encode(spec: impl serde::Serialize) -> Result<Value, String> {
-    serde_json::to_value(spec).map_err(|error| error.to_string())
-}
+/// The spec of the resource kind definition kind `K` is served as.
+type SpecOf<K> = <<K as Definition>::Resource as Resource>::Spec;
 
 /// A kind whose stored form is built from its spec whole.
 macro_rules! whole {
-    ($($stored:ty => $name:literal, $spec:ty);* $(;)?) => {$(
+    ($($stored:ty => $resource:ty);* $(;)?) => {$(
         impl Definition for $stored {
-            const NAME: &'static str = $name;
-            fn build(_: Option<String>, spec: Value) -> Result<Self, String> {
-                Ok(<$stored>::new(&decode::<$spec>($name, spec)?))
+            type Resource = $resource;
+            fn build(_: Option<String>, spec: SpecOf<Self>) -> Result<Self, String> {
+                Ok(<$stored>::new(&spec))
             }
-            fn spec(&self) -> Result<Value, String> {
-                encode(<$stored>::spec(self))
+            fn spec(&self) -> SpecOf<Self> {
+                <$stored>::spec(self)
             }
         }
     )*};
 }
 
 whole!(
-    ForgeDefinition => "Forge", ForgeSpec;
-    FleetDesignationDefinition => "FleetDesignation", FleetDesignationSpec;
-    CredentialSpecDefinition => "CredentialSpec", CredentialSpecSpec;
-    CredentialGrantDefinition => "CredentialGrant", CredentialGrantSpec;
-    CrewDefaultsDefinition => "CrewDefaults", CrewDefaultsSpec;
-    ConvoyEnsureDefinition => "ConvoyEnsure", ConvoyEnsureSpec;
+    ForgeDefinition => Forge;
+    FleetDesignationDefinition => FleetDesignation;
+    CredentialSpecDefinition => CredentialSpec;
+    CredentialGrantDefinition => CredentialGrant;
+    CrewDefaultsDefinition => CrewDefaults;
+    ConvoyEnsureDefinition => ConvoyEnsure;
 );
 
 impl Definition for ImageLayerDefinition {
-    const NAME: &'static str = "ImageLayer";
-    fn build(_: Option<String>, spec: Value) -> Result<Self, String> {
-        match decode::<ImageLayerResourceSpec>(Self::NAME, spec)? {
+    type Resource = ImageLayer;
+    fn build(_: Option<String>, spec: ImageLayerResourceSpec) -> Result<Self, String> {
+        match spec {
             ImageLayerResourceSpec::Current(layer) => ImageLayerDefinition::new(&layer),
             // Handled before building: see `EngineDefinitions::apply`.
             ImageLayerResourceSpec::Retired => Err("a retired ImageLayer has no stored form".into()),
         }
     }
-    fn spec(&self) -> Result<Value, String> {
-        encode(ImageLayerResourceSpec::Current(Box::new(ImageLayerDefinition::spec(self).clone())))
+    fn spec(&self) -> ImageLayerResourceSpec {
+        ImageLayerResourceSpec::Current(Box::new(ImageLayerDefinition::spec(self).clone()))
     }
 }
 
 impl Definition for WorkflowTemplateDefinition {
-    const NAME: &'static str = "WorkflowTemplate";
-    fn build(project: Option<String>, spec: Value) -> Result<Self, String> {
-        WorkflowTemplateDefinition::new(project, &decode::<WorkflowTemplateSpec>(Self::NAME, spec)?)
+    type Resource = WorkflowTemplate;
+    fn build(project: Option<String>, spec: SpecOf<Self>) -> Result<Self, String> {
+        WorkflowTemplateDefinition::new(project, &spec)
     }
     fn project(&self) -> Option<&str> {
         self.project.as_deref()
     }
-    fn spec(&self) -> Result<Value, String> {
-        encode(WorkflowTemplateDefinition::spec(self))
+    fn spec(&self) -> SpecOf<Self> {
+        WorkflowTemplateDefinition::spec(self).clone()
     }
 }
 
@@ -214,9 +211,8 @@ fn object<K: Definition>(
     value: &K,
     origin: &DefinitionOrigin,
 ) -> Held {
-    let spec = value.spec().map_err(|error| format!("{} {name} at {home}: {error}", K::NAME))?;
     let (labels, annotations) = stamp(origin);
-    Ok(EngineObject { name, home, version, created_at, labels, annotations, spec, status: None })
+    Record::<K::Resource> { name, home, version, created_at, labels, annotations, spec: value.spec(), status: None }.engine_object()
 }
 
 /// Record `id` as the old object, with the stamps its last change says.
@@ -405,7 +401,7 @@ impl EngineDefinitions {
     }
 
     fn write<K: Definition>(&self, name: &str, origin: DefinitionOrigin, spec: Value) -> Result<EngineObject, String> {
-        let value = K::build(provenance::materialized_project(&origin), spec)?;
+        let value = K::build(provenance::materialized_project(&origin), decode_spec::<K::Resource>(name, spec)?)?;
         // Writers of one name at this home are not serialised (the manifest reconciler, the CLI,
         // project ops): a write that loses a race reads again and writes over the winner, as the
         // old store's last writer won.
@@ -512,23 +508,28 @@ impl EngineRecords for EngineDefinitions {
         spec: Value,
     ) -> Result<EngineObject, String> {
         let origin = provenance::resolve_stamped_root(&self.service, &self.home, origin(labels, annotations)?)?;
-        if kind == ImageLayerDefinition::NAME && decode::<ImageLayerResourceSpec>(kind, spec.clone())?.is_retired() {
-            // ADR 0053's retired layers stay admissible for one roll, so that previous-generation
-            // manifests still apply, and are inert for resolution. The import drops them; so does
-            // a write: this home's copy is removed, and the written value is returned unstored.
-            self.remove::<ImageLayerDefinition>(name)?;
-            let (labels, annotations) = stamp(&origin);
-            return Ok(EngineObject {
-                name: name.to_owned(),
-                home: self.home.clone(),
-                version: 0,
-                // Not stored, so created by this write.
-                created_at: self.clock.now(),
-                labels,
-                annotations,
-                spec,
-                status: None,
-            });
+        if kind == ImageLayerDefinition::NAME {
+            let layer = decode_spec::<ImageLayer>(name, spec.clone())?;
+            if layer.is_retired() {
+                // ADR 0053's retired layers stay admissible for one roll, so that previous-generation
+                // manifests still apply, and are inert for resolution. The import drops them; so
+                // does a write: this home's copy is removed, and the written value is returned
+                // unstored.
+                self.remove::<ImageLayerDefinition>(name)?;
+                let (labels, annotations) = stamp(&origin);
+                return Record::<ImageLayer> {
+                    name: name.to_owned(),
+                    home: self.home.clone(),
+                    version: 0,
+                    // Not stored, so created by this write.
+                    created_at: self.clock.now(),
+                    labels,
+                    annotations,
+                    spec: layer,
+                    status: None,
+                }
+                .engine_object();
+            }
         }
         by_kind!(kind, |K| self.write::<K>(name, origin, spec))
     }

@@ -21,8 +21,8 @@ use flotilla_engine_store::{
 use flotilla_resources::{
     definition_provenance::SEEDING_MANAGER,
     definitions::{origin, stamp},
-    engine_records::{EngineObject, EngineRecords},
-    FulfilmentKindSpec, CONVOY_LABEL, MANAGED_BY_LABEL, PLACEMENT_SNAPSHOT_KIND, PREPARED_SNAPSHOT_LABEL,
+    engine_records::{decode_spec, EngineObject, EngineRecords, Record},
+    FulfilmentKind, CONVOY_LABEL, MANAGED_BY_LABEL, PLACEMENT_SNAPSHOT_KIND, PREPARED_SNAPSHOT_LABEL,
 };
 use flotilla_schema::{ChangeHeader, ChangeItem, Identity, Kind, KindCode, NewChange, Timestamp};
 use flotilla_schema_sqlite::{stream::Service, Read, ResourceId, StoreError};
@@ -120,8 +120,7 @@ fn object(
     let change = read.last_change(id)?;
     let (labels, annotations) = stamps(read, roots, &name, change.as_ref())?;
     let created_at = created_at(read, id)?;
-    let spec = serde_json::to_value(value.spec()).map_err(|error| format!("{KIND} {name} at {home}: {error}"));
-    Ok(spec.map(|spec| EngineObject { name, home, version, created_at, labels, annotations, spec, status: None }))
+    Ok(Record::<FulfilmentKind> { name, home, version, created_at, labels, annotations, spec: value.spec(), status: None }.engine_object())
 }
 
 fn reload(read: &mut Read<'_>, records: &mut Records, name: &str, home: &str) -> Result<(), StoreError> {
@@ -278,18 +277,18 @@ impl EngineKinds {
             };
             match written {
                 Ok(version) => {
-                    let spec = serde_json::to_value(value.spec()).map_err(|error| format!("{KIND} {name}: {error}"))?;
                     let created = self.log.created::<FulfilmentKindDefinition>(name, &self.home).map_err(|error| error.to_string())?;
-                    return Ok(EngineObject {
+                    return Record::<FulfilmentKind> {
                         name: name.to_owned(),
                         home: self.home.clone(),
                         version,
                         created_at: created.to_datetime(),
                         labels: labels.clone(),
                         annotations: annotations.clone(),
-                        spec,
+                        spec: value.spec(),
                         status: None,
-                    });
+                    }
+                    .engine_object();
                 }
                 Err(PlainError::Conflict { .. } | PlainError::Exists { .. } | PlainError::Missing { .. }) => continue,
                 Err(error) => return Err(format!("write {KIND} {name}: {error}")),
@@ -373,7 +372,7 @@ impl EngineRecords for EngineKinds {
         spec: Value,
     ) -> Result<EngineObject, String> {
         refuse_kind(kind)?;
-        let spec: FulfilmentKindSpec = serde_json::from_value(spec).map_err(|error| format!("{KIND} spec: {error}"))?;
+        let spec = decode_spec::<FulfilmentKind>(name, spec)?;
         self.write(name, labels, annotations, &FulfilmentKindDefinition::new(&spec)?)
     }
 

@@ -30,7 +30,7 @@ use flotilla_protocol::{
     EnvironmentId, HostSummary, NodeId, NodeInfo, SystemInfo,
 };
 use flotilla_resources::{
-    engine_records::{EngineObject, EngineRecords},
+    engine_records::{decode_spec, decode_status, EngineObject, EngineRecords, Record},
     CredentialExpiry, FulfilmentFacts, HarnessFacts, HostCondition, HostConnection, HostSpec, HostStatus, LocalImageInventories,
     AGENT_ADAPTERS_CAPABILITY, CODEX_CENTRAL_LOGIN_CAPABILITY, CREDENTIAL_EXPIRY_CAPABILITY, ENVIRONMENT_PROVIDERS_CAPABILITY,
     HELD_CREDENTIALS_CAPABILITY, IMAGE_DIGESTS_CAPABILITY, OWNING_DAEMON_CAPABILITY, PLACEMENT_CAPABILITY, SSH_HOST_CAPABILITY,
@@ -392,10 +392,7 @@ impl EngineHosts {
         let (host, host_version, created_at) = held.host.as_ref()?;
         let spec = host.spec();
         let status = held.observation.as_ref().map(|(observation, _)| status(name, home, &spec, observation, self.heard(home), self.now()));
-        let encoded = serde_json::to_value(&spec)
-            .and_then(|spec| Ok((spec, status.map(serde_json::to_value).transpose()?)))
-            .map_err(|error| format!("{KIND} {name} at {home}: {error}"));
-        Some(encoded.map(|(spec, status)| EngineObject {
+        let record = Record::<flotilla_resources::Host> {
             name: name.to_owned(),
             home: home.to_owned(),
             // A change token for the writers' version checks, which read it back from this home: it
@@ -407,7 +404,8 @@ impl EngineHosts {
             annotations: BTreeMap::new(),
             spec,
             status,
-        }))
+        };
+        Some(record.engine_object())
     }
 
     /// This home's records of `name`, read from the store rather than the resident map.
@@ -561,7 +559,7 @@ impl EngineRecords for EngineHosts {
         spec: Value,
     ) -> Result<EngineObject, String> {
         refuse_kind(kind)?;
-        let spec: HostSpec = serde_json::from_value(spec).map_err(|error| format!("{KIND} spec: {error}"))?;
+        let spec = decode_spec::<flotilla_resources::Host>(name, spec)?;
         self.homed_here(name, &spec)?;
         let _writing = self.writing.lock().await;
         self.write_spec(name, &HostRecord::new(&spec))?;
@@ -570,7 +568,7 @@ impl EngineRecords for EngineHosts {
 
     async fn set_status(&self, kind: &str, name: &str, status: Value) -> Result<EngineObject, String> {
         refuse_kind(kind)?;
-        let status: HostStatus = serde_json::from_value(status).map_err(|error| format!("{KIND} status: {error}"))?;
+        let status = decode_status::<flotilla_resources::Host>(name, status)?;
         let _writing = self.writing.lock().await;
         let Some((host, _, _)) = self.own(name)?.host else {
             return Err(format!("{KIND} {name} is not held at {}", self.home));

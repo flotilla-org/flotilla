@@ -5,6 +5,34 @@ use std::sync::{Arc, Mutex, PoisonError};
 
 use futures::{stream::BoxStream, StreamExt};
 
+/// `object`, read at `home`, as the engine port hands it to the old store: its version a digest of
+/// what it shows, so a watcher sees each change of the record, of what it joins, or of what its
+/// home holds of it in memory.
+pub(crate) fn view_object<R: flotilla_resources::Resource>(
+    object: flotilla_resources::ResourceObject<R>,
+    home: String,
+) -> Result<flotilla_resources::engine_records::EngineObject, String> {
+    let resource_version = object.metadata.resource_version;
+    let record = flotilla_resources::engine_records::Record::<R> {
+        name: object.metadata.name,
+        home,
+        version: 0,
+        created_at: object.metadata.creation_timestamp,
+        labels: object.metadata.labels,
+        annotations: object.metadata.annotations,
+        spec: object.spec,
+        status: object.status,
+    };
+    let mut held = record.engine_object()?;
+    let mut digest = std::hash::DefaultHasher::new();
+    std::hash::Hash::hash(
+        &(&resource_version, held.spec.to_string(), held.status.as_ref().map(ToString::to_string), &held.labels),
+        &mut digest,
+    );
+    held.version = std::hash::Hasher::finish(&digest);
+    Ok(held)
+}
+
 /// A tick per message on `changes`, and one when it lagged: a reader reads everything again.
 pub(crate) fn ticks<T: Clone + Send + 'static>(changes: tokio::sync::broadcast::Receiver<T>) -> BoxStream<'static, ()> {
     futures::stream::unfold(changes, |mut changes| async move {

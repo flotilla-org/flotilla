@@ -25,8 +25,11 @@ use flotilla_engine_store::{
 };
 use flotilla_resources::{
     address::record_name,
-    engine_records::{BranchChangeRequest, ChangeRequestBranches, EngineObject, EngineRecords, ObservationFailures, SourceObservers},
-    ChangeRequestSpec, ChangeRequestStatus, IssueSpec, IssueStatus,
+    engine_records::{
+        decode_spec, decode_status, BranchChangeRequest, ChangeRequestBranches, EngineObject, EngineRecords, ObservationFailures, Record,
+        SourceObservers,
+    },
+    ChangeRequest, ChangeRequestSpec, ChangeRequestStatus, Issue, IssueSpec, IssueStatus, Resource,
 };
 use flotilla_schema::{Kind, KindCode, NewChange, Timestamp};
 use flotilla_schema_sqlite::{stream::Service, Read, ResourceId, StoreError};
@@ -79,8 +82,10 @@ impl Held {
 
 /// One of the two observation records, as the port writes it.
 trait Observed: Kind + PartialEq + Clone {
-    type Spec: serde::de::DeserializeOwned;
-    type Status: serde::de::DeserializeOwned;
+    type Spec;
+    type Status;
+    /// The resource kind it is served as.
+    type Resource: Resource<Spec = Self::Spec, Status = Self::Status>;
 
     /// The source `(service, scope)` `spec` names.
     fn spec_source(spec: &Self::Spec) -> (&str, &str);
@@ -99,6 +104,7 @@ trait Observed: Kind + PartialEq + Clone {
 impl Observed for ChangeRequestRecord {
     type Spec = ChangeRequestSpec;
     type Status = ChangeRequestStatus;
+    type Resource = ChangeRequest;
 
     fn spec_source(spec: &ChangeRequestSpec) -> (&str, &str) {
         (&spec.service, &spec.scope)
@@ -143,6 +149,7 @@ impl Observed for ChangeRequestRecord {
 impl Observed for IssueRecord {
     type Spec = IssueSpec;
     type Status = IssueStatus;
+    type Resource = Issue;
 
     fn spec_source(spec: &IssueSpec) -> (&str, &str) {
         (&spec.service, &spec.scope)
@@ -346,7 +353,7 @@ impl EngineObservations {
 
     /// Writes this home's record `name` of `K` from `spec`, as its observer.
     async fn apply_observed<K: Observed>(&self, kind: &'static str, name: &str, spec: Value) -> Result<EngineObject, String> {
-        let spec: K::Spec = serde_json::from_value(spec).map_err(|error| format!("{kind} spec: {error}"))?;
+        let spec = decode_spec::<K::Resource>(name, spec)?;
         K::check_name(name, &spec)?;
         self.observer_write(kind, name, K::spec_source(&spec)).await?;
         self.apply_as::<K>(kind, name, &spec)
@@ -404,27 +411,29 @@ impl EngineObservations {
     /// `held` as the old object, and when its values were last confirmed.
     fn object(&self, name: &str, home: &str, held: &Held) -> Result<(DateTime<Utc>, EngineObject), String> {
         let confirmed = self.confirmed_at(home, held.failing_since());
-        let encode = |value: serde_json::Result<Value>| value.map_err(|error| format!("{name} at {home}: {error}"));
-        let (version, spec, status) = match held {
-            Held::ChangeRequest(version, _, record) => (
-                *version,
-                encode(serde_json::to_value(record.old_spec(home)))?,
-                encode(serde_json::to_value(record.old_status(confirmed)))?,
-            ),
-            Held::Issue(version, _, record) => {
-                let status = record.old_status(confirmed).map_err(|error| format!("{name} at {home}: {error}"))?;
-                (*version, encode(serde_json::to_value(record.old_spec(home)))?, encode(serde_json::to_value(status))?)
+        let object = match held {
+            Held::ChangeRequest(version, _, record) => Record::<ChangeRequest> {
+                name: name.to_owned(),
+                home: home.to_owned(),
+                version: *version,
+                created_at: held.created(),
+                labels: BTreeMap::new(),
+                annotations: BTreeMap::new(),
+                spec: record.old_spec(home),
+                status: Some(record.old_status(confirmed)),
             }
-        };
-        let object = EngineObject {
-            name: name.to_owned(),
-            home: home.to_owned(),
-            version,
-            created_at: held.created(),
-            labels: BTreeMap::new(),
-            annotations: BTreeMap::new(),
-            spec,
-            status: Some(status),
+            .engine_object()?,
+            Held::Issue(version, _, record) => Record::<Issue> {
+                name: name.to_owned(),
+                home: home.to_owned(),
+                version: *version,
+                created_at: held.created(),
+                labels: BTreeMap::new(),
+                annotations: BTreeMap::new(),
+                spec: record.old_spec(home),
+                status: Some(record.old_status(confirmed).map_err(|error| format!("{name} at {home}: {error}"))?),
+            }
+            .engine_object()?,
         };
         Ok((confirmed, object))
     }
@@ -489,7 +498,7 @@ impl EngineObservations {
     }
 
     fn set_status_as<K: Observed>(&self, kind: &'static str, name: &str, status: Value) -> Result<EngineObject, String> {
-        let status: K::Status = serde_json::from_value(status).map_err(|error| format!("{kind} status: {error}"))?;
+        let status = decode_status::<K::Resource>(name, status)?;
         let current = self.log.get::<K>(name, &self.home).map_err(|error| error.to_string())?;
         let current = current.ok_or_else(|| format!("{kind} {name} is not held at {}", self.home))?;
         self.write(name, &current.spec.observed(&self.home, &status))?;

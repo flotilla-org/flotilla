@@ -18,7 +18,6 @@
 
 use std::{
     collections::{BTreeMap, BTreeSet},
-    hash::{Hash, Hasher},
     sync::{
         atomic::{AtomicU64, Ordering},
         Arc, Mutex, PoisonError,
@@ -419,25 +418,10 @@ impl std::fmt::Debug for ConvoyViews {
     }
 }
 
-/// `source` as the engine port hands it to the old store: its version a digest of what it shows,
-/// so a watcher sees each change of the launch, of what it joins, or of its home's notes.
+/// `source` as the engine port hands it to the old store: a change of the launch, of what it
+/// joins, or of its home's notes moves its version.
 fn engine_object(source: ReadResourceObject<Convoy>, home: String) -> Result<EngineObject, String> {
-    let object = source.object;
-    let spec = serde_json::to_value(&object.spec).map_err(|error| error.to_string())?;
-    let status = object.status.as_ref().map(serde_json::to_value).transpose().map_err(|error| error.to_string())?;
-    let mut digest = std::hash::DefaultHasher::new();
-    (&object.metadata.resource_version, spec.to_string(), status.as_ref().map(ToString::to_string), &object.metadata.labels)
-        .hash(&mut digest);
-    Ok(EngineObject {
-        name: object.metadata.name,
-        home,
-        version: digest.finish(),
-        created_at: object.metadata.creation_timestamp,
-        labels: object.metadata.labels,
-        annotations: object.metadata.annotations,
-        spec,
-        status,
-    })
+    crate::held_listing::view_object(source.object, home)
 }
 
 #[async_trait::async_trait]

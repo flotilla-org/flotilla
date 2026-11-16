@@ -18,7 +18,10 @@ use flotilla_engine_store::{
     follow::{Followed, Follower},
     plain::{PendingChange, PlainError, PlainLog},
 };
-use flotilla_resources::engine_records::{EngineObject, EngineRecords};
+use flotilla_resources::{
+    engine_records::{decode_spec, EngineObject, EngineRecords, Record},
+    Resource,
+};
 use flotilla_schema::{Kind, NewChange, Timestamp};
 use flotilla_schema_sqlite::{stream::Service, Read, StoreError};
 use futures::stream::BoxStream;
@@ -44,14 +47,29 @@ fn locked<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
 
 /// A plain kind served as old-store records.
 pub trait PlainKind: Kind + PartialEq + Send + Sync + 'static {
+    /// The resource kind it is served as.
+    type Resource: Resource;
+
     /// The writer recorded on this port's writes.
     const WRITER: &'static str;
 
-    /// The old object `record`, created at `created_at`, reads as, with no status.
-    fn object(name: String, home: String, version: u64, created_at: DateTime<Utc>, record: &Self) -> Held;
+    /// The spec the record reads as.
+    fn spec(&self) -> Result<<Self::Resource as Resource>::Spec, String>;
 
-    /// The record an old object's spec writes.
-    fn from_spec(spec: Value) -> Result<Self, String>;
+    /// The labels the record reads as, read back from what it holds; none unless it says.
+    fn labels(&self) -> BTreeMap<String, String> {
+        BTreeMap::new()
+    }
+
+    /// The record a spec writes.
+    fn from_spec(spec: <Self::Resource as Resource>::Spec) -> Result<Self, String>;
+}
+
+/// `record`, created at `created_at`, as the old object, with no status.
+fn object<K: PlainKind>(name: String, home: String, version: u64, created_at: DateTime<Utc>, record: &K) -> Held {
+    let spec = record.spec().map_err(|error| format!("{} {name} at {home}: {error}", <K as Kind>::KIND))?;
+    let labels = record.labels();
+    Record::<K::Resource> { name, home, version, created_at, labels, annotations: BTreeMap::new(), spec, status: None }.engine_object()
 }
 
 fn reload<K: PlainKind>(read: &mut Read<'_>, records: &mut Records, name: &str, home: &str) -> Result<(), StoreError> {
@@ -59,7 +77,7 @@ fn reload<K: PlainKind>(read: &mut Read<'_>, records: &mut Records, name: &str, 
     match read.resolve(K::CODE, name, home)?.map(|id| read.load::<K>(id)).transpose()?.flatten() {
         Some(loaded) => {
             let created_at = created_at(read, loaded.id)?;
-            records.insert(key, K::object(loaded.name, loaded.home, loaded.version, created_at, &loaded.value))
+            records.insert(key, object(loaded.name, loaded.home, loaded.version, created_at, &loaded.value))
         }
         None => records.remove(&key),
     };
@@ -75,7 +93,7 @@ fn rescan<K: PlainKind>(read: &mut Read<'_>, records: &mut Records, home: &str) 
             if let Some(loaded) = read.load::<K>(id)? {
                 let key = (loaded.name.clone(), home.to_owned());
                 let created_at = created_at(read, id)?;
-                records.insert(key, K::object(loaded.name, loaded.home, loaded.version, created_at, &loaded.value));
+                records.insert(key, object(loaded.name, loaded.home, loaded.version, created_at, &loaded.value));
             }
         }
         after = page.next;
@@ -193,7 +211,7 @@ impl<K: PlainKind> PlainRecords<K> {
             match written {
                 Ok(version) => {
                     let created_at = self.log.created::<K>(name, &self.home).map_err(|error| error.to_string())?.to_datetime();
-                    return K::object(name.to_owned(), self.home.clone(), version, created_at, value);
+                    return object(name.to_owned(), self.home.clone(), version, created_at, value);
                 }
                 Err(error @ (PlainError::Conflict { .. } | PlainError::Exists { .. } | PlainError::Missing { .. })) => lost = Some(error),
                 Err(error) => return Err(format!("write {} {name}: {error}", K::KIND)),
@@ -280,7 +298,7 @@ impl<K: PlainKind> EngineRecords for PlainRecords<K> {
         spec: Value,
     ) -> Result<EngineObject, String> {
         refuse_kind::<K>(kind)?;
-        self.write(name, &K::from_spec(spec)?)
+        self.write(name, &K::from_spec(decode_spec::<K::Resource>(name, spec)?)?)
     }
 
     async fn set_status(&self, kind: &str, name: &str, _status: Value) -> Result<EngineObject, String> {

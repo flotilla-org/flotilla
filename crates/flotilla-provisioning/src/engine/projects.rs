@@ -23,8 +23,8 @@ use flotilla_engine_store::{
 };
 use flotilla_resources::{
     definitions::{origin, stamp, DefinitionOrigin},
-    engine_records::{EngineObject, EngineRecords},
-    DeclarationRefusedCondition, DispatchQueueAttention, DispatchQueueEntry, OperationalEntriesCondition, ProjectSpec, ProjectStatus,
+    engine_records::{decode_spec, decode_status, EngineObject, EngineRecords, Record},
+    DeclarationRefusedCondition, DispatchQueueAttention, DispatchQueueEntry, OperationalEntriesCondition, Project, ProjectStatus,
 };
 use flotilla_schema::{Identity, Kind, KindCode, NewChange, Timestamp};
 use flotilla_schema_sqlite::{stream::Service, Read, ResourceId, StoreError};
@@ -98,7 +98,6 @@ fn datetime(at: Timestamp) -> chrono::DateTime<chrono::Utc> {
 /// `held` as the old object, with `judged` (this home's judgement) when the record is this home's.
 fn object(name: &str, home: &str, held: &Held, judged: Option<&Judged>) -> Option<Result<EngineObject, String>> {
     let (version, project, origin) = held.project.as_ref()?;
-    let encode = |error: serde_json::Error| format!("{KIND} {name} at {home}: {error}");
     let ops = held.ops.as_ref().map(|(_, ops)| ops);
     let queue = judged.map(|judged| judged.queue.clone()).unwrap_or_default();
     let status = ProjectStatus {
@@ -117,18 +116,20 @@ fn object(name: &str, home: &str, held: &Held, judged: Option<&Judged>) -> Optio
     };
     let (labels, annotations) = stamp(origin);
     let version = composed_version(*version, held.ops.as_ref().map(|(version, _)| *version), judged.map_or(0, |judged| judged.revision));
-    Some((|| {
-        Ok(EngineObject {
+    let Some(created_at) = held.created else { return Some(Err(format!("{KIND} {name} at {home} has no creation time"))) };
+    Some(
+        Record::<Project> {
             name: name.to_owned(),
             home: home.to_owned(),
             version,
-            created_at: held.created.ok_or_else(|| format!("{KIND} {name} at {home} has no creation time"))?,
+            created_at,
             labels,
             annotations,
-            spec: serde_json::to_value(project.spec()).map_err(encode)?,
-            status: Some(serde_json::to_value(status).map_err(encode)?),
-        })
-    })())
+            spec: project.spec().clone(),
+            status: Some(status),
+        }
+        .engine_object(),
+    )
 }
 
 /// The version a Project reads at: its records' latest log version, above the judgement's
@@ -480,7 +481,7 @@ impl EngineRecords for EngineProjects {
         spec: Value,
     ) -> Result<EngineObject, String> {
         refuse_kind(kind)?;
-        let spec: ProjectSpec = serde_json::from_value(spec).map_err(|error| format!("{KIND} spec: {error}"))?;
+        let spec = decode_spec::<Project>(name, spec)?;
         let origin = provenance::resolve_stamped_root(&self.service, &self.home, origin(labels, annotations)?)?;
         let value = ProjectDefinition::new(&spec).map_err(|error| format!("{KIND} {name}: {error}"))?;
         let _writing = locked(&self.writing);
@@ -496,7 +497,7 @@ impl EngineRecords for EngineProjects {
 
     async fn set_status(&self, kind: &str, name: &str, status: Value) -> Result<EngineObject, String> {
         refuse_kind(kind)?;
-        let status: ProjectStatus = serde_json::from_value(status).map_err(|error| format!("{KIND} status: {error}"))?;
+        let status = decode_status::<Project>(name, status)?;
         let _writing = locked(&self.writing);
         self.current(name)?;
         // Project operations' conditions are their record; once written it stays, emptied, until

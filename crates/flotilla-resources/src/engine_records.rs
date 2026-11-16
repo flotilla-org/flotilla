@@ -27,6 +27,53 @@ pub struct EngineObject {
     pub status: Option<serde_json::Value>,
 }
 
+/// One record of resource kind `R` as a port reads it: its spec and status typed.
+#[derive(Debug, Clone)]
+pub struct Record<R: crate::Resource> {
+    pub name: String,
+    /// The home that wrote it, its only writer.
+    pub home: String,
+    /// The record's version at its home; it moves with each write.
+    pub version: u64,
+    /// When the record was created at its home: the time of the change that created it.
+    pub created_at: chrono::DateTime<chrono::Utc>,
+    pub labels: BTreeMap<String, String>,
+    pub annotations: BTreeMap<String, String>,
+    pub spec: R::Spec,
+    pub status: Option<R::Status>,
+}
+
+impl<R: crate::Resource> Record<R> {
+    /// The record as an [`EngineObject`]: the one place a port's typed record becomes JSON.
+    pub fn engine_object(self) -> Result<EngineObject, String> {
+        let encode = |what: &str, error: serde_json::Error| format!("{} {} at {} {what}: {error}", R::API_PATHS.kind, self.name, self.home);
+        let spec = serde_json::to_value(&self.spec).map_err(|error| encode("spec", error))?;
+        let status = self.status.as_ref().map(serde_json::to_value).transpose().map_err(|error| encode("status", error))?;
+        Ok(EngineObject {
+            name: self.name,
+            home: self.home,
+            version: self.version,
+            created_at: self.created_at,
+            labels: self.labels,
+            annotations: self.annotations,
+            spec,
+            status,
+        })
+    }
+}
+
+/// `spec`, as an old object carries it, as resource kind `R`'s spec: the one place a port reads
+/// a written spec from JSON.
+pub fn decode_spec<R: crate::Resource>(name: &str, spec: serde_json::Value) -> Result<R::Spec, String> {
+    serde_json::from_value(spec).map_err(|error| format!("{} {name} spec: {error}", R::API_PATHS.kind))
+}
+
+/// `status`, as an old object carries it, as resource kind `R`'s status: the one place a port
+/// reads a written status from JSON.
+pub fn decode_status<R: crate::Resource>(name: &str, status: serde_json::Value) -> Result<R::Status, String> {
+    serde_json::from_value(status).map_err(|error| format!("{} {name} status: {error}", R::API_PATHS.kind))
+}
+
 /// An engine port serving old-store kinds, one kind at a time by its resource kind name. A name
 /// several homes hold reads as this home's record, else the lexically first home's; writes are
 /// this home's alone.

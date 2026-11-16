@@ -18,8 +18,8 @@ use flotilla_engine_store::{
 };
 use flotilla_resources::{
     definition_provenance::{SUPERSEDED_BY_ANNOTATION, VERIFICATION_PROJECT_ANNOTATION, VERIFICATION_PROVENANCE_ANNOTATION},
-    engine_records::{EngineObject, EngineRecords},
-    RepositoryKey, RepositorySpec, RepositoryStatus,
+    engine_records::{decode_spec, decode_status, EngineObject, EngineRecords, Record},
+    Repository, RepositoryKey, RepositoryStatus,
 };
 use flotilla_schema::{Kind, KindCode, NewChange, Timestamp};
 use flotilla_schema_sqlite::{stream::Service, Read, StoreError};
@@ -75,16 +75,17 @@ fn object(name: String, home: String, version: u64, created_at: DateTime<Utc>, r
         default_branch_observations: record.default_branch_observations.clone(),
         ..Default::default()
     };
-    Ok(EngineObject {
-        spec: serde_json::to_value(record.spec()).map_err(encode)?,
-        status: Some(serde_json::to_value(status).map_err(encode)?),
+    Record::<Repository> {
+        spec: record.spec().clone(),
+        status: Some(status),
         name,
         home,
         version,
         created_at,
         labels: BTreeMap::new(),
         annotations,
-    })
+    }
+    .engine_object()
 }
 
 fn reload(read: &mut Read<'_>, records: &mut Records, name: &str, home: &str) -> Result<(), StoreError> {
@@ -317,7 +318,7 @@ impl EngineRecords for EngineRepositories {
         spec: Value,
     ) -> Result<EngineObject, String> {
         refuse_kind(kind)?;
-        let spec: RepositorySpec = serde_json::from_value(spec).map_err(|error| format!("{KIND} spec: {error}"))?;
+        let spec = decode_spec::<Repository>(name, spec)?;
         spec.verify_key(&RepositoryKey(name.to_owned()))?;
         let verification_provenance = match annotations.get(VERIFICATION_PROVENANCE_ANNOTATION) {
             Some(json) => serde_json::from_str::<Vec<VerificationProvenance>>(json)
@@ -340,7 +341,7 @@ impl EngineRecords for EngineRepositories {
 
     async fn set_status(&self, kind: &str, name: &str, status: Value) -> Result<EngineObject, String> {
         refuse_kind(kind)?;
-        let status: RepositoryStatus = serde_json::from_value(status).map_err(|error| format!("{KIND} status: {error}"))?;
+        let status = decode_status::<Repository>(name, status)?;
         self.write(name, |current| {
             let mut record = current.ok_or_else(|| format!("{KIND} {name} is not held here"))?;
             // Checkouts by host and diagnostics have no reader and are not kept (#3824 layer 3a).
