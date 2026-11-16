@@ -11,5 +11,6 @@ pub use framing::{frame_message, frame_turn, subject_text, Expects, TurnHeader};
 mod message_inbox;
 pub use message_inbox::*;
 mod message_conditions;
+pub use message_conditions::ConditionRecords;
 mod role_routing;
 pub use role_routing::*;

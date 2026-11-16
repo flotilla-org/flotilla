@@ -31,8 +31,6 @@ pub enum MessageAdmission {
 pub struct MessageInbox {
     pub(crate) backend: ResourceBackend,
     pub(crate) namespace: String,
-    pub(crate) change_request_stale_after: std::time::Duration,
-    pub(crate) issue_stale_after: std::time::Duration,
     pub(crate) messages: TypedResolver<Message>,
     pub(crate) admission: Arc<Mutex<()>>,
     pub(crate) charter_notifications: Arc<Mutex<()>>,
@@ -46,15 +44,7 @@ impl MessageInbox {
             namespace: namespace.into(),
             admission: Arc::new(Mutex::new(())),
             charter_notifications: Arc::new(Mutex::new(())),
-            change_request_stale_after: std::time::Duration::from_secs(300),
-            issue_stale_after: std::time::Duration::from_secs(300),
         }
-    }
-
-    pub fn with_observation_staleness(mut self, change_request: std::time::Duration, issue: std::time::Duration) -> Self {
-        self.change_request_stale_after = change_request;
-        self.issue_stale_after = issue;
-        self
     }
 
     /// Qualify relative addresses with the sender's explicit creation context.

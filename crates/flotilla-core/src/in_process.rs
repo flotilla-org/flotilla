@@ -2424,6 +2424,8 @@ impl InProcessDaemon {
     pub fn install_message_primitives(&self, primitives: Arc<flotilla_engine_messages::MessagePrimitives>) -> Result<(), String> {
         self.install_convoy_path(primitives.home(), primitives.service())?;
         primitives.install_lifecycle_reads(self.lifecycle_reads())?;
+        let (change_request, issue) = self.crew.message_observation_staleness();
+        primitives.install_observation_staleness(change_request, issue)?;
         self.message_path.set(Arc::clone(&primitives)).map_err(|_| "the Message path is already installed".to_owned())?;
         self.resource_backend.install_attentions(Arc::clone(&primitives) as Arc<dyn flotilla_resources::attentions::Attentions>);
         self.resource_backend

@@ -397,6 +397,8 @@ pub struct MessagePrimitives {
     charter_admission: Arc<tokio::sync::Mutex<()>>,
     bindings: Arc<dyn ports::RoleBindings>,
     conditions: Arc<dyn ports::ConditionReads>,
+    /// The observers' freshness windows the conditions judge by, once installed.
+    observation_staleness: Arc<std::sync::OnceLock<(std::time::Duration, std::time::Duration)>>,
     home_reads: std::sync::OnceLock<Arc<dyn ports::HomeReads>>,
     /// The records messages name, each read by its key; the ports read through them too.
     keyed: Arc<keyed_reads::KeyedReads>,
@@ -465,6 +467,7 @@ impl MessagePrimitives {
         let changes =
             flotilla_engine_store::watch::SharedChanges::new(Arc::clone(&service), [<Resource<Message> as StoredKind>::CODE], "messages");
         let keyed = Arc::new(keyed_reads::KeyedReads::new(home, Arc::clone(&service), backend.downgrade()));
+        let observation_staleness = Arc::new(std::sync::OnceLock::new());
         Ok(Self {
             home: home.to_owned(),
             changes,
@@ -480,7 +483,12 @@ impl MessagePrimitives {
             charter_pass: Arc::default(),
             charter_admission: Arc::default(),
             bindings: Arc::new(ports::RoleRouting { keyed: Arc::clone(&keyed) }),
-            conditions: Arc::new(ports::RecordConditions { keyed: Arc::clone(&keyed) }),
+            conditions: Arc::new(ports::RecordConditions {
+                keyed: Arc::clone(&keyed),
+                staleness: Arc::clone(&observation_staleness),
+                clock: Arc::clone(&clock),
+            }),
+            observation_staleness,
             home_reads: std::sync::OnceLock::new(),
             keyed,
             attention_changes,
@@ -560,6 +568,18 @@ impl MessagePrimitives {
     /// Installs the engine's convoy, vessel and terminal session reads; the composition root owns them.
     pub fn install_lifecycle_reads(&self, reads: Arc<dyn flotilla_resources::lifecycle_reads::LifecycleReads>) -> Result<(), String> {
         self.keyed.install_lifecycle(reads)
+    }
+
+    /// Installs the change-request and issue observers' freshness windows the conditions judge
+    /// by, once, during composition.
+    pub fn install_observation_staleness(&self, change_request: std::time::Duration, issue: std::time::Duration) -> Result<(), String> {
+        self.observation_staleness.set((change_request, issue)).map_err(|_| "the observation windows are already installed".to_owned())
+    }
+
+    /// The freshness windows the conditions judge by: the installed ones, else
+    /// [`ports::UNINSTALLED_STALENESS`].
+    pub fn observation_staleness(&self) -> (std::time::Duration, std::time::Duration) {
+        self.observation_staleness.get().copied().unwrap_or((ports::UNINSTALLED_STALENESS, ports::UNINSTALLED_STALENESS))
     }
 
     /// The keyed reads of the records messages name.

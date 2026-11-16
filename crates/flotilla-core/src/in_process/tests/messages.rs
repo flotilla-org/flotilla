@@ -445,3 +445,52 @@ async fn stored_sender(primitives: &flotilla_engine_messages::MessagePrimitives,
     let (_, stored) = pending.into_iter().find(|(_, message)| message.name() == id).expect("pending");
     stored.spec().sender.to_string()
 }
+
+// A gate on the engine path reads this home's observed issue as fresh: its values are confirmed
+// when read, so the condition holds. It judges freshness by the issue observer's window, as the
+// old store's gates did.
+#[tokio::test]
+async fn engine_conditions_read_this_homes_observations_as_fresh() {
+    use flotilla_resources::{Issue, IssueSpec, IssueStatus, Observation, ObservedIssueState, ThreeValue};
+    let temp = tempfile::tempdir().expect("config directory");
+    std::fs::write(temp.path().join("daemon.toml"), "machine_id = \"condition-test\"\n").expect("machine identity");
+    let backend = ResourceBackend::new(InMemoryBackend::default());
+    let daemon = InProcessDaemon::new_with_resource_backend(
+        Vec::new(),
+        Arc::new(ConfigStore::with_base(temp.path())),
+        fake_discovery(false),
+        HostName::new("test-host"),
+        backend.clone(),
+        std::sync::Arc::new(flotilla_discovery_testkit::HostPeerOverlay::default()),
+    )
+    .await;
+    let primitives = install_engine_messages(&daemon);
+    let address = flotilla_resources::address::stored_issue_address("github.com", "team/repo", 1, &[]).expect("issue address");
+    let name = flotilla_resources::address::record_name(&address).expect("record name");
+    let issues = backend.using::<Issue>("flotilla");
+    let issue = issues
+        .create(
+            &test_meta(&name),
+            &IssueSpec::builder()
+                .service("github.com".into())
+                .scope("team/repo".into())
+                .number(1)
+                .observing_authority("test-host".into())
+                .build(),
+        )
+        .await
+        .expect("issue");
+    let condition = flotilla_address::Condition::resolve(&format!("{address} .state == \"closed\""), &flotilla_address::BuiltinForges)
+        .expect("condition");
+    let observed = Utc::now();
+    let status = IssueStatus {
+        title: Default::default(),
+        assignees: Default::default(),
+        state: Observation::known(ObservedIssueState::Closed, observed),
+        labels: Observation::known(Vec::new(), observed),
+        updated_at: Observation::known(observed, observed),
+    };
+    issues.update_status(&name, &issue.metadata.resource_version, &status).await.expect("observed");
+    assert_eq!(primitives.conditions().value("flotilla", &condition).await.expect("value"), ThreeValue::True);
+    assert_eq!(primitives.observation_staleness(), daemon.crew.message_observation_staleness(), "the observers' windows");
+}

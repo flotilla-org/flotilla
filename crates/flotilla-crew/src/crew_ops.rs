@@ -563,7 +563,9 @@ impl CrewService {
         *self.resource_intent_publisher.write().expect("resource intent publisher lock") = Some(publisher);
     }
 
-    pub(crate) fn message_observation_staleness(&self) -> (std::time::Duration, std::time::Duration) {
+    /// How long change-request and issue observations stay fresh for gates and outcomes: the
+    /// observers' windows.
+    pub fn message_observation_staleness(&self) -> (std::time::Duration, std::time::Duration) {
         (self.leaf_subscriptions.change_request_stale_after(), self.leaf_subscriptions.issue_stale_after())
     }
 
@@ -625,11 +627,7 @@ impl CrewService {
             .lock()
             .await
             .entry(namespace.to_string())
-            .or_insert_with(|| {
-                let (change_request, issue) = self.message_observation_staleness();
-                flotilla_messaging::MessageInbox::new(self.resource_backend.clone(), namespace)
-                    .with_observation_staleness(change_request, issue)
-            })
+            .or_insert_with(|| flotilla_messaging::MessageInbox::new(self.resource_backend.clone(), namespace))
             .clone()
     }
 

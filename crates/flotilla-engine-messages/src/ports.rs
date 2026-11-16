@@ -216,11 +216,17 @@ impl RoleRouting {
     }
 }
 
-/// Condition values through the old inbox's Leaf evaluation: the same reads the old store's
-/// gates make, with a role in a convoy read from its convoy's work, by key.
+/// Condition values through the Leaf evaluation the old store's gates make, with a role in a
+/// convoy read from its convoy's work, by key.
 pub struct RecordConditions {
     pub keyed: Arc<KeyedReads>,
+    /// The change-request and issue observers' freshness windows, which composition installs.
+    pub staleness: Arc<std::sync::OnceLock<(std::time::Duration, std::time::Duration)>>,
+    pub clock: Arc<dyn flotilla_resources::Clock>,
 }
+
+/// The freshness windows of a path no composition installed them on: the old inbox's default.
+pub const UNINSTALLED_STALENESS: std::time::Duration = std::time::Duration::from_secs(300);
 
 impl RecordConditions {
     /// The convoy record and the work holding role `address` in it: from the convoy's snapshot,
@@ -251,10 +257,18 @@ impl ConditionReads for RecordConditions {
             _ => None,
         };
         let leaf = condition_leaf(condition, |convoy, role| work.unwrap_or_else(|| Err(format!("`{role}` in `{convoy}` was not read"))))?;
-        flotilla_messaging::MessageInbox::new(backend, namespace)
-            .condition_value(&leaf, chrono::Utc::now())
-            .await
-            .map_err(|error| error.to_string())
+        let (change_request_stale_after, issue_stale_after) =
+            self.staleness.get().copied().unwrap_or((UNINSTALLED_STALENESS, UNINSTALLED_STALENESS));
+        flotilla_messaging::ConditionRecords {
+            backend,
+            namespace: namespace.to_owned(),
+            change_request_stale_after,
+            issue_stale_after,
+            clock: Arc::clone(&self.clock),
+        }
+        .value(&leaf)
+        .await
+        .map_err(|error| error.to_string())
     }
 }
 
