@@ -1761,8 +1761,6 @@ async fn assert_turn_delivery_enforces_head_identity_and_records_rungs(
     let status = convoys.get(launch).await.expect("convoy").status.expect("status");
     let episodes = &status.turn_deliveries[source].episodes;
     assert_eq!(episodes.len(), 4, "same-head redelivery must not create an episode");
-    assert_eq!(episodes[0].sender, flotilla_resources::CrewMessageSender::Unknown);
-    assert!(serde_json::to_value(&episodes[0]).expect("episode").get("sender").is_none());
     // Message admission is a workflow latch, not confirmation of an agent turn.
     assert_eq!(serde_json::to_value(&episodes[0].outcome).unwrap()["kind"], "message-accepted");
     assert!(

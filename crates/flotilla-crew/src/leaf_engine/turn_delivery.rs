@@ -585,7 +585,6 @@ impl LeafSubscriptionTable {
                     evidence_at,
                     judged_claim_at: judged_at,
                     outcome: TurnDeliveryOutcome::Refused { reason: reason.clone(), refused_at: now, hold_executed: true },
-                    sender: flotilla_resources::CrewMessageSender::Unknown,
                 },
                 ConvoyAttention { source: source.to_string(), reason, raised_at: now },
             )
@@ -618,7 +617,6 @@ impl LeafSubscriptionTable {
                         message: admission.message,
                         accepted_at: Utc::now(),
                     },
-                    sender: flotilla_resources::CrewMessageSender::Unknown,
                 },
                 rule.to.vessel.clone(),
                 rule.to.role.clone(),

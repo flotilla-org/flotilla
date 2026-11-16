@@ -1,8 +1,7 @@
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::BTreeMap;
 
 use chrono::{DateTime, Utc};
 use flotilla_protocol::ConfiguredResourceLimits;
-pub use flotilla_protocol::{CrewMessageDelivery, CrewMessageSender};
 use serde::{Deserialize, Serialize};
 
 use crate::{
@@ -191,29 +190,6 @@ pub struct TerminalCrewContext {
     pub convoy: String,
     /// The Vessel resource name.
     pub vessel_ref: String,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct TerminalCrewMessage {
-    pub id: String,
-    pub text: String,
-    /// Sender attribution for surfaces and audit. The default decodes records
-    /// written before sender framing; remove after the next fleet roll.
-    #[serde(default, serialize_with = "flotilla_protocol::serialize_legacy_crew_sender")]
-    pub sender: CrewMessageSender,
-    /// Decodes queued messages stored before launch-brief attribution; remove
-    /// after the next fleet roll.
-    #[serde(default)]
-    pub delivery: CrewMessageDelivery,
-    /// Messages after this one, in delivery order. Older stored sessions had
-    /// only the head message; remove the compatibility default after one roll.
-    #[serde(default)]
-    pub following: Vec<TerminalCrewMessage>,
-    /// Payload-free receipts preserve exact retry and supervisor acknowledgment
-    /// checks after pruning. Default accepts the previous generation's records;
-    /// remove the compatibility default after one fleet roll.
-    #[serde(default)]
-    pub acknowledged: BTreeSet<String>,
 }
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
@@ -575,20 +551,6 @@ mod tests {
         status.attention.as_mut().unwrap().source = TerminalAttentionSource::Screen;
         status.attention.as_mut().unwrap().state = TerminalAttentionState::Idle;
         assert_eq!(status.attention_obstruction(), None);
-    }
-
-    #[test]
-    fn previous_generation_message_decodes_and_new_message_writes_queue_shape() {
-        let old = serde_json::json!({
-            "id": "operator-1",
-            "text": "Continue",
-            "sender": {"kind": "unknown"},
-            "delivery": "queued"
-        });
-        let message: TerminalCrewMessage = serde_json::from_value(old).expect("old stored message");
-        assert!(message.following.is_empty());
-        let written = serde_json::to_value(message).expect("serialize current message");
-        assert_eq!(written["following"], serde_json::json!([]));
     }
 
     // #3028: a notify-only Codex crew's turn is settled by its next hook Idle after the

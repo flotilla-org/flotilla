@@ -493,8 +493,6 @@ async fn resume_relaunches_exited_active_and_interrupted_crew() {
         .items
         .iter()
         .any(|message| message.spec.body.contains("Recover the unfinished review")));
-    let status = convoys.get(&probe.convoy).await.expect("convoy").status.expect("status");
-    assert!(status.pending_brief().is_none(), "an exited process cannot consume a pending brief");
     // The pool starts the next launch: the coder is at work again.
     terminals.ready(&relaunched, "resume-staging-pool-session-2", &Default::default());
     let status = convoys.get(&probe.convoy).await.expect("convoy").status.expect("status");

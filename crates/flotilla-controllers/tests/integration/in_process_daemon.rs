@@ -8640,8 +8640,6 @@ async fn handoff_uses_remote_session_origin_and_refuses_remote_only_anchor() {
     assert_eq!(convoys.get(&convoy).await.expect("after failed handoff").status, before);
     authority.set_resource_intent_publisher(Arc::downgrade(&publisher));
     authority.crew_handoff_internal(&context, "reviewer", "Review this").await.expect("queue remote handoff");
-    let handed = convoys.get(&convoy).await.expect("convoy after handoff");
-    assert!(handed.status.expect("convoy status").turn_deliveries.values().all(|delivery| delivery.pending_supervisor_turn.is_none()));
     // The authority's log, with the handoff, reaches the session's home.
     flotilla_provisioning_testkit::replicate_home(
         &authority_store,
@@ -8748,8 +8746,6 @@ async fn convoy_resume_finds_a_terminal_session_on_another_host() {
         .await
         .expect("resume remote crew session");
     assert!(matches!(outcome, flotilla_crew::crew_ops::ConvoyResumeOutcome::Queued { .. }));
-    let convoy = convoys.get(&convoy).await.expect("convoy after resume");
-    assert!(convoy.status.expect("convoy status").turn_deliveries.values().all(|delivery| delivery.pending_supervisor_turn.is_none()));
     assert!(authority.resource_backend().using::<TerminalSession>("flotilla").list().await.expect("local sessions").items.is_empty());
     // The authority's log, with its pending turn, reaches the terminal host.
     flotilla_provisioning_testkit::replicate_home(&authority_store, authority_store.home(), &terminal_store);
@@ -8783,7 +8779,6 @@ async fn convoy_resume_queues_a_brief_while_crew_is_working() {
 
     let convoy = convoys.get(&launch).await.expect("read convoy");
     let status = convoy.status.unwrap();
-    assert!(status.pending_brief().is_none());
     let reference = status.crew_work["work"]["coder"].pending_follow_up.as_ref().unwrap();
     let first = backend.using::<flotilla_resources::Message>("flotilla").get(&reference.name).await.unwrap();
     assert_eq!(first.spec.body, "Check the edge case");
@@ -8805,7 +8800,6 @@ async fn convoy_resume_queues_a_brief_while_crew_is_working() {
     );
     let withdrawn = daemon.convoy_withdraw_pending_brief_internal("flotilla", &launch).await.expect("withdraw pending brief");
     assert_eq!(withdrawn.as_deref(), Some("Use the newer instruction"));
-    assert!(convoys.get(&launch).await.expect("read withdrawn convoy").status.expect("convoy status").pending_brief().is_none());
 
     // The convoy lands: its work kept and delivered on the engine (#3108).
     let landing = convoys.get(&launch).await.expect("read convoy");
@@ -8901,7 +8895,6 @@ async fn convoy_resume_queues_confirmed_delivery_when_working_crew_is_already_id
     // #2755: a fresh idle observation from before queuing is sufficient when
     // there is no terminal turn in flight; an idle transition is unnecessary.
     daemon.reconcile_pending_supervisor_turns_once("flotilla").await.expect("release already idle crew");
-    assert!(convoys.get(&launch).await.expect("convoy").status.expect("status").pending_brief().is_none());
 
     assert!(terminal_pool.delivered.lock().await.is_empty(), "agent messages should await reconciled delivery confirmation");
     let records = backend.using::<flotilla_resources::Message>("flotilla").list().await.unwrap().items;
@@ -8930,7 +8923,6 @@ async fn convoy_resume_queues_confirmed_delivery_when_working_crew_is_already_id
     let after_receipt = chrono::Utc::now();
     daemon.reconcile_pending_supervisor_turns_once("flotilla").await.expect("continue after receiver receipt");
     let status = convoys.get(&launch).await.expect("read resumed convoy").status.expect("convoy status");
-    assert!(status.pending_brief().is_none());
     assert_eq!(status.crew_work["work"]["coder"].phase, flotilla_resources::CrewWorkPhase::Working);
     // The crew's current turn is the delivered follow-up: on the engine a crew's message is only
     // its seat's failure, so the turn is read from its Message (#3108).

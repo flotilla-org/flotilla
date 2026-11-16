@@ -2749,8 +2749,6 @@ impl Aggregator {
                 status.attention.as_ref().filter(|attention| !phase.is_terminal() || !status.is_turn_delivery_attention(attention))
             })
             .or_else(|| holds.first());
-        let pending_supervisor_turn_count = delivery_status
-            .map_or(0, |status| status.turn_deliveries.values().filter(|delivery| delivery.pending_supervisor_turn.is_some()).count());
         // Preserve unrelated convoy attention and demands even after settlement;
         // only the crew's working surface is suppressed for terminal convoys.
         let surface_state = if !subject_conflicts.is_empty()
@@ -2758,7 +2756,6 @@ impl Aggregator {
             || attention_demand.is_some()
             || convoy_attention.is_some()
             || !holds.is_empty()
-            || pending_supervisor_turn_count > 0
             || vessels.iter().any(|vessel| vessel.surface_state.needs_attention())
         {
             SurfaceState::NeedsYou
@@ -2813,18 +2810,7 @@ impl Aggregator {
                             format!("conflicting relationships for {details}")
                         })
                     })
-                    .or_else(|| {
-                        let pending = match pending_supervisor_turn_count {
-                            0 => None,
-                            1 => Some("Supervisor turn awaits terminal delivery".to_string()),
-                            count => Some(format!("{count} supervisor turns await terminal delivery")),
-                        };
-                        match (convoy_attention, pending) {
-                            (Some(attention), Some(pending)) => Some(format!("{}; {pending}", attention.reason)),
-                            (Some(attention), None) => Some(attention.reason.clone()),
-                            (None, pending) => pending,
-                        }
-                    })
+                    .or_else(|| convoy_attention.map(|attention| attention.reason.clone()))
                     .or_else(|| status.and_then(|status| status.message.clone())),
             )
             .maybe_disposition(status.and_then(|status| status.disposition.clone()))
@@ -3375,59 +3361,6 @@ mod tests {
         assert!(agent_surface_state(AgentActivity::Interrupted) == SurfaceState::Available);
         assert!(!agent_surface_state(AgentActivity::Idle).needs_attention());
         assert!(!agent_surface_state(AgentActivity::Working).needs_attention());
-    }
-
-    #[tokio::test]
-    async fn pending_supervisor_turn_is_visible_on_the_governor_convoy() {
-        let state = AggregatorProjectionState::new();
-        let (event_tx, _) = broadcast::channel(8);
-        let (mut aggregator, _engine) = with_convoy_engine(Aggregator::new(state.clone(), HostName::new("local"), event_tx));
-        let mut governor = convoy_with_vessel("governor").await;
-        let status = governor.status.as_mut().expect("status");
-        status.attention = Some(flotilla_resources::ConvoyAttention {
-            source: "existing-attention".to_string(),
-            reason: "Existing concern".to_string(),
-            raised_at: Utc::now(),
-        });
-        status.turn_deliveries.insert(
-            "supervision-1".to_string(),
-            flotilla_resources::TurnDeliveryStatus {
-                pending_supervisor_turn: Some(flotilla_resources::PendingSupervisorTurn {
-                    queued_order: 0,
-                    vessel: "govern".to_string(),
-                    role: "governor".to_string(),
-                    message: flotilla_resources::TerminalCrewMessage {
-                        id: "supervision-1".to_string(),
-                        text: "Supervise the stalled crew".to_string(),
-                        sender: flotilla_resources::CrewMessageSender::FlotillaEscalation { from: "coder@work".to_string() },
-                        delivery: flotilla_resources::CrewMessageDelivery::Queued,
-                        acknowledged: Default::default(),
-                        following: Vec::new(),
-                    },
-                }),
-                ..Default::default()
-            },
-        );
-        let mut no_prior_attention = governor.clone();
-        no_prior_attention.metadata.name = "governor-no-prior-attention".to_string();
-        no_prior_attention.status.as_mut().expect("status").attention = None;
-        aggregator.apply_convoy_event(WatchEvent::Added(governor)).await;
-        aggregator.apply_convoy_event(WatchEvent::Added(no_prior_attention)).await;
-        let result = state.result_set().await;
-        let row = result.rows.as_convoys().expect("convoys").iter().find(|row| row.name == "governor").expect("governor row");
-        assert_eq!(row.surface_state, SurfaceState::NeedsYou);
-        assert!(row.message.as_deref().is_some_and(|message| message.contains("Existing concern")));
-        assert!(row.message.as_deref().is_some_and(|message| message.contains("Supervisor turn awaits terminal delivery")));
-        assert!(!row.message.as_deref().is_some_and(|message| message.contains("Supervise the stalled crew")));
-        let row = result
-            .rows
-            .as_convoys()
-            .expect("convoys")
-            .iter()
-            .find(|row| row.name == "governor-no-prior-attention")
-            .expect("governor row without attention");
-        assert_eq!(row.surface_state, SurfaceState::NeedsYou);
-        assert_eq!(row.message.as_deref(), Some("Supervisor turn awaits terminal delivery"));
     }
 
     #[tokio::test]
@@ -8572,19 +8505,6 @@ mod hold_attention_tests {
                         .build()
                 })
                 .collect(),
-            pending_supervisor_turn: Some(flotilla_resources::PendingSupervisorTurn {
-                queued_order: 0,
-                vessel: "work".into(),
-                role: "governor".into(),
-                message: flotilla_resources::TerminalCrewMessage {
-                    id: "supervise".into(),
-                    text: "Supervise".into(),
-                    sender: Default::default(),
-                    delivery: flotilla_resources::CrewMessageDelivery::Queued,
-                    acknowledged: Default::default(),
-                    following: Vec::new(),
-                },
-            }),
             ..Default::default()
         }
     }
@@ -8610,7 +8530,6 @@ mod hold_attention_tests {
                     Some("actionable-review"),
                     Some(ConvoyAttention::QUEUED_TURN_SOURCE),
                     Some(ConvoyAttention::MISSING_TURN_HOOK_SOURCE),
-                    Some(ConvoyAttention::SUPERVISOR_TURN_SOURCE),
                     Some("settlement"),
                 ] {
                     let state = AggregatorProjectionState::new();

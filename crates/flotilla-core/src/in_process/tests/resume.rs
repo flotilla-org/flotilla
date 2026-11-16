@@ -34,7 +34,6 @@ async fn working_resume_uses_message_delivery_instead_of_pending_brief_release()
         .await
         .expect("queue intent");
     daemon.reconcile_pending_supervisor_turns_once("flotilla").await.expect("migration scan");
-    assert!(convoys.get(&probe.convoy).await.expect("convoy").status.expect("status").pending_brief().is_none());
     let records = crew_messages(&daemon, "flotilla").await;
     assert_eq!(records.len(), 1);
     assert_eq!(records[0].spec.body, "operator guidance");

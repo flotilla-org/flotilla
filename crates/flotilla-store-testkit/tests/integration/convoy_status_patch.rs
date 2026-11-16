@@ -5,8 +5,8 @@ use chrono::{TimeZone, Utc};
 use flotilla_protocol::{CanonicalHostId, PlacementDecision, PlacementTargetHost};
 use flotilla_resources::{
     controller_patches, external_patches, provisioning_patches, ConvoyPhase, ConvoyProvisioningState, ConvoyStatus, ConvoyStatusPatch,
-    CrewSource, CrewSpec, CrewWorkPhase, CrewWorkState, PendingBrief, Selector, StatusPatch, VesselRequirement, WorkCompletionAuthority,
-    WorkPhase, WorkState, WorkflowSnapshot,
+    CrewSource, CrewSpec, CrewWorkPhase, CrewWorkState, Selector, StatusPatch, VesselRequirement, WorkCompletionAuthority, WorkPhase,
+    WorkState, WorkflowSnapshot,
 };
 
 fn ts(seconds: i64) -> chrono::DateTime<Utc> {
@@ -102,15 +102,8 @@ fn crew_work(phase: CrewWorkPhase) -> CrewWorkState {
     CrewWorkState::builder().phase(phase).started_at(ts(10)).build()
 }
 
-fn queue_pending_brief(status: &mut ConvoyStatus, role: &str) {
-    // Seed a previous-generation record; current writers cannot queue PendingBrief.
-    status.turn_deliveries.entry("operator".into()).or_default().pending_brief = Some(
-        PendingBrief::builder().vessel("implement".into()).role(role.into()).content("address review".into()).queued_at(ts(15)).build(),
-    );
-}
-
 #[test]
-fn crew_failure_clears_its_pending_brief() {
+fn crew_failure_marks_the_crew_failed() {
     let mut status = ConvoyStatus {
         stalled: None,
         nudge_obligations: Vec::new(),
@@ -118,17 +111,15 @@ fn crew_failure_clears_its_pending_brief() {
         crew_work: BTreeMap::from([("implement".to_string(), BTreeMap::from([("coder".to_string(), crew_work(CrewWorkPhase::Working))]))]),
         ..ConvoyStatus::default()
     };
-    queue_pending_brief(&mut status, "coder");
 
     external_patches::mark_crew_failed("implement".to_string(), "coder".to_string(), ts(20), "session failed".to_string())
         .apply(&mut status);
 
     assert_eq!(status.crew_work["implement"]["coder"].phase, CrewWorkPhase::Failed);
-    assert!(status.pending_brief().is_none());
 }
 
 #[test]
-fn crew_handoff_clears_the_senders_pending_brief() {
+fn crew_handoff_hands_the_sender_back() {
     let mut status = ConvoyStatus {
         phase: ConvoyPhase::Active,
         crew_work: BTreeMap::from([(
@@ -140,7 +131,6 @@ fn crew_handoff_clears_the_senders_pending_brief() {
         )]),
         ..ConvoyStatus::default()
     };
-    queue_pending_brief(&mut status, "coder");
 
     external_patches::handoff_crew_work(
         "implement".to_string(),
@@ -153,11 +143,10 @@ fn crew_handoff_clears_the_senders_pending_brief() {
 
     assert_eq!(status.crew_work["implement"]["coder"].phase, CrewWorkPhase::HandedBack);
     assert_eq!(status.crew_work["implement"]["reviewer"].phase, CrewWorkPhase::Working);
-    assert!(status.pending_brief().is_none());
 }
 
 #[test]
-fn kickoff_handoff_preserves_the_working_senders_pending_brief() {
+fn kickoff_handoff_keeps_the_sender_working() {
     let mut status = ConvoyStatus {
         phase: ConvoyPhase::Active,
         crew_work: BTreeMap::from([(
@@ -169,7 +158,6 @@ fn kickoff_handoff_preserves_the_working_senders_pending_brief() {
         )]),
         ..ConvoyStatus::default()
     };
-    queue_pending_brief(&mut status, "coder");
 
     external_patches::handoff_crew_work(
         "implement".to_string(),
@@ -182,18 +170,15 @@ fn kickoff_handoff_preserves_the_working_senders_pending_brief() {
 
     assert_eq!(status.crew_work["implement"]["coder"].phase, CrewWorkPhase::Working);
     assert_eq!(status.crew_work["implement"]["reviewer"].phase, CrewWorkPhase::Working);
-    assert_eq!(status.pending_brief().map(|brief| brief.role.as_str()), Some("coder"));
 }
 
 #[test]
-fn terminal_convoy_phase_clears_pending_brief() {
+fn terminal_convoy_phase_rolls_up() {
     let mut status = ConvoyStatus { phase: ConvoyPhase::Active, ..ConvoyStatus::default() };
-    queue_pending_brief(&mut status, "coder");
 
     controller_patches::roll_up_phase(ConvoyPhase::Landed, None, Some(ts(20))).apply(&mut status);
 
     assert_eq!(status.phase, ConvoyPhase::Landed);
-    assert!(status.pending_brief().is_none());
 }
 
 #[test]

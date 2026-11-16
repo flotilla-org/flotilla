@@ -142,13 +142,13 @@ pub use convoy::{
     ConvoyRepositorySpec, ConvoySpec, ConvoyStatus, ConvoyStatusPatch, CrewCompletionOverride, CrewCompletionRefusal,
     CrewCompletionRefusalCause, CrewWorkPhase, CrewWorkState, DeclaredSubject, DiscoveredSubject, InputValue, InstantiatedExit,
     InstantiatedExitEntry, InstantiatedTurnDelivery, IssueSnapshot, LandingClaim, LandingEntry, LandingTurn, LeafMaker, NudgeObligation,
-    PendingBrief, PendingSupervisorTurn, PlacementStatus, QueuedTurnObservation, ResumeIntent, SettlementEvaluation, SettlementMode,
-    SettlementSubject, StallCause, StallEvidenceSource, StallNudge, StallProposedDisposition, StallReason, StallRung, StallSupervisor,
-    StalledCondition, SubjectDiscovery, SubjectDiscoverySource, SupersededCrewClaim, TargetMismatch, TurnDeliveryEpisode,
-    TurnDeliveryFailure, TurnDeliveryFailureKind, TurnDeliveryOutcome, TurnDeliveryRung, TurnDeliveryStatus, UnmetSettlementExpectation,
-    UnresolvedChangeRequestSubject, VesselPlacementPin, WorkCompletionAuthority, WorkPhase, WorkState, WorkflowSnapshot,
-    ADOPTED_CHECKOUT_ANNOTATION, CONVOY_UNREADABLE_ANNOTATION, ENSURED_FROM_ANNOTATION, PLACEMENT_SNAPSHOT_ANNOTATION,
-    VESSEL_PLACEMENTS_ANNOTATION, WORKFLOW_SNAPSHOT_ANNOTATION,
+    PlacementStatus, QueuedTurnObservation, ResumeIntent, SettlementEvaluation, SettlementMode, SettlementSubject, StallCause,
+    StallEvidenceSource, StallNudge, StallProposedDisposition, StallReason, StallRung, StallSupervisor, StalledCondition, SubjectDiscovery,
+    SubjectDiscoverySource, SupersededCrewClaim, TargetMismatch, TurnDeliveryEpisode, TurnDeliveryFailure, TurnDeliveryFailureKind,
+    TurnDeliveryOutcome, TurnDeliveryRung, TurnDeliveryStatus, UnmetSettlementExpectation, UnresolvedChangeRequestSubject,
+    VesselPlacementPin, WorkCompletionAuthority, WorkPhase, WorkState, WorkflowSnapshot, ADOPTED_CHECKOUT_ANNOTATION,
+    CONVOY_UNREADABLE_ANNOTATION, ENSURED_FROM_ANNOTATION, PLACEMENT_SNAPSHOT_ANNOTATION, VESSEL_PLACEMENTS_ANNOTATION,
+    WORKFLOW_SNAPSHOT_ANNOTATION,
 };
 pub use convoy_ensure::{
     config_changes, ConvoyEnsure, ConvoyEnsureCondition, ConvoyEnsureConfigDrift, ConvoyEnsureHoldReason, ConvoyEnsureSpec,
@@ -233,11 +233,10 @@ pub use review_bundle::{
 };
 pub use status_patch::{NoStatusPatch, StatusPatch};
 pub use terminal_session::{
-    looks_like_terminal_reply, terminal_session_attach_target, terminal_session_attach_target_with_stale_status, CrewMessageDelivery,
-    CrewMessageSender, CrewSessionStatus, InnerCommandStatus, ScreenObstruction, TerminalAttention, TerminalAttentionSource,
-    TerminalAttentionState, TerminalBrief, TerminalCrewContext, TerminalCrewMessage, TerminalOccupancy, TerminalSession,
-    TerminalSessionAttachTarget, TerminalSessionIdentity, TerminalSessionPhase, TerminalSessionSource, TerminalSessionSpec,
-    TerminalSessionStatus, TerminalSessionTarget,
+    looks_like_terminal_reply, terminal_session_attach_target, terminal_session_attach_target_with_stale_status, CrewSessionStatus,
+    InnerCommandStatus, ScreenObstruction, TerminalAttention, TerminalAttentionSource, TerminalAttentionState, TerminalBrief,
+    TerminalCrewContext, TerminalOccupancy, TerminalSession, TerminalSessionAttachTarget, TerminalSessionIdentity, TerminalSessionPhase,
+    TerminalSessionSource, TerminalSessionSpec, TerminalSessionStatus, TerminalSessionTarget,
 };
 pub use vessel::{
     vessel_resource_name, Vessel, VesselImage, VesselPhase, VesselSpec, VesselStatus, ACTUATOR_HOST_REF_ANNOTATION,

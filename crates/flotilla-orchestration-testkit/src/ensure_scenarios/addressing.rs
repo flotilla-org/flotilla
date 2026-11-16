@@ -74,7 +74,6 @@ pub async fn convoy_explain_surfaces_queued_turn_age_and_blocker(factory: &dyn E
                         message_id: "turn".into(),
                         blocking_reason: "old readiness".into(),
                     },
-                    sender: Default::default(),
                 }],
                 ..Default::default()
             },

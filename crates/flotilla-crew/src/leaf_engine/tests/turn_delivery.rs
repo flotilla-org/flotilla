@@ -153,7 +153,6 @@ fn queued_turn(
                 message_id: message_id.into(),
                 blocking_reason: "initial".into(),
             },
-            sender: Default::default(),
         }],
         ..Default::default()
     }

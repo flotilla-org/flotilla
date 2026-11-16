@@ -413,44 +413,6 @@ fn receiver_snapshot_is_pure_and_refreshes(tc: hegel::TestCase) {
     });
 }
 
-// The next-generation pre-roll guard refuses every legacy authority witness
-// before typed decoding can discard retired fields; clean new shapes pass.
-#[hegel::test]
-fn migration_guard_refuses_legacy_authority_witnesses(tc: hegel::TestCase) {
-    let variant = tc.draw(gs::integers::<u8>().min_value(0).max_value(4));
-    let clean = tc.draw(gs::booleans());
-    let mut document = match variant {
-        0 => serde_json::json!({"kind":"TerminalSession", "status":{"legacy_message_receipts":{}}}),
-        1 => serde_json::json!({"kind":"TerminalSession", "spec":{"source":{"message":null}}}),
-        2 | 3 => serde_json::json!({"kind":"Convoy", "status":{"turn_deliveries":{"source":{}}}}),
-        _ => serde_json::json!({"kind":"Message", "status":{"submission":{"batch_id":"new"}}}),
-    };
-    if !clean {
-        match variant {
-            0 => document["status"]["legacy_message_receipts"]["receipt"] = serde_json::json!({"sender":"system:old"}),
-            1 => document["spec"]["source"]["message"] = serde_json::json!({"id":"old"}),
-            2 => document["status"]["turn_deliveries"]["source"]["pending_brief"] = serde_json::json!({"content":"old"}),
-            3 => document["status"]["turn_deliveries"]["source"]["pending_supervisor_turn"] = serde_json::json!({"message":{"id":"old"}}),
-            _ => document["status"]["submission"]["legacy_launch"] = serde_json::json!({"terminal":"old"}),
-        }
-    }
-    assert_eq!(flotilla_store::validate_message_migration_complete(&document).is_ok(), clean);
-}
-
-// Legacy launch witnesses with ordinary receiver receipts or explicit operator
-// closure have no unresolved uncertainty and may be retired by the next decoder.
-#[tokio::test]
-async fn migration_guard_accepts_resolved_legacy_launches() {
-    for status in [
-        serde_json::json!({"phase":"delivered", "resolved_receiver":{"crew_id":"crew", "session":"session", "delivered_at":at(20), "evidence":"receipt"}}),
-        serde_json::json!({"phase":"dead_lettered", "reason":"operator failed batch: explicitly resolved"}),
-    ] {
-        let mut document = serde_json::json!({"kind":"Message", "status":status});
-        document["status"]["submission"] = serde_json::json!({"legacy_launch":{"terminal":"old"}});
-        flotilla_store::validate_message_migration_complete(&document).expect("resolved witness is eligible");
-    }
-}
-
 // Indexed results agree with the stored view after each generated lifecycle
 // step, including deletion/recreation and receiver-home replica replacement.
 #[hegel::test]

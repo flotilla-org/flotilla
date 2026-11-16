@@ -27,7 +27,7 @@ use flotilla_provider_runtime::ProcessCommandRunner;
 use flotilla_resources::{K8sResourceObject, Project, ReplicationClass, ResourceError, ResourceObject};
 use flotilla_store::validate_resource_document;
 #[cfg(unix)]
-use flotilla_store::{decode_stored_resource_document, validate_message_migration_complete, REGISTERED_RESOURCE_KINDS};
+use flotilla_store::{decode_stored_resource_document, REGISTERED_RESOURCE_KINDS};
 #[cfg(unix)]
 use flotilla_vcs::{
     providers::git_worktree::GitWorktreeStrategy,
@@ -737,7 +737,7 @@ fn parse_documents(path: &Path, content: &str) -> Result<Vec<Value>> {
 /// checks that it can read them (N→N+1), not that they meet current authoring rules.
 #[cfg(unix)]
 fn validate_stored_record(item: &Value) -> Result<(), ResourceError> {
-    validate_message_migration_complete(item).and_then(|()| decode_stored_resource_document(item)).map(drop)
+    decode_stored_resource_document(item).map(drop)
 }
 
 #[cfg(all(test, unix))]
@@ -1111,10 +1111,10 @@ mod tests {
     }
 
     // Process-boundary stand-in serves previous-generation raw records. The
-    // candidate must inspect all advertised stores and refuse a legacy receipt
-    // before new-generation typed decoders can silently drop the retired field.
+    // candidate inspects every advertised store, and a retired field
+    // (`legacy_message_receipts`) decodes and is dropped.
     #[tokio::test]
-    async fn daemon_gate_refuses_legacy_receipts_in_an_advertised_store() {
+    async fn daemon_gate_reads_every_advertised_store() {
         use flotilla_resources::{TerminalSession, TerminalSessionSource, TerminalSessionSpec, TerminalSessionStatus};
         use tokio::{
             io::{AsyncReadExt, AsyncWriteExt},
@@ -1178,11 +1178,7 @@ mod tests {
                     stream.write_all(format!("HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}", body.len()).as_bytes()).await.unwrap();
                 }
             });
-            let result = validate_daemon(&socket, None, None).await;
-            assert_eq!(result.is_err(), legacy);
-            if !legacy {
-                assert_eq!(result.unwrap(), 2);
-            }
+            assert_eq!(validate_daemon(&socket, None, None).await.expect("every store's records decode"), 2);
             server.await.unwrap();
         }
     }

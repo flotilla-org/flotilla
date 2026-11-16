@@ -1037,10 +1037,7 @@ impl ConvoyStatus {
     /// keys in `turn_deliveries`, so terminal row projection can ignore them.
     pub fn is_turn_delivery_attention(&self, attention: &ConvoyAttention) -> bool {
         self.turn_deliveries.contains_key(&attention.source)
-            || matches!(
-                attention.source.as_str(),
-                ConvoyAttention::QUEUED_TURN_SOURCE | ConvoyAttention::MISSING_TURN_HOOK_SOURCE | ConvoyAttention::SUPERVISOR_TURN_SOURCE
-            )
+            || matches!(attention.source.as_str(), ConvoyAttention::QUEUED_TURN_SOURCE | ConvoyAttention::MISSING_TURN_HOOK_SOURCE)
     }
 
     pub fn produces(&self, subject: &Subject) -> bool {
@@ -1429,24 +1426,6 @@ pub enum ConvoyProvisioningState {
     Started { started_at: DateTime<Utc> },
 }
 
-/// Previous-generation queue record, adopted into Message on read.
-/// Remove after the first fleet roll deploying #2710 (ADR 0047).
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, bon::Builder)]
-pub struct PendingBrief {
-    pub vessel: String,
-    pub role: String,
-    pub content: String,
-    pub queued_at: DateTime<Utc>,
-    /// Decodes briefs queued before sender attribution; remove after the next fleet roll.
-    #[serde(
-        default,
-        skip_serializing_if = "crate::CrewMessageSender::is_unknown",
-        serialize_with = "flotilla_protocol::serialize_legacy_crew_sender"
-    )]
-    #[builder(default)]
-    pub sender: crate::CrewMessageSender,
-}
-
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, bon::Builder)]
 pub struct TargetMismatch {
     pub repo_ref: RepositoryKey,
@@ -1481,16 +1460,6 @@ pub struct TurnDeliveryStatus {
     pub failure: Option<TurnDeliveryFailure>,
     #[serde(default)]
     pub episodes: Vec<TurnDeliveryEpisode>,
-    /// Legacy operator queue, read only by Message adoption.
-    /// Remove after the first fleet roll deploying #2710 (ADR 0047).
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub pending_brief: Option<PendingBrief>,
-    /// Legacy remote turn queue, read only by Message adoption.
-    /// Remove after the first fleet roll deploying #2710 (ADR 0047).
-    /// Decodes turn delivery statuses stored before remote supervision; remove
-    /// the compatibility default one fleet roll after this field is deployed.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub pending_supervisor_turn: Option<PendingSupervisorTurn>,
 }
 
 impl TurnDeliveryStatus {
@@ -1537,34 +1506,6 @@ pub struct TurnDeliveryFailure {
     pub kind: TurnDeliveryFailureKind,
     pub attempts: u32,
     pub retry_at: DateTime<Utc>,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct PendingSupervisorTurn {
-    pub vessel: String,
-    pub role: String,
-    pub message: crate::TerminalCrewMessage,
-    /// Order assigned when the convoy authority accepts the turn. Older
-    /// stored turns decode with zero; remove this default one roll later.
-    #[serde(default)]
-    pub queued_order: u64,
-}
-
-pub const PENDING_BRIEF_DELIVERY_SOURCE: &str = "operator";
-
-impl ConvoyStatus {
-    pub fn pending_brief(&self) -> Option<&PendingBrief> {
-        self.turn_deliveries.get(PENDING_BRIEF_DELIVERY_SOURCE).and_then(|delivery| delivery.pending_brief.as_ref())
-    }
-}
-
-fn clear_operator_pending_brief(status: &mut ConvoyStatus) {
-    if let Some(delivery) = status.turn_deliveries.get_mut(PENDING_BRIEF_DELIVERY_SOURCE) {
-        delivery.pending_brief = None;
-    }
-    if status.turn_deliveries.get(PENDING_BRIEF_DELIVERY_SOURCE).is_some_and(|delivery| delivery.episodes.is_empty()) {
-        status.turn_deliveries.remove(PENDING_BRIEF_DELIVERY_SOURCE);
-    }
 }
 
 fn is_same_crew_stall(
@@ -1616,12 +1557,6 @@ fn clear_stall_for_crew(status: &mut ConvoyStatus, vessel: &str, role: &str) {
     }
 }
 
-fn clear_pending_brief_for(status: &mut ConvoyStatus, vessel: &str, role: &str) {
-    if status.pending_brief().is_some_and(|brief| brief.vessel == vessel && brief.role == role) {
-        clear_operator_pending_brief(status);
-    }
-}
-
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, bon::Builder)]
 pub struct TurnDeliveryEpisode {
     /// Stored as `head_sha` before issue subjects generalised the revision
@@ -1631,14 +1566,6 @@ pub struct TurnDeliveryEpisode {
     pub evidence_at: DateTime<Utc>,
     pub judged_claim_at: DateTime<Utc>,
     pub outcome: TurnDeliveryOutcome,
-    /// Decodes episodes stored before sender attribution; remove after the next fleet roll.
-    #[serde(
-        default,
-        skip_serializing_if = "crate::CrewMessageSender::is_unknown",
-        serialize_with = "flotilla_protocol::serialize_legacy_crew_sender"
-    )]
-    #[builder(default)]
-    pub sender: crate::CrewMessageSender,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -1696,7 +1623,6 @@ impl TurnDeliveryOutcome {
 }
 
 impl ConvoyAttention {
-    pub const SUPERVISOR_TURN_SOURCE: &'static str = "supervisor-turn-delivery";
     pub const QUEUED_TURN_SOURCE: &'static str = "queued-turn-delivery";
     pub const MISSING_TURN_HOOK_SOURCE: &'static str = "missing-turn-hook";
 }
@@ -2027,12 +1953,6 @@ pub enum ConvoyStatusPatch {
         reason: Option<String>,
         observed_at: DateTime<Utc>,
     },
-    QueueSupervisorTurn {
-        turn: PendingSupervisorTurn,
-    },
-    AcknowledgeSupervisorTurn {
-        message_id: String,
-    },
     WorkLaunching {
         work: String,
         started_at: DateTime<Utc>,
@@ -2210,8 +2130,6 @@ impl StatusPatch<ConvoyStatus> for ConvoyStatusPatch {
             Self::Settle { .. } => "Settle",
             Self::SetSettlementAttention { .. } => "SetSettlementAttention",
             Self::ObserveTurnHookHealth { .. } => "ObserveTurnHookHealth",
-            Self::QueueSupervisorTurn { .. } => "QueueSupervisorTurn",
-            Self::AcknowledgeSupervisorTurn { .. } => "AcknowledgeSupervisorTurn",
             Self::WorkLaunching { .. } => "WorkLaunching",
             Self::WorkRunning { .. } => "WorkRunning",
             Self::WorkInterrupted { .. } => "WorkInterrupted",
@@ -2364,9 +2282,6 @@ impl StatusPatch<ConvoyStatus> for ConvoyStatusPatch {
                 status.phase = *phase;
                 status.message = Some(message.clone());
                 status.finished_at.get_or_insert(*finished_at);
-                if phase.is_terminal() {
-                    clear_operator_pending_brief(status);
-                }
             }
             Self::AdvanceWorkToReady { ready } => {
                 if !matches!(status.provisioning, Some(ConvoyProvisioningState::Started { .. })) {
@@ -2397,7 +2312,6 @@ impl StatusPatch<ConvoyStatus> for ConvoyStatusPatch {
                         }
                     }
                 }
-                clear_operator_pending_brief(status);
             }
             Self::RollUpPhase { phase, started_at, finished_at } => {
                 // Derived Active roll-up is a continuation of the convoy voyage, not a new attempt.
@@ -2415,9 +2329,6 @@ impl StatusPatch<ConvoyStatus> for ConvoyStatusPatch {
                         status.finished_at = None;
                     }
                     status.finished_at.get_or_insert(*finished_at);
-                }
-                if phase.is_terminal() {
-                    clear_operator_pending_brief(status);
                 }
             }
             Self::RecordLandingEvent { transition } => {
@@ -2444,7 +2355,6 @@ impl StatusPatch<ConvoyStatus> for ConvoyStatusPatch {
                 }
                 status.finished_at.get_or_insert(*finished_at);
                 status.attention = None;
-                clear_operator_pending_brief(status);
             }
             Self::SetSettlementAttention { attention } => status.attention = attention.clone(),
             Self::ObserveTurnHookHealth { reason, observed_at } => {
@@ -2460,37 +2370,6 @@ impl StatusPatch<ConvoyStatus> for ConvoyStatusPatch {
                         }
                         None => status.attention = None,
                     }
-                }
-            }
-            Self::QueueSupervisorTurn { turn } => {
-                let existing_order = status
-                    .turn_deliveries
-                    .get(&turn.message.id)
-                    .and_then(|delivery| delivery.pending_supervisor_turn.as_ref())
-                    .map(|turn| turn.queued_order);
-                let next_order = status
-                    .turn_deliveries
-                    .values()
-                    .filter_map(|delivery| delivery.pending_supervisor_turn.as_ref().map(|turn| turn.queued_order))
-                    .max()
-                    .unwrap_or(0)
-                    .saturating_add(1);
-                let mut queued = turn.clone();
-                queued.queued_order = existing_order.unwrap_or(next_order);
-                status.turn_deliveries.entry(turn.message.id.clone()).or_default().pending_supervisor_turn = Some(queued);
-            }
-            Self::AcknowledgeSupervisorTurn { message_id } => {
-                if let Some(delivery) = status.turn_deliveries.get_mut(message_id) {
-                    delivery.pending_supervisor_turn = None;
-                    if delivery.episodes.is_empty() && delivery.pending_brief.is_none() {
-                        status.turn_deliveries.remove(message_id);
-                    }
-                }
-                // One-generation cleanup for attention written by the original #2285 patch.
-                if !status.turn_deliveries.values().any(|delivery| delivery.pending_supervisor_turn.is_some())
-                    && status.attention.as_ref().is_some_and(|attention| attention.source == ConvoyAttention::SUPERVISOR_TURN_SOURCE)
-                {
-                    status.attention = None;
                 }
             }
             Self::WorkLaunching { work, started_at, placement } => {
@@ -2597,7 +2476,6 @@ impl StatusPatch<ConvoyStatus> for ConvoyStatusPatch {
                     state.finished_at.get_or_insert(*finished_at);
                     state.message = Some(reason.clone());
                 }
-                clear_operator_pending_brief(status);
             }
             Self::DeriveCrewDone { vessel, role, at, engine } => {
                 if status.phase.is_terminal() {
@@ -2695,7 +2573,6 @@ impl StatusPatch<ConvoyStatus> for ConvoyStatusPatch {
                     state.finished_at.get_or_insert(*finished_at);
                     state.message = Some(message.clone());
                 }
-                clear_pending_brief_for(status, vessel, role);
                 clear_stall_for_crew(status, vessel, role);
             }
             Self::MarkCrewStalled { convoy, vessel, role, at, reason, proposed_disposition, message } => {
@@ -2766,7 +2643,6 @@ impl StatusPatch<ConvoyStatus> for ConvoyStatusPatch {
                         sender.finished_at = Some(*handed_off_at);
                         sender.message = Some(message.clone());
                     }
-                    clear_pending_brief_for(status, vessel, sender_role);
                 }
             }
             Self::ResumeCrewWork { vessel, role, resumed_at, prompt, brief_id, intent } => {
@@ -2812,7 +2688,6 @@ impl StatusPatch<ConvoyStatus> for ConvoyStatusPatch {
                     state.message = Some(prompt.clone());
                 }
                 status.stalled = None;
-                clear_pending_brief_for(status, vessel, role);
             }
             Self::QueueMessageFollowUp { vessel, role, message } => {
                 if let Some(state) = status.crew_work.get_mut(vessel).and_then(|crew| crew.get_mut(role)) {
@@ -3288,7 +3163,6 @@ pub mod external_patches {
 #[cfg(test)]
 mod subject_tests {
     use super::*;
-    use crate::{CrewMessageDelivery, CrewMessageSender, TerminalCrewMessage};
 
     // #2684: confirmation is monotonic, and clearing one queued episode must
     // retain attention for another overdue episode and unrelated operator attention.
@@ -3317,7 +3191,6 @@ mod subject_tests {
                             message_id: source.into(),
                             blocking_reason: "Pending".into(),
                         },
-                        sender: Default::default(),
                     }],
                     ..Default::default()
                 },
@@ -3951,69 +3824,6 @@ mod subject_tests {
         }
         .apply(&mut status);
         assert_eq!(status.attention, Some(unrelated));
-    }
-
-    #[test]
-    fn supervisor_turn_acknowledgment_clears_only_prior_generation_delivery_attention() {
-        let old_attention = ConvoyAttention {
-            source: ConvoyAttention::SUPERVISOR_TURN_SOURCE.to_string(),
-            reason: "Pending delivery".to_string(),
-            raised_at: Utc::now(),
-        };
-        let mut status = ConvoyStatus {
-            attention: Some(old_attention.clone()),
-            turn_deliveries: BTreeMap::from([(
-                "turn-1".to_string(),
-                TurnDeliveryStatus {
-                    pending_supervisor_turn: Some(PendingSupervisorTurn {
-                        queued_order: 0,
-                        vessel: "govern".to_string(),
-                        role: "governor".to_string(),
-                        message: TerminalCrewMessage {
-                            id: "turn-1".to_string(),
-                            text: "Supervise".to_string(),
-                            sender: CrewMessageSender::FlotillaEscalation { from: "coder@work".to_string() },
-                            delivery: CrewMessageDelivery::Queued,
-                            acknowledged: Default::default(),
-                            following: Vec::new(),
-                        },
-                    }),
-                    ..Default::default()
-                },
-            )]),
-            ..Default::default()
-        };
-        ConvoyStatusPatch::AcknowledgeSupervisorTurn { message_id: "turn-1".to_string() }.apply(&mut status);
-        assert!(status.attention.is_none());
-
-        status.attention = Some(ConvoyAttention { source: "settlement".to_string(), ..old_attention });
-        ConvoyStatusPatch::AcknowledgeSupervisorTurn { message_id: "turn-1".to_string() }.apply(&mut status);
-        assert_eq!(status.attention.as_ref().map(|attention| attention.source.as_str()), Some("settlement"));
-    }
-
-    #[test]
-    fn supervisor_turns_keep_enqueue_order_independent_of_message_ids() {
-        let mut status = ConvoyStatus::default();
-        for id in ["z-first", "a-second"] {
-            ConvoyStatusPatch::QueueSupervisorTurn {
-                turn: PendingSupervisorTurn {
-                    vessel: "work".into(),
-                    role: "coder".into(),
-                    message: TerminalCrewMessage {
-                        id: id.into(),
-                        text: id.into(),
-                        sender: CrewMessageSender::FlotillaNudge,
-                        delivery: CrewMessageDelivery::Queued,
-                        acknowledged: Default::default(),
-                        following: Vec::new(),
-                    },
-                    queued_order: 0,
-                },
-            }
-            .apply(&mut status);
-        }
-        assert_eq!(status.turn_deliveries["z-first"].pending_supervisor_turn.as_ref().expect("first").queued_order, 1);
-        assert_eq!(status.turn_deliveries["a-second"].pending_supervisor_turn.as_ref().expect("second").queued_order, 2);
     }
 
     // ADR 0047: previous-generation specs carry no dispatch promises and still
