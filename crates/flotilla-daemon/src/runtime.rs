@@ -37,7 +37,11 @@ use flotilla_provisioning::engine::ProvisioningLifecycles;
 use flotilla_provisioning::reconcilers::{ForgeDefaultBranchResolver, RepositoryReconciler};
 use flotilla_resources::LANDING_EVIDENCE_TTL;
 use flotilla_resources::{host_direct_environment_name, Convoy, Forge, Host, Repository, Resource, ResourceError, Vessel};
-use flotilla_store::{controller::ControllerLoop, ResourceBackend};
+use flotilla_store::{
+    controller::ControllerLoop,
+    load_metrics::{attributed, within, Attributed},
+    ResourceBackend,
+};
 use tokio::{sync::watch, task::JoinHandle};
 use tokio_util::task::AbortOnDropHandle;
 use tracing::{debug, error, info, warn};
@@ -649,8 +653,9 @@ impl StartupRestoration {
             options.controller_resync_interval,
             runtime_health.clone(),
         )));
+        let supervisor_turns = Arc::clone(&state.controller_metrics.for_kind("SupervisorTurns").reads);
         let (supervisor_turn_task, _supervisor_turn_ready) =
-            spawn_pending_supervisor_turn_task(Arc::clone(daemon), options.namespace.clone());
+            within(&supervisor_turns, || spawn_pending_supervisor_turn_task(Arc::clone(daemon), options.namespace.clone()));
         controller_tasks.push(AbortOnDropHandle::new(supervisor_turn_task));
         controller_tasks.push(AbortOnDropHandle::new(spawn_provisioned_environment_reconciliation_task(
             Arc::clone(state),
@@ -658,8 +663,8 @@ impl StartupRestoration {
             options.controller_resync_interval,
         )));
         if let Some(delivery) = self.credential_delivery.lock().unwrap_or_else(|poisoned| poisoned.into_inner()).take() {
-            controller_tasks
-                .push(AbortOnDropHandle::new(tokio::spawn(delivery.run(state.controller_metrics.for_kind("CredentialDelivery")))));
+            let metrics = state.controller_metrics.for_kind("CredentialDelivery");
+            controller_tasks.push(AbortOnDropHandle::new(tokio::spawn(attributed(Arc::clone(&metrics.reads), delivery.run(metrics)))));
         }
         // The central Codex login's sole writer; each rotation wakes credential delivery.
         let env = Arc::clone(&state.daemon.discovery_runtime().env);
@@ -887,7 +892,8 @@ fn spawn_controller_loops(
         Some(primitives) => {
             let delivery =
                 self::primitives::MessageDelivery::new(Arc::clone(&state), primitives, namespace_string.clone(), runtime_health.clone());
-            controllers.push(tokio::spawn(delivery.run(state.controller_metrics.for_kind("Message"))));
+            let metrics = state.controller_metrics.for_kind("Message");
+            controllers.push(tokio::spawn(attributed(Arc::clone(&metrics.reads), delivery.run(metrics))));
         }
         None => tracing::warn!(namespace = %namespace_string, "the Message path is not open; nothing delivers messages"),
     }
@@ -994,6 +1000,11 @@ fn archive_shipper(
     Ok(Some((shipper, decided)))
 }
 
+/// `work` with its engine reads counted for `caller` in this daemon's controller metrics.
+fn counted<F: std::future::Future>(state: &ControllerRuntimeState, caller: &str, work: F) -> Attributed<F> {
+    attributed(Arc::clone(&state.controller_metrics.for_kind(caller).reads), work)
+}
+
 /// The Environment controller (#3108): the single writer of this home's environment launches,
 /// realising them through the host's providers and told by its probes what became of them.
 fn spawn_environment_controller(state: &Arc<ControllerRuntimeState>, engine: &ProvisioningLifecycles) -> Option<JoinHandle<()>> {
@@ -1015,7 +1026,7 @@ fn spawn_environment_controller(state: &Arc<ControllerRuntimeState>, engine: &Pr
         Arc::new(VesselLaunchEnvironment { backend: state.daemon.resource_backend(), namespace: state.namespace.clone() }),
     );
     match Controller::start(Arc::clone(&engine.environments), Arc::new(actuator), state.daemon.clock_for_scenarios(), service) {
-        Ok(controller) => Some(tokio::spawn(controller.run(backings))),
+        Ok(controller) => Some(tokio::spawn(counted(state, "engine Environment", controller.run(backings)))),
         Err(error) => {
             error!(%error, "the Environment controller could not start; environments will not launch");
             None
@@ -1044,11 +1055,11 @@ fn spawn_clone_controller(state: &Arc<ControllerRuntimeState>, engine: &Provisio
         Arc::clone(&state.remote_reachability) as _,
     );
     match Controller::start(Arc::clone(&engine.clones), Arc::new(actuator), state.daemon.clock_for_scenarios(), service) {
-        Ok(controller) => Some(tokio::spawn(async move {
+        Ok(controller) => Some(tokio::spawn(counted(state, "engine Clone", async move {
             // No probe observes a clone's backing: what it waits on is in the log.
             let (_unobserved, backings) = tokio::sync::mpsc::channel(1);
             controller.run(backings).await
-        })),
+        }))),
         Err(error) => {
             error!(%error, "the Clone controller could not start; clones will not launch");
             None
@@ -1101,12 +1112,12 @@ fn spawn_image_build_controller(state: &Arc<ControllerRuntimeState>, engine: &Pr
     };
     match Controller::start(Arc::clone(&engine.image_builds), Arc::new(actuator), state.daemon.clock_for_scenarios(), service) {
         Ok(controller) => vec![
-            tokio::spawn(launcher.run()),
-            tokio::spawn(async move {
+            tokio::spawn(counted(state, "engine ImageBuild launcher", launcher.run())),
+            tokio::spawn(counted(state, "engine ImageBuild", async move {
                 // No probe observes a build's backing: the image stays in its cache.
                 let (_unobserved, backings) = tokio::sync::mpsc::channel(1);
                 controller.run(backings).await
-            }),
+            })),
         ],
         Err(error) => {
             error!(%error, "the ImageBuild controller could not start; image builds will not run");
@@ -1153,7 +1164,7 @@ fn spawn_terminal_controller(
             let probe =
                 TerminalProbe::new(provider, records, backings).with_progress(state.daemon.crew_progress()).with_briefs(briefs, rechecks);
             tasks.push(tokio::spawn(probe.run(TERMINAL_PROBE_EVERY)));
-            Some(tokio::spawn(controller.run_with(backing_events, recheck_events)))
+            Some(tokio::spawn(counted(state, "engine TerminalSession", controller.run_with(backing_events, recheck_events))))
         }
         Err(error) => {
             error!(%error, "the TerminalSession controller could not start; terminal sessions will not launch");
@@ -1210,11 +1221,11 @@ fn spawn_checkout_controller(
     }
     tasks.push(tokio::spawn(checkouts::recheck_on_discovered_refresh(Arc::clone(state))));
     match Controller::start(Arc::clone(&engine.checkouts), actuator, state.daemon.clock_for_scenarios(), service) {
-        Ok(controller) => Some(tokio::spawn(async move {
+        Ok(controller) => Some(tokio::spawn(counted(state, "engine Checkout", async move {
             // A checkout's backing is observed at a recheck, not pushed.
             let (_unobserved, backings) = tokio::sync::mpsc::channel(1);
             controller.run_with(backings, rechecks).await
-        })),
+        }))),
         Err(error) => {
             error!(%error, "the Checkout controller could not start; checkouts will not launch");
             None
@@ -1267,11 +1278,11 @@ fn spawn_vessel_controller(
     ));
     let actuator = Arc::new(VesselActuator::new(planning));
     match Controller::start(Arc::clone(&engine.vessels), actuator, state.daemon.clock_for_scenarios(), service) {
-        Ok(controller) => Some(tokio::spawn(async move {
+        Ok(controller) => Some(tokio::spawn(counted(state, "engine Vessel", async move {
             // No probe observes a vessel: its holdings' commits and its rechecks look at it.
             let (_unobserved, backings) = tokio::sync::mpsc::channel(1);
             controller.run_with(backings, rechecks).await
-        })),
+        }))),
         Err(error) => {
             error!(%error, "the Vessel controller could not start; vessels will not launch");
             None

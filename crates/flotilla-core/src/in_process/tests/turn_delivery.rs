@@ -334,11 +334,9 @@ async fn read_by_routing_a_reply(count: usize) -> (u64, u64) {
         "apiVersion":"flotilla.work/v1", "kind":"Message", "metadata":{"name":"reply"},
         "spec":{"sender":crew,"receiver":"system:turn-rules","relation":"peer","body":"done","in_reply_to":admission.message.name}
     });
-    let before = primitives.rows_read();
-    let home = daemon.message_creation_origin("flotilla", &reply).await.expect("the reply has a home");
-    let after = primitives.rows_read();
-    assert_eq!(home, Some(daemon.node_id().clone()), "the convoy's home");
-    (after.loaded - before.loaded, after.converted - before.converted)
+    let (home, reads) = flotilla_store::load_metrics::measure(daemon.message_creation_origin("flotilla", &reply)).await;
+    assert_eq!(home.expect("the reply has a home"), Some(daemon.node_id().clone()), "the convoy's home");
+    reads.get("Message").map_or((0, 0), |counts| (counts.decoded, counts.converted))
 }
 
 // Behaviour: routing a reply to a fleet role reads the original by its identity without

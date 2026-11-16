@@ -23,7 +23,7 @@ use flotilla_resources::{
     promises::{PromiseKind as OldKind, PromiseOperation, PromiseSource as OldSource},
     Convoy as OldConvoy, Forge, ForgeSpec, ResourceObject, SubjectDiscoverySource,
 };
-use flotilla_schema::Timestamp;
+use flotilla_schema::{reads::carry, Timestamp};
 use flotilla_state_machines::{
     machines::convoy::{
         AbandonCause, AddSeat, Authority, Convoy, ConvoyEdge, ConvoyLabel, ConvoyState, Declare, Deliver, FailSeat, Keep, Link, LinkSource,
@@ -85,7 +85,7 @@ impl ConvoyEngine {
         let convoys = Arc::clone(&self.convoys);
         let name = self.target(convoy)?;
         let now = self.now();
-        let edited = tokio::task::spawn_blocking(move || convoys.edit(&name, now, plan)).await.map_err(|error| error.to_string())?;
+        let edited = tokio::task::spawn_blocking(carry(move || convoys.edit(&name, now, plan))).await.map_err(|error| error.to_string())?;
         let applied = match &edited {
             Ok((applied, _)) => *applied,
             Err(error) => error.applied(),
@@ -187,7 +187,7 @@ impl EngineConvoys for ConvoyEngine {
 
     async fn reserve(&self, launch_of: &str) -> Result<String, String> {
         let (convoys, of, now) = (Arc::clone(&self.convoys), launch_of.to_owned(), self.now());
-        tokio::task::spawn_blocking(move || convoys.reserve(&of, now))
+        tokio::task::spawn_blocking(carry(move || convoys.reserve(&of, now)))
             .await
             .map_err(|error| error.to_string())?
             .map_err(|error| format!("reserve a launch of `{launch_of}`: {error:?}"))
@@ -202,11 +202,11 @@ impl EngineConvoys for ConvoyEngine {
         let project = request.project.clone();
         let (convoys, now) = (Arc::clone(&self.convoys), self.now());
         let named = launch.clone();
-        let admitted = tokio::task::spawn_blocking(move || {
+        let admitted = tokio::task::spawn_blocking(carry(move || {
             // Admission read the project; the engine's gate reads that record.
             convoys.world(|world| world.projects.put(&Ref::new(project.as_str()), ()));
             convoys.create_reserved(&named, request, now)
-        })
+        }))
         .await
         .map_err(|error| error.to_string())?;
         match admitted {

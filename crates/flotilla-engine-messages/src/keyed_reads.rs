@@ -13,6 +13,7 @@ use flotilla_resources::{
     lifecycle_reads::LifecycleReads, terminal_records::TerminalRecord, vessel_records::VesselRecord, Convoy, ForgeSpec, Resource,
     ResourceError, ResourceObject, ResourceProvenance, TerminalSession, CONVOY_LABEL, ROLE_LABEL,
 };
+use flotilla_schema::reads::carry;
 use flotilla_schema_sqlite::stream::Service;
 use flotilla_store::{ResourceBackend, WeakResourceBackend};
 
@@ -64,7 +65,7 @@ impl KeyedReads {
         read: impl FnOnce(&dyn LifecycleReads) -> Result<T, String> + Send + 'static,
     ) -> Result<T, String> {
         let reads = self.lifecycle()?;
-        tokio::task::spawn_blocking(move || read(reads.as_ref())).await.map_err(|error| error.to_string())?
+        tokio::task::spawn_blocking(carry(move || read(reads.as_ref()))).await.map_err(|error| error.to_string())?
     }
 
     /// Every home this store holds records of, this one among them.

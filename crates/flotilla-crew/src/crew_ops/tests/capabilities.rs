@@ -352,10 +352,11 @@ async fn read_by_a_card_change(count: usize) -> (u64, u64) {
     for card in ["## Your capabilities\n- first\n", "## Your capabilities\n- second\n"] {
         observe_card(&backend, "flotilla", &session, card, &tracker).await.expect("observe");
     }
-    let before = primitives.rows_read();
-    observe_card(&backend, "flotilla", &session, "## Your capabilities\n- third\n", &tracker).await.expect("card change");
-    let after = primitives.rows_read();
-    (after.loaded - before.loaded, after.converted - before.converted)
+    let (observed, reads) =
+        flotilla_store::load_metrics::measure(observe_card(&backend, "flotilla", &session, "## Your capabilities\n- third\n", &tracker))
+            .await;
+    observed.expect("card change");
+    reads.get("Message").map_or((0, 0), |counts| (counts.decoded, counts.converted))
 }
 
 // Behaviour: a card change loads only its pending notice and admission's read-back, whatever else

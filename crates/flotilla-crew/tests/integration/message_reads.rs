@@ -17,7 +17,10 @@ use flotilla_resources::{
     ArtifactSpec, Convoy, ConvoyEnsure, ConvoyEnsureSpec, ConvoySpec, InputMeta, Project, ProjectSpec, Repository, RepositorySpec,
     SystemClock, TerminalSession, Vessel, ENSURED_FROM_ANNOTATION,
 };
-use flotilla_store::{ResourceBackend, TerminalViews, VesselViews};
+use flotilla_store::{
+    load_metrics::{attributed, CallerReads},
+    ResourceBackend, TerminalViews, VesselViews,
+};
 use flotilla_store_memory::InMemoryBackend;
 use flotilla_store_testkit::{assert_flat_reads, ReadCountsBackendExt, ReadOperation, ReadSnapshot};
 
@@ -36,6 +39,8 @@ struct Home {
     session: String,
     /// Each pool session id given so far, so each realised launch has its own.
     realised: usize,
+    /// The engine reads of the calls measured through [`Home::measured`].
+    reads: Arc<CallerReads>,
     _third: OtherHome,
     _placed: EngineFixture,
 }
@@ -75,6 +80,7 @@ impl Home {
             crew: String::new(),
             session: String::new(),
             realised: 0,
+            reads: Arc::default(),
             _third: third,
             _placed: placed,
         };
@@ -148,10 +154,15 @@ impl Home {
         (
             self.engine.terminals.terminals.launches_read(),
             self.engine.vessels.vessels.launches_read(),
-            self.convoys.views().views_converted(),
+            self.reads.snapshot().get("Convoy").map_or(0, |counts| counts.converted),
             gets,
             self.backend.read_snapshot(),
         )
+    }
+
+    /// `work`, with its engine reads counted for this home's meters.
+    async fn measured<T>(&self, work: impl std::future::Future<Output = T>) -> T {
+        attributed(Arc::clone(&self.reads), work).await
     }
 
     fn spent(&self, before: (u64, u64, u64, KeyedGets, ReadSnapshot)) -> Cost {
@@ -235,7 +246,7 @@ fn no_listing_but(cost: &Cost, listed: &[&str]) {
 async fn holders_read(others: usize) -> (BTreeMap<String, BTreeSet<String>>, Cost) {
     let home = Home::open(others, others).await;
     let before = home.meters();
-    let holders = home.holders().await;
+    let holders = home.measured(home.holders()).await;
     let crew = Address::project(NAMESPACE)
         .and_then(|project| project.child(Kind::Convoy, &home.crew))
         .and_then(|convoy| convoy.child(Kind::Role, "coder"))
@@ -261,7 +272,7 @@ async fn cause_read(others: usize) -> Cost {
     let before = home.meters();
     let failures = BTreeMap::from([("github".to_owned(), "expired".to_owned())]);
     let attention = flotilla_resources::attentions::Attention::credential_refresh(&home.crew, "work", failures, Utc::now());
-    home.messages.primitives().raise(NAMESPACE, &attention).await.expect("raise the attention");
+    home.measured(home.messages.primitives().raise(NAMESPACE, &attention)).await.expect("raise the attention");
     home.spent(before)
 }
 
@@ -285,7 +296,7 @@ async fn condition_read(others: usize) -> (flotilla_resources::ThreeValue, Cost)
         .expect("the crew's role");
     let condition: Condition = format!("{role} .phase == Running").parse().expect("condition");
     let before = home.meters();
-    let value = home.messages.primitives().conditions().value(NAMESPACE, &condition).await.expect("the condition's value");
+    let value = home.measured(home.messages.primitives().conditions().value(NAMESPACE, &condition)).await.expect("the condition's value");
     (value, home.spent(before))
 }
 

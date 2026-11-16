@@ -9,7 +9,7 @@ use axum::{
     http::StatusCode,
     response::{IntoResponse, Response},
 };
-use flotilla_store::load_metrics::{ControllerMetricsRegistry, HistogramSnapshot, ReplicationLoadMetrics};
+use flotilla_store::load_metrics::{callers, ControllerMetricsRegistry, HistogramSnapshot, ReadCounts, ReplicationLoadMetrics};
 
 use super::RouterState;
 
@@ -82,6 +82,19 @@ impl Exposition {
         self.sample(&format!("{name}_count"), labels, histogram.count());
         self.number(&format!("{name}_max"), "gauge", labels, histogram.summary().max_micros as f64 / 1_000_000.0);
     }
+    /// One caller's engine reads, by kind: callers are controller kinds and fixed task names.
+    fn reads(&mut self, caller: &str, reads: &ReadCounts) {
+        for (kind, counts) in reads {
+            let labels = format!(",caller=\"{}\",kind=\"{}\"", escaped(caller), escaped(kind));
+            for (shape, value) in [("keyed", counts.keyed), ("index", counts.index), ("whole_kind", counts.whole_kind)] {
+                self.number("flotilla_engine_reads_total", "counter", &format!("{labels},shape=\"{shape}\""), value);
+            }
+            for (name, value) in [("read_rows", counts.rows), ("records_decoded", counts.decoded), ("records_converted", counts.converted)]
+            {
+                self.number(&format!("flotilla_engine_{name}_total"), "counter", &labels, value);
+            }
+        }
+    }
 }
 fn render(metrics: &LoadMetrics, daemon: &flotilla_core::in_process::InProcessDaemon) -> String {
     let mut out = Exposition { current: String::new(), host: escaped(daemon.host_name().as_str()), families: Default::default() };
@@ -102,6 +115,8 @@ fn render(metrics: &LoadMetrics, daemon: &flotilla_core::in_process::InProcessDa
             out.histogram("flotilla_controller_reconcile_seconds", &labels, &snapshot.reconcile);
             for (name, value) in [
                 ("wakes", snapshot.wakes),
+                ("enqueued", snapshot.enqueued),
+                ("enqueued_coalesced", snapshot.enqueued_coalesced),
                 ("requeues", snapshot.requeues),
                 ("requeues_coalesced", snapshot.requeues_coalesced),
                 ("failures", snapshot.failures),
@@ -114,7 +129,12 @@ fn render(metrics: &LoadMetrics, daemon: &flotilla_core::in_process::InProcessDa
             out.number("flotilla_controller_busy_seconds_total", "counter", &labels, snapshot.busy_micros as f64 / 1_000_000.0);
             out.number("flotilla_controller_queue_peak", "gauge", &labels, snapshot.queue_peak);
             out.number("flotilla_controller_parked", "gauge", &labels, snapshot.parked);
+            out.reads(&kind, &snapshot.reads);
+            out.reads(&format!("{kind} watches"), &snapshot.watch_reads);
         }
+    }
+    for (caller, reads) in callers() {
+        out.reads(&caller, &reads);
     }
     if let Some(convoys) = daemon.engine_convoys() {
         out.number("flotilla_convoys_waiting_capacity", "gauge", "", convoys.memory().capacity_waits());

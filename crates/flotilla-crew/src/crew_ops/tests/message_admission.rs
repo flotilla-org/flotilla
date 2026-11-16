@@ -115,11 +115,9 @@ async fn read_by_one_turn(count: usize) -> (u64, u64) {
         .references(vec![reference.clone()])
         .message_subject(reference)
         .build();
-    let before = primitives.rows_read();
-    let admission = crew.deliver_turn(&request).await.expect("deliver the turn");
-    let after = primitives.rows_read();
-    assert!(admission.new_turn, "nothing open supersedes the turn");
-    (after.loaded - before.loaded, after.converted - before.converted)
+    let (admission, reads) = flotilla_store::load_metrics::measure(crew.deliver_turn(&request)).await;
+    assert!(admission.expect("deliver the turn").new_turn, "nothing open supersedes the turn");
+    reads.get("Message").map_or((0, 0), |counts| (counts.decoded, counts.converted))
 }
 
 // Behaviour: delivering a turn reads the coder's open messages as the engine holds them to find
@@ -161,15 +159,14 @@ async fn read_by_follow_ups(count: usize) -> (u64, u64) {
         flotilla_resources::convoy::engine::set_notes(&held.engine.path(), &launch, &status).expect("queue the follow-up");
         followed.push((launch, name));
     }
-    let before = primitives.rows_read();
-    crew.reconcile_pending_supervisor_turns_once("flotilla").await.expect("reconcile");
-    let after = primitives.rows_read();
+    let (reconciled, reads) = flotilla_store::load_metrics::measure(crew.reconcile_pending_supervisor_turns_once("flotilla")).await;
+    reconciled.expect("reconcile");
     for (launch, name) in &followed {
         let coder = held.engine.view(&backend, launch).await.status.expect("status").crew_work["work"]["coder"].clone();
         assert!(coder.pending_follow_up.is_none(), "{launch}'s follow-up is consumed");
         assert_eq!(coder.resume_brief_id.as_deref(), Some(name.as_str()), "{launch}'s work continues from its follow-up");
     }
-    (after.loaded - before.loaded, after.converted - before.converted)
+    reads.get("Message").map_or((0, 0), |counts| (counts.decoded, counts.converted))
 }
 
 // Behaviour: continuing delivered follow-ups loads each once, converting none to the old shape.

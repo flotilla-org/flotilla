@@ -3,7 +3,7 @@
 
 use std::{collections::BTreeMap, fmt::Write as _, time::Duration};
 
-use flotilla_store::load_metrics::{HistogramSnapshot, LatencySummary, StoreLoadSnapshot};
+use flotilla_store::load_metrics::{counts_since, HistogramSnapshot, LatencySummary, ReadCounts, StoreLoadSnapshot};
 use serde::Serialize;
 
 use crate::target::{HomeSample, TargetSample};
@@ -28,6 +28,8 @@ pub struct LoadReport {
     pub target_errors: TargetErrors,
     pub window: WindowSummary,
     pub home_metrics: Vec<HomeReport>,
+    /// The process's named callers' engine reads over the window, every home's summed.
+    pub reads: BTreeMap<String, ReadCounts>,
     pub resident_bytes: Option<u64>,
     /// Convoys still open when the window ended, by the target's breakdown.
     pub open_at_end: BTreeMap<String, u64>,
@@ -114,6 +116,12 @@ pub struct StoreReport {
 #[derive(Debug, Clone, Default, Serialize)]
 pub struct ControllerReport {
     pub wakes_per_second: f64,
+    /// Objects asked for by its watches, resyncs and requeues; those already queued coalesce.
+    pub enqueued_per_second: f64,
+    pub enqueued_coalesced: u64,
+    /// The engine reads of its passes and of its watches over the window.
+    pub reads: ReadCounts,
+    pub watch_reads: ReadCounts,
     pub requeues_per_second: f64,
     pub requeues_coalesced: u64,
     pub resync_enqueued_per_second: f64,
@@ -151,6 +159,15 @@ fn per_second(count: u64, seconds: f64) -> f64 {
     }
 }
 
+/// The process's named callers' engine reads between two samples of the target.
+pub fn window_reads(start: &TargetSample, end: &TargetSample) -> BTreeMap<String, ReadCounts> {
+    end.reads
+        .iter()
+        .map(|(caller, end)| (caller.clone(), counts_since(end, start.reads.get(caller).unwrap_or(&ReadCounts::new()))))
+        .filter(|(_, reads)| !reads.is_empty())
+        .collect()
+}
+
 /// Every home's metrics between two samples of the target.
 pub fn window_metrics(start: &TargetSample, end: &TargetSample, window: Duration) -> Vec<HomeReport> {
     let seconds = window.as_secs_f64();
@@ -185,6 +202,8 @@ pub fn window_metrics(start: &TargetSample, end: &TargetSample, window: Duration
                     let phase = end.since(start.controllers.get(kind).unwrap_or(&Default::default()));
                     let report = ControllerReport {
                         wakes_per_second: per_second(phase.wakes, seconds),
+                        enqueued_per_second: per_second(phase.enqueued, seconds),
+                        enqueued_coalesced: phase.enqueued_coalesced,
                         requeues_per_second: per_second(phase.requeues, seconds),
                         requeues_coalesced: phase.requeues_coalesced,
                         resync_enqueued_per_second: per_second(phase.resync_enqueued, seconds),
@@ -194,6 +213,8 @@ pub fn window_metrics(start: &TargetSample, end: &TargetSample, window: Duration
                         busy_fraction: if seconds > 0.0 { phase.busy_micros as f64 / (seconds * 1_000_000.0) } else { 0.0 },
                         queue_peak: phase.queue_peak,
                         parked: phase.parked,
+                        reads: phase.reads,
+                        watch_reads: phase.watch_reads,
                     };
                     (kind.clone(), report)
                 })

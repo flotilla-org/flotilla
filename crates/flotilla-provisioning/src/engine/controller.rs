@@ -46,7 +46,7 @@ use std::{
 use async_trait::async_trait;
 use flotilla_engine_store::follow::Followed;
 use flotilla_resources::Clock;
-use flotilla_schema::{Identity, KindCode, Timestamp};
+use flotilla_schema::{reads::carry, Identity, KindCode, Timestamp};
 use flotilla_schema_sqlite::{stream::Service, Read, StoreError};
 use flotilla_state_machines::{
     machines::lifecycle::{Lifecycle, LifecycleKind, LifecycleState, VanishCause},
@@ -565,7 +565,7 @@ where
         let lifecycles = Arc::clone(&self.lifecycles);
         let owned = name.to_owned();
         let at = Timestamp::from_datetime(&self.clock.now());
-        let written = tokio::task::spawn_blocking(move || lifecycles.finish_launch_request(&owned, at))
+        let written = tokio::task::spawn_blocking(carry(move || lifecycles.finish_launch_request(&owned, at)))
             .await
             .unwrap_or_else(|error| Err(EngineError::Failed(format!("lifecycle write did not finish: {error}"))));
         if let Err(error) = written {
@@ -708,7 +708,7 @@ where
         let lifecycles = Arc::clone(&self.lifecycles);
         let owned = name.to_owned();
         let at = Timestamp::from_datetime(&self.clock.now());
-        let written = tokio::task::spawn_blocking(move || lifecycles.step(&owned, &step, at).map(|_| ()))
+        let written = tokio::task::spawn_blocking(carry(move || lifecycles.step(&owned, &step, at).map(|_| ())))
             .await
             .unwrap_or_else(|error| Err(EngineError::Failed(format!("lifecycle write did not finish: {error}"))));
         let error = written.err()?;

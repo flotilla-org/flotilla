@@ -9,6 +9,7 @@ use std::{
 
 use chrono::{DateTime, Utc};
 use flotilla_resources::{WatchEvent, WatchStart};
+use flotilla_schema::reads::attributed;
 use futures::StreamExt;
 use tokio::{
     sync::{mpsc, Mutex},
@@ -198,6 +199,7 @@ pub struct WorkQueueSender {
     sender: mpsc::UnboundedSender<String>,
     progress: Arc<StdMutex<QueueProgress>>,
     every: Arc<tokio::sync::Notify>,
+    metrics: Arc<ControllerLoadMetrics>,
 }
 
 #[derive(Default)]
@@ -215,17 +217,25 @@ impl WorkQueueSender {
     /// instants (or advance relative to them); advancing only its clock does not
     /// simulate progress in the real controller loop.
     pub fn channel() -> (Self, mpsc::UnboundedReceiver<String>) {
+        Self::metered(Arc::default())
+    }
+
+    /// A queue whose sends are counted into `metrics`.
+    fn metered(metrics: Arc<ControllerLoadMetrics>) -> (Self, mpsc::UnboundedReceiver<String>) {
         let (sender, receiver) = mpsc::unbounded_channel();
-        (Self { sender, progress: Arc::default(), every: Arc::default() }, receiver)
+        (Self { sender, progress: Arc::default(), every: Arc::default(), metrics }, receiver)
     }
 
     /// Enqueue completes without suspension; the async signature keeps watch producers uniform.
     pub async fn send(&self, name: String) -> Result<(), mpsc::error::SendError<String>> {
+        self.metrics.enqueued.increment();
         let mut progress = self.progress.lock().expect("controller work queue lock poisoned");
         if progress.queued.is_empty() && progress.processing.is_none() {
             progress.last_progress = Some(Utc::now());
         }
-        if !progress.queued.contains_key(&name) {
+        if progress.queued.contains_key(&name) {
+            self.metrics.enqueued_coalesced.increment();
+        } else {
             progress.queued.insert(name.clone(), Instant::now());
             if let Err(error) = self.sender.send(name.clone()) {
                 progress.queued.remove(&name);
@@ -569,7 +579,8 @@ impl<R: Reconciler> ControllerLoop<R> {
         watch_exited: mpsc::UnboundedSender<WatchExited>,
         restart_backoff: Option<Duration>,
     ) -> JoinHandle<()> {
-        tokio::spawn(async move {
+        let reads = Arc::clone(&sender.metrics.watch_reads);
+        tokio::spawn(attributed(reads, async move {
             if let Some(backoff) = restart_backoff {
                 tokio::time::sleep(backoff).await;
             }
@@ -607,7 +618,7 @@ impl<R: Reconciler> ControllerLoop<R> {
             .await;
 
             let _ = watch_exited.send(WatchExited::Primary(result));
-        })
+        }))
     }
 
     fn spawn_secondary_watch(
@@ -619,13 +630,14 @@ impl<R: Reconciler> ControllerLoop<R> {
         watch_exited: mpsc::UnboundedSender<WatchExited>,
         restart_backoff: Option<Duration>,
     ) -> JoinHandle<()> {
-        tokio::spawn(async move {
+        let reads = Arc::clone(&sender.metrics.watch_reads);
+        tokio::spawn(attributed(reads, async move {
             if let Some(backoff) = restart_backoff {
                 tokio::time::sleep(backoff).await;
             }
             let result = watch.spawn(backend, namespace, sender).await;
             let _ = watch_exited.send(WatchExited::Secondary { index, result });
-        })
+        }))
     }
 
     /// Queues `name` again after `delay`, unless a requeue of it is already scheduled.
@@ -677,8 +689,9 @@ impl<R: Reconciler> ControllerLoop<R> {
         self.run_instrumented(Arc::default()).await
     }
 
-    /// [`Self::run`], also recording wakes, reconcile latency, requeues and
-    /// resyncs into `metrics` for load measurement (#3206).
+    /// [`Self::run`], also recording wakes, reconcile latency, requeues,
+    /// resyncs and the engine reads of its passes and watches into `metrics`
+    /// for load measurement (#3206).
     pub async fn run_observed(self, metrics: Arc<ControllerLoadMetrics>) -> Result<(), ResourceError>
     where
         <R::Resource as Resource>::Status: Default,
@@ -690,8 +703,15 @@ impl<R: Reconciler> ControllerLoop<R> {
     where
         <R::Resource as Resource>::Status: Default,
     {
+        attributed(Arc::clone(&metrics.reads), self.run_passes(metrics)).await
+    }
+
+    async fn run_passes(self, metrics: Arc<ControllerLoadMetrics>) -> Result<(), ResourceError>
+    where
+        <R::Resource as Resource>::Status: Default,
+    {
         let ControllerLoop { primary, secondaries, reconciler, backend } = self;
-        let (sender, mut receiver) = WorkQueueSender::channel();
+        let (sender, mut receiver) = WorkQueueSender::metered(Arc::clone(&metrics));
         let every = Arc::clone(&sender.every);
         let (watch_exited_tx, mut watch_exited_rx) = mpsc::unbounded_channel();
         let primary_watch = Self::spawn_primary_watch(primary.clone(), sender.clone(), watch_exited_tx.clone(), None);

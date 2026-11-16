@@ -74,7 +74,7 @@ use flotilla_schema::{Cause, CodeEnum, KindCode, KindSpec};
 use flotilla_schema_sqlite::stream::{Frame, Service};
 use flotilla_state_machines::machines::{agent_session::AgentSessionEdgeKind, message::MessageSpec};
 use flotilla_store::{
-    load_metrics::{LatencyHistogram, ReplicationLoadMetrics},
+    load_metrics::{callers, LatencyHistogram, ReplicationLoadMetrics},
     ResourceBackend,
 };
 use flotilla_store_sqlite::SqliteBackend;
@@ -553,7 +553,7 @@ impl FleetTarget for InProcessFleet {
                 database_bytes: database_bytes(&home.database),
             })
             .collect();
-        Ok(TargetSample { homes, resident_bytes: resident_bytes() })
+        Ok(TargetSample { homes, resident_bytes: resident_bytes(), reads: callers() })
     }
 }
 

@@ -18,7 +18,7 @@ use flotilla_resources::{
     image_build_records::{ImageBuildChange, ImageBuildRecord, ImageBuildRecords},
     ImageBuildReservation, ImageBuildSpec, ImageDelivery,
 };
-use flotilla_schema::{Frozen, Kind, NewChange, Ref, Timestamp};
+use flotilla_schema::{reads::carry, Frozen, Kind, NewChange, Ref, Timestamp};
 use flotilla_schema_sqlite::{stream::Service, Read, StoreError, StoreHandle};
 use flotilla_state_machines::{machines::lifecycle::LifecycleState, Resource};
 
@@ -408,7 +408,7 @@ impl ImageBuildLauncher {
     /// home's writes take the store's lock.
     async fn launch(&self, demanded: BTreeMap<String, ImageBuildDemand>) {
         let lifecycles = Arc::clone(&self.lifecycles);
-        if let Err(error) = tokio::task::spawn_blocking(move || launch(lifecycles.as_ref(), demanded)).await {
+        if let Err(error) = tokio::task::spawn_blocking(carry(move || launch(lifecycles.as_ref(), demanded))).await {
             tracing::warn!(%error, "image build launches did not finish");
         }
     }

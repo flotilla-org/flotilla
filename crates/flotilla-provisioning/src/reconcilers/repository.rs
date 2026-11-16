@@ -9,6 +9,7 @@ use flotilla_resources::{
     DefaultBranchObservation, DefaultBranchProvenance, ForgeIdentity, LifecycleAuthority, Repository, RepositoryCheckoutRef, RepositoryKey,
     RepositoryStatus, RepositoryStatusPatch, ResourceError, ResourceObject,
 };
+use flotilla_schema::reads::carry;
 use flotilla_store::{
     controller::{ReconcileOutcome, Reconciler, SecondaryWatch, WorkQueueSender},
     ResourceBackend,
@@ -135,7 +136,7 @@ impl Reconciler for RepositoryReconciler {
         // finder's, a made one its holder's. The discovered ones are as the refresh found them.
         let reads = Arc::clone(&self.lifecycle_reads);
         let key = repository_key.clone();
-        let engine = tokio::task::spawn_blocking(move || reads.checkouts().and_then(|checkouts| checkouts.of_repository(&key)))
+        let engine = tokio::task::spawn_blocking(carry(move || reads.checkouts().and_then(|checkouts| checkouts.of_repository(&key))))
             .await
             .map_err(|error| ResourceError::other(format!("engine read: {error}")))?
             .map_err(ResourceError::other)?;
@@ -175,7 +176,7 @@ impl Reconciler for RepositoryReconciler {
         // reads take the store's lock, so they run off the async workers.
         let reads = Arc::clone(&self.lifecycle_reads);
         let key = repository_key.clone();
-        let clones = tokio::task::spawn_blocking(move || reads.clones().and_then(|clones| clones.of_repository(&key)))
+        let clones = tokio::task::spawn_blocking(carry(move || reads.clones().and_then(|clones| clones.of_repository(&key))))
             .await
             .map_err(|error| ResourceError::other(format!("engine read: {error}")))?
             .map_err(ResourceError::other)?;

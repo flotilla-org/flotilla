@@ -18,10 +18,7 @@
 
 use std::{
     collections::{BTreeMap, BTreeSet},
-    sync::{
-        atomic::{AtomicU64, Ordering},
-        Arc, Mutex, PoisonError,
-    },
+    sync::{Arc, Mutex, PoisonError},
 };
 
 use chrono::DateTime;
@@ -55,8 +52,6 @@ pub struct ConvoyViews {
 struct Held {
     state: tokio::sync::Mutex<Option<HeldViews>>,
     ticks: Mutex<Option<tokio::sync::broadcast::Sender<()>>>,
-    /// Views converted into the engine port's objects, the cost of its reads.
-    converted: AtomicU64,
 }
 
 struct HeldViews {
@@ -364,7 +359,7 @@ impl ConvoyViews {
         read: impl FnOnce(&dyn LifecycleReads) -> Result<T, String> + Send + 'static,
     ) -> Result<T, ResourceError> {
         let reads = Arc::clone(&self.reads);
-        tokio::task::spawn_blocking(move || read(reads.as_ref()))
+        tokio::task::spawn_blocking(flotilla_schema::reads::carry(move || read(reads.as_ref())))
             .await
             .map_err(|error| ResourceError::other(error.to_string()))?
             .map_err(ResourceError::other)
@@ -393,7 +388,6 @@ impl ConvoyViews {
 
     /// `sources` as the engine port's objects, each at its home.
     fn engine_objects(&self, sources: Vec<ReadResourceObject<Convoy>>) -> Result<Vec<EngineObject>, String> {
-        self.held.converted.fetch_add(sources.len() as u64, Ordering::Relaxed);
         sources
             .into_iter()
             .map(|source| {
@@ -405,11 +399,6 @@ impl ConvoyViews {
             })
             .collect()
     }
-
-    /// How many views the engine port has converted into objects, for read-cost tests.
-    pub fn views_converted(&self) -> u64 {
-        self.held.converted.load(Ordering::Relaxed)
-    }
 }
 
 impl std::fmt::Debug for ConvoyViews {
@@ -419,8 +408,10 @@ impl std::fmt::Debug for ConvoyViews {
 }
 
 /// `source` as the engine port hands it to the old store: a change of the launch, of what it
-/// joins, or of its home's notes moves its version.
+/// joins, or of its home's notes moves its version. Each is counted as a Convoy converted to the
+/// old shape.
 fn engine_object(source: ReadResourceObject<Convoy>, home: String) -> Result<EngineObject, String> {
+    flotilla_schema::reads::converted("Convoy", 1);
     crate::held_listing::view_object(source.object, home)
 }
 
@@ -447,10 +438,7 @@ impl EngineRecords for ConvoyViews {
     async fn get(&self, _kind: &str, name: &str) -> Result<Option<EngineObject>, String> {
         let home = self.home();
         match self.find(name, None).await.map_err(|error| error.to_string())? {
-            Some(source) => {
-                self.held.converted.fetch_add(1, Ordering::Relaxed);
-                engine_object(source, home).map(Some)
-            }
+            Some(source) => engine_object(source, home).map(Some),
             // Another home's launch of this name reads where this home holds none: the lexically
             // first home's, as a listing chooses.
             None => Ok(self.engine_copies(name).await?.into_iter().min_by(|a, b| a.home.cmp(&b.home))),

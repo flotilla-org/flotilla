@@ -18,7 +18,7 @@ use flotilla_resources::{
     TerminalSessionStatus, WorkflowSnapshot, CONVOY_LABEL, ROLE_ADDRESS_ANNOTATION, ROLE_LABEL, VESSEL_LABEL,
 };
 use flotilla_state_machines::machines::message::{DropReason, MessageState};
-use flotilla_store::ResourceBackend;
+use flotilla_store::{load_metrics::measure, ResourceBackend};
 use flotilla_store_memory::InMemoryBackend;
 
 const NAMESPACE: &str = "flotilla";
@@ -124,10 +124,8 @@ async fn read_by_a_charter_pass(count: usize) -> (u64, u64) {
             .build();
         primitives.admit(NAMESPACE, &format!("other-{index}"), &other).await.expect("another message");
     }
-    let before = primitives.rows_read();
-    apply_and_notify(&backend, primitives, "second").await;
-    let after = primitives.rows_read();
-    (after.loaded - before.loaded, after.converted - before.converted)
+    let ((), reads) = measure(apply_and_notify(&backend, primitives, "second")).await;
+    reads.get("Message").map_or((0, 0), |counts| (counts.decoded, counts.converted))
 }
 
 // Behaviour: a second revision's notice supersedes the first, and a repeated pass admits nothing.

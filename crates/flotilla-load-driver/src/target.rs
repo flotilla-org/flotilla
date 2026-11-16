@@ -4,7 +4,7 @@ use std::collections::BTreeMap;
 
 use async_trait::async_trait;
 use flotilla_dummy_fleet::catalog::CrewMix;
-use flotilla_store::load_metrics::{ControllerLoadSnapshot, HistogramSnapshot, ReplicationLoadSnapshot, StoreLoadSnapshot};
+use flotilla_store::load_metrics::{ControllerLoadSnapshot, HistogramSnapshot, ReadCounts, ReplicationLoadSnapshot, StoreLoadSnapshot};
 
 /// A convoy's state in the terms of ADR 0064: open until its work is delivered
 /// or it is abandoned. Today's control plane can also fail a convoy; that is
@@ -58,6 +58,9 @@ pub struct TargetSample {
     pub homes: Vec<HomeSample>,
     /// Resident memory of the process hosting the target, when it is local.
     pub resident_bytes: Option<u64>,
+    /// The engine reads of the process's named callers (the engine feeds, reads outside every
+    /// caller), summed over every home it runs: each controller's are in its home's sample.
+    pub reads: BTreeMap<String, ReadCounts>,
 }
 
 /// A fleet the driver can dispatch convoys to: one or more homes (daemons),

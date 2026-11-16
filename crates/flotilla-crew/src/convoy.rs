@@ -18,6 +18,7 @@ use flotilla_resources::convoy::reconcile::*;
 use flotilla_resources::*;
 use flotilla_store::{
     controller::{LabelMappedWatch, ReconcileOutcome as ControllerReconcileOutcome, Reconciler, SecondaryWatch},
+    load_metrics::carry,
     DefinitionResolver, PreparedSnapshotGarbageCollector, ReplicaReadResolver, TypedResolver,
 };
 use std::{
@@ -188,7 +189,7 @@ impl ConvoyReconciler {
         // newest launch is ready.
         let reads = Arc::clone(&self.lifecycle_reads);
         let (convoy, work, seat) = (obj.metadata.name.clone(), vessel.to_owned(), role.to_owned());
-        let live = tokio::task::spawn_blocking(move || -> Result<bool, String> {
+        let live = tokio::task::spawn_blocking(carry(move || -> Result<bool, String> {
             let launch_of = vessel_resource_name(flotilla_resources::convoy::launch_of(&convoy), &work);
             let terminals = reads.terminals()?;
             for launch in reads.vessels()?.of_convoy(&convoy)?.into_iter().filter(|launch| launch.launch_of == launch_of) {
@@ -202,7 +203,7 @@ impl ConvoyReconciler {
                 }
             }
             Ok(false)
-        })
+        }))
         .await
         .map_err(|error| ResourceError::other(format!("read the seat's sessions: {error}")))?
         .map_err(ResourceError::other)?;
@@ -367,7 +368,7 @@ impl ConvoyReconciler {
     ) -> Result<BTreeMap<String, flotilla_resources::checkout_records::CheckoutRecord>, ResourceError> {
         let Some(holder) = flotilla_resources::convoy::engine::checkout_holder(obj) else { return Ok(BTreeMap::new()) };
         let reads = Arc::clone(&self.lifecycle_reads);
-        let held = tokio::task::spawn_blocking(move || reads.checkouts()?.held(&holder))
+        let held = tokio::task::spawn_blocking(carry(move || reads.checkouts()?.held(&holder)))
             .await
             .map_err(|error| ResourceError::other(format!("read held checkouts: {error}")))?
             .map_err(ResourceError::other)?;
@@ -385,7 +386,7 @@ impl ConvoyReconciler {
         }
         let reads = Arc::clone(&self.lifecycle_reads);
         let convoy = obj.metadata.name.clone();
-        tokio::task::spawn_blocking(move || reads.vessels()?.of_convoy(&convoy))
+        tokio::task::spawn_blocking(carry(move || reads.vessels()?.of_convoy(&convoy)))
             .await
             .map_err(|error| ResourceError::other(format!("read the convoy's vessels: {error}")))?
             .map_err(ResourceError::other)

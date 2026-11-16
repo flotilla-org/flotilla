@@ -260,7 +260,7 @@ impl ResourceBackend {
         let namespace = self.engines.read().unwrap_or_else(std::sync::PoisonError::into_inner).namespace.clone();
         let namespace = namespace.ok_or_else(|| ResourceError::other(format!("{kind} is served by the engine in no namespace")))?;
         let home = records.home();
-        let sources = records.sources(kind).await.map_err(ResourceError::other)?;
+        let sources = crate::port_reads::sources(records, kind).await.map_err(ResourceError::other)?;
         Ok(if sources.iter().any(|record| !local || record.home == home) { vec![namespace] } else { Vec::new() })
     }
 
@@ -875,7 +875,7 @@ impl<T: Resource> TypedResolver<T> {
         name: &str,
     ) -> Result<Option<flotilla_resources::engine_records::EngineObject>, ResourceError> {
         let home = records.home();
-        let sources = records.sources(T::API_PATHS.kind).await.map_err(ResourceError::other)?;
+        let sources = crate::port_reads::sources(records, T::API_PATHS.kind).await.map_err(ResourceError::other)?;
         Ok(sources.into_iter().find(|record| record.name == name && record.home == home))
     }
 
@@ -886,7 +886,7 @@ impl<T: Resource> TypedResolver<T> {
         let Some(records) = self.engine_owned() else {
             return Ok(ResourceError::not_found(name));
         };
-        let copies = records.copies(T::API_PATHS.kind, name).await.map_err(ResourceError::other)?;
+        let copies = crate::port_reads::copies(&*records, T::API_PATHS.kind, name).await.map_err(ResourceError::other)?;
         if copies.is_empty() {
             return Ok(ResourceError::not_found(name));
         }
@@ -950,7 +950,7 @@ impl<T: Resource> TypedResolver<T> {
             (Some(lifecycle), Some(reads)) => {
                 let reads = std::sync::Arc::clone(reads);
                 let name = name.to_owned();
-                tokio::task::spawn_blocking(move || reads.try_reading(lifecycle, &name, None))
+                tokio::task::spawn_blocking(flotilla_schema::reads::carry(move || reads.try_reading(lifecycle, &name, None)))
                     .await
                     .map_err(|error| ResourceError::other(error.to_string()))?
                     .map_err(ResourceError::other)?

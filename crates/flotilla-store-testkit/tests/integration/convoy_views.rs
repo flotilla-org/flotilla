@@ -28,7 +28,10 @@ use flotilla_resources::{
     workflow_template::{CrewSource, CrewSpec, Selector, VesselRequirement},
     ConvoyAttention, ConvoyPhase, CrewWorkPhase, WorkPhase, WorkflowSnapshot,
 };
-use flotilla_store::ConvoyViews;
+use flotilla_store::{
+    load_metrics::{measure, ReadCounts},
+    ConvoyViews,
+};
 
 const HERE: &str = "home-a";
 
@@ -445,15 +448,15 @@ async fn converted_by_one_read(others: usize) -> (u64, u64) {
     let views = ConvoyViews::new("flotilla", reads);
     assert_eq!(views.sources().await.expect("fill").len(), others + 3);
 
-    let before = views.views_converted();
-    let copies = views.copies("Convoy", "wanted#1").await.expect("copies");
+    let converted = |reads: &ReadCounts| reads.get("Convoy").map_or(0, |counts| counts.converted);
+    let (copies, reads) = measure(views.copies("Convoy", "wanted#1")).await;
+    let copies = copies.expect("copies");
     assert_eq!(copies.iter().map(|copy| copy.home.as_str()).collect::<Vec<_>>(), [HERE, "home-b"]);
-    let copies_cost = views.views_converted() - before;
+    let copies_cost = converted(&reads);
 
-    let before = views.views_converted();
-    let remote = EngineRecords::get(&views, "Convoy", "remote#1").await.expect("get").expect("held at home-b");
-    assert_eq!(remote.home, "home-b");
-    (copies_cost, views.views_converted() - before)
+    let (remote, reads) = measure(EngineRecords::get(&views, "Convoy", "remote#1")).await;
+    assert_eq!(remote.expect("get").expect("held at home-b").home, "home-b");
+    (copies_cost, converted(&reads))
 }
 
 // Behaviour: a read of one launch by name, as a generic Convoy get reads it, converts only that

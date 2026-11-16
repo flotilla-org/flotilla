@@ -11,7 +11,7 @@ use std::{
 };
 
 use crate::follow::{Followed, Follower};
-use flotilla_schema::KindCode;
+use flotilla_schema::{reads::carry, KindCode};
 use flotilla_schema_sqlite::{
     stream::{CommitListener, Committed, Service},
     Read, StoreError,
@@ -88,7 +88,7 @@ impl EngineWatch {
         let service = Arc::clone(&self.service);
         let mut follower = self.follower.clone();
         let reset = self.resets.swap(false, Ordering::SeqCst);
-        let (follower, result) = tokio::task::spawn_blocking(move || {
+        let (follower, result) = tokio::task::spawn_blocking(carry(move || {
             let homes = service.homes();
             let result = service.with_store(|store| {
                 let mut store_read = store.read()?;
@@ -96,7 +96,7 @@ impl EngineWatch {
                 read(&mut store_read, followed)
             });
             (follower, result)
-        })
+        }))
         .await
         .map_err(|error| StoreError::Stream(format!("log pass did not finish: {error}")))?;
         if result.is_ok() {
@@ -113,7 +113,7 @@ impl EngineWatch {
         read: impl FnOnce(&mut Read<'_>) -> Result<T, StoreError> + Send + 'static,
     ) -> Result<T, StoreError> {
         let service = Arc::clone(&self.service);
-        tokio::task::spawn_blocking(move || service.with_store(|store| read(&mut store.read()?)))
+        tokio::task::spawn_blocking(carry(move || service.with_store(|store| read(&mut store.read()?))))
             .await
             .map_err(|error| StoreError::Stream(format!("read did not finish: {error}")))?
     }

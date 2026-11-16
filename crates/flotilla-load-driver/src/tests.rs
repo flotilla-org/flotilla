@@ -145,7 +145,7 @@ impl FleetTarget for ScriptedFleet {
         if self.sample_outage_after.is_some_and(|after| self.started.elapsed() >= after) {
             return Err("sampling unavailable".into());
         }
-        Ok(TargetSample { homes: vec![Default::default(); self.homes], resident_bytes: Some(1 << 20) })
+        Ok(TargetSample { homes: vec![Default::default(); self.homes], resident_bytes: Some(1 << 20), reads: Default::default() })
     }
 }
 

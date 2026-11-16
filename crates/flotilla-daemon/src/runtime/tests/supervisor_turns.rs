@@ -1,4 +1,5 @@
 use super::*;
+use flotilla_store::load_metrics::CallerReads;
 use flotilla_store_testkit::{ReadCountsBackendExt, ReadOperation};
 
 // Startup adopts old queues. Watch notifications reconcile current Message evidence
@@ -58,18 +59,19 @@ async fn a_message_commit_runs_a_pass_without_listing_messages() {
         .relation(flotilla_resources::MessageRelation::System)
         .body("turn".into())
         .build();
+    // The test's and the task's reads count for one caller.
+    let reads = Arc::new(CallerReads::default());
+    let rows = || reads.snapshot().get("Message").map_or((0, 0), |counts| (counts.decoded, counts.converted));
     // Admission reads back the message it admits; what one admission costs, with nothing listening.
-    let rows = primitives.rows_read();
-    primitives.admit(NAMESPACE, "first", &intent).await.expect("admit");
-    let admission = primitives.rows_read();
-    let admission = (admission.loaded - rows.loaded, admission.converted - rows.converted);
+    attributed(Arc::clone(&reads), primitives.admit(NAMESPACE, "first", &intent)).await.expect("admit");
+    let admission = rows();
 
-    let (task, ready) = super::super::tasks::spawn_pending_supervisor_turn_task(Arc::clone(&daemon), NAMESPACE.into());
+    let (task, ready) = within(&reads, || super::super::tasks::spawn_pending_supervisor_turn_task(Arc::clone(&daemon), NAMESPACE.into()));
     let task = tokio_util::task::AbortOnDropHandle::new(task);
     ready.await.expect("startup ready");
 
-    let (before, rows) = (backend.read_snapshot(), primitives.rows_read());
-    primitives.admit(NAMESPACE, "turn", &intent).await.expect("admit");
+    let (before, read) = (backend.read_snapshot(), rows());
+    attributed(Arc::clone(&reads), primitives.admit(NAMESPACE, "turn", &intent)).await.expect("admit");
     tokio::time::timeout(Duration::from_secs(5), async {
         while backend.read_snapshot().since(&before).calls("Convoy", ReadOperation::Query) == 0 {
             tokio::task::yield_now().await;
@@ -77,9 +79,9 @@ async fn a_message_commit_runs_a_pass_without_listing_messages() {
     })
     .await
     .expect("the commit runs a pass");
-    let after = primitives.rows_read();
+    let after = rows();
     assert_eq!(
-        (after.loaded - rows.loaded, after.converted - rows.converted),
+        (after.0 - read.0, after.1 - read.1),
         admission,
         "beyond its admission, hearing a Message commit loads and converts no message"
     );

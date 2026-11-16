@@ -22,7 +22,7 @@ use flotilla_credentials::CredentialStore;
 use flotilla_discovery::registry::{command_provider_registry, ProviderRegistry};
 use flotilla_environment::environment::EnvironmentInput;
 use flotilla_resources::{Convoy, FulfilmentFacts, Host, HostStatusPatch, Resource, ResourceError, RetryBackoff, TerminalSession, Vessel};
-use flotilla_store::{watch_resource_kind_including_replicas, ResourceBackend};
+use flotilla_store::{load_metrics::inherit, watch_resource_kind_including_replicas, ResourceBackend};
 use flotilla_vcs::vcs::REMOTE_CHECKOUT_ARCHIVE_SWEEP_TIMEOUT;
 use futures::stream::{BoxStream, SelectAll};
 use futures::FutureExt;
@@ -665,7 +665,7 @@ where
     Fut: Future<Output = Result<SupervisorTurnWatches, ResourceError>> + Send,
 {
     let (ready_tx, ready_rx) = oneshot::channel();
-    let task = tokio::spawn(async move {
+    let task = tokio::spawn(inherit(async move {
         let mut ready_tx = Some(ready_tx);
         // Legacy convoy queues are adopted once at startup, retried only after a failure: the
         // generation that stopped writing them (#2710) has been rolled across the fleet.
@@ -733,7 +733,7 @@ where
             watch_failures = watch_failures.saturating_add(1);
             tokio::time::sleep(SUPERVISOR_TURN_RETRY.delay(watch_failures)).await;
         }
-    });
+    }));
     (task, ready_rx)
 }
 

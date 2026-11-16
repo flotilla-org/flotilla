@@ -11,7 +11,7 @@ use std::{
     sync::Arc,
 };
 
-use flotilla_schema::{Kind, Timestamp};
+use flotilla_schema::{reads::carry, Kind, Timestamp};
 use flotilla_state_machines::{
     machines::message::{Deliver, DropReason, Expectation, Message, MessageState, Receipts, Settle, Settlement, Supersedes},
     Ref, Resource, Source,
@@ -100,10 +100,10 @@ impl OpenMessages {
     async fn refresh_off_thread(&mut self, primitives: &MessagePrimitives) -> Result<(), String> {
         let sources = LogSources::of(primitives);
         let mut taken = std::mem::take(self);
-        let (taken, refreshed) = tokio::task::spawn_blocking(move || {
+        let (taken, refreshed) = tokio::task::spawn_blocking(carry(move || {
             let refreshed = taken.refresh_from(&sources);
             (taken, refreshed)
-        })
+        }))
         .await
         .map_err(|error| format!("open-message refresh did not finish: {error}"))?;
         *self = taken;

@@ -62,7 +62,7 @@ impl LifecycleViews {
         read: impl FnOnce(&dyn LifecycleReads) -> Result<T, String> + Send + 'static,
     ) -> Result<T, String> {
         let reads = Arc::clone(&self.reads);
-        tokio::task::spawn_blocking(move || read(reads.as_ref())).await.map_err(|error| error.to_string())?
+        tokio::task::spawn_blocking(flotilla_schema::reads::carry(move || read(reads.as_ref()))).await.map_err(|error| error.to_string())?
     }
 
     /// This home, as the engine's lifecycle ports name it.

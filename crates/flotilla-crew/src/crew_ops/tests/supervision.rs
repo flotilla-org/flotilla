@@ -471,10 +471,10 @@ async fn read_by_a_repeated_hold(count: usize) -> (u64, u64) {
         .sender("system:turn-rules".into())
         .build();
     crew.execute_turn_delivery_hold(&request, &HoldAct::State, "episode limit").await.expect("hold");
-    let before = primitives.rows_read();
-    crew.execute_turn_delivery_hold(&request, &HoldAct::State, "episode limit").await.expect("repeated hold");
-    let after = primitives.rows_read();
-    (after.loaded - before.loaded, after.converted - before.converted)
+    let (held, reads) =
+        flotilla_store::load_metrics::measure(crew.execute_turn_delivery_hold(&request, &HoldAct::State, "episode limit")).await;
+    held.expect("repeated hold");
+    reads.get("Message").map_or((0, 0), |counts| (counts.decoded, counts.converted))
 }
 
 // Behaviour: a repeated hold finds its crew notice and supervisor signal by their identities,

@@ -15,6 +15,7 @@ use futures::{stream::BoxStream, StreamExt};
 use serde_json::{Map, Value};
 
 use crate::engine_feed::EngineSnapshot;
+use crate::port_reads;
 use crate::ProjectHierarchyStoreExt;
 use crate::{
     CausalDot, FieldMergeMetadata, InputMeta, MergeConflictSibling, MergeMetadata, ReplicationClass, Resource, ResourceBackend,
@@ -84,8 +85,11 @@ impl<T: Resource> DefinitionResolver<T> {
 
     /// Every engine record of this kind read through this namespace, with the built-ins.
     async fn engine_list(&self, records: &dyn EngineRecords) -> Result<Vec<ResourceObject<T>>, ResourceError> {
-        let listed =
-            if self.holds_engine_records() { records.list(T::API_PATHS.kind).await.map_err(ResourceError::other)? } else { Vec::new() };
+        let listed = if self.holds_engine_records() {
+            port_reads::list(records, T::API_PATHS.kind).await.map_err(ResourceError::other)?
+        } else {
+            Vec::new()
+        };
         let objects = listed.into_iter().map(|record| self.object(record)).collect::<Result<Vec<_>, _>>()?;
         overlay_builtins(T::API_PATHS.kind, &self.namespace, objects, None)
     }
@@ -105,7 +109,7 @@ impl<T: Resource> DefinitionResolver<T> {
             return Some(self.reads(&records.home(), Vec::new(), None));
         }
         if let Some(receiver) = query.message.as_ref().and_then(crate::MessageQuery::open_receiver) {
-            if let Some(open) = records.open_to(T::API_PATHS.kind, receiver).await {
+            if let Some(open) = port_reads::open_to(&*records, T::API_PATHS.kind, receiver).await {
                 return Some(open.map_err(ResourceError::other).and_then(|open| self.reads(&records.home(), open, None)));
             }
         }
@@ -114,8 +118,11 @@ impl<T: Resource> DefinitionResolver<T> {
 
     async fn read_all(&self, records: &dyn EngineRecords) -> Result<Vec<ReadResourceObject<T>>, ResourceError> {
         // Every home's copy, as the old store's replica reads return each origin's.
-        let listed =
-            if self.holds_engine_records() { records.sources(T::API_PATHS.kind).await.map_err(ResourceError::other)? } else { Vec::new() };
+        let listed = if self.holds_engine_records() {
+            port_reads::sources(records, T::API_PATHS.kind).await.map_err(ResourceError::other)?
+        } else {
+            Vec::new()
+        };
         self.reads(&records.home(), listed, None)
     }
 
@@ -125,7 +132,7 @@ impl<T: Resource> DefinitionResolver<T> {
         let records = self.records()?;
         let copies = match self.holds_engine_records() {
             false => Vec::new(),
-            true => match records.copies(T::API_PATHS.kind, name).await {
+            true => match port_reads::copies(&*records, T::API_PATHS.kind, name).await {
                 Ok(copies) => copies,
                 Err(error) => return Some(Err(ResourceError::other(error))),
             },
@@ -280,7 +287,7 @@ impl<T: Resource> DefinitionResolver<T> {
             if !self.holds_engine_records() {
                 return Err(ResourceError::not_found(name));
             }
-            let record = records.get(T::API_PATHS.kind, name).await.map_err(ResourceError::other)?;
+            let record = port_reads::get(&*records, T::API_PATHS.kind, name).await.map_err(ResourceError::other)?;
             return record.map(|record| self.object(record)).unwrap_or_else(|| Err(ResourceError::not_found(name)));
         }
         if self.backend.serves_read_views() {
@@ -363,7 +370,7 @@ impl<T: Resource> DefinitionResolver<T> {
             if !self.holds_engine_records() {
                 return Ok(Vec::new());
             }
-            let stored = records.list(T::API_PATHS.kind).await.map_err(ResourceError::other)?;
+            let stored = port_reads::list(&*records, T::API_PATHS.kind).await.map_err(ResourceError::other)?;
             let objects = stored.into_iter().map(|record| self.object(record)).collect::<Result<Vec<_>, _>>()?;
             return select(objects, &selection);
         }
@@ -519,7 +526,7 @@ impl<T: Resource> DefinitionResolver<T> {
             }
         }
         if let Some(records) = self.records() {
-            if records.get(T::API_PATHS.kind, name).await.map_err(ResourceError::other)?.is_none() {
+            if port_reads::get(&*records, T::API_PATHS.kind, name).await.map_err(ResourceError::other)?.is_none() {
                 return Err(ResourceError::not_found(name));
             }
             return records.delete(T::API_PATHS.kind, name).await.map_err(ResourceError::other);

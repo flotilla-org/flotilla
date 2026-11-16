@@ -38,7 +38,7 @@ use flotilla_resources::{
 };
 #[cfg(test)]
 use flotilla_resources::{CrewMessageDelivery, TerminalCrewMessage};
-use flotilla_store::{off_frame, ResourceBackend, StoreQuery};
+use flotilla_store::{load_metrics::carry, off_frame, ResourceBackend, StoreQuery};
 use tokio::sync::{Mutex, RwLock};
 #[cfg(test)]
 use tracing::debug;
@@ -1568,7 +1568,7 @@ impl CrewService {
     pub async fn held_checkouts(&self, convoy: &ResourceObject<ResourceConvoy>) -> Result<Vec<CheckoutRecord>, String> {
         let Some(holder) = flotilla_resources::convoy::engine::checkout_holder(convoy) else { return Ok(Vec::new()) };
         let reads = Arc::clone(&self.lifecycle_reads);
-        let held = tokio::task::spawn_blocking(move || reads.checkouts()?.held(&holder))
+        let held = tokio::task::spawn_blocking(carry(move || reads.checkouts()?.held(&holder)))
             .await
             .map_err(|error| format!("read held checkouts: {error}"))??;
         Ok(latest_launches(held).into_values().collect())
@@ -1760,7 +1760,7 @@ impl CrewService {
         let convoy = self.resource_backend.clone().using::<ResourceConvoy>(namespace).get(name).await.map_err(|err| err.to_string())?;
         let held = self.held_checkouts(&convoy).await?;
         let reads = Arc::clone(&self.lifecycle_reads);
-        let here = tokio::task::spawn_blocking(move || reads.checkouts()?.here())
+        let here = tokio::task::spawn_blocking(carry(move || reads.checkouts()?.here()))
             .await
             .map_err(|error| format!("read checkouts held here: {error}"))??
             .into_iter()

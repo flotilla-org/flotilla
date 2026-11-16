@@ -30,7 +30,7 @@ use flotilla_resources::{
     clone_records::CloneRecords,
     realisation_settings,
 };
-use flotilla_store::{controller::SecondaryWatch, ReplicaReadResolver, ResourceBackend, TypedResolver};
+use flotilla_store::{controller::SecondaryWatch, load_metrics::carry, ReplicaReadResolver, ResourceBackend, TypedResolver};
 use tracing::{debug, warn};
 
 /// A vessel older than this still waiting for its convoy's snapshot is stuck, not racing admission.
@@ -1472,7 +1472,7 @@ impl ConvoyVesselWake {
             ConvoyWoken::Convoy(convoy) => Some(convoy.clone()),
             ConvoyWoken::Every => None,
         };
-        tokio::task::spawn_blocking(move || {
+        tokio::task::spawn_blocking(carry(move || {
             let vessels = reads.vessels()?;
             let here = vessels.home().to_owned();
             let records = match &woken {
@@ -1480,7 +1480,7 @@ impl ConvoyVesselWake {
                 None => vessels.at(&here)?,
             };
             Ok(records.into_iter().filter(|record| !record.ended()).collect::<Vec<_>>())
-        })
+        }))
         .await
         .map_err(|error| error.to_string())?
         .map(|records: Vec<VesselRecord>| records.into_iter().map(|record| record.name).collect())

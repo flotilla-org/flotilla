@@ -30,6 +30,7 @@ use flotilla_discovery_api::EnvironmentAssertion;
 use flotilla_discovery_api::EnvironmentBag;
 use flotilla_executor::action_support::{fallback_repo_identity, AddRepoOutcome};
 use flotilla_resources::ResumeIntent;
+use flotilla_schema::reads::carry;
 use flotilla_store::get_resource_kind;
 use flotilla_store::off_frame;
 use flotilla_store::ResolvedCascadeStoreExt;
@@ -2003,7 +2004,7 @@ impl InProcessDaemon {
     async fn repository_has_live_checkouts(&self, repository: &RepositoryKey) -> Result<bool, String> {
         let reads = self.lifecycle_reads();
         let repository = repository.clone();
-        let launches = tokio::task::spawn_blocking(move || reads.checkouts()?.of_repository(&repository))
+        let launches = tokio::task::spawn_blocking(carry(move || reads.checkouts()?.of_repository(&repository)))
             .await
             .map_err(|error| error.to_string())??;
         Ok(flotilla_resources::checkout_records::latest_launches(launches).values().any(|checkout| !checkout.ended()))
@@ -4626,14 +4627,14 @@ impl InProcessDaemon {
                     .map(|source| source.object.spec.key())
                     .collect::<BTreeSet<_>>();
                 let reads = self.lifecycle_reads();
-                let held = tokio::task::spawn_blocking(move || {
+                let held = tokio::task::spawn_blocking(carry(move || {
                     let checkouts = reads.checkouts()?;
                     let mut held = Vec::new();
                     for repository in &repositories {
                         held.extend(checkouts.of_repository(repository)?);
                     }
                     Ok::<_, String>(flotilla_resources::checkout_records::latest_launches(held))
-                })
+                }))
                 .await
                 .map_err(|error| error.to_string())??;
                 for (name, checkout) in &held {
@@ -4868,7 +4869,7 @@ impl InProcessDaemon {
             .map_err(|error| error.to_string())?;
         let (environment, cwd) = (session.spec.env_ref.clone(), std::path::PathBuf::from(&session.spec.cwd));
         let reads = self.lifecycle_reads();
-        let launches = tokio::task::spawn_blocking(move || reads.checkouts()?.in_environment(&environment, None))
+        let launches = tokio::task::spawn_blocking(carry(move || reads.checkouts()?.in_environment(&environment, None)))
             .await
             .map_err(|error| error.to_string())??;
         let worked_in = flotilla_resources::checkout_records::latest_launches(launches)
@@ -6339,7 +6340,9 @@ impl ProjectOperations for InProcessDaemon {
     }
     async fn image_build_retry(&self, name: &str) -> Result<String, String> {
         let (reads, owned) = (self.lifecycle_reads(), name.to_owned());
-        tokio::task::spawn_blocking(move || reads.image_builds()?.retry(&owned)).await.map_err(|error| format!("retry {name}: {error}"))?
+        tokio::task::spawn_blocking(carry(move || reads.image_builds()?.retry(&owned)))
+            .await
+            .map_err(|error| format!("retry {name}: {error}"))?
     }
     async fn project_register(&self, target: &str) -> Result<(String, usize), String> {
         InProcessDaemon::project_register(self, target).await

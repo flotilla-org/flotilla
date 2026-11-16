@@ -1015,11 +1015,11 @@ async fn read_by_one_judgement(others: usize) -> (u64, u64, u64) {
     }
     let now = Utc::now();
     wake.judge_stalls_at("flotilla", &objects, now).await.expect("bootstrap");
-    let read = |home: &EngineHome| (home.messages.primitives().rows_read(), home.convoys.keyed_gets().convoys);
-    let before = read(&home);
-    wake.judge_stalls_at("flotilla", &objects, now).await.expect("judgement");
-    let after = read(&home);
-    (after.0.loaded - before.0.loaded, after.0.converted - before.0.converted, after.1 - before.1)
+    let before = home.convoys.keyed_gets().convoys;
+    let (judged, reads) = flotilla_store::load_metrics::measure(wake.judge_stalls_at("flotilla", &objects, now)).await;
+    judged.expect("judgement");
+    let messages = reads.get("Message").copied().unwrap_or_default();
+    (messages.decoded, messages.converted, home.convoys.keyed_gets().convoys - before)
 }
 
 // Behaviour: a stall judgement reads each crew seat's messages as the engine holds them: it

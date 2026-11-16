@@ -41,7 +41,10 @@ use flotilla_resources::{
     Artifact, Convoy, ForgeSpec, Message as OldMessage, MessageReference as OldReference, MessageSpec as OldSpec, Project,
     ReadResourceObject, Repository, ResourceError, ResourceObject, ResourceProvenance, TerminalSession, TerminalSessionSource,
 };
-use flotilla_schema::{CreatedAt, Identity, IndexQuery, Kind as StoredKind, Timestamp};
+use flotilla_schema::{
+    reads::{self, carry},
+    CreatedAt, Identity, IndexQuery, Kind as StoredKind, Timestamp,
+};
 use flotilla_schema_sqlite::{stream::Service, StoreError};
 use flotilla_state_machines::{
     machines::{
@@ -412,17 +415,6 @@ pub struct MessagePrimitives {
     acknowledgements: tokio::sync::broadcast::Sender<()>,
     /// One follower of the Message log, shared by every reader woken by its commits.
     changes: flotilla_engine_store::watch::SharedChanges,
-    /// Message rows the reads loaded and converted, since this path opened.
-    loaded: std::sync::atomic::AtomicU64,
-    converted: std::sync::atomic::AtomicU64,
-}
-
-/// What this path's Message reads have cost since it opened: rows loaded from
-/// the store, and rows converted to the old shape.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct RowsRead {
-    pub loaded: u64,
-    pub converted: u64,
 }
 
 impl MessagePrimitives {
@@ -498,25 +490,7 @@ impl MessagePrimitives {
             attention_changes,
             acknowledgements: tokio::sync::broadcast::channel(16).0,
             backend: backend.downgrade(),
-            loaded: std::sync::atomic::AtomicU64::new(0),
-            converted: std::sync::atomic::AtomicU64::new(0),
         })
-    }
-
-    /// The rows this path's Message reads have loaded and converted.
-    pub fn rows_read(&self) -> RowsRead {
-        RowsRead {
-            loaded: self.loaded.load(std::sync::atomic::Ordering::Relaxed),
-            converted: self.converted.load(std::sync::atomic::Ordering::Relaxed),
-        }
-    }
-
-    fn count_loaded(&self) {
-        self.loaded.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-    }
-
-    fn count_converted(&self, rows: usize) {
-        self.converted.fetch_add(rows as u64, std::sync::atomic::Ordering::Relaxed);
     }
 
     fn backend(&self) -> Result<ResourceBackend, String> {
@@ -620,7 +594,7 @@ impl MessagePrimitives {
                 resources.iter().map(|(created, resource)| old_view(resource, *created, namespace, roles, records)).collect()
             })
             .await?;
-        self.count_converted(resources.len());
+        reads::converted(<Resource<Message> as StoredKind>::KIND, resources.len());
         Ok(views)
     }
 
@@ -640,13 +614,9 @@ impl MessagePrimitives {
             .map_err(|error| ResourceError::other(error.to_string()))
     }
 
-    /// The message `id` held here, counted as a row loaded.
+    /// The message `id` held here: the inbox reads the store only for one it does not hold.
     pub async fn message(&self, id: &str) -> Result<Option<Resource<Message>>, ResourceError> {
-        let message = self.inbox.get_async(id).await.map_err(|error| ResourceError::other(error.to_string()))?;
-        if message.is_some() {
-            self.count_loaded();
-        }
-        Ok(message)
+        self.inbox.get_async(id).await.map_err(|error| ResourceError::other(error.to_string()))
     }
 
     /// Reads what `asked` names into `records`, each record by its key. A convoy role's session
@@ -736,7 +706,7 @@ impl MessagePrimitives {
         let sessions = Arc::clone(&self.sessions);
         let name = session.to_owned();
         // A SQLite write: off the async workers.
-        tokio::task::spawn_blocking(move || sessions.ensure(&name, now)).await.map_err(|error| error.to_string())??;
+        tokio::task::spawn_blocking(carry(move || sessions.ensure(&name, now))).await.map_err(|error| error.to_string())??;
         let consumer = self.consumer(session);
         if self.consumers.lock().expect("consumers").insert(consumer.clone()) {
             let port =
@@ -764,7 +734,7 @@ impl MessagePrimitives {
         }
         let people = Arc::clone(&self.people);
         // A SQLite write: off the async workers.
-        tokio::task::spawn_blocking(move || people.ensure(PERSON, now)).await.map_err(|error| error.to_string())??;
+        tokio::task::spawn_blocking(carry(move || people.ensure(PERSON, now))).await.map_err(|error| error.to_string())??;
         if self.consumers.lock().expect("consumers").insert(consumer.clone()) {
             let port = PersonReceipts { people: Arc::clone(&self.people), name: PERSON.to_owned(), scope: self.receipts.receipt_scope() };
             if let Err(error) = self.inbox.register_async(consumer.clone(), port).await {
@@ -792,7 +762,7 @@ impl MessagePrimitives {
         let services = Arc::clone(&self.services);
         let owned = name.to_owned();
         // A SQLite write: off the async workers.
-        tokio::task::spawn_blocking(move || services.ensure(&owned, now)).await.map_err(|error| error.to_string())??;
+        tokio::task::spawn_blocking(carry(move || services.ensure(&owned, now))).await.map_err(|error| error.to_string())??;
         if self.consumers.lock().expect("consumers").insert(consumer.clone()) {
             let port =
                 ServiceReceipts { services: Arc::clone(&self.services), name: name.to_owned(), scope: self.receipts.receipt_scope() };
@@ -1099,7 +1069,7 @@ impl MessagePrimitives {
             let awaiting = Arc::clone(&self.awaiting);
             let reply = MessageRef::new(id.clone(), self.home.clone());
             let now = self.world.now();
-            match tokio::task::spawn_blocking(move || awaiting.landed(&reply, &inbox_address, in_reply_to.as_ref(), now)).await {
+            match tokio::task::spawn_blocking(carry(move || awaiting.landed(&reply, &inbox_address, in_reply_to.as_ref(), now))).await {
                 Ok(Ok(Some(record))) => tracing::debug!(%record, "a reply answered its awaiting record"),
                 Ok(Ok(None)) => {}
                 Ok(Err(error)) => tracing::warn!(message = %name, %error, "answering the awaiting record failed"),
@@ -1187,7 +1157,7 @@ impl MessagePrimitives {
         let service = Arc::clone(&self.service);
         let here = self.home.clone();
         let now = self.world.now();
-        tokio::task::spawn_blocking(move || {
+        tokio::task::spawn_blocking(carry(move || {
             // What this record replaces, withdrawn only once it is written, so the
             // seat or the sender never reads as not waiting in between. A repeat
             // withdraws again what an earlier attempt left open.
@@ -1238,7 +1208,7 @@ impl MessagePrimitives {
                 true => Ok(recorded),
                 false => Err(format!("recorded, but answering it from earlier replies failed: {}", failures.join("; "))),
             }
-        })
+        }))
         .await
         .map_err(|error| error.to_string())?
     }
@@ -1261,7 +1231,9 @@ impl MessagePrimitives {
             }
         }
         let (awaiting, reason, now) = (Arc::clone(&self.awaiting), reason.to_owned(), self.world.now());
-        tokio::task::spawn_blocking(move || awaiting.end_stalls(&subjects, None, &reason, now)).await.map_err(|error| error.to_string())?
+        tokio::task::spawn_blocking(carry(move || awaiting.end_stalls(&subjects, None, &reason, now)))
+            .await
+            .map_err(|error| error.to_string())?
     }
 
     /// The message `record` in `inbox`, in the old shape: from this replica by its exact
@@ -1374,7 +1346,7 @@ impl MessagePrimitives {
     async fn withdraw_awaiting(&self, message: &str, by: &Address, reason: &str) {
         let awaiting = Arc::clone(&self.awaiting);
         let (message, by, reason, now) = (MessageRef::new(message, self.home.clone()), by.clone(), reason.to_owned(), self.world.now());
-        match tokio::task::spawn_blocking(move || awaiting.withdraw(&message, &by, &reason, now)).await {
+        match tokio::task::spawn_blocking(carry(move || awaiting.withdraw(&message, &by, &reason, now))).await {
             Ok(Ok(_)) => {}
             Ok(Err(error)) => tracing::warn!(%error, "withdrawing the awaiting record failed"),
             Err(error) => tracing::warn!(%error, "withdrawing the awaiting record did not run"),
@@ -1514,7 +1486,6 @@ impl MessagePrimitives {
                         true => read.page_back(query, cursor.as_ref(), PAGE)?,
                     };
                     for id in page.ids {
-                        self.count_loaded();
                         let Some(loaded) = read.load::<Resource<Message>>(id)? else { continue };
                         if !take(loaded.home, loaded.value) {
                             return Ok(());
@@ -1578,7 +1549,6 @@ impl MessagePrimitives {
                         let page = read.scan::<Resource<Message>>(&home, after, PAGE)?;
                         let mut loaded = Vec::with_capacity(page.ids.len());
                         for id in page.ids {
-                            self.count_loaded();
                             if let Some(message) = read.load::<Resource<Message>>(id)? {
                                 loaded.push((read.creation_time(id)?, message.value));
                             }
@@ -1639,7 +1609,6 @@ impl MessagePrimitives {
             .with_store(|store| {
                 let mut read = store.read()?;
                 let Some(stored) = read.resolve(Resource::<Message>::CODE, &id, &home)? else { return Ok(None) };
-                self.count_loaded();
                 let Some(loaded) = read.load::<Resource<Message>>(stored)? else { return Ok(None) };
                 Ok(Some((read.creation_time(stored)?, loaded.value)))
             })

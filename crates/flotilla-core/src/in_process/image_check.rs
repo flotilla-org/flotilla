@@ -252,13 +252,13 @@ fn resolution_layers(error: &ImageResolutionError) -> Vec<String> {
 /// before the builder has launched it.
 pub async fn image_build_report(reads: Arc<dyn LifecycleReads>, name: &str) -> Result<ImageBuildReport, String> {
     let owned = name.to_owned();
-    let (launched, demanded) = tokio::task::spawn_blocking(move || {
+    let (launched, demanded) = tokio::task::spawn_blocking(flotilla_schema::reads::carry(move || {
         let builds = reads.image_builds()?;
         match builds.get(&owned)? {
             Some(launched) => Ok((Some(launched), None)),
             None => Ok::<_, String>((None, builds.demanded(&owned)?)),
         }
-    })
+    }))
     .await
     .map_err(|error| format!("read image build {name}: {error}"))??;
     match (launched, demanded) {

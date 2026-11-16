@@ -13,6 +13,7 @@ use std::{
 
 use crate::DdlMode;
 use flotilla_schema::{
+    reads::{self, ReadShape},
     whole_log_topic, Cause, Change, ChangeHeader, ChangeItem, Code, ColumnDef, ColumnType, CreatedAt, DecodeError, Decoder, Edge,
     EdgeParts, EdgeRow, Effect, Encoder, Event, Hash, Identity, IndexQuery, Kind, KindCode, KindRegistry, Named, NewChange, Row, RowEdit,
     RowPath, Rows, TableRole, Timestamp, Value, HOME_DOMAIN, RESOURCE_NAME_DOMAIN, WRITER_DOMAIN,
@@ -390,17 +391,25 @@ impl Read<'_> {
     // Reads inside a write journal ids into the overlay without a savepoint mark: they never
     // need rewinding alone, and the whole overlay is dropped if the transaction rolls back.
     pub fn resolve(&mut self, kind: KindCode, name: &str, home: &str) -> Result<Option<ResourceId>, StoreError> {
-        self.ctx().resolve(&Identity { kind, name: name.to_owned(), home: home.to_owned() })
+        let id = self.ctx().resolve(&Identity { kind, name: name.to_owned(), home: home.to_owned() })?;
+        count_read(self.runtime, kind, Some(ReadShape::Keyed), usize::from(id.is_some()));
+        Ok(id)
     }
 
     /// The identities of `kind` named `name` at every home this store holds, deleted ones
     /// included: one keyed read of the (kind, name, home) key's prefix.
     pub fn resolve_named(&mut self, kind: KindCode, name: &str) -> Result<Vec<ResourceId>, StoreError> {
-        self.ctx().resolve_named(kind, name)
+        let ids = self.ctx().resolve_named(kind, name)?;
+        count_read(self.runtime, kind, Some(ReadShape::Keyed), ids.len());
+        Ok(ids)
     }
 
     pub fn load<K: Kind>(&mut self, id: ResourceId) -> Result<Option<Loaded<K>>, StoreError> {
-        self.ctx().load(id)
+        let loaded = self.ctx().load(id)?;
+        if loaded.is_some() {
+            reads::decoded(K::KIND, 1);
+        }
+        Ok(loaded)
     }
 
     pub fn load_snapshot(&mut self, id: ResourceId) -> Result<Option<Snapshot>, StoreError> {
@@ -496,14 +505,18 @@ impl Read<'_> {
     /// seen matches nothing, and the query creates nothing. A `limit` of 0 is refused and one above
     /// [`MAX_PAGE`] lowered to it.
     pub fn page<K>(&mut self, query: &IndexQuery<K>, after: Option<&Cursor>, limit: u32) -> Result<Page, StoreError> {
-        self.ctx().page(query, after, limit)
+        let page = self.ctx().page(query, after, limit)?;
+        count_read(self.runtime, query.kind(), after.is_none().then_some(ReadShape::Index), page.ids.len());
+        Ok(page)
     }
 
     /// [`Self::page`] from the top: up to `limit` resources in `query`'s index below `before`, in
     /// descending `order..., id` order, so rows tied on the order continue by id across pages. The
     /// first page (`None`) starts at the highest row; pass `next` back as `before`.
     pub fn page_back<K>(&mut self, query: &IndexQuery<K>, before: Option<&Cursor>, limit: u32) -> Result<Page, StoreError> {
-        self.ctx().page_back(query, before, limit)
+        let page = self.ctx().page_back(query, before, limit)?;
+        count_read(self.runtime, query.kind(), before.is_none().then_some(ReadShape::Index), page.ids.len());
+        Ok(page)
     }
 
     /// Key-only read of a declared single-integer-order index, restricted to one home.
@@ -518,7 +531,10 @@ impl Read<'_> {
         after: i64,
         limit: u32,
     ) -> Result<Vec<(ResourceId, i64)>, StoreError> {
-        self.ctx().integer_index_keys(query, home, after, limit)
+        let keys = self.ctx().integer_index_keys(query, home, after, limit)?;
+        // Paged by a bound, not a cursor: each call counts as a read.
+        count_read(self.runtime, query.kind(), Some(ReadShape::Index), keys.len());
+        Ok(keys)
     }
 
     /// [`Self::integer_index_keys`] the other way: one home's ids and order values strictly below
@@ -530,15 +546,32 @@ impl Read<'_> {
         before: i64,
         limit: u32,
     ) -> Result<Vec<(ResourceId, i64)>, StoreError> {
-        self.ctx().integer_index_keys_before(query, home, before, limit)
+        let keys = self.ctx().integer_index_keys_before(query, home, before, limit)?;
+        count_read(self.runtime, query.kind(), Some(ReadShape::Index), keys.len());
+        Ok(keys)
     }
 
     /// The startup scan: up to `limit` resources of kind `K` homed at `home` with ids above `after`,
     /// in id order, through `resource_identity_by_home`. The one sanctioned pass over a whole kind;
     /// everything else reads by key or declared index.
     pub fn scan<K: Kind>(&mut self, home: &str, after: Option<ResourceId>, limit: u32) -> Result<Page<ResourceId>, StoreError> {
-        self.ctx().scan::<K>(home, after, limit)
+        let page = self.ctx().scan::<K>(home, after, limit)?;
+        reads::rows(K::KIND, page.ids.len());
+        if after.is_none() {
+            reads::read(K::KIND, ReadShape::WholeKind);
+        }
+        Ok(page)
     }
+}
+
+/// Counts a read of `code`'s rows for the caller that made it ([`reads`]): the read itself when
+/// `shape` names it (a paged read counts at its first page), and the rows it returned.
+fn count_read(runtime: &Runtime, code: KindCode, shape: Option<ReadShape>, rows: usize) {
+    let kind = runtime.kinds.get(code).map_or(code.as_str(), |set| set.kind.as_str());
+    if let Some(shape) = shape {
+        reads::read(kind, shape);
+    }
+    reads::rows(kind, rows);
 }
 
 /// Ids this transaction created or read, served before the committed caches. The journal
@@ -756,11 +789,17 @@ impl Write<'_> {
     }
 
     pub fn resolve(&mut self, kind: KindCode, name: &str, home: &str) -> Result<Option<ResourceId>, StoreError> {
-        self.ctx().resolve(&Identity { kind, name: name.to_owned(), home: home.to_owned() })
+        let id = self.ctx().resolve(&Identity { kind, name: name.to_owned(), home: home.to_owned() })?;
+        count_read(self.runtime, kind, Some(ReadShape::Keyed), usize::from(id.is_some()));
+        Ok(id)
     }
 
     pub fn load<K: Kind>(&mut self, id: ResourceId) -> Result<Option<Loaded<K>>, StoreError> {
-        self.ctx().load(id)
+        let loaded = self.ctx().load(id)?;
+        if loaded.is_some() {
+            reads::decoded(K::KIND, 1);
+        }
+        Ok(loaded)
     }
 
     pub fn load_snapshot(&mut self, id: ResourceId) -> Result<Option<Snapshot>, StoreError> {
@@ -813,14 +852,21 @@ impl Write<'_> {
     /// seen matches nothing, and the query creates nothing. A `limit` of 0 is refused and one above
     /// [`MAX_PAGE`] lowered to it.
     pub fn page<K>(&mut self, query: &IndexQuery<K>, after: Option<&Cursor>, limit: u32) -> Result<Page, StoreError> {
-        self.ctx().page(query, after, limit)
+        let page = self.ctx().page(query, after, limit)?;
+        count_read(self.runtime, query.kind(), after.is_none().then_some(ReadShape::Index), page.ids.len());
+        Ok(page)
     }
 
     /// The startup scan: up to `limit` resources of kind `K` homed at `home` with ids above `after`,
     /// in id order, through `resource_identity_by_home`. The one sanctioned pass over a whole kind;
     /// everything else reads by key or declared index.
     pub fn scan<K: Kind>(&mut self, home: &str, after: Option<ResourceId>, limit: u32) -> Result<Page<ResourceId>, StoreError> {
-        self.ctx().scan::<K>(home, after, limit)
+        let page = self.ctx().scan::<K>(home, after, limit)?;
+        reads::rows(K::KIND, page.ids.len());
+        if after.is_none() {
+            reads::read(K::KIND, ReadShape::WholeKind);
+        }
+        Ok(page)
     }
 
     /// Opens a change at this home (#4024): who writes, when, and the records the writes are made

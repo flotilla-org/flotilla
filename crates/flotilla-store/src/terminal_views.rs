@@ -386,7 +386,7 @@ impl TerminalViews {
         read: impl FnOnce(&dyn LifecycleReads) -> Result<T, String> + Send + 'static,
     ) -> Result<T, ResourceError> {
         let reads = Arc::clone(&self.reads);
-        tokio::task::spawn_blocking(move || read(reads.as_ref()))
+        tokio::task::spawn_blocking(flotilla_schema::reads::carry(move || read(reads.as_ref())))
             .await
             .map_err(|error| ResourceError::other(error.to_string()))?
             .map_err(ResourceError::other)

@@ -25,10 +25,11 @@ use flotilla_resources::{
     terminal_records::TerminalLaunchFacts,
     vessel_records::{environment_vessels, EnvironmentVessel},
     Artifact, ArtifactSpec, CheckoutSpec, Convoy, ConvoySpec, EnvironmentSpec, HostDirectEnvironmentSpec, ObservedCheckoutSpec,
-    RepositoryKey, SystemClock,
+    RepositoryKey, ResourceError, ResourceObject, SystemClock,
 };
 use flotilla_store::{
-    controller::{Reconciler, SecondaryWatch, WorkQueueSender},
+    controller::{ControllerLoop, ReconcileOutcome, Reconciler, SecondaryWatch, WorkQueueSender},
+    load_metrics::{attributed, measure_now, CallerReads, ControllerLoadMetrics, ControllerLoadSnapshot},
     ResourceBackend,
 };
 use flotilla_store_memory::InMemoryBackend;
@@ -214,8 +215,11 @@ async fn queued_by_one_checkout(others: usize) -> (Vec<String>, u64, KeyedGets) 
     };
 
     let (sender, mut queued) = WorkQueueSender::channel();
-    let waking =
-        tokio::spawn(Box::new(CheckoutConvoyWake::new(Arc::clone(store.service()))).spawn(backend.clone(), NAMESPACE.to_owned(), sender));
+    // The wake's reads count for it, as a controller's watch's do.
+    let reads = Arc::new(CallerReads::default());
+    let wake = Box::new(CheckoutConvoyWake::new(Arc::clone(store.service())));
+    let waking = tokio::spawn(attributed(Arc::clone(&reads), wake.spawn(backend.clone(), NAMESPACE.to_owned(), sender)));
+    let converted = || reads.snapshot().get("Convoy").map_or(0, |counts| counts.converted);
 
     // The wake follows the log from when it starts: the first convoy's checkouts are requested
     // until one is heard.
@@ -236,7 +240,7 @@ async fn queued_by_one_checkout(others: usize) -> (Vec<String>, u64, KeyedGets) 
     tokio::time::sleep(Duration::from_millis(100)).await;
     while queued.try_recv().is_ok() {}
 
-    let before = (convoys.views().views_converted(), keyed_gets(&convoys, &engine));
+    let before = (converted(), keyed_gets(&convoys, &engine));
     let changed = &launches[1];
     engine.checkouts.request("changed", &checkout("changed"), Some(&CheckoutHolder::Convoy(changed.clone())));
     let mut names = vec![tokio::time::timeout(Duration::from_secs(5), queued.recv()).await.expect("queued").expect("open queue")];
@@ -245,7 +249,7 @@ async fn queued_by_one_checkout(others: usize) -> (Vec<String>, u64, KeyedGets) 
         names.push(name);
     }
     waking.abort();
-    (names, convoys.views().views_converted() - before.0, keyed_gets(&convoys, &engine) - before.1)
+    (names, converted() - before.0, keyed_gets(&convoys, &engine) - before.1)
 }
 
 // Behaviour: a checkout's change queues the convoy it is held for, read by that convoy's launch
@@ -285,13 +289,12 @@ async fn vessels_in_one_environment(others: usize) -> (Vec<EnvironmentVessel>, u
     }
 
     let launches = engine.vessels.vessels.launches_read();
-    let converted = convoys.views().views_converted();
     let gets = keyed_gets(&convoys, &engine);
-    let found = environment_vessels(convoys.reads().as_ref(), Some(&BTreeSet::from(["shared".to_owned()]))).expect("vessels").vessels;
+    let (found, reads) = measure_now(|| environment_vessels(convoys.reads().as_ref(), Some(&BTreeSet::from(["shared".to_owned()]))));
     (
-        found,
+        found.expect("vessels").vessels,
         engine.vessels.vessels.launches_read() - launches,
-        convoys.views().views_converted() - converted,
+        reads.get("Convoy").map_or(0, |counts| counts.converted),
         keyed_gets(&convoys, &engine) - gets,
     )
 }
@@ -481,4 +484,82 @@ async fn open_launches_are_read_by_those_changed_since() {
     assert_eq!(large_listings, small_listings, "the cost does not grow with the other convoys");
     assert_eq!(small_gets, KeyedGets { convoys: 2, ..KeyedGets::default() }, "only the ended and the admitted launches are got");
     assert_eq!(large_gets, small_gets, "the keyed gets do not grow with the other convoys");
+}
+
+/// Changes nothing: a pass reads only what the controller reads to wake it.
+struct Unchanged;
+
+impl Reconciler for Unchanged {
+    type Resource = Convoy;
+    type Prepared = ();
+
+    async fn prepare(&self, _: &ResourceObject<Convoy>) -> Result<(), ResourceError> {
+        Ok(())
+    }
+
+    fn reconcile(&self, _: &ResourceObject<Convoy>, _: &(), _: chrono::DateTime<Utc>) -> ReconcileOutcome<Convoy> {
+        ReconcileOutcome::new(None)
+    }
+
+    async fn run_finalizer(&self, _: &ResourceObject<Convoy>) -> Result<(), ResourceError> {
+        Ok(())
+    }
+
+    fn finalizer_name(&self) -> Option<&'static str> {
+        None
+    }
+}
+
+/// A Convoy controller's load metrics once it has reconciled each of `count` convoys held by
+/// this home's engine.
+async fn first_pass(count: usize) -> ControllerLoadSnapshot {
+    let store = OtherHome::open("home");
+    let engine = EngineFixture::over_service(store.service());
+    let backend = ResourceBackend::new(InMemoryBackend::default());
+    let convoys = EngineConvoysHome::over(store.service(), NAMESPACE, &backend, Arc::new(SystemClock), engine.reads());
+    for n in 0..count {
+        let spec = ConvoySpec::builder().workflow_ref("workflow".into()).build();
+        convoys.launch(convoy(NAMESPACE, &format!("convoy-{n}"), spec, single_agent("coder"))).await;
+    }
+    let metrics = Arc::new(ControllerLoadMetrics::default());
+    let controller = ControllerLoop {
+        primary: backend.using::<Convoy>(NAMESPACE),
+        secondaries: Vec::new(),
+        reconciler: Unchanged,
+        backend: backend.clone(),
+    };
+    let running = tokio::spawn(controller.run_observed(Arc::clone(&metrics)));
+    tokio::time::timeout(Duration::from_secs(5), async {
+        while metrics.snapshot().reconcile.count() < count as u64 {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("each convoy is reconciled");
+    running.abort();
+    metrics.snapshot()
+}
+
+// Behaviour: a controller's load metrics count its wakes against what queued them, and its
+// reads by kind and shape, apart from its watches' (#3108 load measurement). Its first pass gets
+// each convoy by key through the engine port, answered from the views the port holds, each
+// converted to the old shape; its watch lists the kind as often whatever the convoys held.
+#[tokio::test]
+async fn a_controller_pass_counts_its_reads_by_kind_and_shape() {
+    let mut listings = Vec::new();
+    for count in [2, 8] {
+        let pass = first_pass(count).await;
+        let n = count as u64;
+        assert_eq!((pass.enqueued, pass.enqueued_coalesced, pass.wakes), (n, 0, n), "each listed convoy is queued and woken once");
+        let port = pass.reads.get("Convoy port").copied().unwrap_or_default();
+        assert_eq!((port.keyed, port.index, port.whole_kind, port.rows), (n, 0, 0, n), "each wake gets its convoy by key: {pass:#?}");
+        let store = pass.reads.get("Convoy").copied().unwrap_or_default();
+        assert_eq!((store.keyed, store.index, store.whole_kind), (0, 0, 0), "the port answers from its views: {pass:#?}");
+        assert_eq!(store.converted, n, "each convoy got is converted once: {pass:#?}");
+        let watch = pass.watch_reads.get("Convoy port").copied().unwrap_or_default();
+        assert!(watch.whole_kind > 0, "the watch lists the kind: {pass:#?}");
+        assert_eq!((watch.keyed, watch.rows), (0, watch.whole_kind * n), "each listing returns every convoy: {pass:#?}");
+        listings.push(watch.whole_kind);
+    }
+    assert_eq!(listings[0], listings[1], "the watch lists the kind as often whatever the convoys held");
 }

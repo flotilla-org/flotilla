@@ -66,6 +66,7 @@ mod code;
 mod codec;
 mod describe;
 mod descriptor;
+pub mod reads;
 pub use describe::{Describe, DescribeChild, DescribeElement, DescribedRow, RowWriter};
 mod edge;
 mod event;

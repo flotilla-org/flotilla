@@ -215,7 +215,7 @@ impl InProcessDaemon {
             A::ImageBuildRetry { name } => {
                 let (reads, owned) = (self.lifecycle_reads(), name.clone());
                 let builder = off_frame(move || async move {
-                    tokio::task::spawn_blocking(move || reads.image_builds()?.builder_home(&owned))
+                    tokio::task::spawn_blocking(flotilla_schema::reads::carry(move || reads.image_builds()?.builder_home(&owned)))
                         .await
                         .map_err(|error| format!("find the builder of {name}: {error}"))?
                 })

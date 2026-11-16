@@ -16,7 +16,7 @@ use flotilla_resources::{
     TerminalAttentionSource, TerminalAttentionState, TerminalSession, TerminalSessionPhase, TerminalSessionSource, TurnDeliveryRule,
     WorkPhase, CONVOY_LABEL, ROLE_LABEL, VESSEL_LABEL,
 };
-use flotilla_store::off_frame;
+use flotilla_store::{load_metrics::carry, off_frame};
 
 use super::sources::freshest_change_request_refs;
 use super::wake::{ConvoyRead, ReconcilerWake};
@@ -1043,7 +1043,7 @@ impl ReconcilerWake {
                 let held = match flotilla_resources::convoy::engine::checkout_holder(convoy) {
                     Some(holder) => {
                         let reads = Arc::clone(&self.subscriptions.inner.lifecycle_reads);
-                        tokio::task::spawn_blocking(move || reads.checkouts()?.held(&holder))
+                        tokio::task::spawn_blocking(carry(move || reads.checkouts()?.held(&holder)))
                             .await
                             .map_err(|error| format!("held checkouts: {error}"))??
                     }

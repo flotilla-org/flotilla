@@ -2,7 +2,9 @@
 //! the store, controller loops and replication record into, and that a load
 //! driver samples. Most recording uses relaxed atomics; read-retry lifecycle
 //! tracking takes a short mutex only on refusal and completion. Metrics stay
-//! on in production builds.
+//! on in production builds. Engine reads are counted per caller
+//! ([`flotilla_schema::reads`]); each controller loop is one caller for its
+//! passes and one for its watches.
 //!
 //! Counters are cumulative since start. Where supported, subtract an earlier
 //! snapshot to measure one phase (`since`); peaks are high-water marks over
@@ -17,6 +19,10 @@ use std::{
     time::Duration,
 };
 
+pub use flotilla_schema::reads::{
+    attributed, caller, callers, carry, counts_since, inherit, measure, measure_now, within, Attributed, CallerReads, KindReadCounts,
+    ReadCounts,
+};
 use serde::Serialize;
 
 /// Sixteen sub-buckets per power of two keep every quantile within 1/16
@@ -276,6 +282,13 @@ impl StoreLoadSnapshot {
 pub struct ControllerLoadMetrics {
     /// Objects taken from the work queue.
     pub wakes: Counter,
+    /// Objects asked for: each send to the work queue by a watch, a resync or a requeue. Those
+    /// asked for while already queued are also counted as coalesced; every other one wakes.
+    pub enqueued: Counter,
+    pub enqueued_coalesced: Counter,
+    /// The engine reads of the loop's passes, and of its watches.
+    pub reads: Arc<CallerReads>,
+    pub watch_reads: Arc<CallerReads>,
     /// Prepare plus reconcile and its writes, per reconciled object.
     pub reconcile: LatencyHistogram,
     pub queue_wait: LatencyHistogram,
@@ -330,6 +343,10 @@ impl ControllerLoadMetrics {
     pub fn snapshot(&self) -> ControllerLoadSnapshot {
         ControllerLoadSnapshot {
             wakes: self.wakes.get(),
+            enqueued: self.enqueued.get(),
+            enqueued_coalesced: self.enqueued_coalesced.get(),
+            reads: self.reads.snapshot(),
+            watch_reads: self.watch_reads.snapshot(),
             queue_wait: self.queue_wait.snapshot(),
             busy_micros: self.busy_micros(),
             reconcile: self.reconcile.snapshot(),
@@ -348,6 +365,10 @@ impl ControllerLoadMetrics {
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct ControllerLoadSnapshot {
     pub wakes: u64,
+    pub enqueued: u64,
+    pub enqueued_coalesced: u64,
+    pub reads: ReadCounts,
+    pub watch_reads: ReadCounts,
     pub queue_wait: HistogramSnapshot,
     pub busy_micros: u64,
     pub reconcile: HistogramSnapshot,
@@ -366,6 +387,10 @@ impl ControllerLoadSnapshot {
     pub fn since(&self, earlier: &Self) -> Self {
         Self {
             wakes: self.wakes.saturating_sub(earlier.wakes),
+            enqueued: self.enqueued.saturating_sub(earlier.enqueued),
+            enqueued_coalesced: self.enqueued_coalesced.saturating_sub(earlier.enqueued_coalesced),
+            reads: counts_since(&self.reads, &earlier.reads),
+            watch_reads: counts_since(&self.watch_reads, &earlier.watch_reads),
             queue_wait: self.queue_wait.since(&earlier.queue_wait),
             busy_micros: self.busy_micros.saturating_sub(earlier.busy_micros),
             reconcile: self.reconcile.since(&earlier.reconcile),

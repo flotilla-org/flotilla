@@ -16,7 +16,7 @@ use flotilla_resources::{
     MessageRelation, MessageSpec, ResourceError, ResourceObject, ResourceRef, TerminalSession, TerminalSessionPhase, TerminalSessionSource,
     TerminalSessionSpec, Vessel,
 };
-use flotilla_store::ResourceBackend;
+use flotilla_store::{load_metrics::carry, ResourceBackend};
 use sha2::{Digest, Sha256};
 use tokio::sync::Mutex;
 use tracing::warn;
@@ -157,7 +157,7 @@ async fn render_card(
         text.push_str(&reachable_paths(&docker.mounts));
         if let Some(build) = &docker.image_build_ref {
             let (reads, name) = (Arc::clone(&reads), build.clone());
-            let build = tokio::task::spawn_blocking(move || reads.image_builds()?.get(&name))
+            let build = tokio::task::spawn_blocking(carry(move || reads.image_builds()?.get(&name)))
                 .await
                 .map_err(|error| format!("image capability read: {error}"))??;
             // Only a built image has passed every layer's probe.
@@ -634,7 +634,7 @@ pub async fn refresh_cards(
     }
     let (sessions, mut vessels) = {
         let (reads, scope, retried) = (Arc::clone(&reads), scope.clone(), retried.clone());
-        tokio::task::spawn_blocking(move || sessions_in(reads.as_ref(), &scope, &retried))
+        tokio::task::spawn_blocking(carry(move || sessions_in(reads.as_ref(), &scope, &retried)))
             .await
             .map_err(|error| format!("read the sessions for capability cards: {error}"))??
     };

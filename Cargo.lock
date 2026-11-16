@@ -3857,6 +3857,7 @@ dependencies = [
  "flotilla-protocol",
  "flotilla-relay-protocol",
  "flotilla-resources",
+ "flotilla-schema",
  "flotilla-store-testkit",
  "futures",
  "hegeltest",

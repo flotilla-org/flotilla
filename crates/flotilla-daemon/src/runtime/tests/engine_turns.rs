@@ -269,11 +269,9 @@ async fn read_typing_turns(count: usize) -> (u64, u64) {
         };
         crew.send(&format!("turn-{index}"), sender, relation, "Continue the work.").await;
     }
-    let before = crew.primitives.rows_read();
-    passes(&mut delivery, 20).await;
-    let after = crew.primitives.rows_read();
+    let ((), reads) = flotilla_store::load_metrics::measure(passes(&mut delivery, 20)).await;
     assert_eq!(pool.inputs.lock().expect("typed inputs").len(), 1, "the due turns are typed as one turn");
-    (after.loaded - before.loaded, after.converted - before.converted)
+    reads.get("Message").map_or((0, 0), |counts| (counts.decoded, counts.converted))
 }
 
 // Behaviour: typing a session's due turns loads each once and frames it as the engine holds it,

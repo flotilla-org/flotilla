@@ -26,7 +26,7 @@ use flotilla_resources::{
     CheckoutSpec, CloneCredentials,
 };
 use flotilla_schema::CodeEnum;
-use flotilla_schema::{Identity, Kind, KindCode};
+use flotilla_schema::{reads::carry, Identity, Kind, KindCode};
 use flotilla_schema_sqlite::{Read, ResourceId, StoreError};
 use flotilla_state_machines::{
     machines::{
@@ -538,7 +538,7 @@ impl<P: CheckoutProvider> CheckoutActuator<P> {
         let spec = spec_of(request);
         let records = Arc::clone(&self.records);
         let launch = name.to_owned();
-        let held = tokio::task::spawn_blocking(move || records.get(&launch, None))
+        let held = tokio::task::spawn_blocking(carry(move || records.get(&launch, None)))
             .await
             .map_err(|error| error.to_string())
             .and_then(|held| held)
@@ -558,7 +558,7 @@ impl<P: CheckoutProvider> CheckoutActuator<P> {
         let inspection = self.provider.inspect(&request.environment.name, &request.path, &spec, against).await;
         let records = Arc::clone(&self.records);
         let launch = name.to_owned();
-        tokio::task::spawn_blocking(move || match inspection {
+        tokio::task::spawn_blocking(carry(move || match inspection {
             Ok(inspection) => {
                 records.inspected(&launch, inspection)?;
                 // Latched onto the held one: a landing found before stays found.
@@ -568,7 +568,7 @@ impl<P: CheckoutProvider> CheckoutActuator<P> {
                 records.inspection_failed(&launch)?;
                 Err(format!("inspect checkout {launch}: {error}"))
             }
-        })
+        }))
         .await
         .unwrap_or_else(|error| Err(format!("checkout inspection did not finish: {error}")))
     }

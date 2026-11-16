@@ -3,14 +3,18 @@
 //! by name loads and converts only the messages it answers with. The generic verb's listing is the
 //! one read that loads the whole table.
 
+use std::future::Future;
+
 use flotilla_address::Address;
-use flotilla_engine_messages::RowsRead;
 use flotilla_engine_messages_testkit::{designate_fleet, EngineMessagesHome};
 use flotilla_inbox::InboxBackend;
 use flotilla_resources::{MessageRelation, MessageSpec};
 use flotilla_schema::Timestamp;
 use flotilla_state_machines::{machines::message::Deliver, Transport};
-use flotilla_store::ResourceBackend;
+use flotilla_store::{
+    load_metrics::{measure, measure_now, ReadCounts},
+    ResourceBackend,
+};
 use flotilla_store_memory::InMemoryBackend;
 
 const NAMESPACE: &str = "flotilla";
@@ -28,8 +32,21 @@ fn intent(receiver: &str, body: &str) -> MessageSpec {
         .build()
 }
 
-fn cost(before: RowsRead, after: RowsRead) -> (u64, u64) {
-    (after.loaded - before.loaded, after.converted - before.converted)
+/// The Messages decoded and converted.
+fn cost(reads: &ReadCounts) -> (u64, u64) {
+    reads.get("Message").map_or((0, 0), |counts| (counts.decoded, counts.converted))
+}
+
+/// `work`'s result and the Messages it decoded and converted.
+async fn measured<T>(work: impl Future<Output = T>) -> (T, (u64, u64)) {
+    let (value, reads) = measure(work).await;
+    (value, cost(&reads))
+}
+
+/// `work`'s result and the Messages it decoded and converted, read on this thread.
+fn measured_now<T>(work: impl FnOnce() -> T) -> (T, (u64, u64)) {
+    let (value, reads) = measure_now(work);
+    (value, cost(&reads))
 }
 
 #[tokio::test]
@@ -70,68 +87,59 @@ async fn reads_by_receiver_and_by_name_load_only_their_messages() {
     primitives.admit(NAMESPACE, "for-a-person", &to_person).await.expect("admit");
     let total = SETTLED + 2 + 3 + 2 + 1;
 
-    let before = primitives.rows_read();
-    let waiting = primitives.pending_to(NAMESPACE, &[BUSY.to_owned()]).await.expect("pending read");
-    let mut names = waiting.iter().map(|read| read.object.metadata.name.clone()).collect::<Vec<_>>();
+    let (waiting, cost) = measured(primitives.pending_to(NAMESPACE, &[BUSY.to_owned()])).await;
+    let mut names = waiting.expect("pending read").iter().map(|read| read.object.metadata.name.clone()).collect::<Vec<_>>();
     names.sort();
     assert_eq!(names, ["waiting-0", "waiting-1", "waiting-2"]);
-    assert_eq!(cost(before, primitives.rows_read()), (3, 3), "a pending read loads and converts only the waiting messages");
+    assert_eq!(cost, (3, 3), "a pending read loads and converts only the waiting messages");
 
-    let before = primitives.rows_read();
-    let settled = primitives.view_to(NAMESPACE, BUSY, "settled-17").await.expect("by-name read").expect("held");
-    assert_eq!(settled.object.metadata.name, "settled-17");
-    assert_eq!(cost(before, primitives.rows_read()), (1, 1), "a by-name read loads and converts one message");
+    let (settled, cost) = measured(primitives.view_to(NAMESPACE, BUSY, "settled-17")).await;
+    assert_eq!(settled.expect("by-name read").expect("held").object.metadata.name, "settled-17");
+    assert_eq!(cost, (1, 1), "a by-name read loads and converts one message");
 
-    let before = primitives.rows_read();
-    let named = primitives.admitted(NAMESPACE, &intent(QUIET, "quiet-1"), "quiet-1").await.expect("by-name read").expect("held");
-    assert_eq!(named.superseded_by, None);
-    assert_eq!(cost(before, primitives.rows_read()), (1, 0), "a by-name read for an intent loads one message and converts none");
+    let (named, cost) = measured(primitives.admitted(NAMESPACE, &intent(QUIET, "quiet-1"), "quiet-1")).await;
+    assert_eq!(named.expect("by-name read").expect("held").superseded_by, None);
+    assert_eq!(cost, (1, 0), "a by-name read for an intent loads one message and converts none");
 
-    let before = primitives.rows_read();
-    assert!(primitives.view_to(NAMESPACE, QUIET, "settled-17").await.expect("by-name read").is_none(), "another inbox holds none");
-    assert_eq!(cost(before, primitives.rows_read()), (0, 0), "a miss loads nothing");
+    let (missing, cost) = measured(primitives.view_to(NAMESPACE, QUIET, "settled-17")).await;
+    assert!(missing.expect("by-name read").is_none(), "another inbox holds none");
+    assert_eq!(cost, (0, 0), "a miss loads nothing");
 
-    let before = primitives.rows_read();
-    let held = primitives.delivery_held_until(NAMESPACE, BUSY).await.expect("hold read");
-    assert!(held.is_some(), "the waiting messages hold delivery");
-    assert_eq!(cost(before, primitives.rows_read()).0, 3, "a delivery hold loads only the waiting messages");
+    let (held, cost) = measured(primitives.delivery_held_until(NAMESPACE, BUSY)).await;
+    assert!(held.expect("hold read").is_some(), "the waiting messages hold delivery");
+    assert_eq!(cost.0, 3, "a delivery hold loads only the waiting messages");
 
-    let before = primitives.rows_read();
-    let open = primitives.open_to(NAMESPACE, &[BUSY.to_owned()]).await.expect("open read");
-    assert_eq!(open.len(), 3, "the waiting messages are the open ones");
-    assert_eq!(cost(before, primitives.rows_read()), (3, 3), "an open read loads and converts only the open messages");
+    let (open, cost) = measured(primitives.open_to(NAMESPACE, &[BUSY.to_owned()])).await;
+    assert_eq!(open.expect("open read").len(), 3, "the waiting messages are the open ones");
+    assert_eq!(cost, (3, 3), "an open read loads and converts only the open messages");
 
     // A seat's open messages, its newest settled and delivered (here one message), and a named one.
-    let before = primitives.rows_read();
-    let seat =
-        primitives.seat_messages(NAMESPACE, &[BUSY.to_owned()], &[(QUIET.to_owned(), "quiet-0".to_owned())]).await.expect("seat read");
-    let mut names = seat.iter().map(|read| read.object.metadata.name.clone()).collect::<Vec<_>>();
+    let quiet = [(QUIET.to_owned(), "quiet-0".to_owned())];
+    let (seat, cost) = measured(primitives.seat_messages(NAMESPACE, &[BUSY.to_owned()], &quiet)).await;
+    let mut names = seat.expect("seat read").iter().map(|read| read.object.metadata.name.clone()).collect::<Vec<_>>();
     names.sort();
     assert_eq!(names, ["late-1", "quiet-0", "waiting-0", "waiting-1", "waiting-2"]);
-    assert_eq!(cost(before, primitives.rows_read()), (6, 5), "a seat read loads each row it answers with once per read of it");
+    assert_eq!(cost, (6, 5), "a seat read loads each row it answers with once per read of it");
 
-    let before = primitives.rows_read();
-    let newest = primitives.newest_delivered(&inbox).expect("newest delivered").expect("delivered");
+    let (newest, cost) = measured_now(|| primitives.newest_delivered(&inbox));
+    let newest = newest.expect("newest delivered").expect("delivered");
     assert!(newest.1.name().ends_with("/message:late-1"), "{}", newest.1.name());
-    assert_eq!(cost(before, primitives.rows_read()).0, 1, "the newest delivered loads one message");
+    assert_eq!(cost.0, 1, "the newest delivered loads one message");
 
-    let before = primitives.rows_read();
-    let late = primitives.settled_since(&inbox, mark).expect("settled since");
-    assert_eq!(late.len(), 2, "two settled after the mark");
-    assert_eq!(cost(before, primitives.rows_read()).0, 3, "a settled-since read loads those and the one that ends it");
+    let (late, cost) = measured_now(|| primitives.settled_since(&inbox, mark));
+    assert_eq!(late.expect("settled since").len(), 2, "two settled after the mark");
+    assert_eq!(cost.0, 3, "a settled-since read loads those and the one that ends it");
 
-    let before = primitives.rows_read();
-    assert_eq!(primitives.person_messages(NAMESPACE).await.expect("person messages").len(), 1);
-    assert_eq!(cost(before, primitives.rows_read()).0, 1, "a person's waiting messages load only those");
+    let (person, cost) = measured(primitives.person_messages(NAMESPACE)).await;
+    assert_eq!(person.expect("person messages").len(), 1);
+    assert_eq!(cost.0, 1, "a person's waiting messages load only those");
 
-    let before = primitives.rows_read();
-    let named = primitives.view_for_person(NAMESPACE, "for-a-person").await.expect("a person's message");
-    assert_eq!(named.object.metadata.name, "for-a-person");
-    assert_eq!(cost(before, primitives.rows_read()), (1, 1), "a person's message by name loads and converts one");
+    let (named, cost) = measured(primitives.view_for_person(NAMESPACE, "for-a-person")).await;
+    assert_eq!(named.expect("a person's message").object.metadata.name, "for-a-person");
+    assert_eq!(cost, (1, 1), "a person's message by name loads and converts one");
 
     // The generic verb's listing is the one Message read proportional to the table.
-    let before = primitives.rows_read();
-    let listed = backend.using::<flotilla_resources::Message>(NAMESPACE).list().await.expect("verb listing").items;
-    assert_eq!(listed.len(), total);
-    assert_eq!(cost(before, primitives.rows_read()).0, total as u64, "the verb's listing loads every message once");
+    let (listed, cost) = measured(backend.using::<flotilla_resources::Message>(NAMESPACE).list()).await;
+    assert_eq!(listed.expect("verb listing").items.len(), total);
+    assert_eq!(cost.0, total as u64, "the verb's listing loads every message once");
 }

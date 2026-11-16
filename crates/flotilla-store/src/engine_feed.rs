@@ -3,7 +3,14 @@
 use std::sync::Arc;
 
 use flotilla_resources::engine_records::{EngineObject, EngineRecords};
+use flotilla_schema::reads::{attributed, caller};
 use futures::{FutureExt, StreamExt};
+
+use crate::port_reads;
+
+/// The caller the feeds' listings after the first count for: the first counts for the watcher
+/// that started the feed.
+const FEED: &str = "engine feed";
 
 /// Every home's records of one kind as of a pass, or why the pass could not list them.
 pub(crate) type EngineSnapshot = Arc<Result<Vec<EngineObject>, String>>;
@@ -27,10 +34,10 @@ impl EngineFeed {
     /// Subscribes to `records`' changes, then lists `kind`, so no change between the two is lost.
     pub(crate) async fn start(records: Arc<dyn EngineRecords>, kind: &'static str) -> Result<Self, String> {
         let mut changes = records.changes().await?;
-        let initial = records.sources(kind).await?;
+        let initial = port_reads::sources(&*records, kind).await?;
         let (publish, snapshots) = tokio::sync::watch::channel(Arc::new(Ok(initial)));
         let (catch_ups, mut requests) = tokio::sync::mpsc::channel::<tokio::sync::oneshot::Sender<()>>(16);
-        let task = tokio::spawn(async move {
+        let task = tokio::spawn(attributed(caller(FEED), async move {
             loop {
                 let caught_up = tokio::select! {
                     tick = changes.next() => match tick {
@@ -57,7 +64,7 @@ impl EngineFeed {
                     }
                 }
                 if changed {
-                    publish.send_replace(Arc::new(records.sources(kind).await));
+                    publish.send_replace(Arc::new(port_reads::sources(&*records, kind).await));
                 }
                 if let Some(caught_up) = caught_up {
                     caught_up.send(()).ok();
@@ -66,7 +73,7 @@ impl EngineFeed {
                     return;
                 }
             }
-        });
+        }));
         Ok(Self { snapshots, catch_ups, task })
     }
 

@@ -13,7 +13,10 @@ use tokio::time::Instant;
 
 use crate::{
     plan::LoadPlan,
-    report::{summary, window_metrics, DispatchSummary, LoadReport, MixSummary, RampSummary, SeriesPoint, TargetErrors, WindowSummary},
+    report::{
+        summary, window_metrics, window_reads, DispatchSummary, LoadReport, MixSummary, RampSummary, SeriesPoint, TargetErrors,
+        WindowSummary,
+    },
     target::{ConvoyObservation, ConvoyState, FleetTarget, TargetSample},
 };
 
@@ -441,6 +444,7 @@ pub async fn run(target: &dyn FleetTarget, plan: &LoadPlan) -> Result<LoadReport
         target_errors: TargetErrors { count: target_errors, samples: target_error_samples },
         window: progress.window_outcomes.summary(window.as_secs_f64()),
         home_metrics: window_metrics(&start_sample, &end_sample, window),
+        reads: window_reads(&start_sample, &end_sample),
         resident_bytes: end_sample.resident_bytes,
         open_at_end,
         series,

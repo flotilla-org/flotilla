@@ -23,6 +23,7 @@ use flotilla_resources::{
 };
 use flotilla_store::{
     controller::{SecondaryWatch, WorkQueueSender},
+    load_metrics::carry,
     ResourceBackend, StoreQuery, WatchView,
 };
 use tokio::sync::{broadcast, OnceCell};
@@ -578,7 +579,7 @@ impl ReconcilerWake {
             let checkouts = match flotilla_resources::convoy::engine::checkout_holder(convoy) {
                 Some(holder) => {
                     let reads = Arc::clone(&self.subscriptions.inner.lifecycle_reads);
-                    let held = tokio::task::spawn_blocking(move || reads.checkouts()?.held(&holder))
+                    let held = tokio::task::spawn_blocking(carry(move || reads.checkouts()?.held(&holder)))
                         .await
                         .map_err(|error| format!("held checkouts: {error}"))??;
                     latest_launches(held)
@@ -596,7 +597,7 @@ impl ReconcilerWake {
                 }
                 if !clone_readings.contains_key(&spec.repo_ref) {
                     let (reads, repository) = (Arc::clone(&self.subscriptions.inner.lifecycle_reads), spec.repo_ref.clone());
-                    let records = tokio::task::spawn_blocking(move || reads.clones()?.of_repository(&repository))
+                    let records = tokio::task::spawn_blocking(carry(move || reads.clones()?.of_repository(&repository)))
                         .await
                         .map_err(|error| format!("clone readings: {error}"))??;
                     clone_readings.insert(spec.repo_ref.clone(), records);
@@ -798,7 +799,7 @@ impl ReconcilerWake {
                 // The launch's vessel records, whose ends discharge an unread checkout.
                 let launch_vessels = if status.engine_launch.is_some() {
                     let (reads, name) = (Arc::clone(&self.subscriptions.inner.lifecycle_reads), convoy.metadata.name.clone());
-                    tokio::task::spawn_blocking(move || reads.vessels()?.of_convoy(&name))
+                    tokio::task::spawn_blocking(carry(move || reads.vessels()?.of_convoy(&name)))
                         .await
                         .map_err(|error| format!("vessel readings: {error}"))??
                 } else {

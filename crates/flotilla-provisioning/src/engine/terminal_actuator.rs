@@ -36,7 +36,7 @@ use flotilla_resources::{
     terminal_records::{TerminalLaunchFacts as FactsView, TerminalRecord, TerminalRecords, PROCESS_EXITED},
     ScreenObstruction, TerminalAttention, TerminalAttentionState, TerminalOccupancy,
 };
-use flotilla_schema::{Identity, Kind, KindCode};
+use flotilla_schema::{reads::carry, Identity, Kind, KindCode};
 use flotilla_schema_sqlite::{Read, StoreError};
 use flotilla_state_machines::{
     machines::{
@@ -428,14 +428,14 @@ where
     pub async fn pass(&self) -> bool {
         // A store read, off the async workers.
         let reads = Arc::clone(&self.records);
-        let records = match tokio::task::spawn_blocking(move || reads.at(reads.home())).await.unwrap_or_else(|error| Err(error.to_string()))
-        {
-            Ok(records) => records,
-            Err(error) => {
-                warn!(%error, "terminal probe could not read this home's launches");
-                return true;
-            }
-        };
+        let records =
+            match tokio::task::spawn_blocking(carry(move || reads.at(reads.home()))).await.unwrap_or_else(|error| Err(error.to_string())) {
+                Ok(records) => records,
+                Err(error) => {
+                    warn!(%error, "terminal probe could not read this home's launches");
+                    return true;
+                }
+            };
         if let Some((briefs, rechecks)) = &self.briefs {
             for record in records.iter().filter(|record| briefs.awaited().contains(&record.name)) {
                 match self.provider.launch_waits_for(record).await {

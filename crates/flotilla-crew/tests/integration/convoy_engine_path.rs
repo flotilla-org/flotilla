@@ -19,7 +19,11 @@ use flotilla_resources::{
     ConvoySpec, ConvoyStatus, CrewSource, CrewSpec, CrewWorkPhase, CrewWorkState, InputMeta, Observation, ObservedChangeRequestState,
     ResourceObject, VesselRequirement, WorkflowSnapshot,
 };
-use flotilla_store::{controller::Reconciler, ResourceBackend};
+use flotilla_store::{
+    controller::Reconciler,
+    load_metrics::{attributed, measure, CallerReads},
+    ResourceBackend,
+};
 use flotilla_store_memory::InMemoryBackend;
 use flotilla_store_testkit::{assert_flat_reads, ReadCountsBackendExt, ReadOperation, ReadSnapshot, ReadTally};
 
@@ -753,32 +757,42 @@ async fn a_message_commit_wakes_the_convoys_holding_delivery_without_listing_mes
             primitives.admit(NAMESPACE, &format!("turn-{n}"), &intent).await.expect("admit");
         }
     };
+    // The test's reads and its watches' count for one caller, as a controller's watches do.
+    let reads = Arc::new(CallerReads::default());
+    let read = |reads: &CallerReads| reads.snapshot().get("Message").copied().unwrap_or_default();
+
     // Admission reads back the message it admits: what an admission costs, with nothing listening.
-    let unheard = primitives.rows_read();
-    for n in 0..4 {
-        admit(n).await;
-    }
-    let admitted = primitives.rows_read();
-    let admission = ((admitted.loaded - unheard.loaded) / 4, (admitted.converted - unheard.converted) / 4);
+    let unheard = read(&reads);
+    attributed(Arc::clone(&reads), async {
+        for n in 0..4 {
+            admit(n).await;
+        }
+    })
+    .await;
+    let admitted = read(&reads);
+    let admission = ((admitted.decoded - unheard.decoded) / 4, (admitted.converted - unheard.converted) / 4);
 
     // Every wake the convoy controller runs: only the delivery wake has a convoy to wake.
     let (sender, mut queue) = WorkQueueSender::channel();
-    let before = primitives.rows_read();
+    let before = read(&reads);
     let watches = ConvoyReconciler::secondary_watches(&backend, NAMESPACE, Arc::clone(&path), messages)
         .into_iter()
-        .map(|wake| tokio::spawn(wake.spawn(backend.clone(), NAMESPACE.into(), sender.clone())))
+        .map(|wake| tokio::spawn(attributed(Arc::clone(&reads), wake.spawn(backend.clone(), NAMESPACE.into(), sender.clone()))))
         .collect::<Vec<_>>();
     // The wake subscribes when it starts: admit until it hears.
     let mut n = 4;
-    let woken = tokio::time::timeout(std::time::Duration::from_secs(5), async {
-        loop {
-            admit(n).await;
-            n += 1;
-            if let Ok(Some(name)) = tokio::time::timeout(std::time::Duration::from_millis(50), queue.recv()).await {
-                return name;
+    let woken = attributed(
+        Arc::clone(&reads),
+        tokio::time::timeout(std::time::Duration::from_secs(5), async {
+            loop {
+                admit(n).await;
+                n += 1;
+                if let Ok(Some(name)) = tokio::time::timeout(std::time::Duration::from_millis(50), queue.recv()).await {
+                    return name;
+                }
             }
-        }
-    })
+        }),
+    )
     .await
     .expect("woken");
     assert_eq!(woken, "holds-delivery");
@@ -786,18 +800,18 @@ async fn a_message_commit_wakes_the_convoys_holding_delivery_without_listing_mes
         assert_eq!(name, "holds-delivery", "only the convoys noted as holding delivery are woken");
     }
     watches.iter().for_each(tokio::task::JoinHandle::abort);
-    let heard = primitives.rows_read();
+    let heard = read(&reads);
     let admissions = (n - 4) as u64;
     assert_eq!(
-        (heard.loaded - before.loaded, heard.converted - before.converted),
+        (heard.decoded - before.decoded, heard.converted - before.converted),
         (admission.0 * admissions, admission.1 * admissions),
         "beyond its admissions, hearing a Message commit loads and converts no message"
     );
 
     // The meter sees a listing: opening the kind's generic watch lists every message.
-    let before = heard;
-    let _listed = backend.including_replicas::<flotilla_resources::Message>(NAMESPACE).watch().await.expect("listing watch");
-    assert!(primitives.rows_read().loaded > before.loaded, "a listing of the kind loads the messages");
+    let (listed, listing) = measure(backend.including_replicas::<flotilla_resources::Message>(NAMESPACE).watch()).await;
+    let _listed = listed.expect("listing watch");
+    assert!(listing.get("Message").is_some_and(|counts| counts.decoded > 0), "a listing of the kind loads the messages");
 }
 
 // Behaviour (#3732 review): each engine edit's convoy name wakes the convoy reconciler through
