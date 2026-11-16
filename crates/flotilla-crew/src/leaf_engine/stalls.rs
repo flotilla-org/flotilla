@@ -490,6 +490,16 @@ struct RowsVerdict<'a> {
     actionable_rows: usize,
 }
 
+/// What a stall is judged from: its leaves, the maker that cannot move them, and the evidence;
+/// the unable row it came from, when one carried it.
+struct StallCause<'a> {
+    leaves: Vec<Leaf>,
+    maker: LeafMaker,
+    evidence: String,
+    source: StallEvidenceSource,
+    row: Option<&'a LeafSubscriptionRow>,
+}
+
 impl ReconcilerWake {
     /// A crew session's AgentSession, named by the launch its view shows, at the home its record
     /// came from; none when it cannot be read, which judges nothing.
@@ -711,18 +721,44 @@ impl ReconcilerWake {
             able = false;
             unknown = false;
         }
+        // The stall is the judge's cause: an unable row's, else a crew's open declaration, which
+        // is its evidence even with no row to carry it (no exit, nothing actionable): "I'm stuck"
+        // goes up the ladder to the operator either way.
+        let cause = match &unable {
+            Some((row, evidence, source)) => Some(StallCause {
+                leaves: row.leaves.clone(),
+                maker: row.maker.clone(),
+                evidence: evidence.clone(),
+                source: source.clone(),
+                row: Some(*row),
+            }),
+            None => status
+                .stalled
+                .as_ref()
+                .filter(|stalled| stalled.source == StallEvidenceSource::Crew && declared_seat_stalled(status, stalled))
+                .and_then(|stalled| {
+                    let (vessel, role) = stalled.seat()?;
+                    Some(StallCause {
+                        leaves: stalled.leaves.clone(),
+                        maker: LeafMaker::Actor { vessel: vessel.to_owned(), role: role.to_owned() },
+                        evidence: stalled.evidence.clone(),
+                        source: StallEvidenceSource::Crew,
+                        row: None,
+                    })
+                }),
+        };
+        let declared_alone = unable.is_none() && cause.is_some();
         let policy = super::supervision::supervision_policy(tick.inputs.routes(), convoy, &projects.items)?;
         if status.stalled.as_ref().is_some_and(|stalled| stalled.supervision_exhausted)
             && !able
             && !progress_changed
             && launch_underway(status.phase)
-            && actionable_rows > 0
+            && (actionable_rows > 0 || declared_alone)
         {
             return Ok(());
         }
-        let next = if holding && !able && !unknown && (!launch_underway(status.phase) || actionable_rows > 0) {
-            let condition =
-                self.next_stall_condition(tick, convoy, status, &selected_sessions, &mut obligations, unable.as_ref(), &policy).await?;
+        let next = if holding && !able && !unknown && (!launch_underway(status.phase) || actionable_rows > 0 || declared_alone) {
+            let condition = self.next_stall_condition(tick, convoy, status, &selected_sessions, &mut obligations, cause, &policy).await?;
             Some(condition)
         } else {
             status
@@ -1427,16 +1463,16 @@ impl ReconcilerWake {
         status: &ConvoyStatus,
         selected_sessions: &BTreeMap<String, ResourceObject<TerminalSession>>,
         obligations: &mut [NudgeObligation],
-        unable: Option<&(&LeafSubscriptionRow, String, StallEvidenceSource)>,
+        cause: Option<StallCause<'_>>,
         policy: &[SupervisionTarget],
     ) -> Result<StalledCondition, String> {
         let StallTick { namespace, now, .. } = tick;
         let messages = &tick.inputs.messages;
         let (available_convoys, projects) = (&tick.inputs.available_convoys, &tick.inputs.projects);
-        let (leaves, maker, evidence, source) = if let Some((row, evidence, source)) = unable {
-            (row.leaves.clone(), Some(row.maker.clone()), evidence.clone(), source.clone())
-        } else {
-            (Vec::new(), None, empty_row_evidence(status), StallEvidenceSource::LeafEngine)
+        let cause_row = cause.as_ref().and_then(|cause| cause.row);
+        let (leaves, maker, evidence, source) = match cause {
+            Some(StallCause { leaves, maker, evidence, source, .. }) => (leaves, Some(maker), evidence, source),
+            None => (Vec::new(), None, empty_row_evidence(status), StallEvidenceSource::LeafEngine),
         };
         let prior = status.stalled.as_ref().filter(|prior| prior.leaves == leaves && prior.maker == maker);
         let nudge_history = obligations
@@ -1481,7 +1517,7 @@ impl ReconcilerWake {
             }
         }
         let mut awaiting_resumed_turn = false;
-        if let (Some(LeafMaker::Actor { vessel, role }), Some(row)) = (&condition.maker, unable.map(|(row, _, _)| *row)) {
+        if let (Some(LeafMaker::Actor { vessel, role }), Some(row)) = (&condition.maker, cause_row) {
             let session = selected_sessions.values().find(|session| {
                 session.metadata.labels.get(VESSEL_LABEL) == Some(vessel) && session.metadata.labels.get(ROLE_LABEL) == Some(role)
             });

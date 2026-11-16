@@ -57,6 +57,51 @@ async fn stall_attentions(case: &Case) -> Vec<OpenAttention> {
     case.backend.attentions().open("flotilla", Some(Sender::StallJudge), None).await.expect("open attentions")
 }
 
+// #3108: a crew's own stall reaches the operator with no supervisor declared and no row to carry
+// it (nothing actionable): its record holds at the Operator rung and the operator is told.
+#[tokio::test]
+async fn a_declared_stall_with_no_row_reaches_the_operator() {
+    let (backend, home) = engine_backend().await;
+    let wake = supervision_wake(&backend, &home);
+    let delivery = Arc::new(RecordingTurnDelivery::default());
+    wake.subscriptions.set_turn_delivery_actuator(delivery.clone()).await;
+    let work = home.admit("unsupervised-work", convoy_spec(), single_agent("coder")).await;
+    let vessel = home.vessel(&work, "work", "env");
+    home.seat(&backend, &work, (&vessel, "work"), ("coder", "coder-session"), CrewWorkPhase::Working).await;
+    let case = Case { backend, home, wake, delivery, work, vessel, governors: BTreeMap::new() };
+    let work = case.work.clone();
+    case.note(|status| {
+        external_patches::mark_crew_stalled(
+            work,
+            "work".into(),
+            "coder".into(),
+            Utc::now(),
+            flotilla_resources::StallReason::Infra,
+            None,
+            "blocked".into(),
+        )
+        .apply(status)
+    })
+    .await;
+    for _ in 0..2 {
+        case.judge(&case.wake, Utc::now()).await;
+        let status = case.status().await;
+        assert_eq!(status.crew_work["work"]["coder"].phase, CrewWorkPhase::Stalled);
+        let stall = status.stalled.expect("the declared stall is recorded");
+        assert_eq!(
+            (stall.rung, stall.supervisor.as_ref(), &stall.source),
+            (StallRung::Operator, None, &StallEvidenceSource::Crew),
+            "{stall:?}"
+        );
+        assert_eq!(stall.reason, Some(flotilla_resources::StallReason::Infra));
+        // The default ladder's missing governor says why the stall reached the operator.
+        assert_eq!(stall.evidence, "blocked; no live governor for project flotilla (no matching convoy in replica view)");
+        let told = stall_attentions(&case).await;
+        let [attention] = told.as_slice() else { panic!("the operator is told once: {told:?}") };
+        assert_eq!(attention.subject, Subject::ConvoyRole { convoy: case.work.clone(), role: "coder".into() });
+    }
+}
+
 // #3108: a stall that reaches the operator with no person named tells one: one open attention for
 // the stalled seat, however often it is judged, withdrawn when the crew works again.
 #[tokio::test]

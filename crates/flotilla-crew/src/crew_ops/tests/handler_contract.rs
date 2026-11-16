@@ -134,8 +134,14 @@ async fn direct_crew_contract_stall_errors_and_routing_refusal() {
             status.crew_work["work"]["coder"].phase,
             if expected.is_some() { CrewWorkPhase::Working } else { CrewWorkPhase::Stalled }
         );
-        let declared = status.stalled.as_ref().map(|stalled| (stalled.evidence.as_str(), stalled.reason));
-        assert_eq!(declared, expected.is_none().then_some(("blocked", Some(flotilla_protocol::StallReason::Infra))));
+        // With no supervision declared the stall goes up the default ladder, whose missing
+        // governor the evidence names: why the stall reached the operator.
+        let declared = status.stalled.as_ref().map(|stalled| (stalled.evidence.as_str(), stalled.reason, stalled.rung));
+        let evidence = "blocked; no live governor for project flotilla (no matching convoy in replica view)";
+        assert_eq!(
+            declared,
+            expected.is_none().then_some((evidence, Some(flotilla_protocol::StallReason::Infra), flotilla_protocol::StallRung::Operator))
+        );
     }
 }
 
