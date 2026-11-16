@@ -562,16 +562,9 @@ impl GovernorUnavailable {
     const ALL: [Self; 3] = [Self::DeliveryError, Self::NoLiveGeneration, Self::CrewMissing];
 }
 
-#[derive(Clone, Copy, Debug)]
-enum FallbackRecord {
-    Current,
-    LegacyExhausted,
-    LegacyExhaustedCursor,
-}
-
 // #2488: unavailable delivery, missing live convoy, and missing crew must recover
 // in one pass once reachable. Repeated reconciliation must neither freeze nor duplicate delivery.
-async fn unavailable_governor_scenario(unavailable: GovernorUnavailable, restarts: &[bool], record: FallbackRecord) {
+async fn unavailable_governor_scenario(unavailable: GovernorUnavailable, restarts: &[bool]) {
     let crewed = !matches!(unavailable, GovernorUnavailable::CrewMissing);
     let case = project_supervision_case(&[]).await;
     // A governor whose workflow crews no governor seat is a governor without its crew.
@@ -612,17 +605,6 @@ async fn unavailable_governor_scenario(unavailable: GovernorUnavailable, restart
         assert!(delivery.requests.lock().expect("deliveries").is_empty());
     }
     let began_at = case.status().await.stalled.as_ref().expect("stall").began_at;
-    if matches!(record, FallbackRecord::LegacyExhausted | FallbackRecord::LegacyExhaustedCursor) {
-        // Previous generation persisted temporary unavailability as exhausted.
-        case.note(|status| {
-            status.stalled.as_mut().expect("stall").supervision_exhausted = true;
-            if matches!(record, FallbackRecord::LegacyExhaustedCursor) {
-                status.stalled.as_mut().expect("stall").supervision_index = Some(1);
-            }
-        })
-        .await;
-        wake = case.restarted_wake().await;
-    }
     let reachable = if crewed && !matches!(unavailable, GovernorUnavailable::NoLiveGeneration) {
         first
     } else {

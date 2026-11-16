@@ -3490,8 +3490,6 @@ struct SupervisionScenario {
     #[builder(default)]
     subscriptions: bool,
     #[builder(default)]
-    legacy_cursor: bool,
-    #[builder(default)]
     unavailable: bool,
     #[builder(default = 1)]
     passes: usize,
@@ -3502,7 +3500,7 @@ struct SupervisionScenario {
 }
 
 async fn cross_host_supervision_scenario(scenario: SupervisionScenario) {
-    let SupervisionScenario { subscriptions, legacy_cursor, unavailable, passes, source_remote, stale_home } = scenario;
+    let SupervisionScenario { subscriptions, unavailable, passes, source_remote, stale_home } = scenario;
     let topology = spawn_in_memory_request_topology_stateful(empty_daemon_named("host-a").await, empty_daemon_named("host-b").await)
         .await
         .expect("router topology");
@@ -3519,7 +3517,7 @@ async fn cross_host_supervision_scenario(scenario: SupervisionScenario) {
     if subscriptions {
         off_frame(|| seed_governor_subscription(a, b)).await;
     }
-    off_frame(|| stall_source_crew(a, legacy_cursor, unavailable)).await;
+    off_frame(|| stall_source_crew(a, unavailable)).await;
     a_holds.release(&b_home);
     off_frame(|| replicate_governor_to_source(a, b, stale_home)).await;
     off_frame(|| await_replicated_session(a, &governor)).await;
@@ -3534,9 +3532,8 @@ async fn cross_host_supervision_scenario(scenario: SupervisionScenario) {
     off_frame(|| check_supervised_resume(a, &escalation_name)).await;
 }
 
-/// The source crew at `a` declares a stall; a legacy cursor or an unavailable governor pass as
-/// the scenario asks.
-async fn stall_source_crew(a: &InProcessDaemon, legacy_cursor: bool, unavailable: bool) {
+/// The source crew at `a` declares a stall; an unavailable governor pass when the scenario asks.
+async fn stall_source_crew(a: &InProcessDaemon, unavailable: bool) {
     let a_backend = a.resource_backend();
     let convoys = a_backend.using::<Convoy>("flotilla");
     let source = current_launch(a, "stalled-work");
@@ -3557,13 +3554,6 @@ async fn stall_source_crew(a: &InProcessDaemon, legacy_cursor: bool, unavailable
     )
     .await
     .expect("crew stalls");
-    if legacy_cursor {
-        let mut status = convoys.get(&source).await.expect("source").status.expect("status");
-        let stall = status.stalled.as_mut().expect("declared stall");
-        stall.supervision_exhausted = true;
-        stall.supervision_index = Some(1);
-        flotilla_resources::convoy::engine::set_notes(&a.convoy_engine_path(), &source, &status).expect("legacy exhaustion");
-    }
     if unavailable {
         a.reconcile_crew_stalls_once("flotilla").await.expect("unavailable governor pass");
         let stall = convoys.get(&source).await.expect("source").status.expect("status").stalled.expect("stall");
@@ -3840,8 +3830,8 @@ async fn supervise_stall_from_governor(topology: &InMemoryRequestTopology, a: &I
 async fn cross_host_supervision_pinned_scenario_rows() {
     for scenario in [
         SupervisionScenario::builder().build(),
-        SupervisionScenario::builder().legacy_cursor(true).source_remote(true).build(),
-        SupervisionScenario::builder().legacy_cursor(true).unavailable(true).passes(2).source_remote(true).build(),
+        SupervisionScenario::builder().source_remote(true).build(),
+        SupervisionScenario::builder().unavailable(true).passes(2).source_remote(true).build(),
         SupervisionScenario::builder().stale_home(true).passes(2).build(),
         SupervisionScenario::builder().subscriptions(true).source_remote(true).passes(2).build(),
     ] {
@@ -3849,19 +3839,17 @@ async fn cross_host_supervision_pinned_scenario_rows() {
     }
 }
 
-// Generate legacy/current stalls, visibility lag, and repeated reconcile steps.
+// Generate stalls, visibility lag, and repeated reconcile steps.
 // Each step checks the persisted rung and the governor's receiver-homed Message.
 #[hegel::test]
 fn generated_cross_host_supervision(tc: hegel::TestCase) {
     let subscriptions = tc.draw(gs::booleans());
-    let legacy = tc.draw(gs::booleans());
     let unavailable = tc.draw(gs::booleans());
     let passes = tc.draw(gs::integers::<usize>().min_value(1).max_value(4));
     let runtime = tokio::runtime::Builder::new_current_thread().enable_all().build().expect("runtime");
     runtime.block_on(cross_host_supervision_scenario(
         SupervisionScenario::builder()
             .subscriptions(subscriptions)
-            .legacy_cursor(legacy)
             .unavailable(unavailable)
             .passes(passes)
             .source_remote(tc.draw(gs::booleans()))

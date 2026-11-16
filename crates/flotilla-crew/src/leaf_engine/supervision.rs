@@ -276,11 +276,6 @@ impl super::LeafSubscriptionTable {
     }
 }
 
-pub(super) fn operator_target(target: &SupervisionTarget) -> bool {
-    matches!(target, SupervisionTarget::Operator)
-        || matches!(target, SupervisionTarget::Address { address } if address.starts_with("principal:"))
-}
-
 fn target_rung(target: &SupervisionTarget) -> StallRung {
     match target {
         SupervisionTarget::ConvoyCrew { .. } => StallRung::Bosun,

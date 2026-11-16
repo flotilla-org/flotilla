@@ -583,8 +583,7 @@ async fn unavailable_governor_tells_the_operator_once() {
 #[tokio::test]
 async fn unavailable_governor_recovers_in_one_pass() {
     for unavailable in GovernorUnavailable::ALL {
-        unavailable_governor_scenario(unavailable, &[false, true], FallbackRecord::Current).await;
-        unavailable_governor_scenario(unavailable, &[true], FallbackRecord::LegacyExhausted).await;
+        unavailable_governor_scenario(unavailable, &[false, true]).await;
     }
 }
 
@@ -667,10 +666,8 @@ fn generated_unavailable_governor_recovers(tc: hegel::TestCase) {
     let unavailable = GovernorUnavailable::ALL[tc.draw(gs::integers::<usize>().min_value(0).max_value(GovernorUnavailable::ALL.len() - 1))];
     let steps = tc.draw(gs::integers::<usize>().min_value(1).max_value(5));
     let restarts = (0..steps).map(|_| tc.draw(gs::booleans())).collect::<Vec<_>>();
-    let record = [FallbackRecord::Current, FallbackRecord::LegacyExhausted, FallbackRecord::LegacyExhaustedCursor]
-        [tc.draw(gs::integers::<usize>().min_value(0).max_value(2))];
     let runtime = tokio::runtime::Builder::new_current_thread().enable_all().build().expect("runtime");
-    runtime.block_on(unavailable_governor_scenario(unavailable, &restarts, record));
+    runtime.block_on(unavailable_governor_scenario(unavailable, &restarts));
 }
 
 #[tokio::test]
@@ -680,33 +677,6 @@ async fn stalled_work_routes_to_live_governor_after_abandoned_generation() {
     let stalled = case.status().await.stalled.expect("stalled");
     assert_eq!(stalled.supervisor.expect("supervisor").convoy, case.governor("governor-two"));
     assert_eq!(case.delivery.requests.lock().expect("deliveries")[0].convoy, case.governor("governor-two"));
-}
-
-// Legacy stalls consumed the governor rung while no supervisor was assigned.
-// They must retry that rung after a roll, even when the cursor is present.
-#[tokio::test]
-async fn exhausted_governor_cursor_retries_in_one_pass() {
-    let case = project_supervision_case(&[("governor", 1, ConvoyPhase::Active)]).await;
-    let work = case.work.clone();
-    case.note(|status| {
-        external_patches::mark_crew_stalled(
-            work,
-            "work".into(),
-            "coder".into(),
-            Utc::now(),
-            flotilla_resources::StallReason::Infra,
-            None,
-            "needs decision".into(),
-        )
-        .apply(status);
-        let stalled = status.stalled.as_mut().expect("stall");
-        stalled.supervision_exhausted = true;
-        stalled.supervision_index = Some(1);
-    })
-    .await;
-    case.judge(&case.wake, Utc::now()).await;
-    assert_eq!(case.status().await.stalled.expect("stall").rung, StallRung::Governor);
-    assert_eq!(case.delivery.requests.lock().expect("deliveries").len(), 1);
 }
 
 // A governor homed on another daemon must receive the escalation in the same

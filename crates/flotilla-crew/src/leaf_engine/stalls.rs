@@ -712,19 +712,7 @@ impl ReconcilerWake {
             unknown = false;
         }
         let policy = super::supervision::supervision_policy(tick.inputs.routes(), convoy, &projects.items)?;
-        // An exhausted cursor on a crew target is a legacy failed lookup,
-        // not a consumed operator policy. Retry that target after one roll.
-        let retry_exhausted = status.stalled.as_ref().is_some_and(|stalled| {
-            stalled.supervision_exhausted
-                && stalled.supervisor.is_none()
-                && stalled
-                    .supervision_index
-                    .is_some_and(|index| policy.get(index).is_some_and(|target| !super::supervision::operator_target(target)))
-        });
-        // Previous-generation fallback records were marked exhausted with no
-        // consumed rung. Retry those too; only a consumed ladder stays exhausted.
-        if status.stalled.as_ref().is_some_and(|stalled| stalled.supervision_exhausted && stalled.supervision_index.is_some())
-            && !retry_exhausted
+        if status.stalled.as_ref().is_some_and(|stalled| stalled.supervision_exhausted)
             && !able
             && !progress_changed
             && launch_underway(status.phase)
@@ -733,9 +721,8 @@ impl ReconcilerWake {
             return Ok(());
         }
         let next = if holding && !able && !unknown && (!launch_underway(status.phase) || actionable_rows > 0) {
-            let condition = self
-                .next_stall_condition(tick, convoy, status, &selected_sessions, &mut obligations, unable.as_ref(), &policy, retry_exhausted)
-                .await?;
+            let condition =
+                self.next_stall_condition(tick, convoy, status, &selected_sessions, &mut obligations, unable.as_ref(), &policy).await?;
             Some(condition)
         } else {
             status
@@ -1442,7 +1429,6 @@ impl ReconcilerWake {
         obligations: &mut [NudgeObligation],
         unable: Option<&(&LeafSubscriptionRow, String, StallEvidenceSource)>,
         policy: &[SupervisionTarget],
-        retry_exhausted: bool,
     ) -> Result<StalledCondition, String> {
         let StallTick { namespace, now, .. } = tick;
         let messages = &tick.inputs.messages;
@@ -1575,9 +1561,7 @@ impl ReconcilerWake {
                 && condition.evidence == "idle"
                 && condition.nudge_history.is_empty());
         if needs_supervisor && !awaiting_resumed_turn && !condition.evidence.starts_with("nudge delivery failed:") {
-            let start = prior
-                .and_then(|stalled| stalled.supervision_index.map(|index| if retry_exhausted { index } else { index + 1 }))
-                .unwrap_or(0);
+            let start = prior.and_then(|stalled| stalled.supervision_index.map(|index| index + 1)).unwrap_or(0);
             let keep_current =
                 prior.is_some_and(|stalled| stalled.supervisor.is_some()) && !matches!(condition.maker, Some(LeafMaker::Supervisor { .. }));
             let context = format!(
@@ -1631,10 +1615,7 @@ impl ReconcilerWake {
             if keep_current || cached_lookup {
                 condition = prior.expect("checked above").clone();
             } else {
-                off_frame(|| {
-                    self.escalate_stall(tick, convoy, &mut condition, prior, policy, start, retry_exhausted, context_key, context)
-                })
-                .await?;
+                off_frame(|| self.escalate_stall(tick, convoy, &mut condition, prior, policy, start, context_key, context)).await?;
             }
         }
         Ok(condition)
@@ -1688,7 +1669,6 @@ impl ReconcilerWake {
         prior: Option<&StalledCondition>,
         policy: &[SupervisionTarget],
         start: usize,
-        retry_exhausted: bool,
         context_key: (String, String),
         context: String,
     ) -> Result<(), String> {
@@ -1700,18 +1680,7 @@ impl ReconcilerWake {
         // The cursor records consumed rungs, not failed delivery attempts.
         // Retain it so retrying a higher rung cannot route back to a lower one.
         // Persist the last consumed rung, not the next attempt.
-        // Retrying legacy rung i stores i - 1 (None at zero), so
-        // failed lookup/delivery retries i without revisiting lower rungs.
-        condition.supervision_index =
-            prior.and_then(|stalled| stalled.supervision_index).and_then(
-                |index| {
-                    if retry_exhausted {
-                        index.checked_sub(1)
-                    } else {
-                        Some(index)
-                    }
-                },
-            );
+        condition.supervision_index = prior.and_then(|stalled| stalled.supervision_index);
         condition.maker = condition.leaves.first().and_then(|leaf| {
             let LeafAddress::Work { work, .. } = &leaf.address else { return None };
             let role = leaf.field_path.strip_prefix(".crew.")?.strip_suffix(".phase")?;
