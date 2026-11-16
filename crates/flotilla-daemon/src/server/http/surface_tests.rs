@@ -315,7 +315,7 @@ async fn cursors_resume_only_their_own_current_position() {
 #[tokio::test]
 async fn a_cursor_moves_only_with_its_tables_kinds_at_any_home() {
     use flotilla_provisioning_testkit::other_home::{replicate_home_tail, OtherHome};
-    use flotilla_resources::engine_records::EngineRecords as _;
+    use flotilla_resources::engine_records::KindRecords as _;
     let (backend, store) = engine_backend();
     let other = OtherHome::open("other");
     let repository = |name: &str| flotilla_resources::RepositorySpec::remote(format!("https://forge.example/o/{name}")).unwrap();
@@ -337,8 +337,7 @@ async fn a_cursor_moves_only_with_its_tables_kinds_at_any_home() {
         Arc::new(flotilla_resources::SystemClock),
     )
     .unwrap();
-    let spec = serde_json::to_value(delivery("demo")).unwrap();
-    deliveries.apply("AccessDelivery", "remote", &BTreeMap::new(), &BTreeMap::new(), spec).await.unwrap();
+    deliveries.apply("remote", &BTreeMap::new(), &BTreeMap::new(), &delivery("demo")).await.unwrap();
     replicate_home_tail(other.service(), other.home(), &store.service);
     assert_eq!(resumed(&mut client, "table-kind", &cursor).await, ["resync", "table", "rows", "synced"]);
 }

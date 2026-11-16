@@ -17,7 +17,10 @@ use axum::{
 };
 use chrono::{DateTime, Utc};
 use flotilla_protocol::EnvironmentId;
-use flotilla_resources::{AccessDelivery, Clock, InputMeta, CONVOY_LABEL};
+use flotilla_resources::{
+    engine_records::{KindRecords, Record},
+    AccessDelivery, Clock, InputMeta, CONVOY_LABEL,
+};
 use flotilla_store::ResourceBackend;
 use flotilla_store_memory::InMemoryBackend;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
@@ -417,43 +420,48 @@ async fn resource_http_honors_declared_selectors() {
 #[derive(Debug)]
 struct EveryKindEmpty;
 
-static EVERY_KIND: std::sync::LazyLock<Vec<&'static str>> =
-    std::sync::LazyLock::new(|| flotilla_store::REGISTERED_RESOURCE_KINDS.iter().map(|registered| registered.kind).collect());
+impl flotilla_store::EnginePort for EveryKindEmpty {
+    fn install(self: Arc<Self>, backend: &ResourceBackend) {
+        struct Install<'a>(&'a ResourceBackend, Arc<EveryKindEmpty>);
+        impl flotilla_store::RegisteredKindVisitor for Install<'_> {
+            fn visit<R: flotilla_resources::Resource>(&mut self) {
+                self.0.install_engine_kind::<R>(Arc::clone(&self.1) as Arc<dyn KindRecords<R>>);
+            }
+        }
+        flotilla_store::visit_registered_kinds(&mut Install(backend, self));
+    }
+}
 
 #[async_trait::async_trait]
-impl flotilla_resources::engine_records::EngineRecords for EveryKindEmpty {
-    fn kinds(&self) -> &'static [&'static str] {
-        EVERY_KIND.as_slice()
-    }
-    fn codes(&self, _kind: &str) -> Vec<flotilla_resources::engine_records::KindCode> {
+impl<R: flotilla_resources::Resource> KindRecords<R> for EveryKindEmpty {
+    fn codes(&self) -> Vec<flotilla_resources::engine_records::KindCode> {
         Vec::new()
     }
     fn home(&self) -> String {
         "home-a".into()
     }
-    async fn get(&self, _: &str, _: &str) -> Result<Option<flotilla_resources::engine_records::EngineObject>, String> {
+    async fn get(&self, _: &str) -> Result<Option<Record<R>>, String> {
         Ok(None)
     }
-    async fn list(&self, _: &str) -> Result<Vec<flotilla_resources::engine_records::EngineObject>, String> {
+    async fn list(&self) -> Result<Vec<Record<R>>, String> {
         Ok(Vec::new())
     }
-    async fn sources(&self, _: &str) -> Result<Vec<flotilla_resources::engine_records::EngineObject>, String> {
+    async fn sources(&self) -> Result<Vec<Record<R>>, String> {
         Ok(Vec::new())
     }
     async fn apply(
         &self,
         _: &str,
-        _: &str,
         _: &std::collections::BTreeMap<String, String>,
         _: &std::collections::BTreeMap<String, String>,
-        _: serde_json::Value,
-    ) -> Result<flotilla_resources::engine_records::EngineObject, String> {
+        _: &R::Spec,
+    ) -> Result<Record<R>, String> {
         Err("read only".into())
     }
-    async fn set_status(&self, _: &str, _: &str, _: serde_json::Value) -> Result<flotilla_resources::engine_records::EngineObject, String> {
+    async fn set_status(&self, _: &str, _: &R::Status) -> Result<Record<R>, String> {
         Err("read only".into())
     }
-    async fn delete(&self, _: &str, _: &str) -> Result<(), String> {
+    async fn delete(&self, _: &str) -> Result<(), String> {
         Err("read only".into())
     }
     async fn changes(&self) -> Result<futures::stream::BoxStream<'static, ()>, String> {

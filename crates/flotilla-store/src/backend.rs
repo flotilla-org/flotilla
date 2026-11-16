@@ -33,15 +33,18 @@ type EngineSlot = std::sync::Arc<std::sync::RwLock<EngineSlots>>;
 
 #[derive(Debug, Default)]
 struct EngineSlots {
-    ports: std::collections::BTreeMap<&'static str, std::sync::Arc<dyn flotilla_resources::engine_records::EngineRecords>>,
+    ports: std::collections::BTreeMap<&'static str, crate::engine_port::Installed>,
+    /// How many ports have been installed: each installation's mark, so a feed started for a
+    /// replaced port is not kept.
+    installs: u64,
     /// The engine keeps no namespaces: its records read in whichever namespace is asked, and carry
     /// this daemon's one, as a scan for the namespaces holding a kind it serves answers.
     namespace: Option<String>,
     /// Whether this backend is the engine's home: a kind the engine holds is then refused until
     /// its port is installed, never served from the old store.
     home: bool,
-    /// Each kind's shared listing while any watcher holds it.
-    feeds: std::collections::BTreeMap<&'static str, std::sync::Weak<crate::engine_feed::EngineFeed>>,
+    /// Each kind's shared listing, an `EngineFeed` of its resource kind, while any watcher holds it.
+    feeds: std::collections::BTreeMap<&'static str, std::sync::Weak<dyn std::any::Any + Send + Sync>>,
 }
 
 #[derive(Default)]
@@ -91,16 +94,21 @@ impl ResourceBackend {
     pub fn from_arc(store: std::sync::Arc<dyn crate::Store>) -> Self {
         Self { store, engines: EngineSlot::default(), attentions: Default::default() }
     }
-    /// Serves the kinds `records` names from it, the engine's, behind `[primitives]`: every handle
-    /// cloned or derived from this backend reads and writes them there. A daemon runtime restarted
-    /// over the same backend installs its reopened ports in place of the last.
-    pub fn install_engine_records(&self, records: std::sync::Arc<dyn flotilla_resources::engine_records::EngineRecords>) {
+    /// Serves the kinds `port` serves from it, the engine's: every handle cloned or derived from
+    /// this backend reads and writes them there. A daemon runtime restarted over the same backend
+    /// installs its reopened ports in place of the last.
+    pub fn install_engine_records<P: crate::EnginePort + ?Sized>(&self, port: std::sync::Arc<P>) {
+        port.install(self);
+    }
+
+    /// Serves resource kind `R` from `records`, in place of any port installed for it before.
+    pub fn install_engine_kind<R: Resource>(&self, records: std::sync::Arc<dyn flotilla_resources::engine_records::KindRecords<R>>) {
         let mut engines = self.engines.write().unwrap_or_else(std::sync::PoisonError::into_inner);
-        for kind in records.kinds() {
-            engines.ports.insert(kind, std::sync::Arc::clone(&records));
-            // Watchers of the port replaced keep its feed; new ones list the new port.
-            engines.feeds.remove(kind);
-        }
+        engines.installs += 1;
+        let mark = engines.installs;
+        engines.ports.insert(R::API_PATHS.kind, crate::engine_port::Installed::new(records, mark));
+        // Watchers of the port replaced keep its feed; new ones list the new port.
+        engines.feeds.remove(R::API_PATHS.kind);
     }
     /// The namespace the engine's records are served in, the daemon's provisioning namespace: a
     /// namespace scan of a kind the engine serves answers with it.
@@ -116,7 +124,7 @@ impl ResourceBackend {
     /// Whether an engine port serves `kind`: its records reach other homes by log following,
     /// never through the old store's replication.
     pub fn engine_serves(&self, kind: &str) -> bool {
-        self.engine_records(kind).is_some()
+        self.engine_facts(kind).is_some()
     }
 
     /// Marks this backend as the engine's home: until its port is installed, every read and write
@@ -126,61 +134,83 @@ impl ResourceBackend {
         self.engines.write().unwrap_or_else(std::sync::PoisonError::into_inner).home = true;
     }
 
-    /// The engine port serving `kind`, when one is installed; on the engine's home, a refusing
-    /// port for a kind the engine holds before its port is installed.
-    pub(crate) fn engine_records(&self, kind: &str) -> Option<std::sync::Arc<dyn flotilla_resources::engine_records::EngineRecords>> {
+    /// Whether this backend refuses `kind` for want of its port: the engine's home before the
+    /// port of a kind the engine holds is installed.
+    fn uncomposed(engines: &EngineSlots, kind: &str) -> bool {
+        engines.home && crate::REGISTERED_RESOURCE_KINDS.iter().any(|registered| registered.kind == kind)
+    }
+
+    /// The engine port serving `R`, when one is installed, with its installation's mark; on the
+    /// engine's home, a refusing port for a kind the engine holds before its port is installed.
+    fn engine_port<R: Resource>(&self) -> Option<(std::sync::Arc<dyn flotilla_resources::engine_records::KindRecords<R>>, u64)> {
         let engines = self.engines.read().unwrap_or_else(std::sync::PoisonError::into_inner);
-        if let Some(port) = engines.ports.get(kind) {
-            return Some(std::sync::Arc::clone(port));
+        match engines.ports.get(R::API_PATHS.kind) {
+            Some(installed) => installed.typed::<R>(),
+            None => Self::uncomposed(&engines, R::API_PATHS.kind)
+                .then(|| (std::sync::Arc::new(crate::uncomposed_records::Uncomposed::<R>::default()) as _, 0)),
         }
-        let held = crate::REGISTERED_RESOURCE_KINDS.iter().any(|registered| registered.kind == kind);
-        (engines.home && held).then(|| {
-            std::sync::Arc::new(crate::uncomposed_records::Uncomposed { kind: kind.to_owned() })
-                as std::sync::Arc<dyn flotilla_resources::engine_records::EngineRecords>
-        })
+    }
+
+    /// The engine port serving `R`; see [`Self::engine_port`].
+    pub(crate) fn engine_records<R: Resource>(&self) -> Option<std::sync::Arc<dyn flotilla_resources::engine_records::KindRecords<R>>> {
+        self.engine_port::<R>().map(|(records, _)| records)
+    }
+
+    /// What the engine port serving `kind` says of it whatever its type; on the engine's home, a
+    /// refusing port's for a kind the engine holds before its port is installed.
+    pub(crate) fn engine_facts(&self, kind: &str) -> Option<std::sync::Arc<dyn crate::engine_port::KindFacts>> {
+        let engines = self.engines.read().unwrap_or_else(std::sync::PoisonError::into_inner);
+        match engines.ports.get(kind) {
+            Some(installed) => Some(installed.facts()),
+            None => Self::uncomposed(&engines, kind).then(|| crate::engine_port::uncomposed_facts(kind)),
+        }
     }
 
     /// The stored kinds whose log entries can change `kind`'s records as its port reads them;
     /// `None` unless the engine serves `kind`.
     pub fn engine_codes(&self, kind: &str) -> Option<Vec<flotilla_resources::engine_records::KindCode>> {
-        self.engine_records(kind).map(|port| port.codes(kind))
+        self.engine_facts(kind).map(|port| port.codes())
     }
 
     /// How many times `kind`'s engine records changed outside the log since this home started;
     /// `None` unless the engine serves `kind` with some of its state held only in memory.
     pub fn engine_unlogged_changes(&self, kind: &str) -> Option<u64> {
-        self.engine_records(kind).and_then(|port| port.unlogged_changes(kind))
+        self.engine_facts(kind).and_then(|port| port.unlogged_changes())
     }
 
-    /// The shared listing of `kind`'s engine records, started for the first watcher; `None` unless
-    /// the engine serves `kind`.
-    pub(crate) async fn engine_feed(
+    /// The shared listing of `R`'s engine records, started for the first watcher; `None` unless
+    /// the engine serves `R`.
+    pub(crate) async fn engine_feed<R: Resource>(
         &self,
-        kind: &'static str,
-    ) -> Option<Result<std::sync::Arc<crate::engine_feed::EngineFeed>, ResourceError>> {
-        let records = self.engine_records(kind)?;
-        if let Some(feed) = self.held_engine_feed(kind) {
+    ) -> Option<Result<std::sync::Arc<crate::engine_feed::EngineFeed<R>>, ResourceError>> {
+        let (records, mark) = self.engine_port::<R>()?;
+        if let Some(feed) = self.held_engine_feed::<R>() {
             return Some(Ok(feed));
         }
-        let started = match crate::engine_feed::EngineFeed::start(std::sync::Arc::clone(&records), kind).await {
+        let started = match crate::engine_feed::EngineFeed::start(records).await {
             Ok(started) => std::sync::Arc::new(started),
             Err(error) => return Some(Err(ResourceError::other(error))),
         };
         let mut engines = self.engines.write().unwrap_or_else(std::sync::PoisonError::into_inner);
         // Another watcher may have started one meanwhile: the first kept wins, for its port.
-        if !engines.ports.get(kind).is_some_and(|installed| std::sync::Arc::ptr_eq(installed, &records)) {
+        if engines.ports.get(R::API_PATHS.kind).is_none_or(|installed| installed.mark() != mark) {
             return Some(Ok(started));
         }
-        if let Some(feed) = engines.feeds.get(kind).and_then(std::sync::Weak::upgrade) {
+        if let Some(feed) = Self::feed_of::<R>(&engines) {
             return Some(Ok(feed));
         }
-        engines.feeds.insert(kind, std::sync::Arc::downgrade(&started));
+        let held: std::sync::Arc<dyn std::any::Any + Send + Sync> = started.clone();
+        engines.feeds.insert(R::API_PATHS.kind, std::sync::Arc::downgrade(&held));
         Some(Ok(started))
     }
 
-    /// The shared listing of `kind`'s engine records while any watcher holds it.
-    pub(crate) fn held_engine_feed(&self, kind: &str) -> Option<std::sync::Arc<crate::engine_feed::EngineFeed>> {
-        self.engines.read().unwrap_or_else(std::sync::PoisonError::into_inner).feeds.get(kind).and_then(std::sync::Weak::upgrade)
+    /// The shared listing of `R`'s engine records while any watcher holds it.
+    pub(crate) fn held_engine_feed<R: Resource>(&self) -> Option<std::sync::Arc<crate::engine_feed::EngineFeed<R>>> {
+        Self::feed_of::<R>(&self.engines.read().unwrap_or_else(std::sync::PoisonError::into_inner))
+    }
+
+    fn feed_of<R: Resource>(engines: &EngineSlots) -> Option<std::sync::Arc<crate::engine_feed::EngineFeed<R>>> {
+        engines.feeds.get(R::API_PATHS.kind)?.upgrade()?.downcast::<crate::engine_feed::EngineFeed<R>>().ok()
     }
 
     /// Installs the engine's attentions behind `[primitives]`. A daemon runtime restarted over the
@@ -227,41 +257,33 @@ impl ResourceBackend {
 
     /// Namespaces containing locally-authored objects of this kind.
     pub async fn local_namespaces<T: Resource>(&self) -> Result<Vec<String>, ResourceError> {
-        if let Some(records) = self.engine_records(T::API_PATHS.kind) {
-            return self.engine_namespaces::<T>(&*records, true).await;
+        if let Some(facts) = self.engine_facts(T::API_PATHS.kind) {
+            return self.engine_kind_namespaces(T::API_PATHS.kind, &*facts, true).await;
         }
         self.local_namespaces_typed::<T>().await
     }
 
     /// Namespaces containing a local or replicated source of this kind.
     pub async fn stored_namespaces<T: Resource>(&self) -> Result<Vec<String>, ResourceError> {
-        if let Some(records) = self.engine_records(T::API_PATHS.kind) {
-            return self.engine_namespaces::<T>(&*records, false).await;
+        if let Some(facts) = self.engine_facts(T::API_PATHS.kind) {
+            return self.engine_kind_namespaces(T::API_PATHS.kind, &*facts, false).await;
         }
         self.stored_namespaces_typed::<T>().await
     }
 
     /// For a kind the engine serves: its namespace when any home holds a record of the kind (this
     /// home, when `local`), else none.
-    async fn engine_namespaces<T: Resource>(
-        &self,
-        records: &dyn flotilla_resources::engine_records::EngineRecords,
-        local: bool,
-    ) -> Result<Vec<String>, ResourceError> {
-        self.engine_kind_namespaces(T::API_PATHS.kind, records, local).await
-    }
-
     async fn engine_kind_namespaces(
         &self,
         kind: &str,
-        records: &dyn flotilla_resources::engine_records::EngineRecords,
+        facts: &dyn crate::engine_port::KindFacts,
         local: bool,
     ) -> Result<Vec<String>, ResourceError> {
         let namespace = self.engines.read().unwrap_or_else(std::sync::PoisonError::into_inner).namespace.clone();
         let namespace = namespace.ok_or_else(|| ResourceError::other(format!("{kind} is served by the engine in no namespace")))?;
-        let home = records.home();
-        let sources = crate::port_reads::sources(records, kind).await.map_err(ResourceError::other)?;
-        Ok(if sources.iter().any(|record| !local || record.home == home) { vec![namespace] } else { Vec::new() })
+        let homes = facts.homes().await.map_err(ResourceError::other)?;
+        let held = if local { homes.contains(&facts.home()) } else { !homes.is_empty() };
+        Ok(if held { vec![namespace] } else { Vec::new() })
     }
 
     /// Every namespace with an authored or replicated record, by kind plural: a kind the engine
@@ -272,9 +294,9 @@ impl ResourceBackend {
         let home = self.engines.read().unwrap_or_else(std::sync::PoisonError::into_inner).home;
         let mut inventory = if home { std::collections::BTreeMap::new() } else { self.store.namespace_inventory().await? };
         for kind in crate::declared_resource_kinds() {
-            if let Some(records) = self.engine_records(kind.paths.kind) {
-                let namespaces = if records.reads(kind.paths.kind) {
-                    self.engine_kind_namespaces(kind.paths.kind, &*records, false)
+            if let Some(facts) = self.engine_facts(kind.paths.kind) {
+                let namespaces = if facts.reads() {
+                    self.engine_kind_namespaces(kind.paths.kind, &*facts, false)
                         .await
                         .map_err(|error| ResourceError::other(format!("namespaces of {}: {error}", kind.paths.kind)))?
                 } else {
@@ -818,7 +840,7 @@ impl<T: Resource> TypedResolver<T> {
     /// HTTP uses collection metadata from the standard list endpoint.
     pub async fn current_position(&self) -> Result<crate::ResourcePosition, ResourceError> {
         // An engine-served kind has no position to resume from, as its lists carry none.
-        if self.backend.engine_records(T::API_PATHS.kind).is_some() {
+        if self.backend.engine_serves(T::API_PATHS.kind) {
             return Ok(crate::ResourcePosition { resource_version: String::new(), generation: None });
         }
         dispatch_backend!(self, current_position_typed)
@@ -859,8 +881,8 @@ impl<T: Resource> TypedResolver<T> {
 
     /// The engine port serving this kind, for a kind the old store keeps a record of per home
     /// (#3824 layer 3): definitions are served through their resolver instead.
-    fn engine_owned(&self) -> Option<std::sync::Arc<dyn flotilla_resources::engine_records::EngineRecords>> {
-        (T::REPLICATION_CLASS != crate::ReplicationClass::Definitions).then(|| self.backend.engine_records(T::API_PATHS.kind)).flatten()
+    fn engine_owned(&self) -> Option<std::sync::Arc<dyn flotilla_resources::engine_records::KindRecords<T>>> {
+        (T::REPLICATION_CLASS != crate::ReplicationClass::Definitions).then(|| self.backend.engine_records::<T>()).flatten()
     }
 
     /// Refuses a write through a namespace other than the one the engine serves this kind in.
@@ -871,12 +893,12 @@ impl<T: Resource> TypedResolver<T> {
     /// This home's own engine record `name`, if any.
     async fn engine_home_record(
         &self,
-        records: &dyn flotilla_resources::engine_records::EngineRecords,
+        records: &dyn flotilla_resources::engine_records::KindRecords<T>,
         name: &str,
-    ) -> Result<Option<flotilla_resources::engine_records::EngineObject>, ResourceError> {
+    ) -> Result<Option<flotilla_resources::engine_records::Record<T>>, ResourceError> {
         let home = records.home();
-        let sources = crate::port_reads::sources(records, T::API_PATHS.kind).await.map_err(ResourceError::other)?;
-        Ok(sources.into_iter().find(|record| record.name == name && record.home == home))
+        let copies = crate::port_reads::copies(records, name).await.map_err(ResourceError::other)?;
+        Ok(copies.into_iter().find(|record| record.home == home))
     }
 
     /// Why `verb` on `name` fails when this home holds no copy: other homes' copies, named,
@@ -886,7 +908,7 @@ impl<T: Resource> TypedResolver<T> {
         let Some(records) = self.engine_owned() else {
             return Ok(ResourceError::not_found(name));
         };
-        let copies = crate::port_reads::copies(&*records, T::API_PATHS.kind, name).await.map_err(ResourceError::other)?;
+        let copies = crate::port_reads::copies(&*records, name).await.map_err(ResourceError::other)?;
         if copies.is_empty() {
             return Ok(ResourceError::not_found(name));
         }
@@ -897,7 +919,7 @@ impl<T: Resource> TypedResolver<T> {
     /// The engine record `name` at this home, refused unless it is at `resource_version`.
     async fn engine_current(
         &self,
-        records: &dyn flotilla_resources::engine_records::EngineRecords,
+        records: &dyn flotilla_resources::engine_records::KindRecords<T>,
         name: &str,
         resource_version: &str,
     ) -> Result<(), ResourceError> {
@@ -910,14 +932,12 @@ impl<T: Resource> TypedResolver<T> {
 
     async fn engine_apply(
         &self,
-        records: &dyn flotilla_resources::engine_records::EngineRecords,
+        records: &dyn flotilla_resources::engine_records::KindRecords<T>,
         meta: &InputMeta,
         spec: &T::Spec,
     ) -> Result<ResourceObject<T>, ResourceError> {
-        let value = serde_json::to_value(spec).map_err(|error| ResourceError::decode(error.to_string()))?;
-        let record =
-            records.apply(T::API_PATHS.kind, &meta.name, &meta.labels, &meta.annotations, value).await.map_err(ResourceError::other)?;
-        crate::definition::engine_object(&self.namespace, record)
+        let record = records.apply(&meta.name, &meta.labels, &meta.annotations, spec).await.map_err(ResourceError::other)?;
+        Ok(crate::definition::record_object(&self.namespace, record))
     }
 
     pub async fn update(&self, meta: &InputMeta, resource_version: &str, spec: &T::Spec) -> Result<ResourceObject<T>, ResourceError> {
@@ -959,11 +979,10 @@ impl<T: Resource> TypedResolver<T> {
             _ => false,
         };
         // A definition kind with a status (Project, #3824 layer 3b) writes it through its port too.
-        if let Some(records) = self.backend.engine_records(T::API_PATHS.kind) {
+        if let Some(records) = self.backend.engine_records::<T>() {
             self.engine_current(&*records, name, resource_version).await?;
-            let value = serde_json::to_value(status).map_err(|error| ResourceError::decode(error.to_string()))?;
-            let record = records.set_status(T::API_PATHS.kind, name, value).await.map_err(ResourceError::other)?;
-            return crate::definition::engine_object(&self.namespace, record);
+            let record = records.set_status(name, status).await.map_err(ResourceError::other)?;
+            return Ok(crate::definition::record_object(&self.namespace, record));
         }
         if !engine_owned {
             return dispatch_backend!(self, update_status_typed, name, resource_version, status);
@@ -984,7 +1003,7 @@ impl<T: Resource> TypedResolver<T> {
             if self.engine_home_record(&*records, name).await?.is_none() {
                 return Err(self.not_held_here(name, "delete").await?);
             }
-            return records.delete(T::API_PATHS.kind, name).await.map_err(ResourceError::other);
+            return records.delete(name).await.map_err(ResourceError::other);
         }
         dispatch_backend!(self, delete_typed, name)
     }
@@ -998,7 +1017,7 @@ impl<T: Resource> TypedResolver<T> {
     }
 
     pub async fn watch(&self, start: WatchStart) -> Result<WatchStream<T>, ResourceError> {
-        if self.backend.engine_records(T::API_PATHS.kind).is_some() {
+        if self.backend.engine_serves(T::API_PATHS.kind) {
             // An engine-served kind's lists carry no position, so a resume cannot be honoured:
             // refuse it as expired, and the caller watches from now and lists again.
             if let WatchStart::FromVersion(requested_version)
@@ -1048,71 +1067,93 @@ impl<S: crate::Store + 'static> From<S> for ResourceBackend {
 mod tests {
     use std::{collections::BTreeMap, sync::Arc};
 
-    use flotilla_resources::engine_records::{EngineObject, EngineRecords};
+    use flotilla_resources::{
+        engine_records::{KindRecords, Record},
+        Artifact, ImageBuild, Resource, Vessel, VesselSpec,
+    };
     use futures::stream::BoxStream;
 
-    /// A port serving `kinds`: one Vessel record, ImageBuild only to refuse it, and every read of
-    /// a kind in `failing` failed.
-    #[derive(Debug)]
-    struct Port {
-        kinds: &'static [&'static str],
-        failing: &'static [&'static str],
+    /// A port serving `records`; refusing the kind when it does not read it, and failing every
+    /// read when `failing`.
+    struct Port<R: Resource> {
+        records: Vec<Record<R>>,
+        reads: bool,
+        failing: bool,
+    }
+
+    impl<R: Resource> std::fmt::Debug for Port<R> {
+        fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+            formatter.debug_struct("Port").field("records", &self.records).finish_non_exhaustive()
+        }
+    }
+
+    impl<R: Resource> Port<R> {
+        fn serving(records: Vec<Record<R>>) -> Arc<Self> {
+            Arc::new(Self { records, reads: true, failing: false })
+        }
     }
 
     #[async_trait::async_trait]
-    impl EngineRecords for Port {
-        fn kinds(&self) -> &'static [&'static str] {
-            self.kinds
-        }
-        fn codes(&self, _kind: &str) -> Vec<flotilla_resources::engine_records::KindCode> {
+    impl<R: Resource> KindRecords<R> for Port<R> {
+        fn codes(&self) -> Vec<flotilla_resources::engine_records::KindCode> {
             Vec::new()
         }
-        fn reads(&self, kind: &str) -> bool {
-            kind != "ImageBuild"
+        fn reads(&self) -> bool {
+            self.reads
         }
         fn home(&self) -> String {
             "kiwi".into()
         }
-        async fn get(&self, kind: &str, name: &str) -> Result<Option<EngineObject>, String> {
-            Ok(self.sources(kind).await?.into_iter().find(|record| record.name == name))
+        async fn get(&self, name: &str) -> Result<Option<Record<R>>, String> {
+            Ok(self.sources().await?.into_iter().find(|record| record.name == name))
         }
-        async fn list(&self, kind: &str) -> Result<Vec<EngineObject>, String> {
-            self.sources(kind).await
+        async fn list(&self) -> Result<Vec<Record<R>>, String> {
+            self.sources().await
         }
-        async fn sources(&self, kind: &str) -> Result<Vec<EngineObject>, String> {
-            match kind {
-                "ImageBuild" => Err("ImageBuild is not read through the resource commands".into()),
-                failing if self.failing.contains(&failing) => Err("the records could not be read".into()),
-                _ => Ok(vec![EngineObject {
-                    name: "v#1".into(),
-                    home: "kiwi".into(),
-                    version: 1,
-                    created_at: chrono::DateTime::UNIX_EPOCH,
-                    labels: BTreeMap::new(),
-                    annotations: BTreeMap::new(),
-                    spec: serde_json::json!({ "convoy_ref": "c", "vessel_name": "w", "fulfilment_kind_ref": "k" }),
-                    status: None,
-                }]),
+        async fn sources(&self) -> Result<Vec<Record<R>>, String> {
+            if !self.reads {
+                return Err(format!("{} is not read through the resource commands", R::API_PATHS.kind));
             }
+            if self.failing {
+                return Err("the records could not be read".into());
+            }
+            Ok(self.records.clone())
         }
         async fn apply(
             &self,
-            _kind: &str,
             _name: &str,
             _labels: &BTreeMap<String, String>,
             _annotations: &BTreeMap<String, String>,
-            _spec: serde_json::Value,
-        ) -> Result<EngineObject, String> {
+            _spec: &R::Spec,
+        ) -> Result<Record<R>, String> {
             Err("read only".into())
         }
-        async fn set_status(&self, _kind: &str, _name: &str, _status: serde_json::Value) -> Result<EngineObject, String> {
+        async fn set_status(&self, _name: &str, _status: &R::Status) -> Result<Record<R>, String> {
             Err("read only".into())
         }
-        async fn delete(&self, _kind: &str, _name: &str) -> Result<(), String> {
+        async fn delete(&self, _name: &str) -> Result<(), String> {
             Err("read only".into())
         }
         async fn changes(&self) -> Result<BoxStream<'static, ()>, String> {
             Err("no changes".into())
+        }
+    }
+
+    fn vessel() -> Record<Vessel> {
+        Record {
+            name: "v#1".into(),
+            home: "kiwi".into(),
+            version: 1,
+            created_at: chrono::DateTime::UNIX_EPOCH,
+            labels: BTreeMap::new(),
+            annotations: BTreeMap::new(),
+            spec: VesselSpec {
+                convoy_ref: "c".into(),
+                vessel_name: "w".into(),
+                fulfilment_kind_ref: "k".into(),
+                adopted_checkout_refs: BTreeMap::new(),
+            },
+            status: None,
         }
     }
 
@@ -1122,13 +1163,62 @@ mod tests {
     async fn namespace_inventory_lists_refused_kinds_empty_and_names_a_failing_kind() {
         let backend = crate::test_store::memory_backend();
         backend.serve_engine_in("flotilla");
-        backend.install_engine_records(Arc::new(Port { kinds: &["Vessel", "ImageBuild"], failing: &[] }));
+        backend.install_engine_kind::<Vessel>(Port::serving(vec![vessel()]));
+        backend.install_engine_kind::<ImageBuild>(Arc::new(Port { records: Vec::new(), reads: false, failing: false }));
         let inventory = backend.stored_namespace_inventory().await.expect("inventory");
         assert_eq!(inventory.get("imagebuilds"), Some(&Vec::new()), "image builds are in no namespace: {inventory:?}");
         assert_eq!(inventory.get("vessels"), Some(&vec!["flotilla".to_owned()]), "{inventory:?}");
 
-        backend.install_engine_records(Arc::new(Port { kinds: &["Artifact"], failing: &["Artifact"] }));
+        backend.install_engine_kind::<Artifact>(Arc::new(Port { records: Vec::new(), reads: true, failing: true }));
         let error = backend.stored_namespace_inventory().await.expect_err("a failing kind fails discovery").to_string();
         assert!(error.contains("Artifact") && error.contains("could not be read"), "the failing kind is named: {error}");
+    }
+
+    thread_local! {
+        static ENCODED: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+    }
+
+    /// A kind whose spec counts each time it is encoded.
+    struct Counted;
+
+    #[derive(Debug, Clone, serde::Deserialize)]
+    struct CountedSpec(String);
+
+    impl serde::Serialize for CountedSpec {
+        fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+            ENCODED.with(|encoded| encoded.set(encoded.get() + 1));
+            serializer.serialize_str(&self.0)
+        }
+    }
+
+    impl Resource for Counted {
+        type Spec = CountedSpec;
+        type Status = ();
+        type StatusPatch = flotilla_resources::NoStatusPatch;
+        const API_PATHS: flotilla_resources::ApiPaths =
+            flotilla_resources::ApiPaths { group: "flotilla.work", version: "v1", plural: "counteds", kind: "Counted" };
+    }
+
+    // Behaviour (#3108 R3): a typed read of an engine kind through its resolver hands over the
+    // port's records as they are: a get and a list encode nothing.
+    #[tokio::test]
+    async fn a_typed_read_of_an_engine_kind_encodes_nothing() {
+        let backend = crate::test_store::memory_backend();
+        backend.serve_engine_in("flotilla");
+        let record = Record::<Counted> {
+            name: "one".into(),
+            home: "kiwi".into(),
+            version: 1,
+            created_at: chrono::DateTime::UNIX_EPOCH,
+            labels: BTreeMap::new(),
+            annotations: BTreeMap::new(),
+            spec: CountedSpec("value".into()),
+            status: None,
+        };
+        backend.install_engine_kind::<Counted>(Port::serving(vec![record]));
+        let resolver = backend.using::<Counted>("flotilla");
+        assert_eq!(resolver.get("one").await.expect("get").spec.0, "value");
+        assert_eq!(resolver.list().await.expect("list").items.len(), 1);
+        assert_eq!(ENCODED.with(std::cell::Cell::get), 0, "a typed read encodes no spec");
     }
 }

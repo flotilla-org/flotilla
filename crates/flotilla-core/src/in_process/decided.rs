@@ -13,7 +13,7 @@ use flotilla_provisioning::engine::{
     hosts::EngineHosts, kinds::EngineKinds, manifest_root::EngineManifestRoots, observations::EngineObservations, projects::EngineProjects,
     repositories::EngineRepositories,
 };
-use flotilla_resources::engine_records::EngineRecords;
+use flotilla_store::EnginePort;
 
 use super::{ComposedEngine, EngineIdentity, EngineOpener};
 
@@ -86,9 +86,9 @@ pub fn open(state_dir: &Path, identity: EngineIdentity) -> Result<ComposedEngine
     // reach through their records as well.
     let accounts = Arc::new(EngineAccounts::open(Arc::clone(&service), clock())?);
     let manifest_roots = Arc::new(EngineManifestRoots::open(Arc::clone(&service), clock())?);
-    let records: Vec<Arc<dyn EngineRecords>> = vec![
-        Arc::clone(&accounts) as Arc<dyn EngineRecords>,
-        Arc::clone(&manifest_roots) as Arc<dyn EngineRecords>,
+    let records: Vec<Arc<dyn EnginePort>> = vec![
+        Arc::clone(&accounts) as Arc<dyn EnginePort>,
+        Arc::clone(&manifest_roots) as Arc<dyn EnginePort>,
         // #3824 layer 2b-ii: the definition kinds.
         Arc::new(EngineDefinitions::open(Arc::clone(&service), clock())?),
         // #3824 layer 3a and 3b: Repository, and Project with its operations' record.

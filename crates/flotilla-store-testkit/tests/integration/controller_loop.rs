@@ -7,7 +7,10 @@ use std::{
     time::Duration,
 };
 
-use flotilla_resources::{ApiPaths, InputMeta, LifecycleAuthority, NoStatusPatch, Resource, ResourceError, ResourceObject, StatusPatch};
+use flotilla_resources::{
+    engine_records::{KindRecords, Record},
+    ApiPaths, InputMeta, LifecycleAuthority, NoStatusPatch, Resource, ResourceError, ResourceObject, StatusPatch,
+};
 use flotilla_store::{
     controller::{
         ControllerLoop, LabelJoinWatch, LabelMappedWatch, ReconcileErrorExhaustion, ReconcileErrorPolicy, ReconcileFailure,
@@ -2048,7 +2051,7 @@ async fn a_failing_reconcile_without_a_policy_parks_after_ten_tries_and_a_change
 /// releases it, whichever of its list and watch the controller opens first.
 #[derive(Debug, Default)]
 struct HeldListingPort {
-    records: Mutex<Vec<flotilla_resources::engine_records::EngineObject>>,
+    records: Mutex<Vec<Record<PrimaryResource>>>,
     subscribers: Mutex<Vec<futures::channel::mpsc::UnboundedSender<()>>>,
     subscribed: AtomicBool,
     listed: AtomicBool,
@@ -2058,14 +2061,14 @@ struct HeldListingPort {
 
 impl HeldListingPort {
     fn put(&self, name: &str) {
-        let record = flotilla_resources::engine_records::EngineObject {
+        let record = Record {
             name: name.into(),
             home: "kiwi".into(),
             version: 1,
             created_at: chrono::DateTime::UNIX_EPOCH,
             labels: Default::default(),
             annotations: Default::default(),
-            spec: serde_json::json!({ "value": "one" }),
+            spec: PrimarySpec { value: "one".into() },
             status: None,
         };
         self.records.lock().expect("records").push(record);
@@ -2076,23 +2079,20 @@ impl HeldListingPort {
 }
 
 #[async_trait::async_trait]
-impl flotilla_resources::engine_records::EngineRecords for HeldListingPort {
-    fn kinds(&self) -> &'static [&'static str] {
-        &["TestPrimary"]
-    }
-    fn codes(&self, _kind: &str) -> Vec<flotilla_resources::engine_records::KindCode> {
+impl KindRecords<PrimaryResource> for HeldListingPort {
+    fn codes(&self) -> Vec<flotilla_resources::engine_records::KindCode> {
         Vec::new()
     }
     fn home(&self) -> String {
         "kiwi".into()
     }
-    async fn get(&self, _kind: &str, name: &str) -> Result<Option<flotilla_resources::engine_records::EngineObject>, String> {
+    async fn get(&self, name: &str) -> Result<Option<Record<PrimaryResource>>, String> {
         Ok(self.records.lock().expect("records").iter().find(|record| record.name == name).cloned())
     }
-    async fn list(&self, kind: &str) -> Result<Vec<flotilla_resources::engine_records::EngineObject>, String> {
-        self.sources(kind).await
+    async fn list(&self) -> Result<Vec<Record<PrimaryResource>>, String> {
+        self.sources().await
     }
-    async fn sources(&self, _kind: &str) -> Result<Vec<flotilla_resources::engine_records::EngineObject>, String> {
+    async fn sources(&self) -> Result<Vec<Record<PrimaryResource>>, String> {
         let listed = self.records.lock().expect("records").clone();
         let opening = self.subscribed.swap(false, Ordering::SeqCst);
         if !opening && !self.listed.swap(true, Ordering::SeqCst) {
@@ -2103,23 +2103,17 @@ impl flotilla_resources::engine_records::EngineRecords for HeldListingPort {
     }
     async fn apply(
         &self,
-        _kind: &str,
         _name: &str,
         _labels: &std::collections::BTreeMap<String, String>,
         _annotations: &std::collections::BTreeMap<String, String>,
-        _spec: serde_json::Value,
-    ) -> Result<flotilla_resources::engine_records::EngineObject, String> {
+        _spec: &PrimarySpec,
+    ) -> Result<Record<PrimaryResource>, String> {
         Err("read only".into())
     }
-    async fn set_status(
-        &self,
-        _kind: &str,
-        _name: &str,
-        _status: serde_json::Value,
-    ) -> Result<flotilla_resources::engine_records::EngineObject, String> {
+    async fn set_status(&self, _name: &str, _status: &()) -> Result<Record<PrimaryResource>, String> {
         Err("read only".into())
     }
-    async fn delete(&self, _kind: &str, _name: &str) -> Result<(), String> {
+    async fn delete(&self, _name: &str) -> Result<(), String> {
         Err("read only".into())
     }
     async fn changes(&self) -> Result<futures::stream::BoxStream<'static, ()>, String> {
@@ -2138,7 +2132,7 @@ async fn controller_loop_reconciles_an_engine_change_committed_during_its_initia
     let backend = ResourceBackend::new(InMemoryBackend::default());
     let port = Arc::new(HeldListingPort::default());
     port.put("alpha");
-    backend.install_engine_records(Arc::clone(&port) as Arc<dyn flotilla_resources::engine_records::EngineRecords>);
+    backend.install_engine_kind::<PrimaryResource>(Arc::clone(&port) as Arc<dyn KindRecords<PrimaryResource>>);
 
     let reconciled = Arc::new(Mutex::new(Vec::new()));
     let mut harness = TestLoopHarness::new();

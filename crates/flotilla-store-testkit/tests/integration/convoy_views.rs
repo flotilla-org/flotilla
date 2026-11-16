@@ -18,7 +18,7 @@ use flotilla_protocol::{LifecycleReading, PrincipalRef};
 use flotilla_resources::{
     convoy::admission::AdmissionDocument,
     convoy_records::{ConvoyChange, ConvoyListing, ConvoyMemory, ConvoyNotes, ConvoyRecord, ConvoyRecords, CrewNotes},
-    engine_records::EngineRecords,
+    engine_records::KindRecords,
     lifecycle_reads::{ChangeCursor, LifecycleReads, ProvisioningKind},
     promises::{Promise, PromiseKind, PromiseSource, PromiseState},
     terminal_records::{
@@ -368,7 +368,7 @@ async fn a_launch_reads_with_its_vessels_sessions_and_home_notes() {
     assert_eq!(reads.convoys.read.load(Ordering::SeqCst), read, "a read recomposes nothing");
 
     // A change recomposes the launch it touches, then ticks the watchers.
-    let mut ticks = EngineRecords::changes(&views).await.expect("follow");
+    let mut ticks = KindRecords::changes(&views).await.expect("follow");
     let (_, changed) = reads.convoys.memory.update("fix-it#1", |notes: &mut ConvoyNotes| {
         notes.attention = Some(ConvoyAttention { source: "turn".into(), reason: "queued".into(), raised_at: at(120) });
         notes.crew.entry("work".into()).or_default().insert("reviewer".into(), CrewNotes { task_assigned: true, ..CrewNotes::default() });
@@ -400,10 +400,11 @@ async fn the_views_refuse_writes() {
     });
     let views = ConvoyViews::new("flotilla", reads);
     let none = BTreeMap::new();
-    assert!(views.apply("Convoy", "fix-it#1", &none, &none, serde_json::Value::Null).await.is_err());
-    assert!(views.set_status("Convoy", "fix-it#1", serde_json::Value::Null).await.is_err());
-    assert!(views.delete("Convoy", "fix-it#1").await.is_err());
-    assert_eq!(EngineRecords::list(&views, "Convoy").await.expect("list").len(), 1);
+    let held = KindRecords::get(&views, "fix-it#1").await.expect("get").expect("held");
+    assert!(views.apply("fix-it#1", &none, &none, &held.spec).await.is_err());
+    assert!(views.set_status("fix-it#1", &held.status.expect("status")).await.is_err());
+    assert!(KindRecords::delete(&views, "fix-it#1").await.is_err());
+    assert_eq!(KindRecords::list(&views).await.expect("list").len(), 1);
 }
 
 // Behaviour: a read dropped while it composes a changed launch again leaves that launch owed. The
@@ -449,12 +450,12 @@ async fn converted_by_one_read(others: usize) -> (u64, u64) {
     assert_eq!(views.sources().await.expect("fill").len(), others + 3);
 
     let converted = |reads: &ReadCounts| reads.get("Convoy").map_or(0, |counts| counts.converted);
-    let (copies, reads) = measure(views.copies("Convoy", "wanted#1")).await;
+    let (copies, reads) = measure(views.copies("wanted#1")).await;
     let copies = copies.expect("copies");
     assert_eq!(copies.iter().map(|copy| copy.home.as_str()).collect::<Vec<_>>(), [HERE, "home-b"]);
     let copies_cost = converted(&reads);
 
-    let (remote, reads) = measure(EngineRecords::get(&views, "Convoy", "remote#1")).await;
+    let (remote, reads) = measure(KindRecords::get(&views, "remote#1")).await;
     assert_eq!(remote.expect("get").expect("held at home-b").home, "home-b");
     (copies_cost, converted(&reads))
 }

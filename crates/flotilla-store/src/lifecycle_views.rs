@@ -11,7 +11,7 @@
 //! Image builds have no resource view: the engine holds them as demands and launches. Every
 //! generic verb on `ImageBuild` is refused, naming where to look instead.
 //!
-//! Installed as the backend's [`EngineRecords`] for `Clone`, `Environment`, `Checkout` and
+//! Installed as the backend's [`KindRecords`] for `Clone`, `Environment`, `Checkout` and
 //! `ImageBuild`.
 
 use std::{
@@ -28,16 +28,11 @@ use flotilla_protocol::LifecycleReading;
 use flotilla_resources::{
     checkout_records::CheckoutRecord,
     clone_records::{launched, CloneRecord},
-    engine_records::{EngineObject, EngineRecords, Record},
+    engine_records::{KindRecords, Record},
     environment_records::EnvironmentRecord,
-    lifecycle_reads::LifecycleReads,
-    Checkout, ClonePhase, CloneStatus, Environment, EnvironmentPhase, EnvironmentStatus, Resource,
+    lifecycle_reads::{LifecycleReads, RecordSet},
+    Checkout, ClonePhase, CloneStatus, Environment, EnvironmentPhase, EnvironmentStatus, ImageBuild, Resource,
 };
-
-const CLONE: &str = "Clone";
-const ENVIRONMENT: &str = "Environment";
-const CHECKOUT: &str = "Checkout";
-const IMAGE_BUILD: &str = "ImageBuild";
 
 /// What the generic verbs say of a write.
 const WRITTEN_BY: &str = "the provisioning reconcilers write it for a convoy's vessels; see them with `flotilla convoy explain`";
@@ -46,7 +41,7 @@ const WRITTEN_BY: &str = "the provisioning reconcilers write it for a convoy's v
 const IMAGE_BUILDS_HELD_AS: &str = "the engine holds image builds as demands and launches, not resources; \
 see an image's builds with `flotilla image check`";
 
-/// The engine's clones and environments as the old store's typed reads see them.
+/// The engine's clones and environments as the typed reads see them.
 #[derive(Clone)]
 pub struct LifecycleViews {
     reads: Arc<dyn LifecycleReads>,
@@ -69,31 +64,87 @@ impl LifecycleViews {
     fn here(&self) -> String {
         self.reads.terminals().map(|terminals| terminals.home().to_owned()).unwrap_or_default()
     }
-
-    /// Every home's record of every name of `kind`.
-    async fn objects(&self, kind: &str) -> Result<Vec<EngineObject>, String> {
-        match kind {
-            CLONE => {
-                let records = self.blocking(|reads| reads.clones()?.every()).await?;
-                newest_launches(records).into_iter().filter_map(|record| clone_object(record).transpose()).collect()
-            }
-            ENVIRONMENT => {
-                let records = self.blocking(|reads| reads.environments()?.every()).await?;
-                records.into_iter().filter_map(|record| environment_object(record).transpose()).collect()
-            }
-            CHECKOUT => {
-                let records = self.blocking(|reads| reads.checkouts()?.every()).await?;
-                newest_checkout_launches(records).into_iter().map(checkout_object).collect()
-            }
-            IMAGE_BUILD => Err(format!("{IMAGE_BUILD} is not read through the resource commands; {IMAGE_BUILDS_HELD_AS}")),
-            other => Err(format!("{other} is not served by the lifecycle views")),
-        }
-    }
 }
 
 impl std::fmt::Debug for LifecycleViews {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         formatter.debug_struct("LifecycleViews").finish_non_exhaustive()
+    }
+}
+
+/// A kind the lifecycle views serve.
+#[async_trait::async_trait]
+trait LifecycleKind: Resource + Sized {
+    /// The records its views are read from; none for a kind served only to refuse.
+    const SET: Option<RecordSet>;
+
+    /// Every home's record of every name.
+    async fn records(views: &LifecycleViews) -> Result<Vec<Record<Self>>, String>;
+
+    /// Why a write of `name` is refused.
+    fn written(name: &str) -> String {
+        format!("{} {name} is not written through the resource commands; {WRITTEN_BY}", Self::API_PATHS.kind)
+    }
+
+    /// Why a status write of `name` is refused.
+    fn status_written(name: &str) -> String {
+        format!("{} {name}'s status is the engine's lifecycle reading; {WRITTEN_BY}", Self::API_PATHS.kind)
+    }
+
+    /// Why a delete of `name` is refused.
+    fn deleted(name: &str) -> String {
+        format!("{} {name} is released with its vessels, not deleted; {WRITTEN_BY}", Self::API_PATHS.kind)
+    }
+}
+
+#[async_trait::async_trait]
+impl LifecycleKind for flotilla_resources::Clone {
+    const SET: Option<RecordSet> = Some(RecordSet::Clones);
+
+    async fn records(views: &LifecycleViews) -> Result<Vec<Record<Self>>, String> {
+        let records = views.blocking(|reads| reads.clones()?.every()).await?;
+        newest_launches(records).into_iter().filter_map(|record| clone_object(record).transpose()).collect()
+    }
+}
+
+#[async_trait::async_trait]
+impl LifecycleKind for Environment {
+    const SET: Option<RecordSet> = Some(RecordSet::Environments);
+
+    async fn records(views: &LifecycleViews) -> Result<Vec<Record<Self>>, String> {
+        let records = views.blocking(|reads| reads.environments()?.every()).await?;
+        records.into_iter().filter_map(|record| environment_object(record).transpose()).collect()
+    }
+}
+
+#[async_trait::async_trait]
+impl LifecycleKind for Checkout {
+    const SET: Option<RecordSet> = Some(RecordSet::Checkouts);
+
+    async fn records(views: &LifecycleViews) -> Result<Vec<Record<Self>>, String> {
+        let records = views.blocking(|reads| reads.checkouts()?.every()).await?;
+        newest_checkout_launches(records).into_iter().map(checkout_object).collect()
+    }
+}
+
+#[async_trait::async_trait]
+impl LifecycleKind for ImageBuild {
+    const SET: Option<RecordSet> = None;
+
+    async fn records(_: &LifecycleViews) -> Result<Vec<Record<Self>>, String> {
+        Err(format!("{} is not read through the resource commands; {IMAGE_BUILDS_HELD_AS}", Self::API_PATHS.kind))
+    }
+
+    fn written(name: &str) -> String {
+        format!("{} {name} is not written through the resource commands; {IMAGE_BUILDS_HELD_AS}", Self::API_PATHS.kind)
+    }
+
+    fn status_written(name: &str) -> String {
+        format!("{} {name}'s status is not written through the resource commands; {IMAGE_BUILDS_HELD_AS}", Self::API_PATHS.kind)
+    }
+
+    fn deleted(name: &str) -> String {
+        format!("{} {name} is not deleted through the resource commands; {IMAGE_BUILDS_HELD_AS}", Self::API_PATHS.kind)
     }
 }
 
@@ -124,7 +175,7 @@ fn newest_checkout_launches(records: Vec<CheckoutRecord>) -> Vec<CheckoutRecord>
 }
 
 /// `record`'s launch as its read view shows it, under the checkout's name.
-fn checkout_object(record: CheckoutRecord) -> Result<EngineObject, String> {
+fn checkout_object(record: CheckoutRecord) -> Result<Record<Checkout>, String> {
     let view = record.read_view();
     let mut object = object::<Checkout>(view.metadata.name, record.home, record.requested_at, view.spec, view.status)?;
     // A later launch showing the same spec and status is still a change.
@@ -148,7 +199,7 @@ fn cause(reading: &LifecycleReading) -> Option<String> {
 }
 
 /// `record`'s launch as the old Clone it shows: none once released.
-fn clone_object(record: CloneRecord) -> Result<Option<EngineObject>, String> {
+fn clone_object(record: CloneRecord) -> Result<Option<Record<flotilla_resources::Clone>>, String> {
     let phase = match &record.reading {
         LifecycleReading::Released => return Ok(None),
         LifecycleReading::InProgress | LifecycleReading::Retrying { .. } | LifecycleReading::Exhausted { .. } => ClonePhase::Cloning,
@@ -163,7 +214,7 @@ fn clone_object(record: CloneRecord) -> Result<Option<EngineObject>, String> {
 
 /// `record` as the old Environment it shows: none once released. Its identity reads as the
 /// backing it is realised under.
-fn environment_object(record: EnvironmentRecord) -> Result<Option<EngineObject>, String> {
+fn environment_object(record: EnvironmentRecord) -> Result<Option<Record<Environment>>, String> {
     let phase = match &record.reading {
         LifecycleReading::Released => return Ok(None),
         LifecycleReading::InProgress | LifecycleReading::Retrying { .. } | LifecycleReading::Exhausted { .. } => {
@@ -189,57 +240,55 @@ fn environment_object(record: EnvironmentRecord) -> Result<Option<EngineObject>,
     object::<Environment>(record.name, record.home, record.requested_at, record.spec, Some(status)).map(Some)
 }
 
-/// An old object of `spec` and `status`, created at `created_at`, its version a digest of what it
-/// shows, so a watcher sees each change.
+/// A record of `spec` and `status`, created at `created_at`, its version a digest of what it
+/// shows, so a watcher sees each change. The digest encodes what it shows; R4 replaces it with
+/// the record's log position.
 fn object<R: Resource>(
     name: String,
     home: String,
     created_at: chrono::DateTime<chrono::Utc>,
     spec: R::Spec,
     status: Option<R::Status>,
-) -> Result<EngineObject, String> {
-    let record = Record::<R> { name, home, version: 0, created_at, labels: BTreeMap::new(), annotations: BTreeMap::new(), spec, status };
-    let mut object = record.engine_object()?;
+) -> Result<Record<R>, String> {
+    let shown = |value: serde_json::Result<String>| value.map_err(|error| format!("{} {name}: {error}", R::API_PATHS.kind));
     let mut digest = std::hash::DefaultHasher::new();
-    (object.spec.to_string(), object.status.as_ref().map_or_else(|| "null".to_owned(), ToString::to_string)).hash(&mut digest);
-    object.version = digest.finish();
-    Ok(object)
+    (shown(serde_json::to_string(&spec))?, status.as_ref().map(|status| shown(serde_json::to_string(status))).transpose()?)
+        .hash(&mut digest);
+    Ok(Record { name, home, version: digest.finish(), created_at, labels: BTreeMap::new(), annotations: BTreeMap::new(), spec, status })
+}
+
+impl crate::EnginePort for LifecycleViews {
+    fn install(self: Arc<Self>, backend: &crate::ResourceBackend) {
+        backend.install_engine_kind::<flotilla_resources::Clone>(self.clone());
+        backend.install_engine_kind::<Environment>(self.clone());
+        backend.install_engine_kind::<Checkout>(self.clone());
+        backend.install_engine_kind::<ImageBuild>(self);
+    }
 }
 
 #[async_trait::async_trait]
-impl EngineRecords for LifecycleViews {
-    fn kinds(&self) -> &'static [&'static str] {
-        &[CLONE, ENVIRONMENT, CHECKOUT, IMAGE_BUILD]
+impl<R: LifecycleKind> KindRecords<R> for LifecycleViews {
+    fn codes(&self) -> Vec<flotilla_resources::engine_records::KindCode> {
+        R::SET.map_or_else(Vec::new, |set| flotilla_resources::lifecycle_reads::record_codes(self.reads.as_ref(), &[set]))
     }
 
-    fn codes(&self, kind: &str) -> Vec<flotilla_resources::engine_records::KindCode> {
-        use flotilla_resources::lifecycle_reads::{record_codes, RecordSet};
-        let set = match kind {
-            CLONE => RecordSet::Clones,
-            ENVIRONMENT => RecordSet::Environments,
-            CHECKOUT => RecordSet::Checkouts,
-            _ => return Vec::new(),
-        };
-        record_codes(self.reads.as_ref(), &[set])
-    }
-
-    fn reads(&self, kind: &str) -> bool {
-        kind != IMAGE_BUILD
+    fn reads(&self) -> bool {
+        R::SET.is_some()
     }
 
     fn home(&self) -> String {
         self.here()
     }
 
-    async fn get(&self, kind: &str, name: &str) -> Result<Option<EngineObject>, String> {
-        Ok(self.list(kind).await?.into_iter().find(|object| object.name == name))
+    async fn get(&self, name: &str) -> Result<Option<Record<R>>, String> {
+        Ok(KindRecords::<R>::list(self).await?.into_iter().find(|object| object.name == name))
     }
 
     /// Each name's record, this home's where it holds one, else the lexically first home's.
-    async fn list(&self, kind: &str) -> Result<Vec<EngineObject>, String> {
+    async fn list(&self) -> Result<Vec<Record<R>>, String> {
         let home = self.here();
-        let mut chosen = BTreeMap::<String, EngineObject>::new();
-        for object in self.objects(kind).await? {
+        let mut chosen = BTreeMap::<String, Record<R>>::new();
+        for object in R::records(self).await? {
             let keep = chosen.get(&object.name).is_some_and(|held| held.home == home || (object.home != home && held.home <= object.home));
             if !keep {
                 chosen.insert(object.name.clone(), object);
@@ -248,36 +297,26 @@ impl EngineRecords for LifecycleViews {
         Ok(chosen.into_values().collect())
     }
 
-    async fn sources(&self, kind: &str) -> Result<Vec<EngineObject>, String> {
-        self.objects(kind).await
+    async fn sources(&self) -> Result<Vec<Record<R>>, String> {
+        R::records(self).await
     }
 
     async fn apply(
         &self,
-        kind: &str,
         name: &str,
         _labels: &BTreeMap<String, String>,
         _annotations: &BTreeMap<String, String>,
-        _spec: serde_json::Value,
-    ) -> Result<EngineObject, String> {
-        if kind == IMAGE_BUILD {
-            return Err(format!("{kind} {name} is not written through the resource commands; {IMAGE_BUILDS_HELD_AS}"));
-        }
-        Err(format!("{kind} {name} is not written through the resource commands; {WRITTEN_BY}"))
+        _spec: &R::Spec,
+    ) -> Result<Record<R>, String> {
+        Err(R::written(name))
     }
 
-    async fn set_status(&self, kind: &str, name: &str, _status: serde_json::Value) -> Result<EngineObject, String> {
-        if kind == IMAGE_BUILD {
-            return Err(format!("{kind} {name}'s status is not written through the resource commands; {IMAGE_BUILDS_HELD_AS}"));
-        }
-        Err(format!("{kind} {name}'s status is the engine's lifecycle reading; {WRITTEN_BY}"))
+    async fn set_status(&self, name: &str, _status: &R::Status) -> Result<Record<R>, String> {
+        Err(R::status_written(name))
     }
 
-    async fn delete(&self, kind: &str, name: &str) -> Result<(), String> {
-        if kind == IMAGE_BUILD {
-            return Err(format!("{kind} {name} is not deleted through the resource commands; {IMAGE_BUILDS_HELD_AS}"));
-        }
-        Err(format!("{kind} {name} is released with its vessels, not deleted; {WRITTEN_BY}"))
+    async fn delete(&self, name: &str) -> Result<(), String> {
+        Err(R::deleted(name))
     }
 
     /// A tick at each clone, environment or checkout change at any home.

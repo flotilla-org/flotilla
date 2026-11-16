@@ -1,6 +1,6 @@
 //! FulfilmentKind on the engine, behind `[primitives]`.
 //!
-//! [`EngineKinds`] is the [`EngineRecords`] port of FulfilmentKind over the decided store. This
+//! [`EngineKinds`] is the [`KindRecords`] port of FulfilmentKind over the decided store. This
 //! home writes its own kinds through the plain-kind port; every home's are read from a resident map
 //! kept current by following the log.
 //!
@@ -21,13 +21,12 @@ use flotilla_engine_store::{
 use flotilla_resources::{
     definition_provenance::SEEDING_MANAGER,
     definitions::{origin, stamp},
-    engine_records::{decode_spec, EngineObject, EngineRecords, Record},
-    FulfilmentKind, CONVOY_LABEL, MANAGED_BY_LABEL, PLACEMENT_SNAPSHOT_KIND, PREPARED_SNAPSHOT_LABEL,
+    engine_records::{KindRecords, Record},
+    FulfilmentKind, FulfilmentKindSpec, CONVOY_LABEL, MANAGED_BY_LABEL, PLACEMENT_SNAPSHOT_KIND, PREPARED_SNAPSHOT_LABEL,
 };
 use flotilla_schema::{ChangeHeader, ChangeItem, Identity, Kind, KindCode, NewChange, Timestamp};
 use flotilla_schema_sqlite::{stream::Service, Read, ResourceId, StoreError};
 use futures::stream::BoxStream;
-use serde_json::Value;
 
 use super::provenance;
 use super::reads::created_at;
@@ -49,8 +48,8 @@ const WRITE_ATTEMPTS: usize = 3;
 /// The writer of a delete, which names no origin: the port deletes what its callers remove.
 const WRITER: &str = "kind-records";
 
-/// One home's record as the resident map holds it: the old object it reads as, or why it does not.
-type Held = Result<EngineObject, String>;
+/// One home's record as the resident map holds it.
+type Held = Record<FulfilmentKind>;
 
 /// Every home's records, by name and home.
 type Records = BTreeMap<(String, String), Held>;
@@ -107,7 +106,7 @@ fn stamps(read: &mut Read<'_>, roots: &mut provenance::Roots, name: &str, change
     }
 }
 
-/// Record `id` as the old object, with the stamps its last change says.
+/// Record `id` as the resource, with the stamps its last change says.
 fn object(
     read: &mut Read<'_>,
     roots: &mut provenance::Roots,
@@ -120,7 +119,7 @@ fn object(
     let change = read.last_change(id)?;
     let (labels, annotations) = stamps(read, roots, &name, change.as_ref())?;
     let created_at = created_at(read, id)?;
-    Ok(Record::<FulfilmentKind> { name, home, version, created_at, labels, annotations, spec: value.spec(), status: None }.engine_object())
+    Ok(Record { name, home, version, created_at, labels, annotations, spec: value.spec(), status: None })
 }
 
 fn reload(read: &mut Read<'_>, records: &mut Records, name: &str, home: &str) -> Result<(), StoreError> {
@@ -258,7 +257,7 @@ impl EngineKinds {
         labels: &BTreeMap<String, String>,
         annotations: &BTreeMap<String, String>,
         value: &FulfilmentKindDefinition,
-    ) -> Result<EngineObject, String> {
+    ) -> Result<Held, String> {
         for _ in 0..WRITE_ATTEMPTS {
             let change = PendingChange::joining(change_of(labels, annotations, &self.home, self.now())?);
             let written = match self.log.get::<FulfilmentKindDefinition>(name, &self.home).map_err(|error| error.to_string())? {
@@ -278,7 +277,7 @@ impl EngineKinds {
             match written {
                 Ok(version) => {
                     let created = self.log.created::<FulfilmentKindDefinition>(name, &self.home).map_err(|error| error.to_string())?;
-                    return Record::<FulfilmentKind> {
+                    return Ok(Record {
                         name: name.to_owned(),
                         home: self.home.clone(),
                         version,
@@ -287,8 +286,7 @@ impl EngineKinds {
                         annotations: annotations.clone(),
                         spec: value.spec(),
                         status: None,
-                    }
-                    .engine_object();
+                    });
                 }
                 Err(PlainError::Conflict { .. } | PlainError::Exists { .. } | PlainError::Missing { .. }) => continue,
                 Err(error) => return Err(format!("write {KIND} {name}: {error}")),
@@ -298,21 +296,15 @@ impl EngineKinds {
     }
 }
 
-fn refuse_kind(kind: &str) -> Result<(), String> {
-    if kind == KIND {
-        Ok(())
-    } else {
-        Err(format!("{kind} is not served by the fulfilment kind records"))
+impl flotilla_store::EnginePort for EngineKinds {
+    fn install(self: Arc<Self>, backend: &flotilla_store::ResourceBackend) {
+        backend.install_engine_kind::<FulfilmentKind>(self);
     }
 }
 
 #[async_trait::async_trait]
-impl EngineRecords for EngineKinds {
-    fn kinds(&self) -> &'static [&'static str] {
-        &[KIND]
-    }
-
-    fn codes(&self, _kind: &str) -> Vec<KindCode> {
+impl KindRecords<FulfilmentKind> for EngineKinds {
+    fn codes(&self) -> Vec<KindCode> {
         vec![CODE, ROOT]
     }
 
@@ -320,68 +312,50 @@ impl EngineRecords for EngineKinds {
         self.home.clone()
     }
 
-    async fn get(&self, kind: &str, name: &str) -> Result<Option<EngineObject>, String> {
-        refuse_kind(kind)?;
+    async fn get(&self, name: &str) -> Result<Option<Held>, String> {
         let resident = self.refresh()?;
-        resolve(&resident.records, &self.home, name).transpose()
+        Ok(resolve(&resident.records, &self.home, name))
     }
 
-    async fn list(&self, kind: &str) -> Result<Vec<EngineObject>, String> {
-        refuse_kind(kind)?;
+    async fn list(&self) -> Result<Vec<Held>, String> {
         let resident = self.refresh()?;
         let mut names: Vec<&String> = resident.records.keys().map(|(name, _)| name).collect();
         // The map orders by name, then home, so one name's homes are adjacent.
         names.dedup();
-        Ok(names
-            .into_iter()
-            .filter_map(|name| resolve(&resident.records, &self.home, name))
-            .filter_map(|held| held.map_err(|error| tracing::warn!(%error, "skipping a fulfilment kind that does not encode")).ok())
-            .collect())
+        Ok(names.into_iter().filter_map(|name| resolve(&resident.records, &self.home, name)).collect())
     }
 
-    async fn sources(&self, kind: &str) -> Result<Vec<EngineObject>, String> {
-        refuse_kind(kind)?;
+    async fn sources(&self) -> Result<Vec<Held>, String> {
         let resident = self.refresh()?;
-        Ok(resident
-            .records
-            .values()
-            .filter_map(|held| held.clone().map_err(|error| tracing::warn!(%error, "skipping a fulfilment kind that does not encode")).ok())
-            .collect())
+        Ok(resident.records.values().cloned().collect())
     }
 
     /// Every home's record `name`, read from the resident map by name.
-    async fn copies(&self, kind: &str, name: &str) -> Result<Vec<EngineObject>, String> {
-        refuse_kind(kind)?;
+    async fn copies(&self, name: &str) -> Result<Vec<Held>, String> {
         let resident = self.refresh()?;
         Ok(resident
             .records
             .range((name.to_owned(), String::new())..)
             .take_while(|((held, _), _)| held == name)
-            .filter_map(|(_, held)| {
-                held.clone().map_err(|error| tracing::warn!(%error, "skipping a fulfilment kind that does not encode")).ok()
-            })
+            .map(|(_, held)| held.clone())
             .collect())
     }
 
     async fn apply(
         &self,
-        kind: &str,
         name: &str,
         labels: &BTreeMap<String, String>,
         annotations: &BTreeMap<String, String>,
-        spec: Value,
-    ) -> Result<EngineObject, String> {
-        refuse_kind(kind)?;
-        let spec = decode_spec::<FulfilmentKind>(name, spec)?;
-        self.write(name, labels, annotations, &FulfilmentKindDefinition::new(&spec)?)
+        spec: &FulfilmentKindSpec,
+    ) -> Result<Held, String> {
+        self.write(name, labels, annotations, &FulfilmentKindDefinition::new(spec)?)
     }
 
-    async fn set_status(&self, kind: &str, name: &str, _status: Value) -> Result<EngineObject, String> {
-        Err(format!("{kind} {name}: a fulfilment kind has no status"))
+    async fn set_status(&self, name: &str, _status: &()) -> Result<Held, String> {
+        Err(format!("{KIND} {name}: a fulfilment kind has no status"))
     }
 
-    async fn delete(&self, kind: &str, name: &str) -> Result<(), String> {
-        refuse_kind(kind)?;
+    async fn delete(&self, name: &str) -> Result<(), String> {
         let Some(current) = self.log.get::<FulfilmentKindDefinition>(name, &self.home).map_err(|error| error.to_string())? else {
             return Ok(());
         };

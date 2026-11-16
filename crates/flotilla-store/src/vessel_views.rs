@@ -5,8 +5,8 @@
 //! held for it, its terminal sessions and its convoy's checkouts at its home. Nothing here writes:
 //! launches are requested and stepped through [`VesselRecords`] by their home.
 //!
-//! Installed as the backend's [`EngineRecords`] for `Vessel`, it serves the old store's typed
-//! reads, lists and watches of the kind; its writes are refused.
+//! Installed as the backend's [`KindRecords`] for `Vessel`, it serves the typed reads, lists and
+//! watches of the kind; its writes are refused.
 
 use std::{
     collections::{BTreeMap, BTreeSet},
@@ -19,12 +19,12 @@ use flotilla_protocol::{LifecycleReading, NodeId};
 use flotilla_resources::{
     checkout_records::{latest_launches, CheckoutChange, CheckoutHolder, CheckoutRecord},
     convoy_records::ConvoyChange,
-    engine_records::{EngineObject, EngineRecords},
+    engine_records::{KindRecords, Record},
     environment_records::{EnvironmentChange, EnvironmentRecord},
     lifecycle_reads::{ChangeCursor, LifecycleReads},
     terminal_records::{TerminalChange, TerminalRecord},
     vessel_records::{VesselChange, VesselJoins, VesselRecord, VesselRecords},
-    Convoy, ReadResourceObject, ReadWatchEvent, ResourceError, ResourceObject, ResourceProvenance, Vessel,
+    Convoy, ReadResourceObject, ReadWatchEvent, ResourceError, ResourceObject, ResourceProvenance, Vessel, VesselSpec, VesselStatus,
 };
 
 use crate::{
@@ -32,7 +32,6 @@ use crate::{
     ResourceBackend, WeakResourceBackend,
 };
 
-const KIND: &str = "Vessel";
 /// Where a vessel is seen, for a refused write.
 const EXPLAIN: &str = "see it with `flotilla convoy explain`";
 
@@ -79,7 +78,7 @@ struct Entry {
     /// What its convoy's checkouts are held for, while it is listed.
     holder: Option<CheckoutHolder>,
     /// Its view, while it is listed.
-    view: Option<EngineObject>,
+    view: Option<Record<Vessel>>,
 }
 
 /// What the changes since the last pass named. The records' changes are read from the log at each
@@ -221,7 +220,7 @@ impl VesselViews {
     /// homes' replicas of their home. A released launch is listed no more, as an old Vessel was
     /// deleted at its convoy's teardown; one that ended otherwise is listed while its convoy is
     /// live, its end shown.
-    async fn listed(&self) -> Result<Vec<EngineObject>, ResourceError> {
+    async fn listed(&self) -> Result<Vec<Record<Vessel>>, ResourceError> {
         let mut listing = self.listing.lock().await;
         let (mut dirt, watched) = {
             let mut held = self.dirt.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
@@ -361,7 +360,7 @@ impl VesselViews {
                 ResourceProvenance::Local => here.clone(),
                 ResourceProvenance::Replica { origin_root, .. } => origin_root.as_str().to_owned(),
             };
-            let view = engine_object(view, home).map_err(ResourceError::other)?;
+            let view = view_record(view, home).map_err(ResourceError::other)?;
             entries.push((work_of(&record), Entry { record, holder, view: Some(view) }));
         }
         entries.extend(hidden.into_iter().map(|record| (work_of(&record), Entry { record, holder: None, view: None })));
@@ -511,27 +510,29 @@ fn join(reads: &dyn LifecycleReads, record: &VesselRecord, holder: Option<&Check
     }
 }
 
-/// `source` as the engine port hands it to the old store: a change of the launch or of what it is
-/// joined with moves its version.
-fn engine_object(source: ReadResourceObject<Vessel>, home: String) -> Result<EngineObject, String> {
+/// `source` as the engine port hands it out: a change of the launch or of what it is joined with
+/// moves its version.
+fn view_record(source: ReadResourceObject<Vessel>, home: String) -> Result<Record<Vessel>, String> {
     crate::held_listing::view_object(source.object, home)
 }
 
-#[async_trait::async_trait]
-impl EngineRecords for VesselViews {
-    fn kinds(&self) -> &'static [&'static str] {
-        &[KIND]
+impl crate::EnginePort for VesselViews {
+    fn install(self: Arc<Self>, backend: &crate::ResourceBackend) {
+        backend.install_engine_kind::<Vessel>(self);
     }
+}
 
+#[async_trait::async_trait]
+impl KindRecords<Vessel> for VesselViews {
     /// The launches' kinds and those of everything their views join, the convoys among them.
-    fn codes(&self, _kind: &str) -> Vec<flotilla_resources::engine_records::KindCode> {
+    fn codes(&self) -> Vec<flotilla_resources::engine_records::KindCode> {
         use flotilla_resources::lifecycle_reads::{record_codes, RecordSet};
         let sets = [RecordSet::Vessels, RecordSet::Environments, RecordSet::Terminals, RecordSet::Checkouts, RecordSet::Convoys];
         record_codes(self.reads.as_ref(), &sets)
     }
 
     /// The notes of the convoys the views join.
-    fn unlogged_changes(&self, _kind: &str) -> Option<u64> {
+    fn unlogged_changes(&self) -> Option<u64> {
         Some(self.reads.convoys().map_or(0, |convoys| convoys.memory().changed()))
     }
 
@@ -539,46 +540,45 @@ impl EngineRecords for VesselViews {
         self.vessels().map(|vessels| vessels.home().to_owned()).unwrap_or_default()
     }
 
-    async fn get(&self, _kind: &str, name: &str) -> Result<Option<EngineObject>, String> {
+    async fn get(&self, name: &str) -> Result<Option<Record<Vessel>>, String> {
         let here = self.home();
         let Some(source) = self.find(name).await.map_err(|error| error.to_string())? else { return Ok(None) };
         let home = match &source.provenance {
             ResourceProvenance::Local => here,
             ResourceProvenance::Replica { origin_root, .. } => origin_root.as_str().to_owned(),
         };
-        engine_object(source, home).map(Some)
+        view_record(source, home).map(Some)
     }
 
     /// Each work's newest launch at each home; launch names are unique, so each is listed once.
-    async fn list(&self, _kind: &str) -> Result<Vec<EngineObject>, String> {
+    async fn list(&self) -> Result<Vec<Record<Vessel>>, String> {
         self.listed().await.map_err(|error| error.to_string())
     }
 
-    async fn sources(&self, _kind: &str) -> Result<Vec<EngineObject>, String> {
+    async fn sources(&self) -> Result<Vec<Record<Vessel>>, String> {
         self.listed().await.map_err(|error| error.to_string())
     }
 
     /// The one launch `name` names: launch names are unique across homes.
-    async fn copies(&self, kind: &str, name: &str) -> Result<Vec<EngineObject>, String> {
-        Ok(self.get(kind, name).await?.into_iter().collect())
+    async fn copies(&self, name: &str) -> Result<Vec<Record<Vessel>>, String> {
+        Ok(self.get(name).await?.into_iter().collect())
     }
 
     async fn apply(
         &self,
-        _kind: &str,
         name: &str,
         _labels: &BTreeMap<String, String>,
         _annotations: &BTreeMap<String, String>,
-        _spec: serde_json::Value,
-    ) -> Result<EngineObject, String> {
+        _spec: &VesselSpec,
+    ) -> Result<Record<Vessel>, String> {
         Err(format!("vessel {name} is launched by its convoy's home, not written; {EXPLAIN}"))
     }
 
-    async fn set_status(&self, _kind: &str, name: &str, _status: serde_json::Value) -> Result<EngineObject, String> {
+    async fn set_status(&self, name: &str, _status: &VesselStatus) -> Result<Record<Vessel>, String> {
         Err(format!("vessel {name}'s status is its launch's, not written; {EXPLAIN}"))
     }
 
-    async fn delete(&self, _kind: &str, name: &str) -> Result<(), String> {
+    async fn delete(&self, name: &str) -> Result<(), String> {
         Err(format!("vessel {name} is released by its home when its convoy no longer needs it, not deleted; {EXPLAIN}"))
     }
 

@@ -419,8 +419,9 @@ pub async fn replicated_ensure_is_not_reconciled_away_from_its_project_home(fact
     backend.using::<Project>("flotilla").delete("standing-project").await.expect("remove local project");
 
     // The Project and the ensure are homed at the remote root and reach this daemon through that home's log.
-    let spec = serde_json::to_value(&ensure.spec).expect("ensure spec");
-    other_home(&daemon, "remote-root").stamped_definition("ConvoyEnsure", "quartermaster", &ensure.metadata.annotations, spec).await;
+    other_home(&daemon, "remote-root")
+        .stamped_definition::<ConvoyEnsure>("quartermaster", &ensure.metadata.annotations, &ensure.spec)
+        .await;
     project_at_other_home(&daemon, "remote-root", &project).await;
 
     assert!(backend.definitions::<Project>("flotilla").get("standing-project").await.is_ok(), "replicated project should be visible");
@@ -597,7 +598,7 @@ pub async fn standing_ensure_admission_uses_default_branch_observed_only_on_non_
         (SOURCE_COMMIT_ANNOTATION.to_string(), "abc123".to_string()),
         (SOURCE_ENTRY_PATH_ANNOTATION.to_string(), "ops/cross-root.md".to_string()),
     ]);
-    root_a.stamped_definition("ConvoyEnsure", "cross-root", &stamps, serde_json::to_value(&ensure).expect("ensure spec")).await;
+    root_a.stamped_definition::<ConvoyEnsure>("cross-root", &stamps, &ensure).await;
     replicate_other_home(&daemon, "root-a");
 
     assert_eq!(
@@ -738,8 +739,7 @@ pub async fn off_home_driver_admits_an_ensure_from_replicated_project_definition
         home.project(&project.metadata.name, &project.metadata.labels, &project.metadata.annotations, &project.spec).await;
     }
     for workflow in home_backend.using::<WorkflowTemplate>("flotilla").list().await.expect("home workflows").items {
-        let spec = serde_json::to_value(&workflow.spec).expect("workflow spec");
-        home.stamped_definition("WorkflowTemplate", &workflow.metadata.name, &workflow.metadata.annotations, spec).await;
+        home.stamped_definition::<WorkflowTemplate>(&workflow.metadata.name, &workflow.metadata.annotations, &workflow.spec).await;
     }
     replicate_other_home(&driver, "home-root");
     for repository in home_backend.using::<Repository>("flotilla").list().await.expect("home repositories").items {

@@ -218,7 +218,7 @@ async fn message_routing_refuses_unknown_homes_and_finished_convoys() {
         .role("reviewer".into())
         .repositories(Vec::new())
         .build();
-    remote.definition("ConvoyEnsure", "waiting-reviewer", serde_json::to_value(&reviewer).expect("declaration")).await;
+    remote.definition::<flotilla_resources::ConvoyEnsure>("waiting-reviewer", &reviewer).await;
     remote.replicate_to(&decided);
     assert_eq!(
         daemon.message_creation_origin("flotilla", &document("flotilla/reviewer")).await.expect("remote declared absent holder"),

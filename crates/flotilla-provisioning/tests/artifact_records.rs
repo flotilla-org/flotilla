@@ -167,34 +167,29 @@ fn pump(from: &Service, from_home: &str, to: &Service, cursor: Option<u64>) -> u
 // listed as sources, and only this home's own copy is deleted here.
 #[tokio::test]
 async fn another_homes_artifacts_read_here_and_this_homes_own_win() {
-    use flotilla_resources::engine_records::EngineRecords;
+    use flotilla_resources::engine_records::{KindRecords, Record};
     let directory = tempfile::tempdir().expect("temp dir");
     let (zeta, zeta_records) = home(&directory, "zeta");
     let (beta, beta_records) = home(&directory, "beta");
     let put = |records: &Arc<EngineArtifacts>, name: &'static str, digest: &'static str| {
         let records = Arc::clone(records);
-        async move {
-            let value = serde_json::to_value(spec("demo", digest)).expect("spec");
-            records.apply("Artifact", name, &BTreeMap::new(), &BTreeMap::new(), value).await.expect("put")
-        }
+        async move { records.apply(name, &BTreeMap::new(), &BTreeMap::new(), &spec("demo", digest)).await.expect("put") }
     };
     put(&beta_records, "shared", "beta").await;
     put(&beta_records, "remote", "beta").await;
     put(&zeta_records, "shared", "zeta").await;
     let cursor = pump(&beta, "beta", &zeta, None);
 
-    let digest = |object: Option<flotilla_resources::engine_records::EngineObject>| {
-        object.map(|object| (object.home, object.spec["digest"].as_str().unwrap_or_default().to_owned()))
-    };
-    assert_eq!(digest(zeta_records.get("Artifact", "shared").await.expect("get")), Some(("zeta".into(), "zeta".into())));
-    assert_eq!(digest(zeta_records.get("Artifact", "remote").await.expect("get")), Some(("beta".into(), "beta".into())));
-    assert_eq!(zeta_records.list("Artifact").await.expect("list").len(), 2);
-    assert_eq!(zeta_records.sources("Artifact").await.expect("sources").len(), 3);
+    let digest = |object: Option<Record<Artifact>>| object.map(|object| (object.home, object.spec.digest));
+    assert_eq!(digest(zeta_records.get("shared").await.expect("get")), Some(("zeta".into(), "zeta".into())));
+    assert_eq!(digest(zeta_records.get("remote").await.expect("get")), Some(("beta".into(), "beta".into())));
+    assert_eq!(zeta_records.list().await.expect("list").len(), 2);
+    assert_eq!(zeta_records.sources().await.expect("sources").len(), 3);
 
-    zeta_records.delete("Artifact", "shared").await.expect("delete own");
-    zeta_records.delete("Artifact", "remote").await.expect("another home's copy is not this home's to delete");
-    assert_eq!(digest(zeta_records.get("Artifact", "shared").await.expect("get")), Some(("beta".into(), "beta".into())));
-    beta_records.delete("Artifact", "remote").await.expect("delete at its home");
+    zeta_records.delete("shared").await.expect("delete own");
+    zeta_records.delete("remote").await.expect("another home's copy is not this home's to delete");
+    assert_eq!(digest(zeta_records.get("shared").await.expect("get")), Some(("beta".into(), "beta".into())));
+    beta_records.delete("remote").await.expect("delete at its home");
     pump(&beta, "beta", &zeta, Some(cursor));
-    assert_eq!(zeta_records.get("Artifact", "remote").await.expect("get"), None);
+    assert_eq!(digest(zeta_records.get("remote").await.expect("get")), None);
 }

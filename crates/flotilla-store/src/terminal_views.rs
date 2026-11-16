@@ -5,8 +5,8 @@
 //! Vessel's convoy and labels and, at the launch's own home, with what that home observes of it.
 //! Nothing here writes: requests and renewals go through [`TerminalRecords`].
 //!
-//! Installed as the backend's [`EngineRecords`] for `TerminalSession`, it serves the old store's
-//! typed reads, lists and watches of the kind; its writes are refused.
+//! Installed as the backend's [`KindRecords`] for `TerminalSession`, it serves the typed reads,
+//! lists and watches of the kind; its writes are refused.
 
 use std::{
     collections::{BTreeMap, BTreeSet},
@@ -17,18 +17,16 @@ use futures::{stream::BoxStream, StreamExt};
 
 use flotilla_protocol::{LifecycleReading, NodeId};
 use flotilla_resources::{
-    engine_records::{EngineObject, EngineRecords},
+    engine_records::{KindRecords, Record},
     environment_records::{EnvironmentChange, EnvironmentRecord},
     lifecycle_reads::{ChangeCursor, LifecycleReads},
     terminal_records::{newest_launches, TerminalChange, TerminalHolderView, TerminalRecord, TerminalRecords},
     vessel_records::VesselChange,
     vessel_seats::VesselSeats,
-    ReadResourceObject, ResourceError, ResourceObject, ResourceProvenance, TerminalSession,
+    ReadResourceObject, ResourceError, ResourceObject, ResourceProvenance, TerminalSession, TerminalSessionSpec, TerminalSessionStatus,
 };
 
 use crate::held_listing::{drained, ticks};
-
-const KIND: &str = "TerminalSession";
 
 /// Read views of the terminal sessions in one namespace.
 ///
@@ -57,7 +55,7 @@ struct Listing {
 struct Entry {
     record: TerminalRecord,
     /// Its view, while it is listed: a released launch is not.
-    view: Option<EngineObject>,
+    view: Option<Record<TerminalSession>>,
     /// Whether its holder vessel could not be read when it was composed: its holder is unknown,
     /// not absent, so each pass composes it again until it is read.
     unresolved: bool,
@@ -154,12 +152,12 @@ impl TerminalViews {
 
     /// Each session's newest launch at every home, as the engine port lists it: this home's
     /// local, other homes' replicas of their home. A released launch is listed no more.
-    async fn listed(&self) -> Result<Vec<EngineObject>, ResourceError> {
+    async fn listed(&self) -> Result<Vec<Record<TerminalSession>>, ResourceError> {
         self.listed_where(|_| true).await
     }
 
-    /// The listed objects `keep` selects: only those are copied out of the listing.
-    async fn listed_where(&self, keep: impl Fn(&EngineObject) -> bool) -> Result<Vec<EngineObject>, ResourceError> {
+    /// The listed records `keep` selects: only those are copied out of the listing.
+    async fn listed_where(&self, keep: impl Fn(&Record<TerminalSession>) -> bool) -> Result<Vec<Record<TerminalSession>>, ResourceError> {
         let mut listing = self.listing.lock().await;
         let held = listing.cursors.take();
         let (cursors, dirt) = self
@@ -248,7 +246,7 @@ impl TerminalViews {
                 ResourceProvenance::Local => here.clone(),
                 ResourceProvenance::Replica { origin_root, .. } => origin_root.as_str().to_owned(),
             };
-            let view = engine_object(view, home).map_err(ResourceError::other)?;
+            let view = view_record(view, home).map_err(ResourceError::other)?;
             let unresolved = record.vessel.is_some() && !view.labels.contains_key(flotilla_resources::VESSEL_LABEL);
             entries.push(((record.home.clone(), record.session_name().to_owned()), Entry { record, view: Some(view), unresolved }));
         }
@@ -399,9 +397,9 @@ impl std::fmt::Debug for TerminalViews {
     }
 }
 
-/// `source` as the engine port hands it to the old store: a change of the launch or of what its
-/// home observes of it moves its version.
-fn engine_object(source: ReadResourceObject<TerminalSession>, home: String) -> Result<EngineObject, String> {
+/// `source` as the engine port hands it out: a change of the launch or of what its home observes
+/// of it moves its version.
+fn view_record(source: ReadResourceObject<TerminalSession>, home: String) -> Result<Record<TerminalSession>, String> {
     crate::held_listing::view_object(source.object, home)
 }
 
@@ -410,24 +408,26 @@ impl TerminalViews {
         self.reads.terminals()
     }
 
-    async fn engine_sources(&self) -> Result<Vec<EngineObject>, String> {
+    async fn engine_sources(&self) -> Result<Vec<Record<TerminalSession>>, String> {
         self.listed().await.map_err(|error| error.to_string())
     }
 }
 
-#[async_trait::async_trait]
-impl EngineRecords for TerminalViews {
-    fn kinds(&self) -> &'static [&'static str] {
-        &[KIND]
+impl crate::EnginePort for TerminalViews {
+    fn install(self: Arc<Self>, backend: &crate::ResourceBackend) {
+        backend.install_engine_kind::<TerminalSession>(self);
     }
+}
 
-    fn codes(&self, _kind: &str) -> Vec<flotilla_resources::engine_records::KindCode> {
+#[async_trait::async_trait]
+impl KindRecords<TerminalSession> for TerminalViews {
+    fn codes(&self) -> Vec<flotilla_resources::engine_records::KindCode> {
         use flotilla_resources::lifecycle_reads::{record_codes, RecordSet};
         record_codes(self.reads.as_ref(), &[RecordSet::Terminals, RecordSet::Environments, RecordSet::Vessels])
     }
 
     /// This home's observations of its launches.
-    fn unlogged_changes(&self, _kind: &str) -> Option<u64> {
+    fn unlogged_changes(&self) -> Option<u64> {
         Some(self.reads.terminals().map_or(0, |terminals| terminals.observations().changed()))
     }
 
@@ -437,7 +437,7 @@ impl EngineRecords for TerminalViews {
 
     /// This home's newest launch of `name`, read afresh so a home reads its own writes, else
     /// another home's as listed. A released launch reads as absent, as from a listing.
-    async fn get(&self, _kind: &str, name: &str) -> Result<Option<EngineObject>, String> {
+    async fn get(&self, name: &str) -> Result<Option<Record<TerminalSession>>, String> {
         let here = self.home();
         let owned = name.to_owned();
         let record = self.blocking(move |reads| reads.terminals()?.get(&owned, None)).await.map_err(|error| error.to_string())?;
@@ -446,7 +446,7 @@ impl EngineRecords for TerminalViews {
                 return Ok(None);
             }
             let view = self.compose(vec![record]).await.map_err(|error| error.to_string())?.pop();
-            return view.map(|view| engine_object(view, here)).transpose();
+            return view.map(|view| view_record(view, here)).transpose();
         }
         let named = self.listed_where(|object| object.name == name && object.home != here).await.map_err(|error| error.to_string())?;
         Ok(named.into_iter().min_by(|a, b| a.home.cmp(&b.home)))
@@ -454,9 +454,9 @@ impl EngineRecords for TerminalViews {
 
     /// Each session's newest launch, this home's where it holds one, else the lexically first
     /// home's.
-    async fn list(&self, _kind: &str) -> Result<Vec<EngineObject>, String> {
+    async fn list(&self) -> Result<Vec<Record<TerminalSession>>, String> {
         let home = self.home();
-        let mut chosen = BTreeMap::<String, EngineObject>::new();
+        let mut chosen = BTreeMap::<String, Record<TerminalSession>>::new();
         for object in self.engine_sources().await? {
             let keep = chosen.get(&object.name).is_some_and(|held| held.home == home || (object.home != home && held.home <= object.home));
             if !keep {
@@ -466,17 +466,17 @@ impl EngineRecords for TerminalViews {
         Ok(chosen.into_values().collect())
     }
 
-    async fn sources(&self, _kind: &str) -> Result<Vec<EngineObject>, String> {
+    async fn sources(&self) -> Result<Vec<Record<TerminalSession>>, String> {
         self.engine_sources().await
     }
 
     /// Every home's listed copy of `name`, and this home's newest launch of it however it ended.
-    async fn copies(&self, _kind: &str, name: &str) -> Result<Vec<EngineObject>, String> {
+    async fn copies(&self, name: &str) -> Result<Vec<Record<TerminalSession>>, String> {
         let here = self.home();
         let mut copies = self.listed_where(|object| object.name == name).await.map_err(|error| error.to_string())?;
         if !copies.iter().any(|object| object.home == here) {
             if let Some(found) = self.find(name, None).await.map_err(|error| error.to_string())? {
-                copies.push(engine_object(found, here)?);
+                copies.push(view_record(found, here)?);
             }
         }
         Ok(copies)
@@ -484,20 +484,19 @@ impl EngineRecords for TerminalViews {
 
     async fn apply(
         &self,
-        _kind: &str,
         name: &str,
         _labels: &BTreeMap<String, String>,
         _annotations: &BTreeMap<String, String>,
-        _spec: serde_json::Value,
-    ) -> Result<EngineObject, String> {
+        _spec: &TerminalSessionSpec,
+    ) -> Result<Record<TerminalSession>, String> {
         Err(format!("terminal session {name} is requested through the engine's terminal sessions, not written"))
     }
 
-    async fn set_status(&self, _kind: &str, name: &str, _status: serde_json::Value) -> Result<EngineObject, String> {
+    async fn set_status(&self, name: &str, _status: &TerminalSessionStatus) -> Result<Record<TerminalSession>, String> {
         Err(format!("terminal session {name}'s status is the engine's; it is not written"))
     }
 
-    async fn delete(&self, _kind: &str, name: &str) -> Result<(), String> {
+    async fn delete(&self, name: &str) -> Result<(), String> {
         Err(format!("terminal session {name} ends when its holder does; it is not deleted"))
     }
 

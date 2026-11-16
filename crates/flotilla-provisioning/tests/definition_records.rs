@@ -388,7 +388,7 @@ async fn an_apply_stamped_with_a_root_another_home_holds_is_refused() {
 // gone a new one is still woken.
 #[tokio::test]
 async fn watchers_of_the_definitions_share_one_follower_and_each_hears_a_write() {
-    use flotilla_resources::engine_records::EngineRecords;
+    use flotilla_resources::engine_records::KindRecords;
 
     let directory = tempfile::tempdir().expect("temp dir");
     let mut kinds = flotilla_schema::KindRegistry::new();
@@ -399,20 +399,21 @@ async fn watchers_of_the_definitions_share_one_follower_and_each_hears_a_write()
     let service = Arc::new(Service::open(&directory.path().join("decided.sqlite"), "alpha", kinds).expect("store"));
     let records = Arc::new(EngineDefinitions::open(service, Arc::new(SystemClock) as Arc<dyn Clock>).expect("open"));
     let backend = ResourceBackend::new(InMemoryBackend::default());
-    backend.install_engine_records(Arc::clone(&records) as Arc<dyn EngineRecords>);
+    backend.install_engine_records(Arc::clone(&records));
     let forges = backend.definitions::<Forge>(NS);
     async fn tick(stream: &mut futures::stream::BoxStream<'static, ()>) {
         tokio::time::timeout(Duration::from_secs(10), stream.next()).await.expect("a tick").expect("the stream stays open")
     }
+    let changes = || KindRecords::<Forge>::changes(&*records);
 
-    let mut first = records.changes().await.expect("first watcher");
-    let mut second = records.changes().await.expect("second watcher");
+    let mut first = changes().await.expect("first watcher");
+    let mut second = changes().await.expect("second watcher");
     forges.apply(&meta("lab", &DefinitionOrigin::Operator), &forge("lab")).await.expect("apply");
     tick(&mut first).await;
     tick(&mut second).await;
 
     drop((first, second));
-    let mut later = records.changes().await.expect("a watcher after the others went");
+    let mut later = changes().await.expect("a watcher after the others went");
     forges.apply(&meta("lab2", &DefinitionOrigin::Operator), &forge("lab2")).await.expect("apply");
     tick(&mut later).await;
 }

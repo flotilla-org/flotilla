@@ -1,6 +1,6 @@
 //! One engine port for a plain kind, behind `[primitives]`.
 //!
-//! [`PlainRecords`] is the [`EngineRecords`] port of a [`PlainKind`] over the decided store. Each
+//! [`PlainRecords`] is the [`KindRecords`] port of a [`PlainKind`] over the decided store. Each
 //! record is written at its home through the plain-kind port; every home's are read from a
 //! resident map kept current by following the log.
 
@@ -19,33 +19,32 @@ use flotilla_engine_store::{
     plain::{PendingChange, PlainError, PlainLog},
 };
 use flotilla_resources::{
-    engine_records::{decode_spec, EngineObject, EngineRecords, Record},
+    engine_records::{KindRecords, Record},
     Resource,
 };
 use flotilla_schema::{Kind, NewChange, Timestamp};
 use flotilla_schema_sqlite::{stream::Service, Read, StoreError};
 use futures::stream::BoxStream;
-use serde_json::Value;
 
 /// How often a write that loses a race to another writer of its name reads and tries again.
 const WRITE_ATTEMPTS: usize = 3;
 
-/// One home's record as the resident map holds it: the old object it reads as, or why it does not.
-pub type Held = Result<EngineObject, String>;
+/// One home's record as the resident map holds it: the resource it reads as, or why it does not.
+type Held<K> = Result<Record<<K as PlainKind>::Resource>, String>;
 
 /// Every home's records, by name and home.
-type Records = BTreeMap<(String, String), Held>;
+type Records<K> = BTreeMap<(String, String), Held<K>>;
 
-struct Resident {
+struct Resident<K: PlainKind> {
     follower: Follower,
-    records: Records,
+    records: Records<K>,
 }
 
 fn locked<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
     mutex.lock().unwrap_or_else(PoisonError::into_inner)
 }
 
-/// A plain kind served as old-store records.
+/// A plain kind served as resource records.
 pub trait PlainKind: Kind + PartialEq + Send + Sync + 'static {
     /// The resource kind it is served as.
     type Resource: Resource;
@@ -65,14 +64,14 @@ pub trait PlainKind: Kind + PartialEq + Send + Sync + 'static {
     fn from_spec(spec: <Self::Resource as Resource>::Spec) -> Result<Self, String>;
 }
 
-/// `record`, created at `created_at`, as the old object, with no status.
-fn object<K: PlainKind>(name: String, home: String, version: u64, created_at: DateTime<Utc>, record: &K) -> Held {
+/// `record`, created at `created_at`, as the resource, with no status.
+fn object<K: PlainKind>(name: String, home: String, version: u64, created_at: DateTime<Utc>, record: &K) -> Held<K> {
     let spec = record.spec().map_err(|error| format!("{} {name} at {home}: {error}", <K as Kind>::KIND))?;
     let labels = record.labels();
-    Record::<K::Resource> { name, home, version, created_at, labels, annotations: BTreeMap::new(), spec, status: None }.engine_object()
+    Ok(Record { name, home, version, created_at, labels, annotations: BTreeMap::new(), spec, status: None })
 }
 
-fn reload<K: PlainKind>(read: &mut Read<'_>, records: &mut Records, name: &str, home: &str) -> Result<(), StoreError> {
+fn reload<K: PlainKind>(read: &mut Read<'_>, records: &mut Records<K>, name: &str, home: &str) -> Result<(), StoreError> {
     let key = (name.to_owned(), home.to_owned());
     match read.resolve(K::CODE, name, home)?.map(|id| read.load::<K>(id)).transpose()?.flatten() {
         Some(loaded) => {
@@ -84,7 +83,7 @@ fn reload<K: PlainKind>(read: &mut Read<'_>, records: &mut Records, name: &str, 
     Ok(())
 }
 
-fn rescan<K: PlainKind>(read: &mut Read<'_>, records: &mut Records, home: &str) -> Result<(), StoreError> {
+fn rescan<K: PlainKind>(read: &mut Read<'_>, records: &mut Records<K>, home: &str) -> Result<(), StoreError> {
     records.retain(|(_, owner), _| owner != home);
     let mut after = None;
     loop {
@@ -104,7 +103,7 @@ fn rescan<K: PlainKind>(read: &mut Read<'_>, records: &mut Records, home: &str) 
 }
 
 /// `name`'s record as several homes' resolve at `home`: its own, else the lexically first home's.
-fn resolve(records: &Records, home: &str, name: &str) -> Option<Held> {
+fn resolve<K: PlainKind>(records: &Records<K>, home: &str, name: &str) -> Option<Held<K>> {
     let mut held = records.range((name.to_owned(), String::new())..).take_while(|((held, _), _)| held == name);
     let first = held.next()?;
     let chosen = std::iter::once(first).chain(held).find(|((_, owner), _)| owner == home).unwrap_or(first);
@@ -112,11 +111,11 @@ fn resolve(records: &Records, home: &str, name: &str) -> Option<Held> {
 }
 
 /// The records of one plain kind in the decided store at one home.
-pub struct PlainRecords<K> {
+pub struct PlainRecords<K: PlainKind> {
     service: Arc<Service>,
     home: String,
     log: PlainLog,
-    resident: Mutex<Resident>,
+    resident: Mutex<Resident<K>>,
     /// Whether the store has committed since the resident map was last brought up to it.
     commits: CommitsSeen,
     // One follower for every watcher of these records on this daemon.
@@ -142,7 +141,7 @@ impl<K: PlainKind> PlainRecords<K> {
             service,
             home,
             log,
-            resident: Mutex::new(Resident { follower: Follower::new([K::CODE]), records: Records::new() }),
+            resident: Mutex::new(Resident { follower: Follower::new([K::CODE]), records: Records::<K>::new() }),
             clock,
             kind: PhantomData,
         };
@@ -166,7 +165,7 @@ impl<K: PlainKind> PlainRecords<K> {
     }
 
     /// Brings the resident map up to the store: every entry written since the last refresh.
-    fn refresh(&self) -> Result<MutexGuard<'_, Resident>, String> {
+    fn refresh(&self) -> Result<MutexGuard<'_, Resident<K>>, String> {
         let mut resident = locked(&self.resident);
         if !self.commits.take() {
             return Ok(resident);
@@ -200,7 +199,7 @@ impl<K: PlainKind> PlainRecords<K> {
 
     /// Writes this home's record `name` as `value`, created or replaced, re-reading and trying
     /// again when another writer of the name wins the race.
-    fn write(&self, name: &str, value: &K) -> Result<EngineObject, String> {
+    fn write(&self, name: &str, value: &K) -> Held<K> {
         let mut lost = None;
         for _ in 0..WRITE_ATTEMPTS {
             let current = self.log.get::<K>(name, &self.home).map_err(|error| error.to_string())?;
@@ -222,21 +221,15 @@ impl<K: PlainKind> PlainRecords<K> {
     }
 }
 
-fn refuse_kind<K: PlainKind>(kind: &str) -> Result<(), String> {
-    if kind == K::KIND {
-        Ok(())
-    } else {
-        Err(format!("{kind} is not served by the {} records", K::KIND))
+impl<K: PlainKind> flotilla_store::EnginePort for PlainRecords<K> {
+    fn install(self: Arc<Self>, backend: &flotilla_store::ResourceBackend) {
+        backend.install_engine_kind::<K::Resource>(self);
     }
 }
 
 #[async_trait::async_trait]
-impl<K: PlainKind> EngineRecords for PlainRecords<K> {
-    fn kinds(&self) -> &'static [&'static str] {
-        &[K::KIND]
-    }
-
-    fn codes(&self, _kind: &str) -> Vec<flotilla_schema::KindCode> {
+impl<K: PlainKind> KindRecords<K::Resource> for PlainRecords<K> {
+    fn codes(&self) -> Vec<flotilla_schema::KindCode> {
         vec![K::CODE]
     }
 
@@ -244,27 +237,24 @@ impl<K: PlainKind> EngineRecords for PlainRecords<K> {
         self.home.clone()
     }
 
-    async fn get(&self, kind: &str, name: &str) -> Result<Option<EngineObject>, String> {
-        refuse_kind::<K>(kind)?;
+    async fn get(&self, name: &str) -> Result<Option<Record<K::Resource>>, String> {
         let resident = self.refresh()?;
-        resolve(&resident.records, &self.home, name).transpose()
+        resolve::<K>(&resident.records, &self.home, name).transpose()
     }
 
-    async fn list(&self, kind: &str) -> Result<Vec<EngineObject>, String> {
-        refuse_kind::<K>(kind)?;
+    async fn list(&self) -> Result<Vec<Record<K::Resource>>, String> {
         let resident = self.refresh()?;
         let mut names: Vec<&String> = resident.records.keys().map(|(name, _)| name).collect();
         // The map orders by name, then home, so one name's homes are adjacent.
         names.dedup();
         Ok(names
             .into_iter()
-            .filter_map(|name| resolve(&resident.records, &self.home, name))
+            .filter_map(|name| resolve::<K>(&resident.records, &self.home, name))
             .filter_map(|held| held.map_err(|error| tracing::warn!(%error, kind = K::KIND, "skipping a record that does not encode")).ok())
             .collect())
     }
 
-    async fn sources(&self, kind: &str) -> Result<Vec<EngineObject>, String> {
-        refuse_kind::<K>(kind)?;
+    async fn sources(&self) -> Result<Vec<Record<K::Resource>>, String> {
         let resident = self.refresh()?;
         Ok(resident
             .records
@@ -276,8 +266,7 @@ impl<K: PlainKind> EngineRecords for PlainRecords<K> {
     }
 
     /// Every home's record `name`, read from the resident map by name.
-    async fn copies(&self, kind: &str, name: &str) -> Result<Vec<EngineObject>, String> {
-        refuse_kind::<K>(kind)?;
+    async fn copies(&self, name: &str) -> Result<Vec<Record<K::Resource>>, String> {
         let resident = self.refresh()?;
         Ok(resident
             .records
@@ -291,23 +280,19 @@ impl<K: PlainKind> EngineRecords for PlainRecords<K> {
 
     async fn apply(
         &self,
-        kind: &str,
         name: &str,
         _labels: &BTreeMap<String, String>,
         _annotations: &BTreeMap<String, String>,
-        spec: Value,
-    ) -> Result<EngineObject, String> {
-        refuse_kind::<K>(kind)?;
-        self.write(name, &K::from_spec(decode_spec::<K::Resource>(name, spec)?)?)
+        spec: &<K::Resource as Resource>::Spec,
+    ) -> Result<Record<K::Resource>, String> {
+        self.write(name, &K::from_spec(spec.clone())?)
     }
 
-    async fn set_status(&self, kind: &str, name: &str, _status: Value) -> Result<EngineObject, String> {
-        refuse_kind::<K>(kind)?;
+    async fn set_status(&self, name: &str, _status: &<K::Resource as Resource>::Status) -> Result<Record<K::Resource>, String> {
         Err(format!("{} {name} keeps no status", K::KIND))
     }
 
-    async fn delete(&self, kind: &str, name: &str) -> Result<(), String> {
-        refuse_kind::<K>(kind)?;
+    async fn delete(&self, name: &str) -> Result<(), String> {
         let Some(current) = self.log.get::<K>(name, &self.home).map_err(|error| error.to_string())? else { return Ok(()) };
         match self.log.delete::<K>(name, current.version, &PendingChange::new(NewChange::new(K::WRITER, self.now()))) {
             Ok(()) | Err(PlainError::Missing { .. }) => Ok(()),

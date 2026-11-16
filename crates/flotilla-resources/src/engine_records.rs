@@ -1,34 +1,17 @@
-//! Old-store kinds served by the engine behind `[primitives]` (#3824 layers 2b-ii and 3).
+//! Resource kinds served by the engine (#3108).
 //!
-//! [`EngineRecords`] is one engine port as the old store's typed paths see it: each record as an
-//! old object's name, labels, annotations, spec and status, with the home that wrote it. The
-//! store installs ports on its backend by the kinds they serve, and its resolvers, queries and
-//! watches serve those kinds from them; each port maps the old shape onto its kind's records
-//! (an origin read from a definition's stamps, a repository's ops data from its annotations).
+//! [`KindRecords`] is one engine port for one resource kind: each record typed, with its name,
+//! labels, annotations and the home that wrote it. The store installs a port per kind on its
+//! backend, and its resolvers, queries and watches serve the kind from it; each port maps its
+//! kind's stored records onto the resource (an origin read from a definition's stamps, a
+//! repository's ops data from its annotations).
 
 use std::collections::BTreeMap;
 
 pub use flotilla_schema::KindCode;
 use futures::stream::BoxStream;
 
-/// One record as the old store's objects carry it: its spec and status as JSON.
-#[derive(Debug, Clone, PartialEq)]
-pub struct EngineObject {
-    pub name: String,
-    /// The home that wrote it, its only writer.
-    pub home: String,
-    /// The record's version at its home; it moves with each write.
-    pub version: u64,
-    /// When the record was created at its home: the time of the change that created it.
-    pub created_at: chrono::DateTime<chrono::Utc>,
-    pub labels: BTreeMap<String, String>,
-    pub annotations: BTreeMap<String, String>,
-    pub spec: serde_json::Value,
-    pub status: Option<serde_json::Value>,
-}
-
-/// One record of resource kind `R` as a port reads it: its spec and status typed.
-#[derive(Debug, Clone)]
+/// One record of resource kind `R` as a port reads it.
 pub struct Record<R: crate::Resource> {
     pub name: String,
     /// The home that wrote it, its only writer.
@@ -43,93 +26,90 @@ pub struct Record<R: crate::Resource> {
     pub status: Option<R::Status>,
 }
 
-impl<R: crate::Resource> Record<R> {
-    /// The record as an [`EngineObject`]: the one place a port's typed record becomes JSON.
-    pub fn engine_object(self) -> Result<EngineObject, String> {
-        let encode = |what: &str, error: serde_json::Error| format!("{} {} at {} {what}: {error}", R::API_PATHS.kind, self.name, self.home);
-        let spec = serde_json::to_value(&self.spec).map_err(|error| encode("spec", error))?;
-        let status = self.status.as_ref().map(serde_json::to_value).transpose().map_err(|error| encode("status", error))?;
-        Ok(EngineObject {
-            name: self.name,
-            home: self.home,
+impl<R: crate::Resource> std::fmt::Debug for Record<R> {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("Record")
+            .field("kind", &R::API_PATHS.kind)
+            .field("name", &self.name)
+            .field("home", &self.home)
+            .field("version", &self.version)
+            .field("created_at", &self.created_at)
+            .field("labels", &self.labels)
+            .field("annotations", &self.annotations)
+            .field("spec", &self.spec)
+            .field("status", &self.status)
+            .finish()
+    }
+}
+
+impl<R: crate::Resource> Clone for Record<R> {
+    fn clone(&self) -> Self {
+        Self {
+            name: self.name.clone(),
+            home: self.home.clone(),
             version: self.version,
             created_at: self.created_at,
-            labels: self.labels,
-            annotations: self.annotations,
-            spec,
-            status,
-        })
+            labels: self.labels.clone(),
+            annotations: self.annotations.clone(),
+            spec: self.spec.clone(),
+            status: self.status.clone(),
+        }
     }
 }
 
-/// `spec`, as an old object carries it, as resource kind `R`'s spec: the one place a port reads
-/// a written spec from JSON.
-pub fn decode_spec<R: crate::Resource>(name: &str, spec: serde_json::Value) -> Result<R::Spec, String> {
-    serde_json::from_value(spec).map_err(|error| format!("{} {name} spec: {error}", R::API_PATHS.kind))
-}
-
-/// `status`, as an old object carries it, as resource kind `R`'s status: the one place a port
-/// reads a written status from JSON.
-pub fn decode_status<R: crate::Resource>(name: &str, status: serde_json::Value) -> Result<R::Status, String> {
-    serde_json::from_value(status).map_err(|error| format!("{} {name} status: {error}", R::API_PATHS.kind))
-}
-
-/// An engine port serving old-store kinds, one kind at a time by its resource kind name. A name
-/// several homes hold reads as this home's record, else the lexically first home's; writes are
-/// this home's alone.
+/// An engine port serving resource kind `R`. A name several homes hold reads as this home's
+/// record, else the lexically first home's; writes are this home's alone.
 #[async_trait::async_trait]
-pub trait EngineRecords: Send + Sync + std::fmt::Debug {
-    /// The resource kinds this port serves.
-    fn kinds(&self) -> &'static [&'static str];
-    /// The stored kinds whose log entries can change `kind`'s records as this port reads them:
-    /// its own and every kind it joins or follows. A table's position counts only these.
-    fn codes(&self, kind: &str) -> Vec<KindCode>;
-    /// How many times `kind`'s records, as this port reads them, changed outside the log since
-    /// this home started: this home's state held in memory, lost on restart. Counted after each
-    /// change is in place, and each such change ticks [`EngineRecords::changes`]. `None` where
-    /// every change is in the log.
-    fn unlogged_changes(&self, _kind: &str) -> Option<u64> {
+pub trait KindRecords<R: crate::Resource>: Send + Sync + std::fmt::Debug {
+    /// The stored kinds whose log entries can change these records as this port reads them: the
+    /// kind's own and every kind it joins or follows. A table's position counts only these.
+    fn codes(&self) -> Vec<KindCode>;
+    /// How many times these records, as this port reads them, changed outside the log since this
+    /// home started: this home's state held in memory, lost on restart. Counted after each change
+    /// is in place, and each such change ticks [`KindRecords::changes`]. `None` where every change
+    /// is in the log.
+    fn unlogged_changes(&self) -> Option<u64> {
         None
     }
-    /// Whether `kind`'s records are read through this port; a kind it serves only to refuse
+    /// Whether the kind's records are read through this port; a kind it serves only to refuse
     /// holds none as resources, so lists in no namespace.
-    fn reads(&self, _kind: &str) -> bool {
+    fn reads(&self) -> bool {
         true
     }
     /// This home: the writer of the records it holds.
     fn home(&self) -> String;
-    /// `kind`'s record `name`, as several homes' resolve.
-    async fn get(&self, kind: &str, name: &str) -> Result<Option<EngineObject>, String>;
-    /// Every name of `kind`, each resolved as [`EngineRecords::get`].
-    async fn list(&self, kind: &str) -> Result<Vec<EngineObject>, String>;
-    /// Every home's record of every name of `kind`.
-    async fn sources(&self, kind: &str) -> Result<Vec<EngineObject>, String>;
-    /// Every home's record `name` of `kind`: those [`EngineRecords::sources`] lists, unless the
-    /// port can read one name alone.
-    async fn copies(&self, kind: &str, name: &str) -> Result<Vec<EngineObject>, String> {
-        Ok(self.sources(kind).await?.into_iter().filter(|record| record.name == name).collect())
+    /// The record `name`, as several homes' resolve.
+    async fn get(&self, name: &str) -> Result<Option<Record<R>>, String>;
+    /// Every name, each resolved as [`KindRecords::get`].
+    async fn list(&self) -> Result<Vec<Record<R>>, String>;
+    /// Every home's record of every name.
+    async fn sources(&self) -> Result<Vec<Record<R>>, String>;
+    /// Every home's record `name`: those [`KindRecords::sources`] lists, unless the port can read
+    /// one name alone.
+    async fn copies(&self, name: &str) -> Result<Vec<Record<R>>, String> {
+        Ok(self.sources().await?.into_iter().filter(|record| record.name == name).collect())
     }
-    /// Every home's open record of `kind` addressed to `receiver`, through the port's own index;
-    /// `None` when the port keeps none for `kind`, and readers filter [`EngineRecords::sources`].
-    async fn open_to(&self, _kind: &str, _receiver: &str) -> Option<Result<Vec<EngineObject>, String>> {
+    /// Every home's open record addressed to `receiver`, through the port's own index; `None`
+    /// when the port keeps none, and readers filter [`KindRecords::sources`].
+    async fn open_to(&self, _receiver: &str) -> Option<Result<Vec<Record<R>>, String>> {
         None
     }
-    /// Writes this home's record `name` of `kind` from an old object's metadata and spec: created,
-    /// or replaced, keeping its status. Stamps the kind does not keep are not kept.
+    /// Writes this home's record `name` from its metadata and spec: created, or replaced, keeping
+    /// its status. Stamps the kind does not keep are not kept.
     async fn apply(
         &self,
-        kind: &str,
         name: &str,
         labels: &BTreeMap<String, String>,
         annotations: &BTreeMap<String, String>,
-        spec: serde_json::Value,
-    ) -> Result<EngineObject, String>;
+        spec: &R::Spec,
+    ) -> Result<Record<R>, String>;
     /// Replaces this home's record's status; refused for a kind with none.
-    async fn set_status(&self, kind: &str, name: &str, status: serde_json::Value) -> Result<EngineObject, String>;
-    /// Deletes this home's record `name` of `kind`; absent is done. Another home's copy still reads.
-    async fn delete(&self, kind: &str, name: &str) -> Result<(), String>;
-    /// A tick for each pass that found any home's records of these kinds changed since the pass
-    /// before, from the moment it is called; watchers read the records again on each.
+    async fn set_status(&self, name: &str, status: &R::Status) -> Result<Record<R>, String>;
+    /// Deletes this home's record `name`; absent is done. Another home's copy still reads.
+    async fn delete(&self, name: &str) -> Result<(), String>;
+    /// A tick for each pass that found any home's records changed since the pass before, from
+    /// the moment it is called; watchers read the records again on each.
     async fn changes(&self) -> Result<BoxStream<'static, ()>, String>;
 }
 

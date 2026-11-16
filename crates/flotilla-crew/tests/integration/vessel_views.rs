@@ -4,7 +4,7 @@ use std::sync::Arc;
 
 use flotilla_engine_convoys_testkit::{convoy, single_agent, EngineConvoysHome};
 use flotilla_provisioning_testkit::{EngineFixture, OtherHome};
-use flotilla_resources::{engine_records::EngineRecords, vessel_records::VesselStep, Convoy, ConvoySpec, SystemClock, Vessel};
+use flotilla_resources::{engine_records::KindRecords, vessel_records::VesselStep, Convoy, ConvoySpec, SystemClock, Vessel};
 use flotilla_store::{ResourceBackend, VesselViews};
 use flotilla_store_memory::InMemoryBackend;
 

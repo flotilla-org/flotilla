@@ -1,6 +1,6 @@
 //! ChangeRequest and Issue on the engine, behind `[primitives]`.
 //!
-//! [`EngineObservations`] is the [`EngineRecords`] port of both kinds over the decided store. The
+//! [`EngineObservations`] is the [`KindRecords`] port of both kinds over the decided store. The
 //! source's observer writes its record at its own home, only when an observed value changes; every
 //! home's are read from a resident map kept current by following the log. A value's age is a
 //! judgement made when it is read: a record holds no observation times, so its values were last
@@ -25,16 +25,12 @@ use flotilla_engine_store::{
 };
 use flotilla_resources::{
     address::record_name,
-    engine_records::{
-        decode_spec, decode_status, BranchChangeRequest, ChangeRequestBranches, EngineObject, EngineRecords, ObservationFailures, Record,
-        SourceObservers,
-    },
+    engine_records::{BranchChangeRequest, ChangeRequestBranches, KindRecords, ObservationFailures, Record, SourceObservers},
     ChangeRequest, ChangeRequestSpec, ChangeRequestStatus, Issue, IssueSpec, IssueStatus, Resource,
 };
 use flotilla_schema::{Kind, KindCode, NewChange, Timestamp};
 use flotilla_schema_sqlite::{stream::Service, Read, ResourceId, StoreError};
 use futures::stream::BoxStream;
-use serde_json::Value;
 
 use super::reads::created_at;
 use super::watch::CommitsSeen;
@@ -86,6 +82,15 @@ trait Observed: Kind + PartialEq + Clone {
     type Status;
     /// The resource kind it is served as.
     type Resource: Resource<Spec = Self::Spec, Status = Self::Status>;
+    /// The resource kind's name.
+    const NAME: &'static str;
+
+    /// The record `held` holds, when it is of this kind.
+    fn of_held(held: &Held) -> Option<&Self>;
+    /// The spec the record reads as at `home`.
+    fn spec_at(&self, home: &str) -> Self::Spec;
+    /// The status the record reads as, its values last confirmed at `confirmed`.
+    fn status_at(&self, confirmed: DateTime<Utc>) -> Result<Self::Status, String>;
 
     /// The source `(service, scope)` `spec` names.
     fn spec_source(spec: &Self::Spec) -> (&str, &str);
@@ -105,6 +110,22 @@ impl Observed for ChangeRequestRecord {
     type Spec = ChangeRequestSpec;
     type Status = ChangeRequestStatus;
     type Resource = ChangeRequest;
+    const NAME: &'static str = CHANGE_REQUEST;
+
+    fn of_held(held: &Held) -> Option<&Self> {
+        match held {
+            Held::ChangeRequest(_, _, record) => Some(record),
+            Held::Issue(..) => None,
+        }
+    }
+
+    fn spec_at(&self, home: &str) -> ChangeRequestSpec {
+        self.old_spec(home)
+    }
+
+    fn status_at(&self, confirmed: DateTime<Utc>) -> Result<ChangeRequestStatus, String> {
+        Ok(self.old_status(confirmed))
+    }
 
     fn spec_source(spec: &ChangeRequestSpec) -> (&str, &str) {
         (&spec.service, &spec.scope)
@@ -150,6 +171,22 @@ impl Observed for IssueRecord {
     type Spec = IssueSpec;
     type Status = IssueStatus;
     type Resource = Issue;
+    const NAME: &'static str = ISSUE;
+
+    fn of_held(held: &Held) -> Option<&Self> {
+        match held {
+            Held::Issue(_, _, record) => Some(record),
+            Held::ChangeRequest(..) => None,
+        }
+    }
+
+    fn spec_at(&self, home: &str) -> IssueSpec {
+        self.old_spec(home)
+    }
+
+    fn status_at(&self, confirmed: DateTime<Utc>) -> Result<IssueStatus, String> {
+        self.old_status(confirmed)
+    }
 
     fn spec_source(spec: &IssueSpec) -> (&str, &str) {
         (&spec.service, &spec.scope)
@@ -181,6 +218,22 @@ impl Observed for IssueRecord {
         Self { failing_since: Some(since), ..self }
     }
 }
+
+/// The observation record a resource kind is stored as.
+trait ObservedAs: Resource {
+    type Record: Observed<Resource = Self, Spec = <Self as Resource>::Spec, Status = <Self as Resource>::Status>;
+}
+
+impl ObservedAs for ChangeRequest {
+    type Record = ChangeRequestRecord;
+}
+
+impl ObservedAs for Issue {
+    type Record = IssueRecord;
+}
+
+/// A record with when its values were last confirmed.
+type Confirmed<R> = (DateTime<Utc>, Record<R>);
 
 /// Every home's records, by kind, name and home.
 type Records = BTreeMap<(&'static str, String, String), Held>;
@@ -352,11 +405,10 @@ impl EngineObservations {
     }
 
     /// Writes this home's record `name` of `K` from `spec`, as its observer.
-    async fn apply_observed<K: Observed>(&self, kind: &'static str, name: &str, spec: Value) -> Result<EngineObject, String> {
-        let spec = decode_spec::<K::Resource>(name, spec)?;
-        K::check_name(name, &spec)?;
-        self.observer_write(kind, name, K::spec_source(&spec)).await?;
-        self.apply_as::<K>(kind, name, &spec)
+    async fn apply_observed<K: Observed>(&self, name: &str, spec: &K::Spec) -> Result<Record<K::Resource>, String> {
+        K::check_name(name, spec)?;
+        self.observer_write(K::NAME, name, K::spec_source(spec)).await?;
+        self.apply_as::<K>(name, spec)
     }
 
     /// Brings the resident map up to the store: every entry written since the last refresh.
@@ -408,39 +460,28 @@ impl EngineObservations {
         at.to_datetime().unwrap_or(DateTime::UNIX_EPOCH)
     }
 
-    /// `held` as the old object, and when its values were last confirmed.
-    fn object(&self, name: &str, home: &str, held: &Held) -> Result<(DateTime<Utc>, EngineObject), String> {
+    /// `held` as the resource, and when its values were last confirmed.
+    fn object<K: Observed>(&self, name: &str, home: &str, held: &Held) -> Result<Confirmed<K::Resource>, String> {
+        let record = K::of_held(held).ok_or_else(|| format!("{name} at {home} is not a {}", K::NAME))?;
         let confirmed = self.confirmed_at(home, held.failing_since());
-        let object = match held {
-            Held::ChangeRequest(version, _, record) => Record::<ChangeRequest> {
-                name: name.to_owned(),
-                home: home.to_owned(),
-                version: *version,
-                created_at: held.created(),
-                labels: BTreeMap::new(),
-                annotations: BTreeMap::new(),
-                spec: record.old_spec(home),
-                status: Some(record.old_status(confirmed)),
-            }
-            .engine_object()?,
-            Held::Issue(version, _, record) => Record::<Issue> {
-                name: name.to_owned(),
-                home: home.to_owned(),
-                version: *version,
-                created_at: held.created(),
-                labels: BTreeMap::new(),
-                annotations: BTreeMap::new(),
-                spec: record.old_spec(home),
-                status: Some(record.old_status(confirmed).map_err(|error| format!("{name} at {home}: {error}"))?),
-            }
-            .engine_object()?,
+        let status = record.status_at(confirmed).map_err(|error| format!("{name} at {home}: {error}"))?;
+        let object = Record {
+            name: name.to_owned(),
+            home: home.to_owned(),
+            version: held.version(),
+            created_at: held.created(),
+            labels: BTreeMap::new(),
+            annotations: BTreeMap::new(),
+            spec: record.spec_at(home),
+            status: Some(status),
         };
         Ok((confirmed, object))
     }
 
-    /// Every home's copy of `kind`'s records, or of its record `name` alone, as objects with when
-    /// each was last confirmed. A record that does not encode is reported once and not read.
-    fn copies(&self, kind: &'static str, name: Option<&str>) -> Result<Vec<(DateTime<Utc>, EngineObject)>, String> {
+    /// Every home's copy of `K`'s records, or of its record `name` alone, with when each was last
+    /// confirmed. A record that does not encode is reported once and not read.
+    fn copies_of<K: Observed>(&self, name: Option<&str>) -> Result<Vec<Confirmed<K::Resource>>, String> {
+        let kind = K::NAME;
         let mut resident = self.refresh()?;
         let Resident { records, warned, .. } = &mut *resident;
         let held = match name {
@@ -455,7 +496,7 @@ impl EngineObservations {
         };
         let mut copies = Vec::with_capacity(held.len());
         for ((_, name, home), held) in held {
-            match self.object(name, home, held) {
+            match self.object::<K>(name, home, held) {
                 Ok(copy) => copies.push(copy),
                 Err(error) => {
                     if warned.insert((kind, name.clone(), home.clone(), held.version())) {
@@ -468,8 +509,8 @@ impl EngineObservations {
     }
 
     /// Each name's copy as several homes' resolve: the most recently confirmed, this home's on a tie.
-    fn resolve(&self, copies: Vec<(DateTime<Utc>, EngineObject)>) -> BTreeMap<String, EngineObject> {
-        let mut by_name = BTreeMap::<String, (DateTime<Utc>, EngineObject)>::new();
+    fn resolve<R: Resource>(&self, copies: Vec<Confirmed<R>>) -> BTreeMap<String, Record<R>> {
+        let mut by_name = BTreeMap::<String, Confirmed<R>>::new();
         for (at, copy) in copies {
             match by_name.get(&copy.name) {
                 Some((prior_at, prior)) if (*prior_at, prior.home == self.home) >= (at, copy.home == self.home) => {}
@@ -491,25 +532,24 @@ impl EngineObservations {
         written.map_err(|error| format!("write {} {name}: {error}", K::KIND))
     }
 
-    fn apply_as<K: Observed>(&self, kind: &'static str, name: &str, spec: &K::Spec) -> Result<EngineObject, String> {
+    fn apply_as<K: Observed>(&self, name: &str, spec: &K::Spec) -> Result<Record<K::Resource>, String> {
         let current = self.log.get::<K>(name, &self.home).map_err(|error| error.to_string())?.map(|current| current.spec);
         self.write(name, &K::of_subject(current, spec))?;
-        self.written(kind, name)
+        self.written::<K>(name)
     }
 
-    fn set_status_as<K: Observed>(&self, kind: &'static str, name: &str, status: Value) -> Result<EngineObject, String> {
-        let status = decode_status::<K::Resource>(name, status)?;
+    fn set_status_as<K: Observed>(&self, name: &str, status: &K::Status) -> Result<Record<K::Resource>, String> {
         let current = self.log.get::<K>(name, &self.home).map_err(|error| error.to_string())?;
-        let current = current.ok_or_else(|| format!("{kind} {name} is not held at {}", self.home))?;
-        self.write(name, &current.spec.observed(&self.home, &status))?;
-        self.written(kind, name)
+        let current = current.ok_or_else(|| format!("{} {name} is not held at {}", K::NAME, self.home))?;
+        self.write(name, &current.spec.observed(&self.home, status))?;
+        self.written::<K>(name)
     }
 
-    fn delete_as<K: Observed>(&self, kind: &'static str, name: &str) -> Result<(), String> {
+    fn delete_as<K: Observed>(&self, name: &str) -> Result<(), String> {
         let Some(current) = self.log.get::<K>(name, &self.home).map_err(|error| error.to_string())? else { return Ok(()) };
         match self.log.delete::<K>(name, current.version, &self.change()) {
             Ok(()) | Err(PlainError::Missing { .. }) => Ok(()),
-            Err(error) => Err(format!("delete {kind} {name}: {error}")),
+            Err(error) => Err(format!("delete {} {name}: {error}", K::NAME)),
         }
     }
 
@@ -521,76 +561,66 @@ impl EngineObservations {
         Ok(())
     }
 
-    fn written(&self, kind: &'static str, name: &str) -> Result<EngineObject, String> {
+    fn written<K: Observed>(&self, name: &str) -> Result<Record<K::Resource>, String> {
         let resident = self.refresh()?;
-        let held =
-            resident.records.get(&(kind, name.to_owned(), self.home.clone())).ok_or_else(|| format!("{kind} {name} was not written"))?;
-        self.object(name, &self.home, held).map(|(_, object)| object)
+        let held = resident
+            .records
+            .get(&(K::NAME, name.to_owned(), self.home.clone()))
+            .ok_or_else(|| format!("{} {name} was not written", K::NAME))?;
+        self.object::<K>(name, &self.home, held).map(|(_, object)| object)
+    }
+}
+
+impl flotilla_store::EnginePort for EngineObservations {
+    fn install(self: Arc<Self>, backend: &flotilla_store::ResourceBackend) {
+        backend.install_engine_kind::<ChangeRequest>(self.clone());
+        backend.install_engine_kind::<Issue>(self);
     }
 }
 
 #[async_trait::async_trait]
-impl EngineRecords for EngineObservations {
-    fn kinds(&self) -> &'static [&'static str] {
-        &[CHANGE_REQUEST, ISSUE]
-    }
-
-    fn codes(&self, kind: &str) -> Vec<KindCode> {
-        vec![if kind == CHANGE_REQUEST { CHANGE_REQUEST_CODE } else { ISSUE_CODE }]
+impl<R: ObservedAs> KindRecords<R> for EngineObservations {
+    fn codes(&self) -> Vec<KindCode> {
+        vec![R::Record::CODE]
     }
 
     fn home(&self) -> String {
         self.home.clone()
     }
 
-    async fn get(&self, kind: &str, name: &str) -> Result<Option<EngineObject>, String> {
-        Ok(self.resolve(self.copies(kind_of(kind)?, Some(name))?).into_values().next())
+    async fn get(&self, name: &str) -> Result<Option<Record<R>>, String> {
+        Ok(self.resolve(self.copies_of::<R::Record>(Some(name))?).into_values().next())
     }
 
-    async fn list(&self, kind: &str) -> Result<Vec<EngineObject>, String> {
-        Ok(self.resolve(self.copies(kind_of(kind)?, None)?).into_values().collect())
+    async fn list(&self) -> Result<Vec<Record<R>>, String> {
+        Ok(self.resolve(self.copies_of::<R::Record>(None)?).into_values().collect())
     }
 
-    async fn sources(&self, kind: &str) -> Result<Vec<EngineObject>, String> {
-        Ok(self.copies(kind_of(kind)?, None)?.into_iter().map(|(_, copy)| copy).collect())
+    async fn sources(&self) -> Result<Vec<Record<R>>, String> {
+        Ok(self.copies_of::<R::Record>(None)?.into_iter().map(|(_, copy)| copy).collect())
     }
 
-    async fn copies(&self, kind: &str, name: &str) -> Result<Vec<EngineObject>, String> {
-        Ok(EngineObservations::copies(self, kind_of(kind)?, Some(name))?.into_iter().map(|(_, copy)| copy).collect())
+    async fn copies(&self, name: &str) -> Result<Vec<Record<R>>, String> {
+        Ok(self.copies_of::<R::Record>(Some(name))?.into_iter().map(|(_, copy)| copy).collect())
     }
 
     async fn apply(
         &self,
-        kind: &str,
         name: &str,
         _labels: &BTreeMap<String, String>,
         _annotations: &BTreeMap<String, String>,
-        spec: Value,
-    ) -> Result<EngineObject, String> {
-        match kind_of(kind)? {
-            CHANGE_REQUEST => self.apply_observed::<ChangeRequestRecord>(CHANGE_REQUEST, name, spec).await,
-            _ => self.apply_observed::<IssueRecord>(ISSUE, name, spec).await,
-        }
+        spec: &R::Spec,
+    ) -> Result<Record<R>, String> {
+        self.apply_observed::<R::Record>(name, spec).await
     }
 
-    async fn set_status(&self, kind: &str, name: &str, status: Value) -> Result<EngineObject, String> {
-        match kind_of(kind)? {
-            CHANGE_REQUEST => {
-                self.observer_rewrite::<ChangeRequestRecord>(CHANGE_REQUEST, name).await?;
-                self.set_status_as::<ChangeRequestRecord>(CHANGE_REQUEST, name, status)
-            }
-            _ => {
-                self.observer_rewrite::<IssueRecord>(ISSUE, name).await?;
-                self.set_status_as::<IssueRecord>(ISSUE, name, status)
-            }
-        }
+    async fn set_status(&self, name: &str, status: &R::Status) -> Result<Record<R>, String> {
+        self.observer_rewrite::<R::Record>(R::Record::NAME, name).await?;
+        self.set_status_as::<R::Record>(name, status)
     }
 
-    async fn delete(&self, kind: &str, name: &str) -> Result<(), String> {
-        match kind_of(kind)? {
-            CHANGE_REQUEST => self.delete_as::<ChangeRequestRecord>(CHANGE_REQUEST, name),
-            _ => self.delete_as::<IssueRecord>(ISSUE, name),
-        }
+    async fn delete(&self, name: &str) -> Result<(), String> {
+        self.delete_as::<R::Record>(name)
     }
 
     async fn changes(&self) -> Result<BoxStream<'static, ()>, String> {

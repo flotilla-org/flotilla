@@ -488,13 +488,13 @@ pub(super) async fn daemon_with_decided_store(
         hosts::EngineHosts, kinds::EngineKinds, manifest_root::EngineManifestRoots, observations::EngineObservations,
         projects::EngineProjects, repositories::EngineRepositories,
     };
-    use flotilla_resources::engine_records::EngineRecords;
+    use flotilla_store::EnginePort;
     let tmp = tempfile::tempdir().expect("tempdir");
     let config = test_config_store(tmp.path().join("config"));
     let engine: flotilla_core::in_process::EngineOpener = Box::new(move |identity: flotilla_core::in_process::EngineIdentity| {
         Box::pin(async move {
             let clock = || Arc::clone(&identity.clock);
-            let records: Vec<Arc<dyn EngineRecords>> = vec![
+            let records: Vec<Arc<dyn EnginePort>> = vec![
                 Arc::new(EngineDefinitions::open(Arc::clone(&store), clock())?),
                 Arc::new(EngineRepositories::open(Arc::clone(&store), clock())?),
                 Arc::new(EngineProjects::open(Arc::clone(&store), clock())?),

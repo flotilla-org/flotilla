@@ -24,8 +24,8 @@ use flotilla_protocol::{HostName, IssueSource, Relationship, Subject, SubjectKin
 use flotilla_provisioning::engine::observations::EngineObservations;
 use flotilla_provisioning_testkit::other_home::OtherHome;
 use flotilla_resources::{
-    engine_records::EngineRecords, ChangeRequestReviewObservation, ChangeRequestSpec, ChangeRequestStatus, Convoy, ConvoyEnsure,
-    ConvoyEnsureSpec, ConvoySpec, DeclaredSubject, HostSpec, HostStatus, InputMeta, IssueSourceBindingSpec, Observation,
+    engine_records::KindRecords, ChangeRequest, ChangeRequestReviewObservation, ChangeRequestSpec, ChangeRequestStatus, Convoy,
+    ConvoyEnsure, ConvoyEnsureSpec, ConvoySpec, DeclaredSubject, HostSpec, HostStatus, InputMeta, IssueSourceBindingSpec, Observation,
     ObservedChangeRequestState, ProjectSpec, SystemClock, ENSURED_FROM_ANNOTATION,
 };
 use flotilla_schema_sqlite::stream::Service;
@@ -174,14 +174,13 @@ impl RemoteObserver {
             .number(42)
             .observing_authority("remote".into())
             .build();
-        let spec = serde_json::to_value(spec).expect("spec");
-        self.records.apply("ChangeRequest", &cr_name(), &Default::default(), &Default::default(), spec).await.expect("observed");
-        let status = serde_json::to_value(status(title, time)).expect("status");
-        self.records.set_status("ChangeRequest", &cr_name(), status).await.expect("observed status");
+        let records: &dyn KindRecords<ChangeRequest> = &self.records;
+        records.apply(&cr_name(), &Default::default(), &Default::default(), &spec).await.expect("observed");
+        records.set_status(&cr_name(), &status(title, time)).await.expect("observed status");
         self.home.replicate_to(&self.daemon);
     }
     async fn forget(&self) {
-        self.records.delete("ChangeRequest", &cr_name()).await.expect("forgotten");
+        KindRecords::<ChangeRequest>::delete(&self.records, &cr_name()).await.expect("forgotten");
         self.home.replicate_to(&self.daemon);
     }
 }

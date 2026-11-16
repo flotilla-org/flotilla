@@ -1,6 +1,6 @@
 //! Host on the engine, behind `[primitives]`.
 //!
-//! [`EngineHosts`] is the [`EngineRecords`] port of Host over the decided store. A Host is two plain
+//! [`EngineHosts`] is the [`KindRecords`] port of Host over the decided store. A Host is two plain
 //! records homed at the daemon that writes them: `Host`, the spec, and `HostObservation`, what that
 //! daemon last observed there. This home writes its own host's and each SSH host's it owns; every
 //! home's are read from a resident map kept current by following the log.
@@ -30,8 +30,8 @@ use flotilla_protocol::{
     EnvironmentId, HostSummary, NodeId, NodeInfo, SystemInfo,
 };
 use flotilla_resources::{
-    engine_records::{decode_spec, decode_status, EngineObject, EngineRecords, Record},
-    CredentialExpiry, FulfilmentFacts, HarnessFacts, HostCondition, HostConnection, HostSpec, HostStatus, LocalImageInventories,
+    engine_records::{KindRecords, Record},
+    CredentialExpiry, FulfilmentFacts, HarnessFacts, Host, HostCondition, HostConnection, HostSpec, HostStatus, LocalImageInventories,
     AGENT_ADAPTERS_CAPABILITY, CODEX_CENTRAL_LOGIN_CAPABILITY, CREDENTIAL_EXPIRY_CAPABILITY, ENVIRONMENT_PROVIDERS_CAPABILITY,
     HELD_CREDENTIALS_CAPABILITY, IMAGE_DIGESTS_CAPABILITY, OWNING_DAEMON_CAPABILITY, PLACEMENT_CAPABILITY, SSH_HOST_CAPABILITY,
     TRANSPORT_CAPABILITY,
@@ -387,12 +387,12 @@ impl EngineHosts {
             .and_then(|watermark| watermark.applied_through.to_datetime())
     }
 
-    /// `held`, at `home`, as the old object; None for an observation whose Host is gone.
-    fn object(&self, name: &str, home: &str, held: &Held) -> Option<Result<EngineObject, String>> {
+    /// `held`, at `home`, as the resource; None for an observation whose Host is gone.
+    fn object(&self, name: &str, home: &str, held: &Held) -> Option<Record<Host>> {
         let (host, host_version, created_at) = held.host.as_ref()?;
         let spec = host.spec();
         let status = held.observation.as_ref().map(|(observation, _)| status(name, home, &spec, observation, self.heard(home), self.now()));
-        let record = Record::<flotilla_resources::Host> {
+        Some(Record {
             name: name.to_owned(),
             home: home.to_owned(),
             // A change token for the writers' version checks, which read it back from this home: it
@@ -404,8 +404,7 @@ impl EngineHosts {
             annotations: BTreeMap::new(),
             spec,
             status,
-        };
-        Some(record.engine_object())
+        })
     }
 
     /// This home's records of `name`, read from the store rather than the resident map.
@@ -422,9 +421,9 @@ impl EngineHosts {
         Ok(Held { host, observation: observation.map(|observation| (observation.spec, observation.version)) })
     }
 
-    fn own_object(&self, name: &str) -> Result<EngineObject, String> {
+    fn own_object(&self, name: &str) -> Result<Record<Host>, String> {
         let held = self.own(name)?;
-        self.object(name, &self.home, &held).unwrap_or_else(|| Err(format!("{KIND} {name} is not held at {}", self.home)))
+        self.object(name, &self.home, &held).ok_or_else(|| format!("{KIND} {name} is not held at {}", self.home))
     }
 
     /// Refused unless a Host `spec` describes is homed here: this daemon's own, or an SSH host it owns.
@@ -480,31 +479,21 @@ impl EngineHosts {
     }
 }
 
-fn refuse_kind(kind: &str) -> Result<(), String> {
-    if kind == KIND {
-        Ok(())
-    } else {
-        Err(format!("{kind} is not served by the host records"))
+impl flotilla_store::EnginePort for EngineHosts {
+    fn install(self: Arc<Self>, backend: &flotilla_store::ResourceBackend) {
+        backend.install_engine_kind::<Host>(self);
     }
-}
-
-fn warn_skipped(held: Result<EngineObject, String>) -> Option<EngineObject> {
-    held.map_err(|error| tracing::warn!(%error, "skipping a Host that does not encode")).ok()
 }
 
 #[async_trait::async_trait]
-impl EngineRecords for EngineHosts {
-    fn kinds(&self) -> &'static [&'static str] {
-        &[KIND]
-    }
-
-    fn codes(&self, _kind: &str) -> Vec<KindCode> {
+impl KindRecords<Host> for EngineHosts {
+    fn codes(&self) -> Vec<KindCode> {
         vec![HOST, OBSERVATION]
     }
 
     /// None counted: what moves outside the log is when each home was last heard, from this
     /// home's clock and the change streams' watermarks, which tick no change.
-    fn unlogged_changes(&self, _kind: &str) -> Option<u64> {
+    fn unlogged_changes(&self) -> Option<u64> {
         Some(0)
     }
 
@@ -512,14 +501,12 @@ impl EngineRecords for EngineHosts {
         self.home.clone()
     }
 
-    async fn get(&self, kind: &str, name: &str) -> Result<Option<EngineObject>, String> {
-        refuse_kind(kind)?;
+    async fn get(&self, name: &str) -> Result<Option<Record<Host>>, String> {
         let resident = self.refresh()?;
-        resolve(&resident.records, &self.home, name).and_then(|(home, held)| self.object(name, home, held)).transpose()
+        Ok(resolve(&resident.records, &self.home, name).and_then(|(home, held)| self.object(name, home, held)))
     }
 
-    async fn list(&self, kind: &str) -> Result<Vec<EngineObject>, String> {
-        refuse_kind(kind)?;
+    async fn list(&self) -> Result<Vec<Record<Host>>, String> {
         let resident = self.refresh()?;
         let mut names: Vec<&String> = resident.records.keys().map(|(name, _)| name).collect();
         // The map orders by name, then home, so one name's homes are adjacent.
@@ -527,58 +514,48 @@ impl EngineRecords for EngineHosts {
         Ok(names
             .into_iter()
             .filter_map(|name| resolve(&resident.records, &self.home, name).and_then(|(home, held)| self.object(name, home, held)))
-            .filter_map(warn_skipped)
             .collect())
     }
 
-    async fn sources(&self, kind: &str) -> Result<Vec<EngineObject>, String> {
-        refuse_kind(kind)?;
+    async fn sources(&self) -> Result<Vec<Record<Host>>, String> {
         let resident = self.refresh()?;
-        Ok(resident.records.iter().filter_map(|((name, home), held)| self.object(name, home, held)).filter_map(warn_skipped).collect())
+        Ok(resident.records.iter().filter_map(|((name, home), held)| self.object(name, home, held)).collect())
     }
 
     /// Every home's Host `name`, read from the resident map by name.
-    async fn copies(&self, kind: &str, name: &str) -> Result<Vec<EngineObject>, String> {
-        refuse_kind(kind)?;
+    async fn copies(&self, name: &str) -> Result<Vec<Record<Host>>, String> {
         let resident = self.refresh()?;
         Ok(resident
             .records
             .range((name.to_owned(), String::new())..)
             .take_while(|((held, _), _)| held == name)
             .filter_map(|((name, home), held)| self.object(name, home, held))
-            .filter_map(warn_skipped)
             .collect())
     }
 
     async fn apply(
         &self,
-        kind: &str,
         name: &str,
         _labels: &BTreeMap<String, String>,
         _annotations: &BTreeMap<String, String>,
-        spec: Value,
-    ) -> Result<EngineObject, String> {
-        refuse_kind(kind)?;
-        let spec = decode_spec::<flotilla_resources::Host>(name, spec)?;
-        self.homed_here(name, &spec)?;
+        spec: &HostSpec,
+    ) -> Result<Record<Host>, String> {
+        self.homed_here(name, spec)?;
         let _writing = self.writing.lock().await;
-        self.write_spec(name, &HostRecord::new(&spec))?;
+        self.write_spec(name, &HostRecord::new(spec))?;
         self.own_object(name)
     }
 
-    async fn set_status(&self, kind: &str, name: &str, status: Value) -> Result<EngineObject, String> {
-        refuse_kind(kind)?;
-        let status = decode_status::<flotilla_resources::Host>(name, status)?;
+    async fn set_status(&self, name: &str, status: &HostStatus) -> Result<Record<Host>, String> {
         let _writing = self.writing.lock().await;
         let Some((host, _, _)) = self.own(name)?.host else {
             return Err(format!("{KIND} {name} is not held at {}", self.home));
         };
-        self.write_observation(name, &host.spec(), &status)?;
+        self.write_observation(name, &host.spec(), status)?;
         self.own_object(name)
     }
 
-    async fn delete(&self, kind: &str, name: &str) -> Result<(), String> {
-        refuse_kind(kind)?;
+    async fn delete(&self, name: &str) -> Result<(), String> {
         let _writing = self.writing.lock().await;
         let held = self.own(name)?;
         let change = self.change(SPEC_WRITER);

@@ -3,14 +3,20 @@
 //! own reads count under the stored kind's name; so the port's count under the kind's name with
 //! [`PORT`] after it, and the two are never summed.
 
-use flotilla_resources::engine_records::{EngineObject, EngineRecords};
+use flotilla_resources::engine_records::{KindRecords, Record};
 use flotilla_schema::reads::{self, ReadShape};
+
+use crate::Resource;
 
 /// What follows a kind's name in the port's counts.
 pub(crate) const PORT: &str = " port";
 
-fn counted(kind: &str, shape: ReadShape, read: Result<Vec<EngineObject>, String>) -> Result<Vec<EngineObject>, String> {
-    let kind = format!("{kind}{PORT}");
+fn port<R: Resource>() -> String {
+    format!("{}{PORT}", R::API_PATHS.kind)
+}
+
+fn counted<R: Resource>(shape: ReadShape, read: Result<Vec<Record<R>>, String>) -> Result<Vec<Record<R>>, String> {
+    let kind = port::<R>();
     reads::read(&kind, shape);
     if let Ok(records) = &read {
         reads::rows(&kind, records.len());
@@ -18,10 +24,10 @@ fn counted(kind: &str, shape: ReadShape, read: Result<Vec<EngineObject>, String>
     read
 }
 
-/// The record `name` of `kind`, as the port chooses it among the homes holding one.
-pub(crate) async fn get(records: &dyn EngineRecords, kind: &str, name: &str) -> Result<Option<EngineObject>, String> {
-    let record = records.get(kind, name).await;
-    let kind = format!("{kind}{PORT}");
+/// The record `name`, as the port chooses it among the homes holding one.
+pub(crate) async fn get<R: Resource>(records: &dyn KindRecords<R>, name: &str) -> Result<Option<Record<R>>, String> {
+    let record = records.get(name).await;
+    let kind = port::<R>();
     reads::read(&kind, ReadShape::Keyed);
     if let Ok(Some(_)) = &record {
         reads::rows(&kind, 1);
@@ -29,23 +35,23 @@ pub(crate) async fn get(records: &dyn EngineRecords, kind: &str, name: &str) -> 
     record
 }
 
-/// One record of each name of `kind`.
-pub(crate) async fn list(records: &dyn EngineRecords, kind: &str) -> Result<Vec<EngineObject>, String> {
-    counted(kind, ReadShape::WholeKind, records.list(kind).await)
+/// One record of each name.
+pub(crate) async fn list<R: Resource>(records: &dyn KindRecords<R>) -> Result<Vec<Record<R>>, String> {
+    counted(ReadShape::WholeKind, records.list().await)
 }
 
-/// Every home's records of `kind`.
-pub(crate) async fn sources(records: &dyn EngineRecords, kind: &str) -> Result<Vec<EngineObject>, String> {
-    counted(kind, ReadShape::WholeKind, records.sources(kind).await)
+/// Every home's records.
+pub(crate) async fn sources<R: Resource>(records: &dyn KindRecords<R>) -> Result<Vec<Record<R>>, String> {
+    counted(ReadShape::WholeKind, records.sources().await)
 }
 
-/// Every home's record `name` of `kind`.
-pub(crate) async fn copies(records: &dyn EngineRecords, kind: &str, name: &str) -> Result<Vec<EngineObject>, String> {
-    counted(kind, ReadShape::Keyed, records.copies(kind, name).await)
+/// Every home's record `name`.
+pub(crate) async fn copies<R: Resource>(records: &dyn KindRecords<R>, name: &str) -> Result<Vec<Record<R>>, String> {
+    counted(ReadShape::Keyed, records.copies(name).await)
 }
 
-/// The open records of `kind` addressed to `receiver`, where the port keeps them indexed.
-pub(crate) async fn open_to(records: &dyn EngineRecords, kind: &str, receiver: &str) -> Option<Result<Vec<EngineObject>, String>> {
-    let open = records.open_to(kind, receiver).await?;
-    Some(counted(kind, ReadShape::Index, open))
+/// The open records addressed to `receiver`, where the port keeps them indexed.
+pub(crate) async fn open_to<R: Resource>(records: &dyn KindRecords<R>, receiver: &str) -> Option<Result<Vec<Record<R>>, String>> {
+    let open = records.open_to(receiver).await?;
+    Some(counted(ReadShape::Index, open))
 }

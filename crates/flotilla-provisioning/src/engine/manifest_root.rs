@@ -574,12 +574,12 @@ impl std::fmt::Debug for EngineManifestRoots {
 
 const ROOT_KIND: &str = "ManifestRoot";
 
+/// A root as the resource kind serves it.
+type RootRecord = flotilla_resources::engine_records::Record<flotilla_resources::ManifestRoot>;
+
 impl EngineManifestRoots {
-    /// Every home's live root (named `name`, when given) as the old store's object.
-    fn objects(&self, kind: &str, name: Option<&str>) -> Result<Vec<flotilla_resources::engine_records::EngineObject>, String> {
-        if kind != ROOT_KIND {
-            return Err(format!("{kind} is not served by the ManifestRoot records"));
-        }
+    /// Every home's live root (named `name`, when given) as the resource.
+    fn objects(&self, name: Option<&str>) -> Result<Vec<RootRecord>, String> {
         let resident = self.refresh()?;
         live_roots(&resident, name)
             .into_iter()
@@ -591,7 +591,7 @@ impl EngineManifestRoots {
                     .get(&(home.clone(), root.name().to_owned()))
                     .copied()
                     .ok_or_else(|| format!("{ROOT_KIND} {} at {home} has no creation time", root.name()))?;
-                flotilla_resources::engine_records::Record::<flotilla_resources::ManifestRoot> {
+                Ok(RootRecord {
                     name: view.name,
                     home,
                     version: root.version().0,
@@ -600,27 +600,28 @@ impl EngineManifestRoots {
                     annotations: BTreeMap::new(),
                     spec: view.spec,
                     status: Some(view.status),
-                }
-                .engine_object()
+                })
             })
             .collect()
+    }
+}
+
+impl flotilla_store::EnginePort for EngineManifestRoots {
+    fn install(self: Arc<Self>, backend: &flotilla_store::ResourceBackend) {
+        backend.install_engine_kind::<flotilla_resources::ManifestRoot>(self);
     }
 }
 
 /// The generic resource verbs read roots; a root is written only by its home's manifest
 /// reconciler and the `flotilla manifest` commands.
 #[async_trait::async_trait]
-impl flotilla_resources::engine_records::EngineRecords for EngineManifestRoots {
-    fn kinds(&self) -> &'static [&'static str] {
-        &[ROOT_KIND]
-    }
-
-    fn codes(&self, _kind: &str) -> Vec<KindCode> {
+impl flotilla_resources::engine_records::KindRecords<flotilla_resources::ManifestRoot> for EngineManifestRoots {
+    fn codes(&self) -> Vec<KindCode> {
         vec![ROOT]
     }
 
     /// This home's judgements of its roots' documents.
-    fn unlogged_changes(&self, _kind: &str) -> Option<u64> {
+    fn unlogged_changes(&self) -> Option<u64> {
         Some(*self.judged_changes.borrow())
     }
 
@@ -628,15 +629,15 @@ impl flotilla_resources::engine_records::EngineRecords for EngineManifestRoots {
         self.home.clone()
     }
 
-    async fn get(&self, kind: &str, name: &str) -> Result<Option<flotilla_resources::engine_records::EngineObject>, String> {
-        let mut held = self.objects(kind, Some(name))?;
+    async fn get(&self, name: &str) -> Result<Option<RootRecord>, String> {
+        let mut held = self.objects(Some(name))?;
         held.sort_by_key(|object| (object.home != self.home, object.home.clone()));
         Ok(held.into_iter().next())
     }
 
-    async fn list(&self, kind: &str) -> Result<Vec<flotilla_resources::engine_records::EngineObject>, String> {
+    async fn list(&self) -> Result<Vec<RootRecord>, String> {
         let mut by_name = BTreeMap::new();
-        let mut objects = self.objects(kind, None)?;
+        let mut objects = self.objects(None)?;
         objects.sort_by_key(|object| (object.home != self.home, object.home.clone()));
         for object in objects {
             by_name.entry(object.name.clone()).or_insert(object);
@@ -644,36 +645,30 @@ impl flotilla_resources::engine_records::EngineRecords for EngineManifestRoots {
         Ok(by_name.into_values().collect())
     }
 
-    async fn sources(&self, kind: &str) -> Result<Vec<flotilla_resources::engine_records::EngineObject>, String> {
-        self.objects(kind, None)
+    async fn sources(&self) -> Result<Vec<RootRecord>, String> {
+        self.objects(None)
     }
 
-    async fn copies(&self, kind: &str, name: &str) -> Result<Vec<flotilla_resources::engine_records::EngineObject>, String> {
-        self.objects(kind, Some(name))
+    async fn copies(&self, name: &str) -> Result<Vec<RootRecord>, String> {
+        self.objects(Some(name))
     }
 
     async fn apply(
         &self,
-        kind: &str,
         name: &str,
         _labels: &BTreeMap<String, String>,
         _annotations: &BTreeMap<String, String>,
-        _spec: serde_json::Value,
-    ) -> Result<flotilla_resources::engine_records::EngineObject, String> {
-        Err(root_refusal(kind, name))
+        _spec: &flotilla_resources::ManifestRootSpec,
+    ) -> Result<RootRecord, String> {
+        Err(root_refusal(name))
     }
 
-    async fn set_status(
-        &self,
-        kind: &str,
-        name: &str,
-        _status: serde_json::Value,
-    ) -> Result<flotilla_resources::engine_records::EngineObject, String> {
-        Err(root_refusal(kind, name))
+    async fn set_status(&self, name: &str, _status: &flotilla_resources::ManifestRootStatus) -> Result<RootRecord, String> {
+        Err(root_refusal(name))
     }
 
-    async fn delete(&self, kind: &str, name: &str) -> Result<(), String> {
-        Err(root_refusal(kind, name))
+    async fn delete(&self, name: &str) -> Result<(), String> {
+        Err(root_refusal(name))
     }
 
     async fn changes(&self) -> Result<futures::stream::BoxStream<'static, ()>, String> {
@@ -698,8 +693,8 @@ impl flotilla_resources::engine_records::EngineRecords for EngineManifestRoots {
     }
 }
 
-fn root_refusal(kind: &str, name: &str) -> String {
+fn root_refusal(name: &str) -> String {
     format!(
-        "{kind} {name} is written only by its home's manifest reconciler, from its declared source; resolve its documents with `flotilla manifest`"
+        "{ROOT_KIND} {name} is written only by its home's manifest reconciler, from its declared source; resolve its documents with `flotilla manifest`"
     )
 }

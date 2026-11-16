@@ -13,7 +13,7 @@ use chrono::{DateTime, TimeZone, Utc};
 use flotilla_provisioning::engine::observations::EngineObservations;
 use flotilla_resources::{
     address::record_name,
-    engine_records::{EngineRecords, ObservationFailures},
+    engine_records::{KindRecords, ObservationFailures, Record},
     ChangeRequest, ChangeRequestReviewObservation, ChangeRequestSpec, ChangeRequestStatus, Clock, InputMeta, Issue, IssueSpec, IssueStatus,
     Observation, ObservedChangeRequestState, ObservedChecks, ObservedIssueState, ObservedMergeability, ObservedReviewDecision,
 };
@@ -172,16 +172,22 @@ async fn the_engine_keeps_the_observation_contract() {
 async fn a_change_request_under_another_name_is_refused() {
     let directory = tempfile::tempdir().expect("temp dir");
     let (_, records) = open(&directory, "alpha", ManualClock::at(1_800_000_000));
-    let spec = serde_json::to_value(cr_spec(1, "alpha")).expect("spec");
-    let refused = records.apply("ChangeRequest", "cr-1", &BTreeMap::new(), &BTreeMap::new(), spec.clone()).await;
+    let records = cr_port(&records);
+    let spec = cr_spec(1, "alpha");
+    let refused = records.apply("cr-1", &BTreeMap::new(), &BTreeMap::new(), &spec).await;
     let error = refused.expect_err("a name that is not the record name is refused");
     assert!(error.contains("cr-1") && error.contains(&cr_1()), "{error}");
-    assert!(records.sources("ChangeRequest").await.expect("sources").is_empty(), "nothing is written");
-    records.apply("ChangeRequest", &cr_1(), &BTreeMap::new(), &BTreeMap::new(), spec).await.expect("the record name is written");
+    assert!(records.sources().await.expect("sources").is_empty(), "nothing is written");
+    records.apply(&cr_1(), &BTreeMap::new(), &BTreeMap::new(), &spec).await.expect("the record name is written");
 }
 
-fn status_of(object: &flotilla_resources::engine_records::EngineObject) -> ChangeRequestStatus {
-    serde_json::from_value(object.status.clone().expect("status")).expect("decodes")
+/// The observation records as the ChangeRequest port.
+fn cr_port(records: &Arc<EngineObservations>) -> &dyn KindRecords<ChangeRequest> {
+    &**records
+}
+
+fn status_of(object: &Record<ChangeRequest>) -> ChangeRequestStatus {
+    object.status.clone().expect("status")
 }
 
 // Behaviour (observation ruling: written only when a value changes): a publish that changes no
@@ -191,14 +197,15 @@ async fn a_publish_that_changes_no_value_writes_nothing() {
     let directory = tempfile::tempdir().expect("temp dir");
     let clock = ManualClock::at(1_800_000_000);
     let (_, records) = open(&directory, "alpha", clock.clone());
-    let spec = serde_json::to_value(cr_spec(1, "alpha")).expect("spec");
-    records.apply("ChangeRequest", &cr_1(), &BTreeMap::new(), &BTreeMap::new(), spec.clone()).await.expect("create");
-    let status = |checks, at| serde_json::to_value(cr_status(ObservedChangeRequestState::Open, checks, epoch(at))).expect("status");
-    let first = records.set_status("ChangeRequest", &cr_1(), status(ObservedChecks::Pending, 10)).await.expect("publish");
-    let again = records.set_status("ChangeRequest", &cr_1(), status(ObservedChecks::Pending, 20)).await.expect("publish again");
-    let reapplied = records.apply("ChangeRequest", &cr_1(), &BTreeMap::new(), &BTreeMap::new(), spec).await.expect("ensure again");
+    let records = cr_port(&records);
+    let spec = cr_spec(1, "alpha");
+    records.apply(&cr_1(), &BTreeMap::new(), &BTreeMap::new(), &spec).await.expect("create");
+    let status = |checks, at| cr_status(ObservedChangeRequestState::Open, checks, epoch(at));
+    let first = records.set_status(&cr_1(), &status(ObservedChecks::Pending, 10)).await.expect("publish");
+    let again = records.set_status(&cr_1(), &status(ObservedChecks::Pending, 20)).await.expect("publish again");
+    let reapplied = records.apply(&cr_1(), &BTreeMap::new(), &BTreeMap::new(), &spec).await.expect("ensure again");
     assert_eq!((again.version, reapplied.version), (first.version, first.version));
-    let changed = records.set_status("ChangeRequest", &cr_1(), status(ObservedChecks::Pass, 30)).await.expect("publish change");
+    let changed = records.set_status(&cr_1(), &status(ObservedChecks::Pass, 30)).await.expect("publish change");
     assert!(changed.version > first.version);
     assert_eq!(status_of(&changed).checks.value, Some(ObservedChecks::Pass));
 }
@@ -209,25 +216,25 @@ async fn a_publish_that_changes_no_value_writes_nothing() {
 async fn a_failing_observer_ages_its_values_from_the_first_failure() {
     let directory = tempfile::tempdir().expect("temp dir");
     let clock = ManualClock::at(1_800_000_000);
-    let (_, records) = open(&directory, "alpha", clock.clone());
-    let spec = serde_json::to_value(cr_spec(1, "alpha")).expect("spec");
-    records.apply("ChangeRequest", &cr_1(), &BTreeMap::new(), &BTreeMap::new(), spec).await.expect("create");
-    let open = serde_json::to_value(cr_status(ObservedChangeRequestState::Open, ObservedChecks::Pass, epoch(0))).expect("status");
-    records.set_status("ChangeRequest", &cr_1(), open.clone()).await.expect("publish");
-    let read = || async { status_of(&records.get("ChangeRequest", &cr_1()).await.expect("get").expect("held")).state.observed_at };
+    let (_, observations) = open(&directory, "alpha", clock.clone());
+    let records = cr_port(&observations);
+    records.apply(&cr_1(), &BTreeMap::new(), &BTreeMap::new(), &cr_spec(1, "alpha")).await.expect("create");
+    let open = cr_status(ObservedChangeRequestState::Open, ObservedChecks::Pass, epoch(0));
+    records.set_status(&cr_1(), &open).await.expect("publish");
+    let read = || async { status_of(&records.get(&cr_1()).await.expect("get").expect("held")).state.observed_at };
     assert_eq!(read().await, epoch(1_800_000_000));
 
     clock.set(1_800_000_100);
-    records.failing("ChangeRequest", &cr_1()).await.expect("failing");
+    observations.failing("ChangeRequest", &cr_1()).await.expect("failing");
     clock.set(1_800_000_900);
-    let version = records.get("ChangeRequest", &cr_1()).await.expect("get").expect("held").version;
-    records.failing("ChangeRequest", &cr_1()).await.expect("still failing");
-    assert_eq!(records.get("ChangeRequest", &cr_1()).await.expect("get").expect("held").version, version, "failing is recorded once");
+    let version = records.get(&cr_1()).await.expect("get").expect("held").version;
+    observations.failing("ChangeRequest", &cr_1()).await.expect("still failing");
+    assert_eq!(records.get(&cr_1()).await.expect("get").expect("held").version, version, "failing is recorded once");
     assert_eq!(read().await, epoch(1_800_000_100));
 
-    records.set_status("ChangeRequest", &cr_1(), open).await.expect("a read succeeds again");
+    records.set_status(&cr_1(), &open).await.expect("a read succeeds again");
     assert_eq!(read().await, epoch(1_800_000_900));
-    records.failing("ChangeRequest", "absent").await.expect("an absent record is done");
+    observations.failing("ChangeRequest", "absent").await.expect("an absent record is done");
 }
 
 /// One round of `from`'s stream applied at `to`, served at `at`; a reset round when `cursor` is none.
@@ -253,26 +260,27 @@ fn pump(from: &Service, from_home: &str, to: &Service, cursor: Option<u64>, at: 
 async fn another_homes_values_are_confirmed_when_that_home_was_last_heard() {
     let directory = tempfile::tempdir().expect("temp dir");
     let clock = ManualClock::at(1_800_000_000);
-    let (beta, beta_records) = open(&directory, "beta", clock.clone());
-    let (alpha, alpha_records) = open(&directory, "alpha", clock.clone());
-    let spec = serde_json::to_value(cr_spec(1, "beta")).expect("spec");
-    beta_records.apply("ChangeRequest", &cr_1(), &BTreeMap::new(), &BTreeMap::new(), spec.clone()).await.expect("create");
-    let merged = serde_json::to_value(cr_status(ObservedChangeRequestState::Merged, ObservedChecks::Pass, epoch(0))).expect("status");
-    beta_records.set_status("ChangeRequest", &cr_1(), merged).await.expect("publish");
+    let (beta, beta_observations) = open(&directory, "beta", clock.clone());
+    let (alpha, alpha_observations) = open(&directory, "alpha", clock.clone());
+    let (beta_records, alpha_records) = (cr_port(&beta_observations), cr_port(&alpha_observations));
+    let spec = cr_spec(1, "beta");
+    beta_records.apply(&cr_1(), &BTreeMap::new(), &BTreeMap::new(), &spec).await.expect("create");
+    let merged = cr_status(ObservedChangeRequestState::Merged, ObservedChecks::Pass, epoch(0));
+    beta_records.set_status(&cr_1(), &merged).await.expect("publish");
     let cursor = pump(&beta, "beta", &alpha, None, epoch(1_800_000_050));
-    let read = || async { alpha_records.get("ChangeRequest", &cr_1()).await.expect("get").expect("held") };
+    let read = || async { alpha_records.get(&cr_1()).await.expect("get").expect("held") };
     assert_eq!((read().await.home, status_of(&read().await).state.observed_at), ("beta".to_owned(), epoch(1_800_000_050)));
     pump(&beta, "beta", &alpha, Some(cursor), epoch(1_800_000_070));
     assert_eq!(status_of(&read().await).state.observed_at, epoch(1_800_000_070));
 
     // A former observer's own copy, failing since before beta was last heard, reads below beta's.
-    alpha_records.apply("ChangeRequest", &cr_1(), &BTreeMap::new(), &BTreeMap::new(), spec).await.expect("own copy");
+    alpha_records.apply(&cr_1(), &BTreeMap::new(), &BTreeMap::new(), &spec).await.expect("own copy");
     clock.set(1_800_000_060);
-    alpha_records.failing("ChangeRequest", &cr_1()).await.expect("failing");
+    alpha_observations.failing("ChangeRequest", &cr_1()).await.expect("failing");
     clock.set(1_800_000_100);
     assert_eq!(read().await.home, "beta");
-    assert_eq!(alpha_records.sources("ChangeRequest").await.expect("sources").len(), 2);
-    assert_eq!(alpha_records.list("ChangeRequest").await.expect("list").len(), 1);
+    assert_eq!(alpha_records.sources().await.expect("sources").len(), 2);
+    assert_eq!(alpha_records.list().await.expect("list").len(), 1);
 }
 
 /// Observes every source, or none.
@@ -304,10 +312,10 @@ async fn a_home_that_does_not_observe_the_source_writes_nothing_and_reads_the_ob
     let backend = ResourceBackend::new(InMemoryBackend::default());
     backend.install_engine_records(alpha_records.clone());
 
-    let spec = serde_json::to_value(cr_spec(1, "beta")).expect("spec");
-    beta_records.apply("ChangeRequest", &cr_1(), &BTreeMap::new(), &BTreeMap::new(), spec).await.expect("the observer's record");
+    let beta_port = cr_port(&beta_records);
+    beta_port.apply(&cr_1(), &BTreeMap::new(), &BTreeMap::new(), &cr_spec(1, "beta")).await.expect("the observer's record");
     let merged = cr_status(ObservedChangeRequestState::Merged, ObservedChecks::Pass, epoch(0));
-    beta_records.set_status("ChangeRequest", &cr_1(), serde_json::to_value(&merged).expect("status")).await.expect("publish");
+    beta_port.set_status(&cr_1(), &merged).await.expect("publish");
     pump(&beta, "beta", &alpha, None, epoch(1_800_000_050));
 
     let change_requests = backend.using::<ChangeRequest>(NS);
@@ -334,7 +342,7 @@ async fn a_home_that_does_not_observe_the_source_writes_nothing_and_reads_the_ob
     );
     assert_eq!(selected.values().map(|record| record.spec.observing_authority.as_str()).collect::<Vec<_>>(), vec!["beta"]);
     assert_eq!(
-        alpha_records.sources("ChangeRequest").await.expect("sources").iter().map(|copy| copy.home.as_str()).collect::<Vec<_>>(),
+        cr_port(&alpha_records).sources().await.expect("sources").iter().map(|copy| copy.home.as_str()).collect::<Vec<_>>(),
         vec!["beta"]
     );
 }

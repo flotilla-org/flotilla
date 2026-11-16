@@ -10,16 +10,14 @@ use std::{
 
 use flotilla_engine_store::watch::EngineWatch;
 use flotilla_resources::{
-    engine_records::{decode_spec, EngineObject, EngineRecords, Record},
-    Message as OldMessage, ReadResourceObject, ResourceProvenance,
+    engine_records::{KindRecords, Record},
+    Message as OldMessage, MessageSpec, MessageStatus, ReadResourceObject, ResourceProvenance,
 };
 use flotilla_schema::Kind as _;
 use flotilla_state_machines::{machines::message::Message, Resource};
 use futures::stream::BoxStream;
 
 use super::MessagePrimitives;
-
-const MESSAGE_KIND: &str = "Message";
 
 /// The engine's messages served under the daemon's provisioning namespace, the one the old
 /// shapes' role addresses are read in.
@@ -37,13 +35,13 @@ impl MessageRecords {
         self.namespace.read().unwrap_or_else(std::sync::PoisonError::into_inner).clone()
     }
 
-    fn object(&self, read: ReadResourceObject<OldMessage>) -> Result<EngineObject, String> {
+    fn object(&self, read: ReadResourceObject<OldMessage>) -> Result<Record<OldMessage>, String> {
         let home = match read.provenance {
             ResourceProvenance::Local => self.primitives.home().to_owned(),
             ResourceProvenance::Replica { origin_root, .. } => origin_root.to_string(),
         };
         let metadata = read.object.metadata;
-        Record::<OldMessage> {
+        Ok(Record {
             name: metadata.name,
             home,
             version: metadata.resource_version.parse().map_err(|error| format!("message version: {error}"))?,
@@ -52,8 +50,7 @@ impl MessageRecords {
             annotations: metadata.annotations,
             spec: read.object.spec,
             status: read.object.status,
-        }
-        .engine_object()
+        })
     }
 }
 
@@ -63,13 +60,15 @@ impl std::fmt::Debug for MessageRecords {
     }
 }
 
-#[async_trait::async_trait]
-impl EngineRecords for MessageRecords {
-    fn kinds(&self) -> &'static [&'static str] {
-        &[MESSAGE_KIND]
+impl flotilla_store::EnginePort for MessageRecords {
+    fn install(self: Arc<Self>, backend: &flotilla_store::ResourceBackend) {
+        backend.install_engine_kind::<OldMessage>(self);
     }
+}
 
-    fn codes(&self, _kind: &str) -> Vec<flotilla_schema::KindCode> {
+#[async_trait::async_trait]
+impl KindRecords<OldMessage> for MessageRecords {
+    fn codes(&self) -> Vec<flotilla_schema::KindCode> {
         vec![Resource::<Message>::CODE]
     }
 
@@ -79,52 +78,50 @@ impl EngineRecords for MessageRecords {
 
     /// By its full engine address, a keyed read; by a bare record name, which names no inbox,
     /// through the listing.
-    async fn get(&self, _kind: &str, name: &str) -> Result<Option<EngineObject>, String> {
+    async fn get(&self, name: &str) -> Result<Option<Record<OldMessage>>, String> {
         let view = self.primitives.verb_get(&self.namespace(), name).map_err(|error| error.to_string())?;
         view.map(|read| self.object(read)).transpose()
     }
 
-    async fn list(&self, _kind: &str) -> Result<Vec<EngineObject>, String> {
+    async fn list(&self) -> Result<Vec<Record<OldMessage>>, String> {
         let views = self.primitives.verb_listing(&self.namespace()).map_err(|error| error.to_string())?;
         views.into_iter().map(|read| self.object(read)).collect()
     }
 
     /// Each message has one home, its receiver's, so every source is its only record.
-    async fn sources(&self, kind: &str) -> Result<Vec<EngineObject>, String> {
-        self.list(kind).await
+    async fn sources(&self) -> Result<Vec<Record<OldMessage>>, String> {
+        self.list().await
     }
 
     /// The one record `name` names, its receiver's home's.
-    async fn copies(&self, kind: &str, name: &str) -> Result<Vec<EngineObject>, String> {
-        Ok(self.get(kind, name).await?.into_iter().collect())
+    async fn copies(&self, name: &str) -> Result<Vec<Record<OldMessage>>, String> {
+        Ok(self.get(name).await?.into_iter().collect())
     }
 
     /// Pending, then Awaiting, in the receiver's inbox: read down its index.
-    async fn open_to(&self, _kind: &str, receiver: &str) -> Option<Result<Vec<EngineObject>, String>> {
+    async fn open_to(&self, receiver: &str) -> Option<Result<Vec<Record<OldMessage>>, String>> {
         let views = self.primitives.verb_open_to(&self.namespace(), receiver).map_err(|error| error.to_string());
         Some(views.and_then(|views| views.into_iter().map(|read| self.object(read)).collect()))
     }
 
     async fn apply(
         &self,
-        _kind: &str,
         name: &str,
         _labels: &BTreeMap<String, String>,
         _annotations: &BTreeMap<String, String>,
-        spec: serde_json::Value,
-    ) -> Result<EngineObject, String> {
+        spec: &MessageSpec,
+    ) -> Result<Record<OldMessage>, String> {
         let namespace = self.namespace();
-        let spec = decode_spec::<OldMessage>(name, spec)?;
-        let (id, _) = self.primitives.admit_at(&namespace, name, &spec).await.map_err(|error| error.to_string())?;
+        let (id, _) = self.primitives.admit_at(&namespace, name, spec).await.map_err(|error| error.to_string())?;
         let view = self.primitives.verb_get(&namespace, &id).map_err(|error| error.to_string())?;
         self.object(view.ok_or_else(|| format!("Message {name} is not readable after its admission"))?)
     }
 
-    async fn set_status(&self, _kind: &str, name: &str, _status: serde_json::Value) -> Result<EngineObject, String> {
+    async fn set_status(&self, name: &str, _status: &MessageStatus) -> Result<Record<OldMessage>, String> {
         Err(format!("Message {name}'s state moves only through delivery and receipts; acknowledge it with `flotilla message acknowledge`"))
     }
 
-    async fn delete(&self, _kind: &str, name: &str) -> Result<(), String> {
+    async fn delete(&self, name: &str) -> Result<(), String> {
         Err(format!("Message {name} is kept by its inbox until retention removes it; acknowledge it with `flotilla message acknowledge`"))
     }
 

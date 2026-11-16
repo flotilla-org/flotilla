@@ -1091,7 +1091,7 @@ async fn a_host_named_manifest_stamp_imports_as_the_root_it_names() {
             MANIFEST_MANAGED_BY_VALUE, MANIFEST_PATH_ANNOTATION, MANIFEST_RECONCILER_ROOT_ANNOTATION, MANIFEST_REVISION_ANNOTATION,
             MANIFEST_SOURCE_ANNOTATION,
         },
-        engine_records::EngineRecords,
+        engine_records::KindRecords,
         manifest_roots::ManifestRoots,
         DocumentKey, DocumentPhase, DocumentState, ManifestRootStatus, MANAGED_BY_LABEL,
     };
@@ -1173,15 +1173,16 @@ async fn a_host_named_manifest_stamp_imports_as_the_root_it_names() {
     );
     let clock: Arc<dyn flotilla_resources::Clock> = Arc::new(flotilla_resources::SystemClock);
     let projects = EngineProjects::open(service.clone(), clock.clone()).expect("projects");
-    let app = projects.get("Project", "app").await.expect("read").expect("imported");
+    let app = projects.get("app").await.expect("read").expect("imported");
     // The manifest reconciler's "claimed by two sources" check passes once the stamp is its root's name.
     assert_eq!(app.annotations[MANIFEST_RECONCILER_ROOT_ANNOTATION], declared);
     assert_eq!(app.annotations[MANIFEST_SOURCE_ANNOTATION], "project-map");
     assert_eq!(app.annotations[MANIFEST_PATH_ANNOTATION], "projects/app.yaml");
-    projects.apply("Project", "app", &app.labels, &app.annotations, app.spec.clone()).await.expect("a read re-applies");
+    projects.apply("app", &app.labels, &app.annotations, &app.spec).await.expect("a read re-applies");
 
     let definitions = EngineDefinitions::open(service.clone(), clock.clone()).expect("definitions");
-    let ensure = definitions.get("ConvoyEnsure", "quartermaster").await.expect("read").expect("imported");
+    let ensure =
+        KindRecords::<flotilla_resources::ConvoyEnsure>::get(&definitions, "quartermaster").await.expect("read").expect("imported");
     assert_eq!(ensure.annotations[MANIFEST_RECONCILER_ROOT_ANNOTATION], declared);
     assert_eq!(ensure.annotations[MANIFEST_PATH_ANNOTATION], "ensures/quartermaster.yaml");
     // The acting-home check's primary path: the stamped root, read as this home's.

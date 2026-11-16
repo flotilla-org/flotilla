@@ -98,6 +98,7 @@ use flotilla_protocol::TopologyRoute;
 use flotilla_protocol_testkit::TestIssue;
 use flotilla_provider_runtime::ChannelLabel;
 use flotilla_provider_runtime::CommandRunner;
+use flotilla_provisioning_testkit::other_home::Seed;
 use flotilla_resources::{
     controller_patches as convoy_controller_patches, implement_review_workflow_spec, single_agent_shepherd_workflow_spec,
     single_agent_workflow_spec, Checkout as ResourceCheckout, CheckoutPhase as ResourceCheckoutPhase, CheckoutSpec as ResourceCheckoutSpec,
@@ -7223,7 +7224,7 @@ async fn forge_identity_sweep_merges_separately_bootstrapped_records() {
 #[tokio::test]
 async fn forge_identity_sweep_includes_replica_only_legacy_repository() {
     use flotilla_provisioning::engine::repositories::EngineRepositories;
-    use flotilla_resources::{engine_records::EngineRecords, Forge};
+    use flotilla_resources::{engine_records::KindRecords, Forge};
 
     let temp = tempfile::tempdir().expect("create tempdir");
     let repo = temp.path().join("ghostty-ops");
@@ -7246,7 +7247,7 @@ async fn forge_identity_sweep_includes_replica_only_legacy_repository() {
     let source = flotilla_provisioning_testkit::OtherHome::open("source-root");
     EngineRepositories::open(Arc::clone(source.service()), Arc::new(flotilla_resources::SystemClock))
         .expect("source repositories")
-        .apply("Repository", &old.key().to_string(), &BTreeMap::new(), &BTreeMap::new(), serde_json::to_value(&old).expect("spec"))
+        .apply(&old.key().to_string(), &BTreeMap::new(), &BTreeMap::new(), &old)
         .await
         .expect("author legacy Repository");
     source.replicate_to(&daemon.decided_store().expect("decided store"));
@@ -9412,10 +9413,7 @@ impl CommandRunner for StartupForgeRunner {
 /// The decided store's opener for a daemon whose state is under `state_dir`, with `seed` written
 /// at the daemon's home first: declarations the daemon reads while it composes, such as the
 /// Forge, credentials and Repository its startup discovery resolves.
-fn seeded_engine_opener(
-    state_dir: PathBuf,
-    seed: Vec<(&'static str, String, serde_json::Value)>,
-) -> flotilla_core::in_process::EngineOpener {
+fn seeded_engine_opener(state_dir: PathBuf, seed: Vec<Seed>) -> flotilla_core::in_process::EngineOpener {
     use flotilla_core::in_process::{decided, EngineIdentity};
 
     Box::new(move |identity: EngineIdentity| {
@@ -9439,7 +9437,7 @@ async fn startup_forgejo_case(
     let healthy = fixture.join("healthy");
     std::fs::create_dir_all(&repo).expect("create Forgejo checkout directory");
     std::fs::create_dir_all(&healthy).expect("create healthy checkout directory");
-    let mut seed = vec![("Forge", "flotilla-lab".to_string(), serde_json::to_value(lab_forge_spec()).expect("Forge spec"))];
+    let mut seed = vec![Seed::definition::<flotilla_resources::Forge>("flotilla-lab", lab_forge_spec())];
     for name in (0..work_credentials).map(|n| format!("work-{n}")).chain(std::iter::once("daemon".into())) {
         let credential = CredentialSpecSpec::builder()
             .consumer(CredentialConsumer::Forgejo {
@@ -9449,13 +9447,13 @@ async fn startup_forgejo_case(
             .source(CredentialSource::File { path: format!("/tokens/{name}") })
             .lifecycle(CredentialLifecycle::Static)
             .build();
-        seed.push(("CredentialSpec", name, serde_json::to_value(credential).expect("credential spec")));
+        seed.push(Seed::definition::<flotilla_resources::CredentialSpec>(name, credential));
     }
     let spec = RepositorySpec::remote("https://forgejo.lab.flotilla.work/lab/repo")
         .expect("parse startup repository remote")
         .on_forge(&lab_forge_spec())
         .expect("resolve startup repository Forge");
-    seed.push(("Repository", spec.key().to_string(), serde_json::to_value(&spec).expect("repository spec")));
+    seed.push(Seed::repository(spec.key().to_string(), spec));
     let config = test_config_store(temp.path().join("config"));
     if let Some(name) = daemon_credential {
         std::fs::create_dir_all(temp.path().join("config")).expect("create daemon config directory");

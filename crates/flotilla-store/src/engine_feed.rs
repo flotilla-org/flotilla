@@ -2,39 +2,39 @@
 
 use std::sync::Arc;
 
-use flotilla_resources::engine_records::{EngineObject, EngineRecords};
+use flotilla_resources::engine_records::{KindRecords, Record};
 use flotilla_schema::reads::{attributed, caller};
 use futures::{FutureExt, StreamExt};
 
-use crate::port_reads;
+use crate::{port_reads, Resource};
 
 /// The caller the feeds' listings after the first count for: the first counts for the watcher
 /// that started the feed.
 const FEED: &str = "engine feed";
 
 /// Every home's records of one kind as of a pass, or why the pass could not list them.
-pub(crate) type EngineSnapshot = Arc<Result<Vec<EngineObject>, String>>;
+pub(crate) type EngineSnapshot<R> = Arc<Result<Vec<Record<R>>, String>>;
 
 /// A kind's records, listed again once for each batch of changes and published to its watchers.
 /// The listing task stops when the last watcher drops the feed.
 #[derive(Debug)]
-pub(crate) struct EngineFeed {
-    snapshots: tokio::sync::watch::Receiver<EngineSnapshot>,
+pub(crate) struct EngineFeed<R: Resource> {
+    snapshots: tokio::sync::watch::Receiver<EngineSnapshot<R>>,
     catch_ups: tokio::sync::mpsc::Sender<tokio::sync::oneshot::Sender<()>>,
     task: tokio::task::JoinHandle<()>,
 }
 
-impl Drop for EngineFeed {
+impl<R: Resource> Drop for EngineFeed<R> {
     fn drop(&mut self) {
         self.task.abort();
     }
 }
 
-impl EngineFeed {
-    /// Subscribes to `records`' changes, then lists `kind`, so no change between the two is lost.
-    pub(crate) async fn start(records: Arc<dyn EngineRecords>, kind: &'static str) -> Result<Self, String> {
+impl<R: Resource> EngineFeed<R> {
+    /// Subscribes to `records`' changes, then lists them, so no change between the two is lost.
+    pub(crate) async fn start(records: Arc<dyn KindRecords<R>>) -> Result<Self, String> {
         let mut changes = records.changes().await?;
-        let initial = port_reads::sources(&*records, kind).await?;
+        let initial = port_reads::sources(&*records).await?;
         let (publish, snapshots) = tokio::sync::watch::channel(Arc::new(Ok(initial)));
         let (catch_ups, mut requests) = tokio::sync::mpsc::channel::<tokio::sync::oneshot::Sender<()>>(16);
         let task = tokio::spawn(attributed(caller(FEED), async move {
@@ -64,7 +64,7 @@ impl EngineFeed {
                     }
                 }
                 if changed {
-                    publish.send_replace(Arc::new(port_reads::sources(&*records, kind).await));
+                    publish.send_replace(Arc::new(port_reads::sources(&*records).await));
                 }
                 if let Some(caught_up) = caught_up {
                     caught_up.send(()).ok();
@@ -78,7 +78,7 @@ impl EngineFeed {
     }
 
     /// The latest listing, marked seen, and a receiver of the ones after it.
-    pub(crate) fn subscribe(&self) -> (EngineSnapshot, tokio::sync::watch::Receiver<EngineSnapshot>) {
+    pub(crate) fn subscribe(&self) -> (EngineSnapshot<R>, tokio::sync::watch::Receiver<EngineSnapshot<R>>) {
         let mut snapshots = self.snapshots.clone();
         let current = snapshots.borrow_and_update().clone();
         (current, snapshots)
@@ -105,7 +105,7 @@ mod tests {
         },
     };
 
-    use flotilla_resources::{ReadWatchEvent, Vessel};
+    use flotilla_resources::{ReadWatchEvent, Vessel, VesselSpec, VesselStatus};
     use futures::stream::BoxStream;
 
     use super::*;
@@ -117,20 +117,25 @@ mod tests {
         listings: AtomicUsize,
         /// How many times each listing yields before it answers, as a listing read from storage does.
         yields: AtomicUsize,
-        records: Mutex<Vec<EngineObject>>,
+        records: Mutex<Vec<Record<Vessel>>>,
         subscribers: Mutex<Vec<futures::channel::mpsc::UnboundedSender<()>>>,
     }
 
     impl Counted {
         fn put(&self, name: &str, version: u64) {
-            let record = EngineObject {
+            let record = Record::<Vessel> {
                 name: name.into(),
                 home: "kiwi".into(),
                 version,
                 created_at: chrono::DateTime::UNIX_EPOCH,
                 labels: BTreeMap::new(),
                 annotations: BTreeMap::new(),
-                spec: serde_json::json!({ "convoy_ref": "c", "vessel_name": "w", "fulfilment_kind_ref": "k" }),
+                spec: VesselSpec {
+                    convoy_ref: "c".into(),
+                    vessel_name: "w".into(),
+                    fulfilment_kind_ref: "k".into(),
+                    adopted_checkout_refs: BTreeMap::new(),
+                },
                 status: None,
             };
             let mut records = self.records.lock().expect("records");
@@ -146,23 +151,20 @@ mod tests {
     }
 
     #[async_trait::async_trait]
-    impl EngineRecords for Counted {
-        fn kinds(&self) -> &'static [&'static str] {
-            &["Vessel"]
-        }
-        fn codes(&self, _kind: &str) -> Vec<flotilla_resources::engine_records::KindCode> {
+    impl KindRecords<Vessel> for Counted {
+        fn codes(&self) -> Vec<flotilla_resources::engine_records::KindCode> {
             Vec::new()
         }
         fn home(&self) -> String {
             "kiwi".into()
         }
-        async fn get(&self, _kind: &str, name: &str) -> Result<Option<EngineObject>, String> {
+        async fn get(&self, name: &str) -> Result<Option<Record<Vessel>>, String> {
             Ok(self.records.lock().expect("records").iter().find(|record| record.name == name).cloned())
         }
-        async fn list(&self, kind: &str) -> Result<Vec<EngineObject>, String> {
-            self.sources(kind).await
+        async fn list(&self) -> Result<Vec<Record<Vessel>>, String> {
+            self.sources().await
         }
-        async fn sources(&self, _kind: &str) -> Result<Vec<EngineObject>, String> {
+        async fn sources(&self) -> Result<Vec<Record<Vessel>>, String> {
             self.listings.fetch_add(1, Ordering::SeqCst);
             for _ in 0..self.yields.load(Ordering::SeqCst) {
                 tokio::task::yield_now().await;
@@ -171,18 +173,17 @@ mod tests {
         }
         async fn apply(
             &self,
-            _kind: &str,
             _name: &str,
             _labels: &BTreeMap<String, String>,
             _annotations: &BTreeMap<String, String>,
-            _spec: serde_json::Value,
-        ) -> Result<EngineObject, String> {
+            _spec: &VesselSpec,
+        ) -> Result<Record<Vessel>, String> {
             Err("read only".into())
         }
-        async fn set_status(&self, _kind: &str, _name: &str, _status: serde_json::Value) -> Result<EngineObject, String> {
+        async fn set_status(&self, _name: &str, _status: &VesselStatus) -> Result<Record<Vessel>, String> {
             Err("read only".into())
         }
-        async fn delete(&self, _kind: &str, _name: &str) -> Result<(), String> {
+        async fn delete(&self, _name: &str) -> Result<(), String> {
             Err("read only".into())
         }
         async fn changes(&self) -> Result<BoxStream<'static, ()>, String> {
@@ -208,7 +209,7 @@ mod tests {
         let records = Arc::new(Counted::default());
         records.put("v#1", 1);
         let backend = crate::test_store::memory_backend();
-        backend.install_engine_records(records.clone());
+        backend.install_engine_kind::<Vessel>(records.clone());
         let watch = || async { backend.definitions::<Vessel>("flotilla").engine_watch().await.expect("served").expect("watch") };
         let (first_initial, mut first) = watch().await;
         let (second_initial, mut second) = watch().await;
@@ -246,7 +247,7 @@ mod tests {
         let records = Arc::new(Counted::default());
         records.put("v#1", 1);
         let backend = crate::test_store::memory_backend();
-        backend.install_engine_records(records.clone());
+        backend.install_engine_kind::<Vessel>(records.clone());
         let view = crate::WatchView::<Vessel>::start(backend, "flotilla").await.expect("view");
         records.yields.store(8, Ordering::SeqCst);
         let names = || async {

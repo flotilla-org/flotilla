@@ -723,7 +723,7 @@ pub struct InProcessDaemon {
     decided_store_metrics: Arc<flotilla_store::load_metrics::StoreLoadMetrics>,
     change_request_branches: std::sync::OnceLock<Arc<dyn flotilla_resources::engine_records::ChangeRequestBranches>>,
     /// The forge observations' records (ChangeRequest and Issue), whose changes wake the aggregator.
-    observation_records: std::sync::OnceLock<Arc<dyn flotilla_resources::engine_records::EngineRecords>>,
+    observation_records: std::sync::OnceLock<Arc<dyn flotilla_resources::engine_records::KindRecords<flotilla_resources::ChangeRequest>>>,
     /// The engine's provisioning readings behind `[primitives]` (#3629 layer 4), installed with
     /// the decided store's provisioning homes; none before, and none with the switch off.
     lifecycle_reads: Arc<flotilla_projections::ports::LateLifecycleReads>,
@@ -836,9 +836,9 @@ pub struct EngineIdentity {
 pub struct ComposedEngine {
     pub service: Arc<flotilla_schema_sqlite::stream::Service>,
     /// Installed on the backend before the daemon composes anything that reads.
-    pub records: Vec<Arc<dyn flotilla_resources::engine_records::EngineRecords>>,
+    pub records: Vec<Arc<dyn flotilla_store::EnginePort>>,
     /// ChangeRequest and Issue, which the forge observers write only on change.
-    pub observations: Arc<dyn flotilla_resources::engine_records::EngineRecords>,
+    pub observations: Arc<flotilla_provisioning::engine::observations::EngineObservations>,
     pub observation_failures: Arc<dyn flotilla_resources::engine_records::ObservationFailures>,
     /// The change requests the forge observers found on their repositories' own branches (#3108).
     pub change_request_branches: Arc<dyn flotilla_resources::engine_records::ChangeRequestBranches>,
@@ -2369,7 +2369,7 @@ impl InProcessDaemon {
     /// swept.
     pub fn install_observation_records(
         &self,
-        records: Arc<dyn flotilla_resources::engine_records::EngineRecords>,
+        records: Arc<flotilla_provisioning::engine::observations::EngineObservations>,
         failures: Arc<dyn flotilla_resources::engine_records::ObservationFailures>,
     ) -> Result<(), String> {
         self.resource_backend().install_engine_records(Arc::clone(&records));

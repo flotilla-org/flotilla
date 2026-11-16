@@ -8,7 +8,7 @@ use std::{
 use chrono::{DateTime, Utc};
 use flotilla_protocol::NodeId;
 use flotilla_resources::{
-    engine_records::{EngineObject, EngineRecords},
+    engine_records::{KindRecords, Record},
     ObjectMeta, ReadResourceObject, ReadWatchEvent,
 };
 use futures::{stream::BoxStream, StreamExt};
@@ -55,8 +55,8 @@ impl<T: Resource> DefinitionResolver<T> {
     }
 
     /// The engine's records of this kind, installed behind `[primitives]` (#3824 layer 2b-ii).
-    fn records(&self) -> Option<Arc<dyn EngineRecords>> {
-        self.backend.engine_records(T::API_PATHS.kind)
+    fn records(&self) -> Option<Arc<dyn KindRecords<T>>> {
+        self.backend.engine_records::<T>()
     }
 
     /// Whether this namespace holds the engine's records of this kind. The engine serves its kinds
@@ -77,20 +77,15 @@ impl<T: Resource> DefinitionResolver<T> {
         }
     }
 
-    /// An engine record as the old store's object: the stamps its port rebuilds, and no merge
-    /// metadata, owner references or finalizers. The engine keeps no creation time.
-    fn object(&self, record: EngineObject) -> Result<ResourceObject<T>, ResourceError> {
-        engine_object(&self.namespace, record)
+    /// An engine record as a resource in this namespace.
+    fn object(&self, record: Record<T>) -> ResourceObject<T> {
+        record_object(&self.namespace, record)
     }
 
     /// Every engine record of this kind read through this namespace, with the built-ins.
-    async fn engine_list(&self, records: &dyn EngineRecords) -> Result<Vec<ResourceObject<T>>, ResourceError> {
-        let listed = if self.holds_engine_records() {
-            port_reads::list(records, T::API_PATHS.kind).await.map_err(ResourceError::other)?
-        } else {
-            Vec::new()
-        };
-        let objects = listed.into_iter().map(|record| self.object(record)).collect::<Result<Vec<_>, _>>()?;
+    async fn engine_list(&self, records: &dyn KindRecords<T>) -> Result<Vec<ResourceObject<T>>, ResourceError> {
+        let listed = if self.holds_engine_records() { port_reads::list(records).await.map_err(ResourceError::other)? } else { Vec::new() };
+        let objects = listed.into_iter().map(|record| self.object(record)).collect();
         overlay_builtins(T::API_PATHS.kind, &self.namespace, objects, None)
     }
 
@@ -109,20 +104,17 @@ impl<T: Resource> DefinitionResolver<T> {
             return Some(self.reads(&records.home(), Vec::new(), None));
         }
         if let Some(receiver) = query.message.as_ref().and_then(crate::MessageQuery::open_receiver) {
-            if let Some(open) = port_reads::open_to(&*records, T::API_PATHS.kind, receiver).await {
+            if let Some(open) = port_reads::open_to(&*records, receiver).await {
                 return Some(open.map_err(ResourceError::other).and_then(|open| self.reads(&records.home(), open, None)));
             }
         }
         Some(self.read_all(&*records).await)
     }
 
-    async fn read_all(&self, records: &dyn EngineRecords) -> Result<Vec<ReadResourceObject<T>>, ResourceError> {
+    async fn read_all(&self, records: &dyn KindRecords<T>) -> Result<Vec<ReadResourceObject<T>>, ResourceError> {
         // Every home's copy, as the old store's replica reads return each origin's.
-        let listed = if self.holds_engine_records() {
-            port_reads::sources(records, T::API_PATHS.kind).await.map_err(ResourceError::other)?
-        } else {
-            Vec::new()
-        };
+        let listed =
+            if self.holds_engine_records() { port_reads::sources(records).await.map_err(ResourceError::other)? } else { Vec::new() };
         self.reads(&records.home(), listed, None)
     }
 
@@ -132,7 +124,7 @@ impl<T: Resource> DefinitionResolver<T> {
         let records = self.records()?;
         let copies = match self.holds_engine_records() {
             false => Vec::new(),
-            true => match port_reads::copies(&*records, T::API_PATHS.kind, name).await {
+            true => match port_reads::copies(&*records, name).await {
                 Ok(copies) => copies,
                 Err(error) => return Some(Err(ResourceError::other(error))),
             },
@@ -142,7 +134,7 @@ impl<T: Resource> DefinitionResolver<T> {
 
     /// `listed` as replica reads, each home's copy with its home as provenance and this home's as
     /// local, followed by the built-ins (those named `name`, when given).
-    fn reads(&self, home: &str, listed: Vec<EngineObject>, name: Option<&str>) -> Result<Vec<ReadResourceObject<T>>, ResourceError> {
+    fn reads(&self, home: &str, listed: Vec<Record<T>>, name: Option<&str>) -> Result<Vec<ReadResourceObject<T>>, ResourceError> {
         let mut reads = Vec::with_capacity(listed.len());
         for record in listed {
             let provenance = if record.home == home {
@@ -150,7 +142,7 @@ impl<T: Resource> DefinitionResolver<T> {
             } else {
                 ResourceProvenance::Replica { origin_root: NodeId::new(record.home.clone()), last_synced_at: Utc::now() }
             };
-            reads.push(ReadResourceObject { object: self.object(record)?, provenance });
+            reads.push(ReadResourceObject { object: self.object(record), provenance });
         }
         let builtins = overlay_builtins(T::API_PATHS.kind, &self.namespace, Vec::new(), None)?;
         reads.extend(
@@ -179,7 +171,7 @@ impl<T: Resource> DefinitionResolver<T> {
             };
             return Some(Ok((initial, futures::stream::pending().boxed())));
         }
-        let feed = match self.backend.engine_feed(T::API_PATHS.kind).await? {
+        let feed = match self.backend.engine_feed::<T>().await? {
             Ok(feed) => feed,
             Err(error) => return Some(Err(error)),
         };
@@ -219,7 +211,7 @@ impl<T: Resource> DefinitionResolver<T> {
     /// The watch events taking `seen` to `snapshot`, with the built-ins: a record whose home,
     /// version, labels and annotations are unchanged keeps its earlier read without decoding again.
     /// A name several homes hold reads as the last listed.
-    fn diff(&self, home: &str, snapshot: &EngineSnapshot, seen: &mut SeenReads<T>) -> Result<Vec<ReadWatchEvent<T>>, ResourceError> {
+    fn diff(&self, home: &str, snapshot: &EngineSnapshot<T>, seen: &mut SeenReads<T>) -> Result<Vec<ReadWatchEvent<T>>, ResourceError> {
         let listed = snapshot.as_ref().as_ref().map_err(|error| ResourceError::other(error.clone()))?;
         let mut current = BTreeMap::new();
         for record in listed {
@@ -232,7 +224,7 @@ impl<T: Resource> DefinitionResolver<T> {
                     } else {
                         ResourceProvenance::Replica { origin_root: NodeId::new(record.home.clone()), last_synced_at: Utc::now() }
                     };
-                    ReadResourceObject { object: self.object(record.clone())?, provenance }
+                    ReadResourceObject { object: self.object(record.clone()), provenance }
                 }
             };
             current.insert(record.name.clone(), (Some(stamp), read));
@@ -263,14 +255,12 @@ impl<T: Resource> DefinitionResolver<T> {
     /// Writes `spec` under `meta`'s name at this home, with the origin `meta`'s stamps name.
     async fn engine_apply(
         &self,
-        records: &dyn EngineRecords,
+        records: &dyn KindRecords<T>,
         meta: &InputMeta,
         spec: &T::Spec,
     ) -> Result<ResourceObject<T>, ResourceError> {
-        let value = serde_json::to_value(spec).map_err(|error| ResourceError::decode(error.to_string()))?;
-        let record =
-            records.apply(T::API_PATHS.kind, &meta.name, &meta.labels, &meta.annotations, value).await.map_err(ResourceError::other)?;
-        self.object(record)
+        let record = records.apply(&meta.name, &meta.labels, &meta.annotations, spec).await.map_err(ResourceError::other)?;
+        Ok(self.object(record))
     }
 
     pub async fn get(&self, name: &str) -> Result<ResourceObject<T>, ResourceError> {
@@ -287,8 +277,8 @@ impl<T: Resource> DefinitionResolver<T> {
             if !self.holds_engine_records() {
                 return Err(ResourceError::not_found(name));
             }
-            let record = port_reads::get(&*records, T::API_PATHS.kind, name).await.map_err(ResourceError::other)?;
-            return record.map(|record| self.object(record)).unwrap_or_else(|| Err(ResourceError::not_found(name)));
+            let record = port_reads::get(&*records, name).await.map_err(ResourceError::other)?;
+            return record.map(|record| self.object(record)).ok_or_else(|| ResourceError::not_found(name));
         }
         if self.backend.serves_read_views() {
             return self.backend.using::<T>(&self.namespace).get(name).await;
@@ -370,8 +360,8 @@ impl<T: Resource> DefinitionResolver<T> {
             if !self.holds_engine_records() {
                 return Ok(Vec::new());
             }
-            let stored = port_reads::list(&*records, T::API_PATHS.kind).await.map_err(ResourceError::other)?;
-            let objects = stored.into_iter().map(|record| self.object(record)).collect::<Result<Vec<_>, _>>()?;
+            let stored = port_reads::list(&*records).await.map_err(ResourceError::other)?;
+            let objects = stored.into_iter().map(|record| self.object(record)).collect();
             return select(objects, &selection);
         }
         selection.include_replicas = true;
@@ -526,10 +516,10 @@ impl<T: Resource> DefinitionResolver<T> {
             }
         }
         if let Some(records) = self.records() {
-            if port_reads::get(&*records, T::API_PATHS.kind, name).await.map_err(ResourceError::other)?.is_none() {
+            if port_reads::get(&*records, name).await.map_err(ResourceError::other)?.is_none() {
                 return Err(ResourceError::not_found(name));
             }
-            return records.delete(T::API_PATHS.kind, name).await.map_err(ResourceError::other);
+            return records.delete(name).await.map_err(ResourceError::other);
         }
         let local_root = self.backend.local_root()?;
         let sources = self.sources_for_name(name).await?;
@@ -779,14 +769,10 @@ pub(crate) fn select_reads<T: Resource>(
         .collect())
 }
 
-/// An engine record as the old store's object in `namespace`: the labels and annotations its
-/// port rebuilds, its creation time, and no merge metadata, owner references or finalizers.
-pub(crate) fn engine_object<T: Resource>(namespace: &str, record: EngineObject) -> Result<ResourceObject<T>, ResourceError> {
-    let decode =
-        |what: &str, error: serde_json::Error| ResourceError::decode(format!("{} {} {what}: {error}", T::API_PATHS.kind, record.name));
-    let spec = serde_json::from_value(record.spec.clone()).map_err(|error| decode("spec", error))?;
-    let status = record.status.clone().map(serde_json::from_value).transpose().map_err(|error| decode("status", error))?;
-    Ok(ResourceObject {
+/// An engine record as a resource in `namespace`: the labels and annotations its port rebuilds,
+/// its creation time, and no merge metadata, owner references or finalizers.
+pub(crate) fn record_object<T: Resource>(namespace: &str, record: Record<T>) -> ResourceObject<T> {
+    ResourceObject {
         metadata: ObjectMeta {
             name: record.name,
             namespace: namespace.to_owned(),
@@ -799,17 +785,17 @@ pub(crate) fn engine_object<T: Resource>(namespace: &str, record: EngineObject) 
             creation_timestamp: record.created_at,
             merge: None,
         },
-        spec,
-        status,
-    })
+        spec: record.spec,
+        status: record.status,
+    }
 }
 
 /// What a watcher last read of each name, and the record it was read from; the built-ins have none.
 /// One watcher's place in its kind's engine listings: the reads it has converted and the events
 /// of the last listing it has not yet handed on.
 struct EngineWatch<T: Resource> {
-    _feed: std::sync::Arc<crate::engine_feed::EngineFeed>,
-    snapshots: tokio::sync::watch::Receiver<EngineSnapshot>,
+    _feed: std::sync::Arc<crate::engine_feed::EngineFeed<T>>,
+    snapshots: tokio::sync::watch::Receiver<EngineSnapshot<T>>,
     seen: SeenReads<T>,
     pending: VecDeque<Result<ReadWatchEvent<T>, ResourceError>>,
     resolver: DefinitionResolver<T>,
@@ -836,7 +822,7 @@ struct RecordStamp {
 }
 
 impl RecordStamp {
-    fn of(record: &EngineObject) -> Self {
+    fn of<T: Resource>(record: &Record<T>) -> Self {
         Self { home: record.home.clone(), version: record.version, labels: record.labels.clone(), annotations: record.annotations.clone() }
     }
 }

@@ -1,10 +1,10 @@
 //! Repository on the engine, behind `[primitives]` (#3824 layer 3a).
 //!
-//! [`EngineRepositories`] is the [`EngineRecords`] port of Repository over the decided store. Each
+//! [`EngineRepositories`] is the [`KindRecords`] port of Repository over the decided store. Each
 //! home writes its own record of each repository it observes, through the plain-kind port; every
 //! home's are read from a resident map kept current by following the log.
 //!
-//! A record reads as the old object: the verification project and provenance and the superseding
+//! A record reads as the resource: the verification project and provenance and the superseding
 //! record as the annotations their writers stamp, and the observed default branch as the status.
 
 use std::{
@@ -18,13 +18,12 @@ use flotilla_engine_store::{
 };
 use flotilla_resources::{
     definition_provenance::{SUPERSEDED_BY_ANNOTATION, VERIFICATION_PROJECT_ANNOTATION, VERIFICATION_PROVENANCE_ANNOTATION},
-    engine_records::{decode_spec, decode_status, EngineObject, EngineRecords, Record},
-    Repository, RepositoryKey, RepositoryStatus,
+    engine_records::{KindRecords, Record},
+    Repository, RepositoryKey, RepositorySpec, RepositoryStatus,
 };
 use flotilla_schema::{Kind, KindCode, NewChange, Timestamp};
 use flotilla_schema_sqlite::{stream::Service, Read, StoreError};
 use futures::stream::BoxStream;
-use serde_json::Value;
 
 use super::reads::created_at;
 use super::watch::CommitsSeen;
@@ -41,8 +40,8 @@ const WRITE_ATTEMPTS: usize = 3;
 /// The writer the plain-kind port records for this port's writes.
 const WRITER: &str = "repository-records";
 
-/// One home's record as the resident map holds it: the old object it reads as, or why it does not.
-type Held = Result<EngineObject, String>;
+/// One home's record as the resident map holds it: the resource it reads as, or why it does not.
+type Held = Result<Record<Repository>, String>;
 
 /// Every home's records, by name and home.
 type Records = BTreeMap<(String, String), Held>;
@@ -56,7 +55,7 @@ fn locked<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
     mutex.lock().unwrap_or_else(PoisonError::into_inner)
 }
 
-/// `record` as the old object: its ops data as annotations, its observations as the status.
+/// `record` as the resource: its ops data as annotations, its observations as the status.
 fn object(name: String, home: String, version: u64, created_at: DateTime<Utc>, record: &RepositoryRecord) -> Held {
     let encode = |error: serde_json::Error| format!("{KIND} {name} at {home}: {error}");
     let mut annotations = BTreeMap::new();
@@ -75,17 +74,7 @@ fn object(name: String, home: String, version: u64, created_at: DateTime<Utc>, r
         default_branch_observations: record.default_branch_observations.clone(),
         ..Default::default()
     };
-    Record::<Repository> {
-        spec: record.spec().clone(),
-        status: Some(status),
-        name,
-        home,
-        version,
-        created_at,
-        labels: BTreeMap::new(),
-        annotations,
-    }
-    .engine_object()
+    Ok(Record { spec: record.spec().clone(), status: Some(status), name, home, version, created_at, labels: BTreeMap::new(), annotations })
 }
 
 fn reload(read: &mut Read<'_>, records: &mut Records, name: &str, home: &str) -> Result<(), StoreError> {
@@ -214,11 +203,7 @@ impl EngineRepositories {
 
     /// Writes this home's record `name` as `edit` makes it from the current one (or none),
     /// re-reading and trying again when another writer of the name wins the race.
-    fn write(
-        &self,
-        name: &str,
-        edit: impl Fn(Option<RepositoryRecord>) -> Result<RepositoryRecord, String>,
-    ) -> Result<EngineObject, String> {
+    fn write(&self, name: &str, edit: impl Fn(Option<RepositoryRecord>) -> Result<RepositoryRecord, String>) -> Held {
         for _ in 0..WRITE_ATTEMPTS {
             let current = self.log.get::<RepositoryRecord>(name, &self.home).map_err(|error| error.to_string())?;
             let version = current.as_ref().map(|current| current.version);
@@ -242,21 +227,15 @@ impl EngineRepositories {
     }
 }
 
-fn refuse_kind(kind: &str) -> Result<(), String> {
-    if kind == KIND {
-        Ok(())
-    } else {
-        Err(format!("{kind} is not served by the repository records"))
+impl flotilla_store::EnginePort for EngineRepositories {
+    fn install(self: Arc<Self>, backend: &flotilla_store::ResourceBackend) {
+        backend.install_engine_kind::<Repository>(self);
     }
 }
 
 #[async_trait::async_trait]
-impl EngineRecords for EngineRepositories {
-    fn kinds(&self) -> &'static [&'static str] {
-        &[KIND]
-    }
-
-    fn codes(&self, _kind: &str) -> Vec<KindCode> {
+impl KindRecords<Repository> for EngineRepositories {
+    fn codes(&self) -> Vec<KindCode> {
         vec![CODE]
     }
 
@@ -264,14 +243,12 @@ impl EngineRecords for EngineRepositories {
         self.home.clone()
     }
 
-    async fn get(&self, kind: &str, name: &str) -> Result<Option<EngineObject>, String> {
-        refuse_kind(kind)?;
+    async fn get(&self, name: &str) -> Result<Option<Record<Repository>>, String> {
         let resident = self.refresh()?;
         resolve(&resident.records, &self.home, name).transpose()
     }
 
-    async fn list(&self, kind: &str) -> Result<Vec<EngineObject>, String> {
-        refuse_kind(kind)?;
+    async fn list(&self) -> Result<Vec<Record<Repository>>, String> {
         let resident = self.refresh()?;
         let mut names: Vec<&String> = resident.records.keys().map(|(name, _)| name).collect();
         // The map orders by name, then home, so one name's homes are adjacent.
@@ -283,8 +260,7 @@ impl EngineRecords for EngineRepositories {
             .collect())
     }
 
-    async fn sources(&self, kind: &str) -> Result<Vec<EngineObject>, String> {
-        refuse_kind(kind)?;
+    async fn sources(&self) -> Result<Vec<Record<Repository>>, String> {
         let resident = self.refresh()?;
         Ok(resident
             .records
@@ -296,8 +272,7 @@ impl EngineRecords for EngineRepositories {
     }
 
     /// Every home's record `name`, read from the resident map by name.
-    async fn copies(&self, kind: &str, name: &str) -> Result<Vec<EngineObject>, String> {
-        refuse_kind(kind)?;
+    async fn copies(&self, name: &str) -> Result<Vec<Record<Repository>>, String> {
         let resident = self.refresh()?;
         Ok(resident
             .records
@@ -311,14 +286,11 @@ impl EngineRecords for EngineRepositories {
 
     async fn apply(
         &self,
-        kind: &str,
         name: &str,
         _labels: &BTreeMap<String, String>,
         annotations: &BTreeMap<String, String>,
-        spec: Value,
-    ) -> Result<EngineObject, String> {
-        refuse_kind(kind)?;
-        let spec = decode_spec::<Repository>(name, spec)?;
+        spec: &RepositorySpec,
+    ) -> Held {
         spec.verify_key(&RepositoryKey(name.to_owned()))?;
         let verification_provenance = match annotations.get(VERIFICATION_PROVENANCE_ANNOTATION) {
             Some(json) => serde_json::from_str::<Vec<VerificationProvenance>>(json)
@@ -339,9 +311,7 @@ impl EngineRecords for EngineRepositories {
         })
     }
 
-    async fn set_status(&self, kind: &str, name: &str, status: Value) -> Result<EngineObject, String> {
-        refuse_kind(kind)?;
-        let status = decode_status::<Repository>(name, status)?;
+    async fn set_status(&self, name: &str, status: &RepositoryStatus) -> Held {
         self.write(name, |current| {
             let mut record = current.ok_or_else(|| format!("{KIND} {name} is not held here"))?;
             // Checkouts by host and diagnostics have no reader and are not kept (#3824 layer 3a).
@@ -351,8 +321,7 @@ impl EngineRecords for EngineRepositories {
         })
     }
 
-    async fn delete(&self, kind: &str, name: &str) -> Result<(), String> {
-        refuse_kind(kind)?;
+    async fn delete(&self, name: &str) -> Result<(), String> {
         let Some(current) = self.log.get::<RepositoryRecord>(name, &self.home).map_err(|error| error.to_string())? else { return Ok(()) };
         match self.log.delete::<RepositoryRecord>(name, current.version, &PendingChange::new(NewChange::new(WRITER, self.now()))) {
             Ok(()) | Err(PlainError::Missing { .. }) => Ok(()),

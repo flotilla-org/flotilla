@@ -11,10 +11,16 @@ use std::{
 };
 
 use chrono::{DateTime, Utc};
-use flotilla_provisioning::engine::{hosts::EngineHosts, projects::EngineProjects, repositories::EngineRepositories};
-use flotilla_resources::{engine_records::EngineRecords, HostConnection, HostSpec, HostStatus, ProjectSpec, RepositorySpec, SystemClock};
+use flotilla_provisioning::engine::{
+    definitions::EngineDefinitions, hosts::EngineHosts, projects::EngineProjects, repositories::EngineRepositories,
+};
+use flotilla_resources::{
+    engine_records::KindRecords, HostConnection, HostSpec, HostStatus, ProjectSpec, RepositorySpec, Resource, SystemClock,
+};
 use flotilla_schema::Timestamp;
 use flotilla_schema_sqlite::stream::{Follower, Service};
+
+type BoxFuture<T> = std::pin::Pin<Box<dyn std::future::Future<Output = T> + Send>>;
 
 /// A decided store homed at `home`, in its own temporary directory or beside the store it writes for.
 pub struct OtherHome {
@@ -64,10 +70,9 @@ impl OtherHome {
             HostConnection::SshHost { owning_daemon, .. } => owning_daemon.clone(),
         };
         let hosts = EngineHosts::open(Arc::clone(&self.service), own_host, Arc::new(SystemClock)).expect("other home hosts");
-        let spec_value = serde_json::to_value(spec).expect("host spec");
-        hosts.apply("Host", name, &Default::default(), &Default::default(), spec_value).await.expect("write host at its home");
+        hosts.apply(name, &Default::default(), &Default::default(), spec).await.expect("write host at its home");
         if let Some(status) = status {
-            hosts.set_status("Host", name, serde_json::to_value(status).expect("host status")).await.expect("observe host at its home");
+            hosts.set_status(name, status).await.expect("observe host at its home");
         }
     }
 
@@ -75,43 +80,43 @@ impl OtherHome {
     pub async fn kind(&self, name: &str, spec: &flotilla_resources::FulfilmentKindSpec) {
         let kinds = flotilla_provisioning::engine::kinds::EngineKinds::open(Arc::clone(&self.service), Arc::new(SystemClock))
             .expect("other home kinds");
-        let spec = serde_json::to_value(spec).expect("kind spec");
-        kinds.apply("FulfilmentKind", name, &Default::default(), &Default::default(), spec).await.expect("write kind at its home");
+        kinds.apply(name, &Default::default(), &Default::default(), spec).await.expect("write kind at its home");
     }
 
     /// Writes Repository `name` here, as this home's observer or operator would.
     pub async fn repository(&self, name: &str, spec: &RepositorySpec) {
         let repositories = EngineRepositories::open(Arc::clone(&self.service), Arc::new(SystemClock)).expect("other home repositories");
-        let spec = serde_json::to_value(spec).expect("repository spec");
-        repositories.apply("Repository", name, &Default::default(), &Default::default(), spec).await.expect("write repository at its home");
+        repositories.apply(name, &Default::default(), &Default::default(), spec).await.expect("write repository at its home");
     }
 
     /// Records what this home's Repository reconciler observed of Repository `name`.
     pub async fn repository_status(&self, name: &str, status: &flotilla_resources::RepositoryStatus) {
         let repositories = EngineRepositories::open(Arc::clone(&self.service), Arc::new(SystemClock)).expect("other home repositories");
-        let status = serde_json::to_value(status).expect("repository status");
-        repositories.set_status("Repository", name, status).await.expect("observe repository at its home");
+        repositories.set_status(name, status).await.expect("observe repository at its home");
     }
 
     /// Writes Project `name` here with its writer's stamps, as this home declares it.
     pub async fn project(&self, name: &str, labels: &BTreeMap<String, String>, annotations: &BTreeMap<String, String>, spec: &ProjectSpec) {
         let projects = EngineProjects::open(Arc::clone(&self.service), Arc::new(SystemClock)).expect("other home projects");
-        let spec = serde_json::to_value(spec).expect("project spec");
-        projects.apply("Project", name, labels, annotations, spec).await.expect("write project at its home");
+        projects.apply(name, labels, annotations, spec).await.expect("write project at its home");
     }
 
-    /// Writes definition `name` of `kind` (a Forge, a credential declaration, ...) here, as this
+    /// Writes definition `name` of kind `R` (a Forge, a credential declaration, ...) here, as this
     /// home's operator would declare it.
-    pub async fn definition(&self, kind: &str, name: &str, spec: serde_json::Value) {
-        self.stamped_definition(kind, name, &BTreeMap::new(), spec).await;
+    pub async fn definition<R: Resource>(&self, name: &str, spec: &R::Spec)
+    where
+        EngineDefinitions: KindRecords<R>,
+    {
+        self.stamped_definition::<R>(name, &BTreeMap::new(), spec).await;
     }
 
     /// [`OtherHome::definition`], with the stamps its writer puts on it.
-    pub async fn stamped_definition(&self, kind: &str, name: &str, annotations: &BTreeMap<String, String>, spec: serde_json::Value) {
-        let definitions =
-            flotilla_provisioning::engine::definitions::EngineDefinitions::open(Arc::clone(&self.service), Arc::new(SystemClock))
-                .expect("other home definitions");
-        definitions.apply(kind, name, &Default::default(), annotations, spec).await.expect("write definition at its home");
+    pub async fn stamped_definition<R: Resource>(&self, name: &str, annotations: &BTreeMap<String, String>, spec: &R::Spec)
+    where
+        EngineDefinitions: KindRecords<R>,
+    {
+        let definitions = EngineDefinitions::open(Arc::clone(&self.service), Arc::new(SystemClock)).expect("other home definitions");
+        KindRecords::<R>::apply(&definitions, name, &Default::default(), annotations, spec).await.expect("write definition at its home");
     }
 
     /// Sends everything this home holds to `target`, heard now.
@@ -201,20 +206,53 @@ pub async fn put_host_at_its_home_heard(
     home.replicate_to_at(target, at);
 }
 
-/// Writes `seed`, each a kind, name and spec, into the decided store at `path` homed at `home`, as
-/// that home's own declarations, before its daemon opens it: the records a daemon reads while it
-/// composes. Repositories go through the repository port, every other kind through the
-/// definitions port.
-pub async fn seed_home(path: &std::path::Path, home: &str, seed: Vec<(&'static str, String, serde_json::Value)>) -> Result<(), String> {
-    use flotilla_provisioning::engine::{definitions::EngineDefinitions, repositories::EngineRepositories};
+/// The ports a [`Seed`] writes through.
+pub struct SeedPorts {
+    definitions: EngineDefinitions,
+    repositories: EngineRepositories,
+}
 
+/// One declaration [`seed_home`] writes: a definition kind's, through the definitions port, or a
+/// Repository, through the repository port.
+pub struct Seed(Box<SeedWrite>);
+
+/// A [`Seed`]'s write through the ports.
+type SeedWrite = dyn FnOnce(Arc<SeedPorts>) -> BoxFuture<Result<(), String>> + Send;
+
+impl Seed {
+    /// Definition `name` of kind `R`.
+    pub fn definition<R: Resource>(name: impl Into<String>, spec: R::Spec) -> Self
+    where
+        EngineDefinitions: KindRecords<R>,
+    {
+        let name = name.into();
+        Self(Box::new(move |ports| {
+            Box::pin(async move {
+                KindRecords::<R>::apply(&ports.definitions, &name, &Default::default(), &Default::default(), &spec).await.map(drop)
+            })
+        }))
+    }
+
+    /// Repository `name`.
+    pub fn repository(name: impl Into<String>, spec: RepositorySpec) -> Self {
+        let name = name.into();
+        Self(Box::new(move |ports| {
+            Box::pin(async move { ports.repositories.apply(&name, &Default::default(), &Default::default(), &spec).await.map(drop) })
+        }))
+    }
+}
+
+/// Writes `seed` into the decided store at `path` homed at `home`, as that home's own
+/// declarations, before its daemon opens it: the records a daemon reads while it composes.
+pub async fn seed_home(path: &std::path::Path, home: &str, seed: Vec<Seed>) -> Result<(), String> {
     let registry = flotilla_provisioning::stored::decided_registry().map_err(|error| format!("{error:?}"))?;
     let service = Arc::new(Service::open(path, home, registry).map_err(|error| error.to_string())?);
-    let definitions = EngineDefinitions::open(Arc::clone(&service), Arc::new(SystemClock))?;
-    let repositories = EngineRepositories::open(Arc::clone(&service), Arc::new(SystemClock))?;
-    for (kind, name, spec) in seed {
-        let port: &dyn EngineRecords = if kind == "Repository" { &repositories } else { &definitions };
-        port.apply(kind, &name, &Default::default(), &Default::default(), spec).await?;
+    let ports = Arc::new(SeedPorts {
+        definitions: EngineDefinitions::open(Arc::clone(&service), Arc::new(SystemClock))?,
+        repositories: EngineRepositories::open(Arc::clone(&service), Arc::new(SystemClock))?,
+    });
+    for Seed(write) in seed {
+        write(Arc::clone(&ports)).await?;
     }
     Ok(())
 }
@@ -229,15 +267,15 @@ mod tests {
         let target = OtherHome::open("target");
         let hosts = EngineHosts::open(Arc::clone(target.service()), "target-host".into(), Arc::new(SystemClock)).expect("hosts");
         put_host_at_its_home(target.service(), "feta", &HostSpec::default(), Some(&HostStatus::default())).await;
-        let feta = hosts.get("Host", "feta").await.expect("read").expect("replicated host");
+        let feta = hosts.get("feta").await.expect("read").expect("replicated host");
         assert_eq!(feta.home, "node-of-feta");
         assert!(feta.status.is_some());
         let mut status = HostStatus::default();
         status.capabilities.insert(flotilla_resources::HELD_CREDENTIALS_CAPABILITY.into(), serde_json::json!(["claude-max"]));
         put_host_at_its_home(target.service(), "feta", &HostSpec::default(), Some(&status)).await;
-        let feta = hosts.get("Host", "feta").await.expect("read").expect("replicated host");
+        let feta = hosts.get("feta").await.expect("read").expect("replicated host");
         assert_eq!(
-            feta.status.expect("status")["capabilities"][flotilla_resources::HELD_CREDENTIALS_CAPABILITY],
+            feta.status.expect("status").capabilities[flotilla_resources::HELD_CREDENTIALS_CAPABILITY],
             serde_json::json!(["claude-max"])
         );
     }

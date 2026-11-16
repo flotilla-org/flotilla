@@ -330,7 +330,7 @@ pub async fn quarantine_undecodable_stored_objects(backend: &ResourceBackend, na
         return Ok(());
     }
     // A kind an engine port serves holds no old-store records to decode.
-    for registered in REGISTERED_RESOURCE_KINDS.iter().filter(|registered| backend.engine_records(registered.kind).is_none()) {
+    for registered in REGISTERED_RESOURCE_KINDS.iter().filter(|registered| !backend.engine_serves(registered.kind)) {
         list_resource_kind(backend, namespace, registered.kind).await?;
     }
     Ok(())
@@ -347,6 +347,21 @@ pub async fn current_resource_kind_position(
 
 async fn current_position_typed<T: Resource>(backend: &ResourceBackend, namespace: &str) -> Result<crate::ResourcePosition, ResourceError> {
     backend.using::<T>(namespace).current_position().await
+}
+
+/// An action on one registered kind, by its resource type.
+pub trait RegisteredKindVisitor {
+    fn visit<R: Resource>(&mut self);
+}
+
+/// Runs `visitor` on each kind in [`REGISTERED_RESOURCE_KINDS`].
+pub fn visit_registered_kinds(visitor: &mut impl RegisteredKindVisitor) {
+    fn visit<R: Resource>(visitor: &mut impl RegisteredKindVisitor) {
+        visitor.visit::<R>();
+    }
+    for registered in REGISTERED_RESOURCE_KINDS {
+        dispatch_resource_kind!(registered.resource, visit(visitor));
+    }
 }
 
 pub fn declared_resource_kinds() -> Vec<crate::ResourceKind> {
@@ -973,14 +988,14 @@ async fn get_all_typed<T: Resource>(backend: &ResourceBackend, namespace: &str, 
 
 async fn delete_typed<T: Resource>(backend: &ResourceBackend, namespace: &str, name: &str) -> Result<DynamicResourceDelete, ResourceError> {
     let resolver = backend.using::<T>(namespace);
-    if let Some(records) = backend.engine_records(T::API_PATHS.kind) {
+    if let Some(records) = backend.engine_records::<T>() {
         backend.definitions::<T>(namespace).refuse_write_elsewhere()?;
         // The engine keeps its own deletions: no old-store tombstone or decode quarantine. Its port
         // answers a delete of a name it does not list too, refusing it when the kind takes no writes.
         let object = match resolver.get(name).await {
             Ok(object) => object,
             Err(ResourceError::NotFound { .. }) => {
-                records.delete(T::API_PATHS.kind, name).await.map_err(ResourceError::invalid)?;
+                records.delete(name).await.map_err(ResourceError::invalid)?;
                 return Err(resolver.not_held_here(name, "delete").await?);
             }
             Err(error) => return Err(error),

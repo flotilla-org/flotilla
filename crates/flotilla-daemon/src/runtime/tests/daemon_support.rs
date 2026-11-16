@@ -93,7 +93,7 @@ pub(super) async fn declare_mapping_forge(backend: &ResourceBackend, namespace: 
 pub(super) async fn declare_mapping_forge_at_home(daemon: &InProcessDaemon, home: &str) {
     let target = daemon.decided_store().expect("decided store");
     let other = flotilla_provisioning_testkit::other_home_for(&target, home);
-    other.definition("Forge", &format!("lab-{home}"), serde_json::to_value(mapping_forge_spec()).expect("Forge spec")).await;
+    other.definition::<flotilla_resources::Forge>(&format!("lab-{home}"), &mapping_forge_spec()).await;
     other.replicate_to(&target);
 }
 

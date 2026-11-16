@@ -14,10 +14,11 @@ use flotilla_resources::{
     address::{artifact_address, record_name, stored_change_request_address},
     artifact::blob_digest_of,
     convoy::engine::{Actor, EngineConvoyPath, EngineConvoys, OldPromises, VerdictScope},
+    engine_records::{KindRecords, Record},
     promises::{self, PromiseKind, PromiseOperation, PromiseSource, PromiseState, Submission},
     Artifact, ArtifactSpec, ChangeRequest, ChangeRequestReviewObservation, ChangeRequestSpec, ChangeRequestStatus, Convoy, ConvoyPhase,
-    ConvoySpec, ConvoyStatus, CrewSource, CrewSpec, CrewWorkPhase, CrewWorkState, InputMeta, Observation, ObservedChangeRequestState,
-    ResourceObject, VesselRequirement, WorkflowSnapshot,
+    ConvoySpec, ConvoyStatus, CrewSource, CrewSpec, CrewWorkPhase, CrewWorkState, Forge, InputMeta, Observation,
+    ObservedChangeRequestState, ResourceObject, VesselRequirement, WorkflowSnapshot,
 };
 use flotilla_store::{
     controller::Reconciler,
@@ -1171,23 +1172,20 @@ struct Forges {
 }
 
 #[async_trait]
-impl flotilla_resources::engine_records::EngineRecords for Forges {
-    fn kinds(&self) -> &'static [&'static str] {
-        &["Forge"]
-    }
-    fn codes(&self, _kind: &str) -> Vec<flotilla_resources::engine_records::KindCode> {
+impl KindRecords<Forge> for Forges {
+    fn codes(&self) -> Vec<flotilla_resources::engine_records::KindCode> {
         Vec::new()
     }
     fn home(&self) -> String {
         "kiwi".into()
     }
-    async fn get(&self, _: &str, _: &str) -> Result<Option<flotilla_resources::engine_records::EngineObject>, String> {
-        self.list("Forge").await.map(|_| None)
+    async fn get(&self, _: &str) -> Result<Option<Record<Forge>>, String> {
+        self.list().await.map(|_| None)
     }
-    async fn list(&self, kind: &str) -> Result<Vec<flotilla_resources::engine_records::EngineObject>, String> {
-        self.sources(kind).await
+    async fn list(&self) -> Result<Vec<Record<Forge>>, String> {
+        self.sources().await
     }
-    async fn sources(&self, _: &str) -> Result<Vec<flotilla_resources::engine_records::EngineObject>, String> {
+    async fn sources(&self) -> Result<Vec<Record<Forge>>, String> {
         if self.failing.load(std::sync::atomic::Ordering::SeqCst) {
             return Err("the forges are unreadable".into());
         }
@@ -1196,17 +1194,16 @@ impl flotilla_resources::engine_records::EngineRecords for Forges {
     async fn apply(
         &self,
         _: &str,
-        _: &str,
         _: &BTreeMap<String, String>,
         _: &BTreeMap<String, String>,
-        _: serde_json::Value,
-    ) -> Result<flotilla_resources::engine_records::EngineObject, String> {
+        _: &flotilla_resources::ForgeSpec,
+    ) -> Result<Record<Forge>, String> {
         Err("read only".into())
     }
-    async fn set_status(&self, _: &str, _: &str, _: serde_json::Value) -> Result<flotilla_resources::engine_records::EngineObject, String> {
+    async fn set_status(&self, _: &str, _: &()) -> Result<Record<Forge>, String> {
         Err("read only".into())
     }
-    async fn delete(&self, _: &str, _: &str) -> Result<(), String> {
+    async fn delete(&self, _: &str) -> Result<(), String> {
         Err("read only".into())
     }
     async fn changes(&self) -> Result<futures::stream::BoxStream<'static, ()>, String> {
@@ -1223,7 +1220,7 @@ async fn a_convoy_failing_before_its_first_note_is_woken_by_any_change_request()
     use flotilla_store::controller::{SecondaryWatch, WorkQueueSender};
     let backend = ResourceBackend::new(InMemoryBackend::default());
     let forges = Arc::new(Forges { failing: true.into() });
-    backend.install_engine_records(Arc::clone(&forges) as Arc<dyn flotilla_resources::engine_records::EngineRecords>);
+    backend.install_engine_kind::<Forge>(Arc::clone(&forges) as Arc<dyn KindRecords<Forge>>);
     let mut convoy = ledger_convoy(&backend).await;
     convoy.status.as_mut().expect("status").promises.clear();
     submit_pr(&mut convoy, 1);

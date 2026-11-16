@@ -73,7 +73,7 @@ impl<T: Resource> ViewSource<T> for StoreViewSource<T> {
     /// An engine kind's changes reach its watches through the shared listing, which is taken
     /// after the write: wait for it.
     async fn catch_up(&self) {
-        if let Some(feed) = self.backend.held_engine_feed(T::API_PATHS.kind) {
+        if let Some(feed) = self.backend.held_engine_feed::<T>() {
             feed.catch_up().await;
         }
     }

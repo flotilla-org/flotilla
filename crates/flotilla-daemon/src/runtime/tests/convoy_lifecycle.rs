@@ -661,12 +661,13 @@ async fn checkout_authority_observes_replicated_landing_and_convoy_authority_set
     // The CR observation is a decided record homed at the checkout authority: it reaches the
     // convoy authority as that home's log does.
     {
-        use flotilla_resources::engine_records::EngineRecords;
+        use flotilla_resources::engine_records::KindRecords;
         let observations = flotilla_provisioning::engine::observations::EngineObservations::open(
             Arc::clone(checkout_home.service()),
             Arc::new(flotilla_resources::SystemClock),
         )
         .expect("checkout authority observations");
+        let observations: &dyn KindRecords<flotilla_resources::ChangeRequest> = &observations;
         let observed = checkout_host
             .using::<flotilla_resources::ChangeRequest>(NAMESPACE)
             .list()
@@ -674,13 +675,8 @@ async fn checkout_authority_observes_replicated_landing_and_convoy_authority_set
             .expect("list checkout authority CR observations");
         for record in observed.items {
             let name = &record.metadata.name;
-            let spec = serde_json::to_value(&record.spec).expect("CR spec");
-            observations
-                .apply("ChangeRequest", name, &record.metadata.labels, &record.metadata.annotations, spec)
-                .await
-                .expect("CR at its home");
-            let status = serde_json::to_value(record.status.expect("CR status")).expect("CR status value");
-            observations.set_status("ChangeRequest", name, status).await.expect("CR status at its home");
+            observations.apply(name, &record.metadata.labels, &record.metadata.annotations, &record.spec).await.expect("CR at its home");
+            observations.set_status(name, &record.status.expect("CR status")).await.expect("CR status at its home");
         }
     }
     // B's checkout and its observations reach A as B's log does.

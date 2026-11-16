@@ -13,8 +13,8 @@
 //! first passes the records' cursors over the log and reads in the note changes not yet read, so
 //! a writer reads back what it has written.
 //!
-//! Installed as the backend's [`EngineRecords`] for `Convoy`, it serves the old store's typed
-//! reads, lists and watches of the kind; its writes are refused.
+//! Installed as the backend's [`KindRecords`] for `Convoy`, it serves the typed reads, lists and
+//! watches of the kind; its writes are refused.
 
 use std::{
     collections::{BTreeMap, BTreeSet},
@@ -28,16 +28,14 @@ use flotilla_protocol::{LifecycleReading, NodeId};
 use flotilla_resources::{
     convoy::view::VesselReading,
     convoy_records::{ConvoyChange, ConvoyJoins, ConvoyNotes, ConvoyRecord, ConvoyRecords, WorkFacts},
-    engine_records::{EngineObject, EngineRecords},
+    engine_records::{KindRecords, Record},
     lifecycle_reads::{ChangeCursor, LifecycleReads},
     terminal_records::{newest_launches, TerminalChange},
     vessel_records::{interrupted_message, VesselChange},
-    Convoy, ReadResourceObject, ResourceError, ResourceObject, ResourceProvenance,
+    Convoy, ConvoySpec, ConvoyStatus, ReadResourceObject, ResourceError, ResourceObject, ResourceProvenance,
 };
 
 use crate::held_listing::ticks;
-
-const KIND: &str = "Convoy";
 
 /// Read views of the convoys in one namespace.
 #[derive(Clone)]
@@ -369,13 +367,13 @@ impl ConvoyViews {
         self.reads.convoys()
     }
 
-    async fn engine_sources(&self) -> Result<Vec<EngineObject>, String> {
+    async fn engine_sources(&self) -> Result<Vec<Record<Convoy>>, String> {
         let sources = self.sources().await.map_err(|error| error.to_string())?;
-        self.engine_objects(sources)
+        self.view_records(sources)
     }
 
-    /// Every home's launch `name`, as the engine port's objects: only those are converted.
-    async fn engine_copies(&self, name: &str) -> Result<Vec<EngineObject>, String> {
+    /// Every home's launch `name`, as the engine port's records: only those are converted.
+    async fn engine_copies(&self, name: &str) -> Result<Vec<Record<Convoy>>, String> {
         let name = name.to_owned();
         let copies = self
             .with_held(move |held| {
@@ -383,11 +381,11 @@ impl ConvoyViews {
             })
             .await
             .map_err(|error| error.to_string())?;
-        self.engine_objects(copies)
+        self.view_records(copies)
     }
 
-    /// `sources` as the engine port's objects, each at its home.
-    fn engine_objects(&self, sources: Vec<ReadResourceObject<Convoy>>) -> Result<Vec<EngineObject>, String> {
+    /// `sources` as the engine port's records, each at its home.
+    fn view_records(&self, sources: Vec<ReadResourceObject<Convoy>>) -> Result<Vec<Record<Convoy>>, String> {
         sources
             .into_iter()
             .map(|source| {
@@ -395,7 +393,7 @@ impl ConvoyViews {
                     ResourceProvenance::Local => self.convoys()?.home().to_owned(),
                     ResourceProvenance::Replica { origin_root, .. } => origin_root.as_str().to_owned(),
                 };
-                engine_object(source, home)
+                view_record(source, home)
             })
             .collect()
     }
@@ -407,27 +405,28 @@ impl std::fmt::Debug for ConvoyViews {
     }
 }
 
-/// `source` as the engine port hands it to the old store: a change of the launch, of what it
-/// joins, or of its home's notes moves its version. Each is counted as a Convoy converted to the
-/// old shape.
-fn engine_object(source: ReadResourceObject<Convoy>, home: String) -> Result<EngineObject, String> {
+/// `source` as the engine port hands it out: a change of the launch, of what it joins, or of its
+/// home's notes moves its version. Each is counted as a Convoy converted to the port's shape.
+fn view_record(source: ReadResourceObject<Convoy>, home: String) -> Result<Record<Convoy>, String> {
     flotilla_schema::reads::converted("Convoy", 1);
     crate::held_listing::view_object(source.object, home)
 }
 
-#[async_trait::async_trait]
-impl EngineRecords for ConvoyViews {
-    fn kinds(&self) -> &'static [&'static str] {
-        &[KIND]
+impl crate::EnginePort for ConvoyViews {
+    fn install(self: Arc<Self>, backend: &crate::ResourceBackend) {
+        backend.install_engine_kind::<Convoy>(self);
     }
+}
 
-    fn codes(&self, _kind: &str) -> Vec<flotilla_resources::engine_records::KindCode> {
+#[async_trait::async_trait]
+impl KindRecords<Convoy> for ConvoyViews {
+    fn codes(&self) -> Vec<flotilla_resources::engine_records::KindCode> {
         use flotilla_resources::lifecycle_reads::{record_codes, RecordSet};
         record_codes(self.reads.as_ref(), &[RecordSet::Convoys, RecordSet::Vessels, RecordSet::Terminals])
     }
 
     /// This home's notes on its launches.
-    fn unlogged_changes(&self, _kind: &str) -> Option<u64> {
+    fn unlogged_changes(&self) -> Option<u64> {
         Some(self.reads.convoys().map_or(0, |convoys| convoys.memory().changed()))
     }
 
@@ -435,10 +434,10 @@ impl EngineRecords for ConvoyViews {
         self.convoys().map(|convoys| convoys.home().to_owned()).unwrap_or_default()
     }
 
-    async fn get(&self, _kind: &str, name: &str) -> Result<Option<EngineObject>, String> {
+    async fn get(&self, name: &str) -> Result<Option<Record<Convoy>>, String> {
         let home = self.home();
         match self.find(name, None).await.map_err(|error| error.to_string())? {
-            Some(source) => engine_object(source, home).map(Some),
+            Some(source) => view_record(source, home).map(Some),
             // Another home's launch of this name reads where this home holds none: the lexically
             // first home's, as a listing chooses.
             None => Ok(self.engine_copies(name).await?.into_iter().min_by(|a, b| a.home.cmp(&b.home))),
@@ -446,9 +445,9 @@ impl EngineRecords for ConvoyViews {
     }
 
     /// Each launch, this home's where it holds one of the name, else the lexically first home's.
-    async fn list(&self, _kind: &str) -> Result<Vec<EngineObject>, String> {
+    async fn list(&self) -> Result<Vec<Record<Convoy>>, String> {
         let home = self.home();
-        let mut chosen = BTreeMap::<String, EngineObject>::new();
+        let mut chosen = BTreeMap::<String, Record<Convoy>>::new();
         for object in self.engine_sources().await? {
             let keep = chosen.get(&object.name).is_some_and(|held| held.home == home || (object.home != home && held.home <= object.home));
             if !keep {
@@ -458,30 +457,29 @@ impl EngineRecords for ConvoyViews {
         Ok(chosen.into_values().collect())
     }
 
-    async fn sources(&self, _kind: &str) -> Result<Vec<EngineObject>, String> {
+    async fn sources(&self) -> Result<Vec<Record<Convoy>>, String> {
         self.engine_sources().await
     }
 
-    async fn copies(&self, _kind: &str, name: &str) -> Result<Vec<EngineObject>, String> {
+    async fn copies(&self, name: &str) -> Result<Vec<Record<Convoy>>, String> {
         self.engine_copies(name).await
     }
 
     async fn apply(
         &self,
-        _kind: &str,
         name: &str,
         _labels: &BTreeMap<String, String>,
         _annotations: &BTreeMap<String, String>,
-        _spec: serde_json::Value,
-    ) -> Result<EngineObject, String> {
+        _spec: &ConvoySpec,
+    ) -> Result<Record<Convoy>, String> {
         Err(format!("convoy {name} is admitted on the engine, not written"))
     }
 
-    async fn set_status(&self, _kind: &str, name: &str, _status: serde_json::Value) -> Result<EngineObject, String> {
+    async fn set_status(&self, name: &str, _status: &ConvoyStatus) -> Result<Record<Convoy>, String> {
         Err(format!("convoy {name}'s status is derived from the engine's records; it is not written"))
     }
 
-    async fn delete(&self, _kind: &str, name: &str) -> Result<(), String> {
+    async fn delete(&self, name: &str) -> Result<(), String> {
         Err(format!("convoy {name} ends on the engine; it is not deleted"))
     }
 
