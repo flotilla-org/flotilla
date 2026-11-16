@@ -8,10 +8,7 @@ use flotilla_protocol::{
     ResourceReadRecord, ResourceRecordProvenance, ResourceRecordType, StepStatus,
 };
 use flotilla_resources::{ConditionValue, IntegrationCondition, ResourceProvenance, WatchStart};
-use flotilla_store::{
-    watch_resource_kind, watch_resource_kind_from, watch_resource_kind_including_replicas, watch_resource_kind_including_replicas_from,
-    ResourceBackend,
-};
+use flotilla_store::{watch_resource_kind_with, DynamicWatchRequest, ResourceBackend};
 use futures::StreamExt;
 use tokio_util::sync::CancellationToken;
 
@@ -42,16 +39,10 @@ pub async fn run_resource_watch_command(context: ResourceWatchCommandContext) ->
         Err(message) => return CommandValue::Error { message },
     };
     // Cancellation below also drops any partial setup.
-    let setup = async {
-        match (context.include_replicas, start) {
-            (true, Some(start)) => {
-                watch_resource_kind_including_replicas_from(&context.backend, &context.namespace, &context.kind, start).await
-            }
-            (true, None) => watch_resource_kind_including_replicas(&context.backend, &context.namespace, &context.kind).await,
-            (false, Some(start)) => watch_resource_kind_from(&context.backend, &context.namespace, &context.kind, start).await,
-            (false, None) => watch_resource_kind(&context.backend, &context.namespace, &context.kind).await,
-        }
-    };
+    // Bookmarks carry the cursor a client resumes from after a drop: an object's resourceVersion
+    // is no position.
+    let request = DynamicWatchRequest { start, include_replicas: context.include_replicas, bookmarks: true };
+    let setup = watch_resource_kind_with(&context.backend, &context.namespace, &context.kind, request);
     let result = tokio::select! {
         biased;
         _ = context.token.cancelled() => return CommandValue::Cancelled,
@@ -107,17 +98,39 @@ pub async fn run_resource_watch_command(context: ResourceWatchCommandContext) ->
         ),
     );
 
+    // The newest bookmark's position, or the list's: a resume from it delivers again any change
+    // after it, so each event carries it rather than its object's resourceVersion.
+    let mut cursor = ResourceCursor::from_position(initial_resource_version, generation.clone());
     let mut stream = watch.stream;
     loop {
         tokio::select! {
             _ = context.token.cancelled() => return CommandValue::Cancelled,
             event = stream.next() => {
                 match event {
+                    Some(Ok(event)) if event["type"] == "BOOKMARK" => {
+                        let Some(position) = event["object"]["metadata"]["resourceVersion"].as_str() else {
+                            return CommandValue::Error { message: "resource watch bookmark is missing resourceVersion".to_string() };
+                        };
+                        cursor = ResourceCursor::from_position(position.to_owned(), generation.clone());
+                        send_resource_watch_event(
+                            &context.event_sink,
+                            context.command_id,
+                            &context.node_id,
+                            &context.repo_identity,
+                            resource_read_envelope(
+                                resource_kind.clone(),
+                                plural.clone(),
+                                namespace.clone(),
+                                cursor.clone(),
+                                vec![ResourceReadRecord {
+                                    record_type: ResourceRecordType::Bookmark,
+                                    provenance: ResourceRecordProvenance::Local { node_id: context.node_id.clone() },
+                                    object: None,
+                                }],
+                            ),
+                        );
+                    }
                     Some(Ok(event)) => {
-                        let resource_version = event["object"]["metadata"]["resourceVersion"]
-                            .as_str()
-                            .unwrap_or(&initial_resource_version)
-                            .to_string();
                         let record = match resource_watch_record(event, &context.node_id) {
                             Ok(Some(record)) => record,
                             Ok(None) => continue,
@@ -133,7 +146,7 @@ pub async fn run_resource_watch_command(context: ResourceWatchCommandContext) ->
                                     resource_kind.clone(),
                                     plural.clone(),
                                     namespace.clone(),
-                                    ResourceCursor::from_position(resource_version, generation.clone()),
+                                    cursor.clone(),
                                     vec![record],
                                 ),
                             );

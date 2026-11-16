@@ -266,7 +266,14 @@ async fn stale_watch_maps_http_gone_to_typed_expiry() {
 
     let error = resolver.watch(WatchStart::FromVersion("6".to_string())).await.expect_err("stale watch should expire");
 
-    assert_eq!(error, ResourceError::WatchExpired { requested_version: "6".to_string(), compacted_through: None });
+    assert_eq!(
+        error,
+        ResourceError::WatchExpired {
+            requested_version: "6".to_string(),
+            compacted_through: None,
+            reason: "too old resource version: 6".to_string(),
+        }
+    );
     let request = request_rx.await.expect("captured request");
     assert!(request.contains("watch=true&resourceVersion=6"));
 }
@@ -281,7 +288,14 @@ async fn stale_watch_maps_http_gone_before_reading_a_truncated_body() {
 
     let error = resolver.watch(WatchStart::FromVersion("6".to_string())).await.expect_err("stale watch should expire");
 
-    assert_eq!(error, ResourceError::WatchExpired { requested_version: "6".to_string(), compacted_through: None });
+    assert_eq!(
+        error,
+        ResourceError::WatchExpired {
+            requested_version: "6".to_string(),
+            compacted_through: None,
+            reason: "the server's reason could not be read".to_string(),
+        }
+    );
 }
 
 #[tokio::test]

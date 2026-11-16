@@ -440,7 +440,15 @@ impl HttpBackend {
                     | WatchStart::FromVersionInGeneration { resource_version: requested_version, .. } => requested_version,
                     WatchStart::Now => String::new(),
                 };
-                return Err(ResourceError::WatchExpired { requested_version, compacted_through: None });
+                // The server's Status message says why; a body that cannot be read still expires.
+                let reason = match response.bytes().await {
+                    Ok(bytes) => serde_json::from_slice::<Value>(&bytes)
+                        .ok()
+                        .and_then(|status| status.get("message").and_then(Value::as_str).map(str::to_owned))
+                        .unwrap_or_else(|| "the server gave no reason".to_owned()),
+                    Err(_) => "the server's reason could not be read".to_owned(),
+                };
+                return Err(ResourceError::WatchExpired { requested_version, compacted_through: None, reason });
             }
             let bytes = response.bytes().await.map_err(|err| ResourceError::other(format!("read watch error body: {err}")))?;
             return Err(map_status_error(status, &bytes, None));

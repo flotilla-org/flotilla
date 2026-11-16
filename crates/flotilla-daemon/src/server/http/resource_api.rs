@@ -8,9 +8,8 @@ use flotilla_resources::{ManifestRoot, Resource, ResourceError, WatchStart};
 use flotilla_schema_sqlite::stream::Service;
 use flotilla_store::{
     get_resource_kind, get_resource_kind_all_provenances, get_resource_kind_including_replicas, list_resource_kind,
-    list_resource_kind_including_replicas, list_resource_kind_replica_sources, registered_resource_namespaces, watch_resource_kind,
-    watch_resource_kind_from, watch_resource_kind_including_replicas, watch_resource_kind_including_replicas_from, DynamicResourceWatch,
-    ResourceBackend, REGISTERED_RESOURCE_KINDS,
+    list_resource_kind_including_replicas, list_resource_kind_replica_sources, registered_resource_namespaces, watch_resource_kind_with,
+    DynamicResourceWatch, DynamicWatchRequest, ResourceBackend, REGISTERED_RESOURCE_KINDS,
 };
 
 /// What the resource API answers, before it is written to a connection.
@@ -47,6 +46,10 @@ impl Reply {
     }
 
     fn resource_error(error: ResourceError) -> Self {
+        // A Status message, as Kubernetes sends with a 410: why the client relists.
+        if let ResourceError::WatchExpired { reason, .. } = &error {
+            return Self::error(410, reason);
+        }
         let status = match error {
             ResourceError::WatchExpired { .. } => 410,
             ResourceError::Invalid { .. } => 400,
@@ -274,13 +277,9 @@ pub(in crate::server) async fn respond(
         None => WatchStart::FromVersion(resource_version.clone()),
     });
     // An engine-served kind's include-replicas watch resumes from its list's position; any other
-    // kind's is refused.
-    let watched = match (include_replicas, start) {
-        (true, Some(start)) => watch_resource_kind_including_replicas_from(&backend, namespace, kind, start).await,
-        (true, None) => watch_resource_kind_including_replicas(&backend, namespace, kind).await,
-        (false, Some(start)) => watch_resource_kind_from(&backend, namespace, kind, start).await,
-        (false, None) => watch_resource_kind(&backend, namespace, kind).await,
-    };
+    // kind's is refused. Bookmarks are sent where asked for, as Kubernetes does.
+    let bookmarks = query.get("allowWatchBookmarks").is_some_and(|allowed| allowed == "true");
+    let watched = watch_resource_kind_with(&backend, namespace, kind, DynamicWatchRequest { start, include_replicas, bookmarks }).await;
 
     match watched {
         Ok(watch) => Reply::Watch(watch),

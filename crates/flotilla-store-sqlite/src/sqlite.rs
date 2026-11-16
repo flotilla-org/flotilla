@@ -3205,6 +3205,7 @@ impl SqliteBackend {
             return Err(ResourceError::WatchExpired {
                 requested_version: "quarantined event leaves a sequence gap; snapshot required".to_string(),
                 compacted_through: None,
+                reason: "a quarantined event leaves a gap in the sequence".to_string(),
             });
         }
 
@@ -3368,6 +3369,7 @@ impl SqliteBackend {
             return Err(ResourceError::WatchExpired {
                 requested_version: replay_from.to_string(),
                 compacted_through: Some(compacted_through.to_string()),
+                reason: format!("events through {compacted_through} were compacted"),
             });
         }
         Ok(())

@@ -287,6 +287,11 @@ struct MockDaemon {
     cancelled: Mutex<Vec<u64>>,
     list_failure: Mutex<Option<String>>,
     unsubscribe_calls: AtomicUsize,
+    /// Each watch asked to resume, by scope and cursor.
+    resumes: Mutex<Vec<((String, String), flotilla_protocol::ResourceCursor)>>,
+    /// Whether a resume is served, with its bookmark alone; else it is refused, as a kind the
+    /// engine does not serve refuses it.
+    serves_resumes: std::sync::atomic::AtomicBool,
 }
 
 impl MockDaemon {
@@ -307,6 +312,8 @@ impl MockDaemon {
             cancelled: Mutex::new(Vec::new()),
             list_failure: Mutex::new(None),
             unsubscribe_calls: AtomicUsize::new(0),
+            resumes: Mutex::new(Vec::new()),
+            serves_resumes: std::sync::atomic::AtomicBool::new(false),
         }
     }
 }
@@ -333,7 +340,41 @@ impl DaemonHandle for MockDaemon {
             return Err("mock".into());
         };
         assert!(include_replicas);
-        assert!(cursor.is_none(), "merged watches bootstrap from their own snapshot");
+        if let Some(cursor) = cursor {
+            self.resumes.lock().expect("resumes").push(((namespace.clone(), kind.clone()), cursor.clone()));
+            if !self.serves_resumes.load(Ordering::SeqCst) {
+                return Err("invalid resource: include-replicas watches do not support resourceVersion resume".into());
+            }
+            let id = self.watch_starts.fetch_add(1, Ordering::SeqCst) as u64 + 1;
+            self.watch_commands.lock().expect("watch commands").insert((namespace.clone(), kind.clone()), id);
+            let bookmark = flotilla_protocol::ResourceReadEnvelope::builder()
+                .api_version("flotilla.work/v1".into())
+                .resource_kind(kind.clone())
+                .plural(kind)
+                .namespace(namespace)
+                .cursor(cursor)
+                .records(vec![flotilla_protocol::ResourceReadRecord {
+                    record_type: flotilla_protocol::ResourceRecordType::Bookmark,
+                    provenance: flotilla_protocol::ResourceRecordProvenance::Local { node_id: flotilla_protocol::NodeId::new("kiwi") },
+                    object: None,
+                }])
+                .build();
+            let event = DaemonEvent::CommandStepUpdate {
+                command_id: id,
+                node_id: flotilla_protocol::NodeId::new("kiwi"),
+                repo_identity: flotilla_protocol::RepoIdentity { authority: "local".into(), path: "resource".into() },
+                repo: None,
+                step_index: 0,
+                step_count: 1,
+                description: "resumed".into(),
+                status: flotilla_protocol::StepStatus::Produced { value: Box::new(CommandValue::ResourceWatchEvent(Box::new(bookmark))) },
+            };
+            if let Some(tx) = &*self.isolated_watch.lock().expect("isolated watch") {
+                let _ = tx.send(event.clone());
+            }
+            self.tx.send(event).expect("resumed bookmark");
+            return Ok(id);
+        }
         let gate = self.watch_gate.lock().expect("watch gate").clone();
         if let Some((gated_kind, notify)) = gate {
             if gated_kind == kind {
@@ -1296,6 +1337,90 @@ async fn reconnect_resumes_an_include_replicas_watch_from_its_cursor() {
     );
 }
 
+// #3108: a watch sends a bookmark after each batch of changes. Dropped after one, it resumes from
+// that bookmark with no snapshot, naming only what changed after it.
+#[tokio::test]
+async fn a_watch_dropped_after_a_batch_resumes_from_its_bookmark() {
+    use flotilla_client::resource::{ResourceClient, ResourceWatch, ResourceWatchRequest};
+    use flotilla_core::in_process::InProcessDaemon;
+    use flotilla_discovery_testkit::fake_discovery;
+    use flotilla_protocol::{ResourceReadEnvelope, ResourceRecordType};
+    use flotilla_resources::{ChangeRequest, InputMeta, K8sResourceObject, ResourceObject};
+    use flotilla_store::ResourceBackend;
+    let tmp = tempfile::tempdir().expect("config directory");
+    std::fs::write(tmp.path().join("daemon.toml"), "machine_id = \"pm-bookmark-3108\"\n").expect("machine id");
+    let daemon = InProcessDaemon::new_with_resource_backend(
+        vec![],
+        Arc::new(ConfigStore::with_base(tmp.path())),
+        fake_discovery(false),
+        HostName::new("local"),
+        ResourceBackend::new(InMemoryBackend::default()),
+        std::sync::Arc::new(flotilla_discovery_testkit::HostPeerOverlay::default()),
+    )
+    .await;
+    let observations = daemon.resource_backend().using::<ChangeRequest>("flotilla");
+    // The fixture's change request, and the next one by number, each named for its subject.
+    let observation = |number: u64| {
+        let mut json = subject_envelope().records[0].object.clone().expect("fixture observation");
+        let name = json["metadata"]["name"].as_str().expect("fixture name").trim_end_matches("42").to_owned() + &number.to_string();
+        json["metadata"]["name"] = serde_json::json!(name);
+        json["spec"]["number"] = serde_json::json!(number);
+        ResourceObject::<ChangeRequest>::from_k8s_object(
+            serde_json::from_value::<K8sResourceObject<ChangeRequest>>(json).expect("typed observation"),
+        )
+        .expect("observation")
+    };
+    let create = |object: ResourceObject<ChangeRequest>| {
+        let observations = &observations;
+        async move { observations.create(&InputMeta::builder().name(object.metadata.name.clone()).build(), &object.spec).await.expect("create") }
+    };
+    let (before, after) = (observation(42), observation(43));
+    let records = |envelope: &ResourceReadEnvelope| -> Vec<_> {
+        envelope
+            .records
+            .iter()
+            .map(|record| {
+                (record.record_type, record.object.as_ref().and_then(|object| object["metadata"]["name"].as_str()).map(str::to_owned))
+            })
+            .collect()
+    };
+    async fn next(watch: &mut ResourceWatch) -> ResourceReadEnvelope {
+        tokio::time::timeout(Duration::from_secs(10), watch.next())
+            .await
+            .expect("an envelope in time")
+            .expect("the watch runs")
+            .expect("the watch has not ended")
+    }
+    let client = ResourceClient::new(daemon.clone() as Arc<dyn DaemonHandle>);
+    let request =
+        |cursor| ResourceWatchRequest::builder().kind("changerequests".into()).include_replicas(true).maybe_cursor(cursor).build();
+
+    let mut watch = client.watch(request(None)).await.expect("watch");
+    while !super::is_bookmark(&next(&mut watch).await) {}
+    let (before_name, after_name) = (before.metadata.name.clone(), after.metadata.name.clone());
+    create(before).await;
+    let mut seen = Vec::new();
+    let bookmark = loop {
+        let envelope = next(&mut watch).await;
+        if super::is_bookmark(&envelope) && !seen.is_empty() {
+            break envelope.cursor;
+        }
+        seen.extend(records(&envelope).into_iter().filter(|(kind, _)| *kind != ResourceRecordType::Bookmark));
+    };
+    assert_eq!(seen, vec![(ResourceRecordType::Added, Some(before_name))], "the batch before its bookmark");
+    watch.cancel().await.expect("drop the watch");
+
+    create(after).await;
+    let mut resumed = client.watch(request(Some(bookmark))).await.expect("resume");
+    let first = next(&mut resumed).await;
+    assert!(super::is_bookmark(&first), "a resume sends no snapshot: {first:?}");
+    assert_eq!(
+        records(&next(&mut resumed).await),
+        vec![(ResourceRecordType::Modified, Some(after_name))],
+        "only the change after the bookmark"
+    );
+}
+
 // #2523: namespaces newly appearing in the named-query graph bootstrap their
 // existing replica observations and then deliver changes/removals on the same
 // actual daemon watch. Query rows are the input seam; resource consumers are real.
@@ -1906,6 +2031,11 @@ async fn lagged_watch_replaces_only_its_scope() {
         isolated.send(convoys_set(1)).expect("lag isolated watch");
     }
     wait_until(|| sink.publications().len() == 2).await;
+    // The resume from its bookmark was refused first, so it rebuilt.
+    assert_eq!(
+        *daemon.resumes.lock().expect("resumes"),
+        vec![(("flotilla".into(), "changerequests".into()), flotilla_protocol::ResourceCursor::from_position("1", None))]
+    );
     let after = daemon.watch_commands.lock().expect("watches").clone();
     assert_eq!(daemon.watch_starts.load(Ordering::SeqCst), before.len() + 1);
     for (scope, id) in &before {
@@ -1927,6 +2057,41 @@ async fn lagged_watch_replaces_only_its_scope() {
         "unrelated namespace facts remain unchanged"
     );
     assert!(publications[1].1.iter().any(|patch| patch.unset.contains(&"flotilla.change_request.readiness".into())));
+    handle.abort();
+}
+
+// #3108: a lagged watch resumes from its newest bookmark where the daemon serves it, keeping its
+// scope's records rather than rebuilding them from a snapshot.
+#[tokio::test]
+async fn lagged_watch_resumes_from_its_bookmark() {
+    let mut convoy = linked_subject_convoy();
+    convoy.resource.namespace = "other".into();
+    let daemon = Arc::new(MockDaemon::new(vec![DaemonEvent::ResultSet(Box::new(ResultSet {
+        seq: 1,
+        rows: Rows::Convoys { scope: None, rows: vec![convoy] },
+        state: Default::default(),
+    }))]));
+    daemon.serves_resumes.store(true, Ordering::SeqCst);
+    daemon.resource_lists.lock().expect("lists").insert(("flotilla".into(), "changerequests".into()), subject_envelope());
+    let (isolated, _) = broadcast::channel(64);
+    *daemon.isolated_watch.lock().expect("isolated") = Some(isolated.clone());
+    let sink = Arc::new(RecordingSink::connection());
+    let handle = spawn_connection(&daemon, &sink, Arc::new(Connector::default()));
+    wait_until(|| sink.publications().len() == 1).await;
+    let before = daemon.watch_starts.load(Ordering::SeqCst);
+    // A rebuild would read this emptied list and unset the change request's facts.
+    daemon.resource_lists.lock().expect("lists").remove(&("flotilla".into(), "changerequests".into()));
+    for _ in 0..100 {
+        isolated.send(convoys_set(1)).expect("lag isolated watch");
+    }
+    wait_until(|| daemon.watch_starts.load(Ordering::SeqCst) == before + 1).await;
+    assert_eq!(
+        *daemon.resumes.lock().expect("resumes"),
+        vec![(("flotilla".into(), "changerequests".into()), flotilla_protocol::ResourceCursor::from_position("1", None))],
+        "resumed from the snapshot's bookmark"
+    );
+    tokio::time::sleep(Duration::from_millis(200)).await;
+    assert_eq!(sink.publications().len(), 1, "no snapshot rebuilt the scope: {:?}", sink.publications());
     handle.abort();
 }
 

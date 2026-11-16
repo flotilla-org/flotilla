@@ -4956,6 +4956,7 @@ mod tests {
                 Err::<WatchEvent<T>, _>(ResourceError::WatchExpired {
                     requested_version: "1".to_string(),
                     compacted_through: Some("2".to_string()),
+                    reason: "events through 2 were compacted".to_string(),
                 })
             })),
         )
@@ -8052,7 +8053,11 @@ mod tests {
         let durable_convoys = Arc::new(ScriptedSource::new(
             vec![ResourceList { items: vec![stale], resource_version: "1".to_string(), generation: None }, empty_list()],
             vec![
-                Err(ResourceError::WatchExpired { requested_version: "1".to_string(), compacted_through: Some("2".to_string()) }),
+                Err(ResourceError::WatchExpired {
+                    requested_version: "1".to_string(),
+                    compacted_through: Some("2".to_string()),
+                    reason: "events through 2 were compacted".to_string(),
+                }),
                 Ok(pending_watch()),
             ],
         ));

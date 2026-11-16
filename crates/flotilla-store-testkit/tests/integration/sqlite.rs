@@ -1012,6 +1012,7 @@ async fn reopening_with_smaller_retention_compacts_existing_events_and_persists_
         expired,
         flotilla_resources::ResourceError::WatchExpired {
             requested_version: first.metadata.resource_version,
+            reason: format!("events through {} were compacted", second.metadata.resource_version),
             compacted_through: Some(second.metadata.resource_version),
         }
     );

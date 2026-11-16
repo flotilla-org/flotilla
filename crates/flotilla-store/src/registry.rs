@@ -515,7 +515,7 @@ pub async fn watch_resource_kind(
     namespace: &str,
     requested_kind: &str,
 ) -> Result<DynamicResourceWatch, ResourceError> {
-    dispatch_resource_kind!(lookup_resource_kind(requested_kind)?.resource, watch_typed(backend, namespace, None).await)
+    watch_resource_kind_with(backend, namespace, requested_kind, DynamicWatchRequest::default()).await
 }
 
 pub async fn watch_resource_kind_from(
@@ -524,7 +524,35 @@ pub async fn watch_resource_kind_from(
     requested_kind: &str,
     start: WatchStart,
 ) -> Result<DynamicResourceWatch, ResourceError> {
-    dispatch_resource_kind!(lookup_resource_kind(requested_kind)?.resource, watch_typed(backend, namespace, Some(start)).await)
+    watch_resource_kind_with(backend, namespace, requested_kind, DynamicWatchRequest { start: Some(start), ..Default::default() }).await
+}
+
+/// What a dynamic watch is asked for.
+#[derive(Clone, Debug, Default)]
+pub struct DynamicWatchRequest {
+    /// Where to start; none lists the current members first.
+    pub start: Option<WatchStart>,
+    /// Every home's copies, with their provenance, rather than one per name.
+    pub include_replicas: bool,
+    /// Whether the stream carries `BOOKMARK` events, each with the resourceVersion a reader that
+    /// took every event before it resumes from. Only an engine-served kind sends them; a reader
+    /// that resumes keeps the newest bookmark or list cursor, never an object's resourceVersion.
+    pub bookmarks: bool,
+}
+
+/// A watch of `requested_kind` as `request` asks.
+pub async fn watch_resource_kind_with(
+    backend: &ResourceBackend,
+    namespace: &str,
+    requested_kind: &str,
+    request: DynamicWatchRequest,
+) -> Result<DynamicResourceWatch, ResourceError> {
+    let DynamicWatchRequest { start, include_replicas, bookmarks } = request;
+    let resource = lookup_resource_kind(requested_kind)?.resource;
+    match include_replicas {
+        true => dispatch_resource_kind!(resource, watch_typed_including_replicas(backend, namespace, start, bookmarks).await),
+        false => dispatch_resource_kind!(resource, watch_typed(backend, namespace, start, bookmarks).await),
+    }
 }
 
 /// A merged-view bootstrap: register local and replica streams before reading
@@ -537,7 +565,7 @@ pub async fn watch_resource_kind_including_replicas(
     namespace: &str,
     requested_kind: &str,
 ) -> Result<DynamicResourceWatch, ResourceError> {
-    dispatch_resource_kind!(lookup_resource_kind(requested_kind)?.resource, watch_typed_including_replicas(backend, namespace, None).await)
+    watch_resource_kind_with(backend, namespace, requested_kind, DynamicWatchRequest { include_replicas: true, ..Default::default() }).await
 }
 
 /// [`watch_resource_kind_including_replicas`] resumed from `start`'s cursor, which an engine-served
@@ -549,10 +577,8 @@ pub async fn watch_resource_kind_including_replicas_from(
     requested_kind: &str,
     start: WatchStart,
 ) -> Result<DynamicResourceWatch, ResourceError> {
-    dispatch_resource_kind!(
-        lookup_resource_kind(requested_kind)?.resource,
-        watch_typed_including_replicas(backend, namespace, Some(start)).await
-    )
+    let request = DynamicWatchRequest { start: Some(start), include_replicas: true, bookmarks: false };
+    watch_resource_kind_with(backend, namespace, requested_kind, request).await
 }
 
 pub async fn list_resource_kind_replica_sources(
@@ -1171,8 +1197,40 @@ async fn watch_typed<T: Resource>(
     backend: &ResourceBackend,
     namespace: &str,
     requested_start: Option<WatchStart>,
+    bookmarks: bool,
 ) -> Result<DynamicResourceWatch, ResourceError> {
     let resolver = backend.using::<T>(namespace);
+    let definitions = backend.definitions::<T>(namespace);
+    // An engine-served kind's watch carries its position, and bookmarks where asked.
+    let fed = match &requested_start {
+        Some(WatchStart::FromVersion(version) | WatchStart::FromVersionInGeneration { resource_version: version, .. }) => {
+            definitions.engine_watch_from_fed(version).await.map(|fed| fed.map(|stream| (version.clone(), stream)))
+        }
+        Some(WatchStart::Now) | None => definitions.engine_watch_fed().await.map(|fed| fed.map(|(_, position, stream)| (position, stream))),
+    };
+    if let Some(fed) = fed {
+        let (position, stream) = fed?;
+        let stream = fed_values(stream, bookmarks, typed_read_event_value::<T>);
+        let (resource_version, initial) = match requested_start {
+            Some(_) => (position, Vec::new()),
+            // Watched before the list: a change between the two is in the list, the stream or both,
+            // and a resume from the list's position names it again.
+            None => {
+                let listed = resolver.list().await?;
+                let initial = listed.items.iter().map(|object| watch_event_value("ADDED", object)).collect::<Result<Vec<_>, _>>()?;
+                (listed.resource_version, initial)
+            }
+        };
+        return Ok(DynamicResourceWatch {
+            kind: T::API_PATHS.kind.to_string(),
+            plural: T::API_PATHS.plural.to_string(),
+            namespace: namespace.to_string(),
+            resource_version,
+            generation: None,
+            initial,
+            stream,
+        });
+    }
     let (resource_version, generation, initial, start) = match requested_start {
         Some(start) => {
             let resource_version = match &start {
@@ -1185,14 +1243,6 @@ async fn watch_typed<T: Resource>(
                 _ => None,
             };
             (resource_version, generation, Vec::new(), start)
-        }
-        None if backend.engine_serves(T::API_PATHS.kind) => {
-            // An engine-served kind's watch cannot resume from a list: watch first, so a change
-            // between the two is in the list, the stream or both.
-            let watch = resolver.watch(WatchStart::Now).await?;
-            let listed = resolver.list().await?;
-            let initial = listed.items.iter().map(|object| watch_event_value("ADDED", object)).collect::<Result<Vec<_>, _>>()?;
-            return Ok(dynamic_watch::<T>(namespace, listed.resource_version, listed.generation, initial, watch));
         }
         None => {
             let listed = resolver.list().await?;
@@ -1228,13 +1278,14 @@ async fn watch_typed_including_replicas<T: Resource>(
     backend: &ResourceBackend,
     namespace: &str,
     start: Option<WatchStart>,
+    bookmarks: bool,
 ) -> Result<DynamicResourceWatch, ResourceError> {
     let definitions = backend.definitions::<T>(namespace);
     if let Some(WatchStart::FromVersion(resource_version) | WatchStart::FromVersionInGeneration { resource_version, .. }) = start {
-        let Some(stream) = definitions.engine_watch_from(&resource_version).await else {
+        let Some(stream) = definitions.engine_watch_from_fed(&resource_version).await else {
             return Err(ResourceError::invalid("include-replicas watches do not support resourceVersion resume"));
         };
-        let stream = stream?.map(|event| event.and_then(|event| read_watch_event_value(&event))).boxed();
+        let stream = fed_values(stream?, bookmarks, read_watch_event_value::<T>);
         return Ok(DynamicResourceWatch {
             kind: T::API_PATHS.kind.to_string(),
             plural: T::API_PATHS.plural.to_string(),
@@ -1250,7 +1301,10 @@ async fn watch_typed_including_replicas<T: Resource>(
     let resolver = backend.including_replicas::<T>(namespace);
     // Subscribe before listing to cover the handoff. WatchChannel is bounded
     // (256 events); overflow reports WatchExpired rather than growing a queue.
-    let stream = resolver.watch().await?.map(|event| event.and_then(|event| read_watch_event_value(&event))).boxed();
+    let stream = match definitions.engine_watch_fed().await {
+        Some(fed) => fed_values(fed?.2, bookmarks, read_watch_event_value::<T>),
+        None => resolver.watch().await?.map(|event| event.and_then(|event| read_watch_event_value(&event))).boxed(),
+    };
     let initial = resolver
         .list()
         .await?
@@ -1355,6 +1409,46 @@ pub(crate) fn read_object_value<T: Resource>(object: &crate::ReadResourceObject<
         annotations.insert(LAST_SYNCED_AT_ANNOTATION.to_string(), Value::String(last_synced_at.to_rfc3339()));
     }
     Ok(value)
+}
+
+/// An engine watch's events as `event_value` writes them, with its bookmarks where `bookmarks`.
+fn fed_values<T: Resource>(
+    stream: crate::definition::FedStream<T>,
+    bookmarks: bool,
+    event_value: fn(&ReadWatchEvent<T>) -> Result<Value, ResourceError>,
+) -> BoxStream<'static, Result<Value, ResourceError>> {
+    use crate::definition::Fed;
+    stream
+        .filter_map(move |fed| {
+            std::future::ready(match fed {
+                Ok(Fed::Event(event)) => Some(event_value(&event)),
+                Ok(Fed::Bookmark(position)) => bookmarks.then(|| Ok(bookmark_value::<T>(&position))),
+                Err(error) => Some(Err(error)),
+            })
+        })
+        .boxed()
+}
+
+/// A Kubernetes `BOOKMARK` event at `resource_version`.
+fn bookmark_value<T: Resource>(resource_version: &str) -> Value {
+    json!({
+        "type": "BOOKMARK",
+        "object": {
+            "apiVersion": api_version(T::API_PATHS),
+            "kind": T::API_PATHS.kind,
+            "metadata": {"resourceVersion": resource_version},
+        },
+    })
+}
+
+/// A read event written as the one-copy watch writes it: the object, without its provenance.
+fn typed_read_event_value<T: Resource>(event: &ReadWatchEvent<T>) -> Result<Value, ResourceError> {
+    match event {
+        ReadWatchEvent::Added(read) => watch_event_value("ADDED", &read.object),
+        ReadWatchEvent::Modified(read) => watch_event_value("MODIFIED", &read.object),
+        ReadWatchEvent::Deleted(read) => watch_event_value("DELETED", &read.object),
+        ReadWatchEvent::DeletedByName { tombstone, .. } => Ok(json!({"type": "DELETED", "object": tombstone_value::<T>(tombstone)})),
+    }
 }
 
 fn read_watch_event_value<T: Resource>(event: &ReadWatchEvent<T>) -> Result<Value, ResourceError> {

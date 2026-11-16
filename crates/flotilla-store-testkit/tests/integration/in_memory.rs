@@ -307,6 +307,7 @@ async fn observed_backend_expires_compacted_version_within_current_generation() 
         err,
         flotilla_resources::ResourceError::WatchExpired {
             requested_version: created.metadata.resource_version,
+            reason: format!("events through {} were compacted", second.metadata.resource_version),
             compacted_through: Some(second.metadata.resource_version),
         }
     );

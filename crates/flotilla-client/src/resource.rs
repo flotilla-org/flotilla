@@ -21,7 +21,7 @@ impl std::fmt::Display for ResourceWatchError {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             Self::Lagged(skipped) => {
-                write!(formatter, "resource watch fell behind by {skipped} events; resume from the last emitted cursor")
+                write!(formatter, "resource watch fell behind by {skipped} events; resume from the last bookmark's cursor")
             }
             Self::Failed(error) => formatter.write_str(error),
         }

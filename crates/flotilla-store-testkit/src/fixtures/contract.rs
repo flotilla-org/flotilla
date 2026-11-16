@@ -1008,6 +1008,7 @@ pub async fn assert_watch_retention_expires_only_versions_below_floor_with_backe
         expired,
         ResourceError::WatchExpired {
             requested_version: created.metadata.resource_version,
+            reason: format!("events through {} were compacted", second.metadata.resource_version),
             compacted_through: Some(second.metadata.resource_version),
         }
     );

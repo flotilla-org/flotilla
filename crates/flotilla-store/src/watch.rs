@@ -98,6 +98,7 @@ impl<E: Send + Sync + 'static> WatchChannel<E> {
                         Err(ResourceError::WatchExpired {
                             requested_version: "live watch lagged; relist required".to_string(),
                             compacted_through: None,
+                            reason: format!("the watch fell {skipped} events behind its {WATCH_RING_CAPACITY}-event ring"),
                         }),
                         (None, namespace),
                     ))

@@ -64,7 +64,9 @@ async fn a_resume_across_a_snapshot_catch_up_is_refused_as_expired() {
     beta.replicate_to(&service);
 
     match kinds.watch(WatchStart::resuming_from(&listed)).await {
-        Err(ResourceError::WatchExpired { .. }) => {}
+        Err(ResourceError::WatchExpired { reason, .. }) => {
+            assert!(reason.contains("snapshot") && reason.starts_with("beta"), "the reason names beta's snapshot catch-up: {reason}");
+        }
         Err(error) => panic!("a resume across a snapshot is refused as expired, not {error}"),
         Ok(_) => panic!("a resume across a snapshot must not start past beta's change"),
     }

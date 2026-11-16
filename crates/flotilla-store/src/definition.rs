@@ -169,6 +169,13 @@ impl<T: Resource> DefinitionResolver<T> {
     pub(crate) async fn engine_watch(
         &self,
     ) -> Option<Result<(Vec<ReadResourceObject<T>>, BoxStream<'static, Result<ReadWatchEvent<T>, ResourceError>>), ResourceError>> {
+        Some(self.engine_watch_fed().await?.map(|(initial, _, stream)| (initial, events_of(stream))))
+    }
+
+    /// [`Self::engine_watch`] with the position its current reads stand at, and a bookmark after
+    /// each batch of changes.
+    #[allow(clippy::type_complexity)]
+    pub(crate) async fn engine_watch_fed(&self) -> Option<Result<(Vec<ReadResourceObject<T>>, String, FedStream<T>), ResourceError>> {
         let records = self.records()?;
         if !self.holds_engine_records() {
             // This namespace holds only the built-ins, which never change.
@@ -176,14 +183,19 @@ impl<T: Resource> DefinitionResolver<T> {
                 Ok(initial) => initial,
                 Err(error) => return Some(Err(error)),
             };
-            return Some(Ok((initial, futures::stream::pending().boxed())));
+            let position = match records.position().await {
+                Ok(position) => position.encode(),
+                Err(error) => return Some(Err(ResourceError::other(error))),
+            };
+            return Some(Ok((initial, position, futures::stream::pending().boxed())));
         }
         let watch = match self.engine_watcher(&records.home(), false).await? {
             Ok(watch) => watch,
             Err(error) => return Some(Err(error)),
         };
         let initial = watch.seen.reads.values().map(|(_, read)| clone_read(read)).collect();
-        Some(Ok((initial, watch.stream())))
+        let position = watch.position.clone();
+        Some(Ok((initial, position, watch.stream())))
     }
 
     /// The engine's records of this kind as a watch resumed from `requested_version`, a position
@@ -194,9 +206,21 @@ impl<T: Resource> DefinitionResolver<T> {
         &self,
         requested_version: &str,
     ) -> Option<Result<BoxStream<'static, Result<ReadWatchEvent<T>, ResourceError>>, ResourceError>> {
+        Some(self.engine_watch_from_fed(requested_version).await?.map(events_of))
+    }
+
+    /// [`Self::engine_watch_from`] with a bookmark after the changes since, and after each later
+    /// batch.
+    pub(crate) async fn engine_watch_from_fed(&self, requested_version: &str) -> Option<Result<FedStream<T>, ResourceError>> {
         let records = self.records()?;
-        let expired = || ResourceError::WatchExpired { requested_version: requested_version.to_owned(), compacted_through: None };
-        let Some(position) = LogPosition::decode(requested_version) else { return Some(Err(expired())) };
+        let expired = |reason: String| ResourceError::WatchExpired {
+            requested_version: requested_version.to_owned(),
+            compacted_through: None,
+            reason,
+        };
+        let Some(position) = LogPosition::decode(requested_version) else {
+            return Some(Err(expired("cursor not readable: it is not a position this daemon handed out".to_owned())));
+        };
         if !self.holds_engine_records() {
             return Some(Ok(futures::stream::pending().boxed()));
         }
@@ -208,13 +232,10 @@ impl<T: Resource> DefinitionResolver<T> {
         // each change after them is also in a later batch.
         let names = match records.changed_since(&position).await {
             Ok(Since::Changed { names, .. }) => names,
-            Ok(Since::Expired(reason)) => {
-                tracing::info!(kind = T::API_PATHS.kind, %reason, "an engine watch's position expired");
-                return Some(Err(expired()));
-            }
+            Ok(Since::Expired(reason)) => return Some(Err(expired(reason))),
             Err(error) => return Some(Err(ResourceError::other(error))),
         };
-        let position = watch.feed.state().position.encode();
+        let position = watch.position.clone();
         for name in names.into_iter().filter(|name| !flotilla_resources::builtins::is_builtin(T::API_PATHS.kind, name)) {
             // A name named but not held changed and is gone: whether the resumer held it is not known.
             let event = match watch.seen.reads.get(&name) {
@@ -229,8 +250,9 @@ impl<T: Resource> DefinitionResolver<T> {
                     provenance: ResourceProvenance::Local,
                 },
             };
-            watch.pending.push_back(Ok(event));
+            watch.pending.push_back(Ok(Fed::Event(event)));
         }
+        watch.pending.push_back(Ok(Fed::Bookmark(position)));
         Some(Ok(watch.stream()))
     }
 
@@ -249,18 +271,19 @@ impl<T: Resource> DefinitionResolver<T> {
             feed.read_through_now().await;
         }
         let mut seen = SeenReads::<T>::default();
-        let serial = {
+        let (serial, position) = {
             let state = feed.state();
             if let Err(error) = self.diff(home, &state.records, &mut seen) {
                 return Some(Err(error));
             }
-            state.serial
+            (state.serial, state.position.encode())
         };
         Some(Ok(EngineWatch {
             feed,
             serials,
             serial,
             seen,
+            position,
             pending: VecDeque::new(),
             resolver: Self::new(self.backend.clone(), self.namespace.clone()),
             home: home.to_owned(),
@@ -878,15 +901,43 @@ struct EngineWatch<T: Resource> {
     /// The serial of the feed's last batch taken.
     serial: u64,
     seen: SeenReads<T>,
-    pending: VecDeque<Result<ReadWatchEvent<T>, ResourceError>>,
+    /// The feed's position that `seen` holds the records at.
+    position: String,
+    pending: VecDeque<Result<Fed<T>, ResourceError>>,
     resolver: DefinitionResolver<T>,
     home: String,
+}
+
+/// What an engine watch sends: an event, or a bookmark naming the position its events so far
+/// bring a reader to, which a watch resumes from as from a listing's.
+// The event is moved through as every watch stream carries it; boxing would allocate per event.
+#[allow(clippy::large_enum_variant)]
+pub(crate) enum Fed<T: Resource> {
+    Event(ReadWatchEvent<T>),
+    Bookmark(String),
+}
+
+/// An engine watch's events and bookmarks.
+pub(crate) type FedStream<T> = BoxStream<'static, Result<Fed<T>, ResourceError>>;
+
+/// `stream`'s events alone, for a reader that never resumes.
+pub(crate) fn events_of<T: Resource>(stream: FedStream<T>) -> BoxStream<'static, Result<ReadWatchEvent<T>, ResourceError>> {
+    stream
+        .filter_map(|fed| {
+            std::future::ready(match fed {
+                Ok(Fed::Event(event)) => Some(Ok(event)),
+                Ok(Fed::Bookmark(_)) => None,
+                Err(error) => Some(Err(error)),
+            })
+        })
+        .boxed()
 }
 
 impl<T: Resource> EngineWatch<T> {
     /// Each event, as the watcher takes the feed's batches: the names a batch read again are
     /// converted, and every record is compared again after a fresh listing or batches missed.
-    fn stream(self) -> BoxStream<'static, Result<ReadWatchEvent<T>, ResourceError>> {
+    /// Each batch taken ends with a bookmark at the feed's position after it.
+    fn stream(self) -> FedStream<T> {
         futures::stream::unfold(self, |mut watch| async move {
             loop {
                 if let Some(event) = watch.pending.pop_front() {
@@ -901,7 +952,7 @@ impl<T: Resource> EngineWatch<T> {
 
     /// The events of the batches after the last taken.
     fn take(&mut self) {
-        let EngineWatch { feed, serial, seen, pending, resolver, home, .. } = self;
+        let EngineWatch { feed, serial, seen, position, pending, resolver, home, .. } = self;
         let state = feed.state();
         if state.serial == *serial {
             return;
@@ -926,7 +977,11 @@ impl<T: Resource> EngineWatch<T> {
         };
         *serial = state.serial;
         match events {
-            Ok(events) => pending.extend(events.into_iter().map(Ok)),
+            Ok(events) => {
+                pending.extend(events.into_iter().map(|event| Ok(Fed::Event(event))));
+                *position = state.position.encode();
+                pending.push_back(Ok(Fed::Bookmark(position.clone())));
+            }
             Err(error) => pending.push_back(Err(error)),
         }
     }

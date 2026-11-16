@@ -1321,6 +1321,7 @@ impl InMemoryBackend {
                 return Err(ResourceError::WatchExpired {
                     requested_version: replay_from.expect("checked replay version").to_string(),
                     compacted_through: Some(store.compacted_through.to_string()),
+                    reason: format!("events through {} were compacted", store.compacted_through),
                 });
             }
             if replay_from.is_some_and(|version| version > store.current_version()) {

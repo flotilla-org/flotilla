@@ -288,6 +288,8 @@ async fn resource_watch_from_before_a_snapshot_catch_up_is_gone() {
         .await
         .expect("a resume past a snapshot is answered, not started");
         assert_eq!(resumed.status, StatusCode::GONE, "{replicas}");
+        let reason = resumed.json()["message"].as_str().unwrap_or_default().to_owned();
+        assert!(reason.starts_with("beta") && reason.contains("snapshot"), "the 410 says why: {reason}");
     }
 }
 

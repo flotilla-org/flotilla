@@ -218,7 +218,11 @@ fn watch_delivers_each_event_after_its_start_exactly_once(tc: hegel::TestCase) {
             let error = watch.err().unwrap_or_else(|| panic!("a start below the compaction floor expires"));
             assert_eq!(
                 error,
-                ResourceError::WatchExpired { requested_version: from.to_string(), compacted_through: Some(floor.to_string()) }
+                ResourceError::WatchExpired {
+                    requested_version: from.to_string(),
+                    compacted_through: Some(floor.to_string()),
+                    reason: format!("events through {floor} were compacted"),
+                }
             );
             return;
         }

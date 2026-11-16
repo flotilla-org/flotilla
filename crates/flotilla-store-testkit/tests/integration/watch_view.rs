@@ -34,7 +34,11 @@ impl ViewSource<Convoy> for GapSource {
             events
                 .map(move |event| {
                     if gap.swap(false, Ordering::SeqCst) {
-                        Err(ResourceError::WatchExpired { requested_version: "injected gap".into(), compacted_through: None })
+                        Err(ResourceError::WatchExpired {
+                            requested_version: "injected gap".into(),
+                            compacted_through: None,
+                            reason: "an injected gap".into(),
+                        })
                     } else {
                         event
                     }

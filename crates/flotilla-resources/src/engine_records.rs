@@ -97,10 +97,12 @@ impl LogPosition {
     }
 }
 
-/// How many changes an [`UnloggedJournal`] remembers the names of.
-const JOURNAL: usize = 1024;
+/// How many changes an [`UnloggedJournal`] remembers the names of: a reconnect after a short drop
+/// resumes, while one further behind relists, which costs no more than following that many changes.
+pub const JOURNAL: usize = 1024;
 
-/// The names each change held in memory touched, by its count, within one run: what lets a port
+/// The names each change held in memory touched, by its count, within one run: an index of what
+/// changed, never the records themselves, that lets a port
 /// whose records change in memory (outside the log, or as views it holds) name its changes since a
 /// position. Lost at a restart, so a position from another run expires.
 #[derive(Debug)]
@@ -140,16 +142,20 @@ impl UnloggedJournal {
     /// The names touched since `read`; `Err` holds why they cannot be named: no read, another
     /// run's, one past the count, or one older than the journal remembers.
     pub fn since(&self, read: Option<&UnloggedRead>) -> Result<std::collections::BTreeSet<String>, String> {
-        let Some(read) = read else { return Err("the position holds no read of the changes held in memory".to_owned()) };
+        let Some(read) = read else { return Err("the cursor holds no read of the changes held in memory".to_owned()) };
         if read.run != self.run {
-            return Err("the position was read from another run, whose changes held in memory were lost at its restart".to_owned());
+            return Err("restart: the cursor is from another run, whose changes held in memory were lost".to_owned());
         }
         if read.read > self.count {
-            return Err(format!("the position read {} changes held in memory, past the {} counted", read.read, self.count));
+            return Err(format!("the cursor read {} changes held in memory, past the {} counted", read.read, self.count));
         }
         let oldest = self.touched.front().map_or(self.count + 1, |(count, _)| *count);
         if read.read + 1 < oldest {
-            return Err(format!("the changes held in memory since {} are no longer remembered", read.read));
+            return Err(format!(
+                "the journal no longer holds change {}: it keeps the last {JOURNAL}, and {} have been counted",
+                read.read + 1,
+                self.count
+            ));
         }
         Ok(self.touched.iter().filter(|(count, _)| *count > read.read).flat_map(|(_, names)| names.iter().cloned()).collect())
     }
@@ -314,13 +320,18 @@ mod tests {
         assert_eq!(journal.since(Some(&start)), Ok(["a", "b", "c"].map(str::to_owned).into()));
         assert_eq!(journal.since(Some(&middle)), Ok(["b", "c"].map(str::to_owned).into()));
         assert_eq!(journal.since(Some(&journal.read())), Ok(BTreeSet::new()));
-        assert!(journal.since(Some(&UnloggedRead { run: "other".into(), read: 0 })).is_err());
+        let restarted = journal.since(Some(&UnloggedRead { run: "other".into(), read: 0 })).expect_err("another run");
+        assert!(restarted.starts_with("restart"), "{restarted}");
         assert!(journal.since(Some(&UnloggedRead { read: 9, ..journal.read() })).is_err());
         assert!(journal.since(None).is_err());
+        // Overflowed: the oldest read still held resumes, one before it is no longer held.
         for _ in 0..JOURNAL {
             journal.record(["d".to_owned()]);
         }
-        assert!(journal.since(Some(&start)).is_err(), "forgotten");
+        let held = UnloggedRead { read: journal.count() - JOURNAL as u64, ..journal.read() };
+        assert_eq!(journal.since(Some(&held)), Ok(BTreeSet::from(["d".to_owned()])));
+        let forgotten = journal.since(Some(&start)).expect_err("forgotten");
+        assert!(forgotten.contains("no longer holds change 1"), "{forgotten}");
         assert!(journal.since(Some(&journal.read())).is_ok());
     }
 

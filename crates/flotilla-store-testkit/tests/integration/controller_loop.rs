@@ -453,7 +453,11 @@ impl flotilla_store::controller::SecondaryWatch for ExpiringSecondaryWatch {
             self.spawned.notify_one();
             if spawn == 0 {
                 self.expire.notified().await;
-                return Err(ResourceError::WatchExpired { requested_version: "1".to_string(), compacted_through: Some("2".to_string()) });
+                return Err(ResourceError::WatchExpired {
+                    requested_version: "1".to_string(),
+                    compacted_through: Some("2".to_string()),
+                    reason: "events through 2 were compacted".to_string(),
+                });
             }
             std::future::pending().await
         })
