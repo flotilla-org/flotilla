@@ -1,4 +1,6 @@
-use crate::{Message, ResourceObject, TerminalSession, TerminalSessionPhase, UnmetSettlementExpectation, ROLE_LABEL, VESSEL_LABEL};
+use crate::{
+    Message, MessagePhase, ResourceObject, TerminalSession, TerminalSessionPhase, UnmetSettlementExpectation, ROLE_LABEL, VESSEL_LABEL,
+};
 use flotilla_protocol::ExplainedUnmetExpectation;
 use std::collections::BTreeMap;
 pub fn queued_turn_session<'a>(
@@ -17,15 +19,25 @@ pub fn queued_turn_evidence(
     message: Option<&ResourceObject<Message>>,
     session: Option<&ResourceObject<TerminalSession>>,
 ) -> (bool, String) {
-    if let Some(message) = message {
-        return match &message.status {
-            Some(status) if status.phase.has_delivery_evidence() => (true, String::new()),
-            Some(status) => {
-                (false, format!("message {:?}: {}", status.phase, status.reason.as_deref().unwrap_or("waiting for receiver evidence")))
-            }
+    match message {
+        Some(message) => match &message.status {
+            Some(status) => queued_message_evidence(status.phase, status.reason.as_deref()),
             None => (false, "message Accepted: waiting for receiver resolution".into()),
-        };
+        },
+        None => queued_session_evidence(session),
     }
+}
+
+/// Whether a queued turn's message, standing at `phase` for `reason`, arrived; and why not.
+pub fn queued_message_evidence(phase: MessagePhase, reason: Option<&str>) -> (bool, String) {
+    if phase.has_delivery_evidence() {
+        return (true, String::new());
+    }
+    (false, format!("message {phase:?}: {}", reason.unwrap_or("waiting for receiver evidence")))
+}
+
+/// Whether a queued turn with no message arrived, as its session says; and why not.
+pub fn queued_session_evidence(session: Option<&ResourceObject<TerminalSession>>) -> (bool, String) {
     let Some(session) = session else { return (false, "terminal session unavailable".into()) };
     match session.status.as_ref() {
         Some(status) if status.delivery_unconfirmed_since.is_some() => {

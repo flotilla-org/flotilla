@@ -980,6 +980,48 @@ async fn landing_observation_cooldown_waits_until_deadline_without_stalling() {
     }
 }
 
+/// The messages a judgement loads and converts and the convoy records it gets, with `others + 1`
+/// local launches each holding a message waiting for its coder.
+async fn read_by_one_judgement(others: usize) -> (u64, u64, u64) {
+    let (backend, home) = engine_backend().await;
+    let wake = supervision_wake(&backend, &home);
+    let mut objects = HashMap::new();
+    for index in 0..=others {
+        let spec = ConvoySpec::builder().workflow_ref("workflow".into()).build();
+        let launch = home.admit(&format!("convoy-{index}"), spec, single_agent("coder")).await;
+        home.vessel(&launch, "work", "env");
+        let convoy = home.view(&backend, &launch).await;
+        let seat = flotilla_resources::convoy_crew_seats("flotilla", &convoy).remove(0);
+        let intent = flotilla_resources::MessageSpec::builder()
+            .sender("system:turn-rules".into())
+            .receiver(seat)
+            .relation(flotilla_resources::MessageRelation::System)
+            .body(format!("turn {index}"))
+            .build();
+        home.messages.primitives().admit("flotilla", &format!("turn-{index}"), &intent).await.expect("admit the turn");
+        objects.insert(launch, convoy);
+    }
+    for convoy in objects.values() {
+        caught_up(&wake, convoy).await;
+    }
+    let now = Utc::now();
+    wake.judge_stalls_at("flotilla", &objects, now).await.expect("bootstrap");
+    let read = |home: &EngineHome| (home.messages.primitives().rows_read(), home.convoys.keyed_gets().convoys);
+    let before = read(&home);
+    wake.judge_stalls_at("flotilla", &objects, now).await.expect("judgement");
+    let after = read(&home);
+    (after.0.loaded - before.0.loaded, after.0.converted - before.0.converted, after.1 - before.1)
+}
+
+// Behaviour: a stall judgement reads each crew seat's messages as the engine holds them: it
+// loads each seat's message once, converts none to the old shape, and gets no convoy record to
+// spell their receivers.
+#[tokio::test]
+async fn a_judgement_reads_seat_messages_without_converting_them() {
+    assert_eq!(read_by_one_judgement(5).await, (6, 0, 0), "six seats' messages are loaded, and none converted");
+    assert_eq!(read_by_one_judgement(60).await, (61, 0, 0), "sixty-one seats' messages are loaded, and none converted");
+}
+
 // #3044: populated kinds are bootstrapped once; repeated no-op judgements perform zero
 // backing-store reads, including indirect supervisor routing reads. (The read counter wraps the
 // resource backend: the launches' engine reads are not counted, the Project and Message reads

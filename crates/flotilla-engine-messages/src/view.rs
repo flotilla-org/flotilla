@@ -299,25 +299,10 @@ fn view_spelled(
             None => None,
         },
     };
-    let since = resource.since().to_datetime().unwrap_or(DateTime::<Utc>::UNIX_EPOCH);
+    let since = since(resource);
     let state = resource.state();
-    let phase = match state {
-        MessageState::Pending => MessagePhase::Deliverable,
-        MessageState::Awaiting { .. } => MessagePhase::Delivered,
-        MessageState::Settled { .. } => match spec.expectation {
-            Expectation::Nothing => MessagePhase::Satisfied,
-            Expectation::Reply => MessagePhase::Answered,
-            Expectation::Outcome { .. } => MessagePhase::OutcomeMet,
-        },
-        MessageState::Dropped { reason, .. } => match reason {
-            DropReason::Expired | DropReason::Withdrawn { .. } => MessagePhase::Expired,
-            DropReason::Superseded { .. } => MessagePhase::Superseded,
-            DropReason::Undeliverable | DropReason::ConsumerUnreachable { .. } => MessagePhase::DeadLettered,
-        },
-    };
-    // The delivered receiver is the inbox's holder; a receipt's time is when it was delivered,
-    // kept through settling and dropping.
-    let delivered_at = state.delivered_at().and_then(|at| at.to_datetime()).unwrap_or(since);
+    let phase = old_phase(resource);
+    let delivered_at = delivered_at(resource).unwrap_or(since);
     let resolved_receiver = state.receiver().map(|consumer| {
         let (crew_id, session) = lookups.session(consumer).unwrap_or_else(|| (consumer.id.clone(), consumer.id.clone()));
         ResolvedMessageReceiver {
@@ -330,11 +315,7 @@ fn view_spelled(
             transport: None,
         }
     });
-    let reason = match state {
-        MessageState::Dropped { reason, .. } => Some(format!("{reason:?}")),
-        MessageState::Pending => Some("waiting for its consumer".into()),
-        _ => None,
-    };
+    let reason = old_reason(resource);
     let canonical_predecessor = match state {
         MessageState::Dropped { reason: DropReason::Superseded { by }, .. } => {
             Some(ResourceRef::new("flotilla.work/v1", "Message", namespace, by.name()))
@@ -371,6 +352,46 @@ fn view_spelled(
             deferred_holder_version: None,
         }),
     })
+}
+
+/// When a message entered its state.
+fn since(resource: &Resource<Message>) -> DateTime<Utc> {
+    resource.since().to_datetime().unwrap_or(DateTime::<Utc>::UNIX_EPOCH)
+}
+
+/// A message's state as the old phase names it.
+pub fn old_phase(resource: &Resource<Message>) -> MessagePhase {
+    match resource.state() {
+        MessageState::Pending => MessagePhase::Deliverable,
+        MessageState::Awaiting { .. } => MessagePhase::Delivered,
+        MessageState::Settled { .. } => match resource.spec().expectation {
+            Expectation::Nothing => MessagePhase::Satisfied,
+            Expectation::Reply => MessagePhase::Answered,
+            Expectation::Outcome { .. } => MessagePhase::OutcomeMet,
+        },
+        MessageState::Dropped { reason, .. } => match reason {
+            DropReason::Expired | DropReason::Withdrawn { .. } => MessagePhase::Expired,
+            DropReason::Superseded { .. } => MessagePhase::Superseded,
+            DropReason::Undeliverable | DropReason::ConsumerUnreachable { .. } => MessagePhase::DeadLettered,
+        },
+    }
+}
+
+/// Why a message stands where it does, as the old status says it.
+pub fn old_reason(resource: &Resource<Message>) -> Option<String> {
+    match resource.state() {
+        MessageState::Dropped { reason, .. } => Some(format!("{reason:?}")),
+        MessageState::Pending => Some("waiting for its consumer".into()),
+        _ => None,
+    }
+}
+
+/// When a message was delivered to its inbox's holder, once it was: a receipt's time, kept
+/// through settling and dropping, else when it entered its state.
+pub fn delivered_at(resource: &Resource<Message>) -> Option<DateTime<Utc>> {
+    let state = resource.state();
+    state.receiver()?;
+    Some(state.delivered_at().and_then(|at| at.to_datetime()).unwrap_or_else(|| since(resource)))
 }
 
 #[cfg(test)]

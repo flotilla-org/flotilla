@@ -1285,12 +1285,12 @@ impl flotilla_messaging::EngineMessages for Turns {
     ) -> Result<Vec<flotilla_resources::ReadResourceObject<flotilla_resources::Message>>, flotilla_resources::ResourceError> {
         unreachable!("the convoy reconciler reads no message views")
     }
-    async fn seat_messages(
+    async fn seat_standings(
         &self,
         _: &str,
         _: &[String],
         _: &[(String, String)],
-    ) -> Result<Vec<flotilla_resources::ReadResourceObject<flotilla_resources::Message>>, flotilla_resources::ResourceError> {
+    ) -> Result<Vec<flotilla_messaging::SeatMessage>, flotilla_resources::ResourceError> {
         unreachable!("the convoy reconciler reads no message views")
     }
     async fn pending_to(

@@ -69,13 +69,28 @@ impl EngineMessages for RecordingMessages {
     async fn open_to(&self, _namespace: &str, receivers: &[String]) -> Result<Vec<ReadResourceObject<Message>>, ResourceError> {
         Ok(self.admitted_to(receivers))
     }
-    async fn seat_messages(
+    async fn seat_standings(
         &self,
         _namespace: &str,
         receivers: &[String],
         _named: &[(String, String)],
-    ) -> Result<Vec<ReadResourceObject<Message>>, ResourceError> {
-        Ok(self.admitted_to(receivers))
+    ) -> Result<Vec<flotilla_messaging::SeatMessage>, ResourceError> {
+        Ok(self
+            .admitted_to(receivers)
+            .into_iter()
+            .map(|read| {
+                let status = read.object.status.as_ref();
+                flotilla_messaging::SeatMessage {
+                    seat: read.object.spec.receiver.clone(),
+                    name: read.object.metadata.name.clone(),
+                    phase: status.map(|status| status.phase).unwrap_or_default(),
+                    reason: status.and_then(|status| status.reason.clone()),
+                    accepted_sequence: status.and_then(|status| status.accepted_sequence).unwrap_or_default(),
+                    created: read.object.metadata.creation_timestamp,
+                    delivered_at: status.and_then(|status| status.resolved_receiver.as_ref()).map(|receiver| receiver.delivered_at),
+                }
+            })
+            .collect())
     }
     async fn pending_to(&self, _namespace: &str, receivers: &[String]) -> Result<Vec<ReadResourceObject<Message>>, ResourceError> {
         Ok(self.admitted_to(receivers))

@@ -30,7 +30,7 @@ use tokio::sync::{broadcast, OnceCell};
 use super::sources::{change_request_sources, freshest_change_requests};
 use super::stalls::{is_active_change_request_probe, is_merged_settlement_probe, launch_underway};
 use super::{EpisodeKeyFields, LeafSubscriptionRow, LeafSubscriptionTable, LeafWatcher, UnableEvidenceKey};
-use flotilla_resources::{queued_turn_evidence, queued_turn_session};
+use flotilla_resources::{queued_message_evidence, queued_session_evidence, queued_turn_session};
 
 #[derive(Clone)]
 pub(super) struct ReconcilerWake {
@@ -266,7 +266,7 @@ impl ReconcilerWake {
         let primitives = self.subscriptions.message_primitives().map_err(|error| error.to_string())?;
         let seats = flotilla_resources::convoy_crew_seats(namespace, convoy);
         let named = flotilla_resources::convoy_seat_turns(namespace, convoy);
-        let messages = primitives.seat_messages(namespace, &seats, &named).await.map_err(|error| error.to_string())?;
+        let messages = primitives.seat_standings(namespace, &seats, &named).await.map_err(|error| error.to_string())?;
         self.observe_queued_turns_from_messages(namespace, convoy, sessions, &messages, now).await
     }
 
@@ -275,7 +275,7 @@ impl ReconcilerWake {
         namespace: &str,
         convoy: &ResourceObject<Convoy>,
         sessions: &BTreeMap<String, ResourceObject<TerminalSession>>,
-        messages: &[flotilla_resources::ReadResourceObject<flotilla_resources::Message>],
+        messages: &[flotilla_messaging::SeatMessage],
         now: DateTime<Utc>,
     ) -> Result<(), String> {
         let Some(status) = &convoy.status else { return Ok(()) };
@@ -283,8 +283,10 @@ impl ReconcilerWake {
         for (source, delivery) in &status.turn_deliveries {
             for episode in &delivery.episodes {
                 let TurnDeliveryOutcome::Queued { vessel, role, message_id, .. } = &episode.outcome else { continue };
-                let message = messages.iter().find(|message| message.object.metadata.name == *message_id).map(|message| &message.object);
-                let (confirmed, blocking_reason) = queued_turn_evidence(message, queued_turn_session(sessions, vessel, role));
+                let (confirmed, blocking_reason) = match messages.iter().find(|message| message.name == *message_id) {
+                    Some(message) => queued_message_evidence(message.phase, message.reason.as_deref()),
+                    None => queued_session_evidence(queued_turn_session(sessions, vessel, role)),
+                };
                 observations.push(flotilla_resources::QueuedTurnObservation {
                     source: source.clone(),
                     subject_revision: episode.subject_revision.clone(),

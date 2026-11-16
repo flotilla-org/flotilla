@@ -1771,29 +1771,84 @@ impl MessagePrimitives {
     ) -> Result<Vec<ReadResourceObject<OldMessage>>, ResourceError> {
         let (roles, inboxes) = self.inboxes_of(namespace, receivers).await?;
         let conversion = Conversion { roles: &roles, forges: &[], records: &convert::NoRecords };
+        let rows = self.seat_rows(&inboxes, &named_inboxes(&conversion, named))?;
+        let receivers: Vec<String> = receivers.iter().cloned().chain(named.iter().map(|(receiver, _)| receiver.clone())).collect();
+        self.spelled_to(rows, namespace, &roles, &receivers).await
+    }
+
+    /// What the stall judge reads of crew seats' inboxes: the messages [`Self::seat_messages`]
+    /// reads, each as where it stands, with nothing of it spelled. A message is read as in the
+    /// first of `receivers` or `named` (old crew addresses) asked for whose inbox holds it, as a
+    /// convoy role's inbox is spelled with the first vessel its workflow gives the role.
+    pub async fn seat_standings(
+        &self,
+        namespace: &str,
+        receivers: &[String],
+        named: &[(String, String)],
+    ) -> Result<Vec<flotilla_messaging::SeatMessage>, ResourceError> {
+        let roles = self.roles(namespace).await.map_err(ResourceError::invalid)?;
+        let conversion = Conversion { roles: &roles, forges: &[], records: &convert::NoRecords };
+        let mut seats = BTreeMap::new();
+        for receiver in receivers {
+            match conversion.inbox(receiver) {
+                Ok(inbox) => {
+                    seats.entry(inbox).or_insert_with(|| receiver.clone());
+                }
+                Err(error) => tracing::debug!(%receiver, %error, "a receiver with no inbox holds no message"),
+            }
+        }
+        let inboxes: BTreeSet<Address> = seats.keys().cloned().collect();
+        let named = named_inboxes(&conversion, named);
+        for (inbox, receiver, _) in &named {
+            seats.entry(inbox.clone()).or_insert_with(|| (*receiver).to_owned());
+        }
+        let rows = self.seat_rows(&inboxes, &named)?;
+        let created = self.created_of(&rows)?;
+        Ok(rows
+            .into_iter()
+            .zip(created)
+            .filter_map(|((_, resource), created)| {
+                let seat = seats.get(&resource.spec().inbox)?.clone();
+                let Some(name) = record_name(resource.name()) else {
+                    tracing::debug!(message = resource.name(), "an engine message with no record name is not read at a seat");
+                    return None;
+                };
+                Some(flotilla_messaging::SeatMessage {
+                    seat,
+                    name,
+                    phase: view::old_phase(&resource),
+                    reason: view::old_reason(&resource),
+                    accepted_sequence: resource.spec().admitted_seq,
+                    created: created.to_datetime(),
+                    delivered_at: view::delivered_at(&resource),
+                })
+            })
+            .collect())
+    }
+
+    /// Each of `inboxes`' open messages, the last one admitted among those settled and the one
+    /// delivered last and not dropped since; then each `named` message by its exact identity,
+    /// each held with its home.
+    fn seat_rows(
+        &self,
+        inboxes: &BTreeSet<Address>,
+        named: &[(Address, &str, &str)],
+    ) -> Result<Vec<(String, Resource<Message>)>, ResourceError> {
         let mut rows = BTreeMap::new();
         let mut keep = |(home, message): (String, Resource<Message>)| {
             rows.entry(message.name().to_owned()).or_insert((home, message));
         };
-        for inbox in &inboxes {
+        for inbox in inboxes {
             self.open_in(inbox).map_err(ResourceError::other)?.into_iter().for_each(&mut keep);
             self.newest_in(inbox, MessageLabel::Settled).map_err(ResourceError::other)?.into_iter().for_each(&mut keep);
             self.newest_delivered(inbox).map_err(ResourceError::other)?.into_iter().for_each(&mut keep);
         }
-        for (receiver, record) in named {
-            let inbox = match conversion.inbox(receiver) {
-                Ok(inbox) => inbox,
-                Err(error) => {
-                    tracing::debug!(%receiver, %record, %error, "a receiver with no inbox holds no message");
-                    continue;
-                }
-            };
-            if let Some((id, home)) = self.locate_in(&inbox, record).map_err(ResourceError::other)? {
+        for (inbox, _, record) in named {
+            if let Some((id, home)) = self.locate_in(inbox, record).map_err(ResourceError::other)? {
                 self.load_at(id, home)?.map(|(home, _, message)| (home, message)).into_iter().for_each(&mut keep);
             }
         }
-        let receivers: Vec<String> = receivers.iter().cloned().chain(named.iter().map(|(receiver, _)| receiver.clone())).collect();
-        self.spelled_to(rows.into_values().collect(), namespace, &roles, &receivers).await
+        Ok(rows.into_values().collect())
     }
 
     /// The pending messages to `receivers` (old addresses) in the old shape, read through each
@@ -1943,13 +1998,13 @@ impl flotilla_messaging::EngineMessages for MessagePrimitives {
     async fn open_to(&self, namespace: &str, receivers: &[String]) -> Result<Vec<ReadResourceObject<OldMessage>>, ResourceError> {
         MessagePrimitives::open_to(self, namespace, receivers).await
     }
-    async fn seat_messages(
+    async fn seat_standings(
         &self,
         namespace: &str,
         receivers: &[String],
         named: &[(String, String)],
-    ) -> Result<Vec<ReadResourceObject<OldMessage>>, ResourceError> {
-        MessagePrimitives::seat_messages(self, namespace, receivers, named).await
+    ) -> Result<Vec<flotilla_messaging::SeatMessage>, ResourceError> {
+        MessagePrimitives::seat_standings(self, namespace, receivers, named).await
     }
     async fn pending_to(&self, namespace: &str, receivers: &[String]) -> Result<Vec<ReadResourceObject<OldMessage>>, ResourceError> {
         MessagePrimitives::pending_to(self, namespace, receivers).await
@@ -2075,6 +2130,21 @@ fn found<T>(read: Result<T, ResourceError>) -> Result<Option<T>, ResourceError> 
 }
 
 /// The work holding `role` in `convoy`'s workflow snapshot.
+/// Each `named` (receiver, record) message's inbox, with its receiver and record; a receiver with
+/// no inbox names none.
+fn named_inboxes<'a>(conversion: &Conversion<'_>, named: &'a [(String, String)]) -> Vec<(Address, &'a str, &'a str)> {
+    named
+        .iter()
+        .filter_map(|(receiver, record)| match conversion.inbox(receiver) {
+            Ok(inbox) => Some((inbox, receiver.as_str(), record.as_str())),
+            Err(error) => {
+                tracing::debug!(%receiver, %record, %error, "a receiver with no inbox holds no message");
+                None
+            }
+        })
+        .collect()
+}
+
 fn snapshot_vessel(convoy: &ResourceObject<Convoy>, role: &str) -> Option<String> {
     let status = convoy.status.as_ref()?;
     status

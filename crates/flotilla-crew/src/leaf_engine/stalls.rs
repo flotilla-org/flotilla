@@ -422,7 +422,7 @@ struct StallInputs {
     observation_list: Arc<flotilla_resources::ReadResourceList<flotilla_resources::ChangeRequest>>,
     forges: Vec<flotilla_resources::ForgeSpec>,
     vessels_list: Arc<flotilla_resources::ReadResourceList<flotilla_resources::Vessel>>,
-    messages_list: Arc<flotilla_resources::ReadResourceList<flotilla_resources::Message>>,
+    messages: Vec<flotilla_messaging::SeatMessage>,
     receivers: flotilla_messaging::MessageReceiverSnapshot,
     declarations: flotilla_store::CascadeDeclarations,
 }
@@ -647,9 +647,7 @@ impl ReconcilerWake {
             .iter()
             .flat_map(|convoy| flotilla_resources::convoy_seat_turns(namespace, &convoy.object))
             .collect::<Vec<_>>();
-        let messages_list = std::sync::Arc::new(flotilla_resources::ReadResourceList {
-            items: primitives.seat_messages(namespace, &seats, &named).await.map_err(|error| error.to_string())?,
-        });
+        let messages = primitives.seat_standings(namespace, &seats, &named).await.map_err(|error| error.to_string())?;
         // Routing helpers retain their public Store-based interface, but all
         // their reads come from the same request snapshot of the watched kinds.
         views.defaults.insert_snapshot(namespace, &mut snapshot).await.map_err(|error| error.to_string())?;
@@ -682,7 +680,7 @@ impl ReconcilerWake {
             observation_list,
             forges,
             vessels_list,
-            messages_list,
+            messages,
             receivers,
             declarations,
         })
@@ -784,7 +782,7 @@ impl ReconcilerWake {
         let StallTick { namespace, now, .. } = tick;
         let sessions = &tick.inputs.sessions_list.items;
         let vessels = &tick.inputs.vessels_list.items;
-        let messages = &tick.inputs.messages_list.items;
+        let messages = &tick.inputs.messages;
         let selected_sessions = select_convoy_children(convoy, sessions);
         self.observe_queued_turns_from_messages(namespace, convoy, &selected_sessions, messages, now).await?;
         let selected_vessels = select_convoy_children(convoy, vessels);
@@ -1014,7 +1012,7 @@ impl ReconcilerWake {
         role: &str,
     ) -> Result<RowJudgement, String> {
         let StallTick { namespace, now, progress_observations, .. } = tick;
-        let messages = &tick.inputs.messages_list.items;
+        let messages = &tick.inputs.messages;
         let judgement: Result<(), (String, StallEvidenceSource)> = {
             let session = selected_sessions.values().find(|session| {
                 session.metadata.labels.get(CONVOY_LABEL) == Some(&convoy.metadata.name)
@@ -1093,33 +1091,16 @@ impl ReconcilerWake {
             let current_message = messages
                 .iter()
                 .filter(|message| {
-                    message.object.spec.receiver == receiver_address
-                        && message
-                            .object
-                            .status
-                            .as_ref()
-                            .is_none_or(|status| !status.phase.is_terminal() || status.phase.has_delivery_evidence())
+                    message.seat == receiver_address && (!message.phase.is_terminal() || message.phase.has_delivery_evidence())
                 })
-                .max_by_key(|message| {
-                    (message.object.status.as_ref().and_then(|status| status.accepted_sequence), message.object.metadata.creation_timestamp)
-                });
+                .max_by_key(|message| (message.accepted_sequence, message.created));
             let session_status = session.and_then(|session| session.status.as_ref());
-            let message_id = current_message.map(|message| message.object.metadata.name.clone());
+            let message_id = current_message.map(|message| message.name.clone());
             let delivered_id = messages
                 .iter()
-                .filter(|message| {
-                    message.object.spec.receiver == receiver_address
-                        && message.object.status.as_ref().is_some_and(|status| status.phase.has_delivery_evidence())
-                })
-                .max_by_key(|message| {
-                    message
-                        .object
-                        .status
-                        .as_ref()
-                        .and_then(|status| status.resolved_receiver.as_ref())
-                        .map(|receiver| receiver.delivered_at)
-                })
-                .map(|message| message.object.metadata.name.clone());
+                .filter(|message| message.seat == receiver_address && message.phase.has_delivery_evidence())
+                .max_by_key(|message| message.delivered_at)
+                .map(|message| message.name.clone());
             if message_id != obligation.message_id || delivered_id != obligation.delivered_message_id {
                 if message_id.is_some() || delivered_id.is_some() {
                     obligation.reply_after = Some(now);
@@ -1128,10 +1109,7 @@ impl ReconcilerWake {
                 obligation.delivered_message_id = delivered_id;
             }
             let agent = session.and_then(|session| self.agent_view(session));
-            let pending_message = messages.iter().any(|message| {
-                message.object.spec.receiver == receiver_address
-                    && message.object.status.as_ref().is_none_or(|status| status.phase.is_waiting())
-            });
+            let pending_message = messages.iter().any(|message| message.seat == receiver_address && message.phase.is_waiting());
             // The agent's own record says when it went idle (#3108). A delivered message's reply
             // is consumed once the agent goes idle after it; until then the quiet clock counts
             // from the delivery.
@@ -1460,7 +1438,7 @@ impl ReconcilerWake {
         retry_exhausted: bool,
     ) -> Result<StalledCondition, String> {
         let StallTick { namespace, now, .. } = tick;
-        let messages = &tick.inputs.messages_list.items;
+        let messages = &tick.inputs.messages;
         let (available_convoys, projects) = (&tick.inputs.available_convoys, &tick.inputs.projects);
         let (leaves, maker, evidence, source) = if let Some((row, evidence, source)) = unable {
             (row.leaves.clone(), Some(row.maker.clone()), evidence.clone(), source.clone())
@@ -1533,10 +1511,8 @@ impl ReconcilerWake {
                     if now.signed_duration_since(resumed_at) >= chrono::Duration::minutes(2) {
                         return false;
                     }
-                    let operator_brief_delivered = messages.iter().any(|message| {
-                        message.object.metadata.name == brief_id
-                            && message.object.status.as_ref().is_some_and(|status| status.phase.has_delivery_evidence())
-                    });
+                    let operator_brief_delivered =
+                        messages.iter().any(|message| message.name == brief_id && message.phase.has_delivery_evidence());
                     !operator_brief_delivered || idle_at.is_none_or(|idle_at| idle_at <= resumed_at)
                 });
             awaiting_resumed_turn = resume_grace;

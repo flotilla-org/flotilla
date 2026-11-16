@@ -13,6 +13,23 @@ pub enum MessageResolution {
     Unknown(String),
 }
 
+/// One message in a crew seat's inbox as the stall judge reads it (#3108): where it stands, and
+/// nothing else of the message.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SeatMessage {
+    /// The seat (an old crew address) whose inbox holds it, as it was asked for.
+    pub seat: String,
+    /// Its record name.
+    pub name: String,
+    pub phase: flotilla_resources::MessagePhase,
+    pub reason: Option<String>,
+    /// Its place in its inbox's admission order.
+    pub accepted_sequence: u64,
+    pub created: chrono::DateTime<chrono::Utc>,
+    /// When it was delivered, once it was.
+    pub delivered_at: Option<chrono::DateTime<chrono::Utc>>,
+}
+
 /// The `[primitives]` switch's Message path, as crew code reads and admits
 /// Messages (#3317). Crew code never reaches the engine: it sees engine
 /// messages in the old shape through this port, which the composition root
@@ -44,12 +61,12 @@ pub trait EngineMessages: Send + Sync {
     /// `receivers` (old crew addresses), its open messages, the last one admitted among those
     /// settled and the one delivered last and not dropped since; then each `named` (receiver,
     /// record) message by its exact identity.
-    async fn seat_messages(
+    async fn seat_standings(
         &self,
         namespace: &str,
         receivers: &[String],
         named: &[(String, String)],
-    ) -> Result<Vec<flotilla_resources::ReadResourceObject<flotilla_resources::Message>>, flotilla_resources::ResourceError>;
+    ) -> Result<Vec<SeatMessage>, flotilla_resources::ResourceError>;
     /// The messages to `receivers` (old addresses) still waiting for delivery, local or replicated.
     async fn pending_to(
         &self,
