@@ -1031,30 +1031,6 @@ fn assert_escalation_refused(
     assert!(records.is_empty());
 }
 
-// Owner ruling in #3430: retained terminal convoys never resume legacy briefs.
-#[tokio::test]
-async fn terminal_legacy_brief_is_ignored() {
-    let (crew, backend, _probe, held) = fixture(CrewWorkPhase::Done).await;
-    held.engine.end(&backend, &held.launch, ConvoyPhase::Landed).await;
-    let status = held
-        .engine
-        .note(&backend, &held.launch, |status| {
-            status.turn_deliveries.entry("operator".into()).or_default().pending_brief = Some(
-                serde_json::from_value(serde_json::json!({
-                    "vessel": "work", "role": "coder", "content": "ignore terminal intent", "queued_at": "2026-10-01T00:00:00Z",
-                    "sender": {"kind": "operator-resume", "principal": {"namespace": "flotilla", "name": "alice"}}
-                }))
-                .expect("legacy brief"),
-            );
-        })
-        .await
-        .status;
-    assert_eq!(status.as_ref().expect("status").phase, ConvoyPhase::Landed);
-    crew.reconcile_pending_supervisor_turns_once("flotilla").await.expect("reconcile");
-    assert!(backend.using::<flotilla_resources::Message>("flotilla").list().await.expect("messages").items.is_empty());
-    assert_eq!(held.convoy(&backend).await.status, status);
-}
-
 // Behaviour (#3587 layer 7): a send's awaiting-reply record is a stall when it supervises a
 // stalled crew, else the kind its expectation names; a send expecting nothing records nothing.
 #[test]

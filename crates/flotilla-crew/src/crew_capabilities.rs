@@ -486,9 +486,10 @@ async fn publish_card_revision(
     CardRevision { revision, card, body, supersedes }: CardRevision<'_>,
     tracker: &CapabilityCardTracker,
 ) -> Result<(String, String), String> {
-    let name = message_record_name(receiver, "system:capabilities", &format!("{}:capabilities@{revision}", session.metadata.name));
     let inbox = flotilla_resources::convoy::engine::role_inbox(receiver)?;
     let primitives = tracker.primitives().map_err(|error| error.to_string())?;
+    let sender = primitives.fleet_role(namespace, "capabilities").await.map_err(|error| error.to_string())?;
+    let name = message_record_name(inbox.as_str(), sender.as_str(), &format!("{}:capabilities@{revision}", session.metadata.name));
     let supersedes = match supersedes {
         // Reaped audit data cannot be a predecessor.
         Some(name) => primitives.holds(&inbox, &name).await.map_err(|error| error.to_string())?.then_some(name),
@@ -510,7 +511,6 @@ async fn publish_card_revision(
         None => (body.to_string(), supersedes),
     };
     // The card is about the seat it is for, at its revision.
-    let sender = primitives.fleet_role(namespace, "capabilities").await.map_err(|error| error.to_string())?;
     let at = flotilla_address::Revision::new(format!("capabilities@{revision}")).map_err(|error| error.to_string())?;
     let mut intent = flotilla_messaging::Intent::new(sender, inbox.clone(), MessageRelation::System, body);
     intent.references = vec![flotilla_messaging::IntentReference::subject(inbox, at)];

@@ -22,7 +22,6 @@ use flotilla_store_testkit::ReadCountsBackendExt;
 use flotilla_vcs::vcs::{CheckoutVcsResolver, Vcs};
 use tokio::sync::RwLock;
 
-use crate::crew_ops::frame_crew_message;
 use crate::crew_ops::CrewService;
 use crate::leaf_engine::LeafSubscriptionTable;
 use crate::ports::WorkCredentialReconciler;
@@ -30,7 +29,6 @@ use flotilla_observation::change_request_observer::ChangeRequestRefreshCadence;
 use flotilla_observation::change_request_observer::ChangeRequestRefresher;
 use flotilla_protocol_testkit::event_sink::RecordingEventSink;
 use flotilla_resources::ConvoyPhase;
-use flotilla_resources::CrewMessageSender;
 
 // Stand-in for forge I/O; these crew scenarios never request forge observations.
 struct UnusedForge;
@@ -367,30 +365,6 @@ async fn build_fixture(
     let held = Held { _config: config_dir, engine, launch, vessel, session, prelude: admitted };
     assert_eq!(held.convoy(&backend).await.status.expect("status").crew_work["work"]["coder"].phase, phase);
     (crew, backend, probe, held)
-}
-
-// Resume must restore work on credential failure and stage credentials before retry delivery (#2221).
-#[test]
-fn crew_message_sender_headers_snapshot() {
-    // Keep the pre-extraction snapshot names and paths; the rendered contract is unchanged.
-    let mut settings = insta::Settings::clone_current();
-    settings.set_prepend_module_to_snapshot(false);
-    settings.set_snapshot_path("../snapshots");
-    let _guard = settings.bind_to_scope();
-    let principal = Some(flotilla_protocol::PrincipalRef { namespace: "flotilla".into(), name: "robert".into() });
-    let cases = [
-        ("nudge", CrewMessageSender::FlotillaNudge),
-        ("turn", CrewMessageSender::FlotillaTurn { source: "conflicting".into() }),
-        ("escalation", CrewMessageSender::FlotillaEscalation { from: "coder@work".into() }),
-        ("resume", CrewMessageSender::OperatorResume { principal: principal.clone() }),
-        ("follow_up", CrewMessageSender::OperatorFollowUp { principal }),
-        ("governor", CrewMessageSender::Governor { name: "wheelhouse".into() }),
-        ("bosun", CrewMessageSender::Bosun { name: "reviewer@implement".into() }),
-        ("handoff", CrewMessageSender::Handoff { from: "coder@implement".into() }),
-    ];
-    for (name, sender) in cases {
-        insta::assert_snapshot!(format!("flotilla_core__in_process__tests__{name}"), frame_crew_message(&sender, "Example message."));
-    }
 }
 
 mod awaiting;
