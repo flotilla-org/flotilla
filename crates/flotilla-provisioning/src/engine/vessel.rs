@@ -41,7 +41,7 @@ use flotilla_schema_sqlite::{stream::Service, Read, StoreHandle};
 use flotilla_state_machines::{
     machines::{
         convoy::{Convoy, ConvoyId, Priority, VesselClass},
-        lifecycle::{Attempted, Lifecycle, LifecycleEdge, Realise, Release, Vanish, VanishCause},
+        lifecycle::{Lifecycle, Realise, Release, Vanish, VanishCause},
         vessel::{live_leases, Vessel, VesselKind, VesselSpec},
     },
     placement::{Host, LedgerError, PlacementError, Placements, Units, VesselId},
@@ -152,24 +152,30 @@ where
     }
 
     fn step(&self, name: &str, step: &Step, at: Timestamp) -> Result<Resource<Lifecycle<VesselKind>>, EngineError> {
-        let edge: LifecycleEdge = match step {
-            Step::Realised { identity } => Realise { identity: identity.clone(), observed: Ref::new(name) }.into(),
-            Step::Released => Release { teardown: Ref::new(name) }.into(),
-            Step::Vanished { cause } => Vanish { cause: cause.clone(), observed: Ref::new(name) }.into(),
-            Step::Attempted(outcome) => Attempted { outcome: outcome.clone() }.into(),
-        };
         let world = evidence(name, step);
         self.with_placements(|placements| {
             let id = VesselId::new(name);
-            if let Step::Attempted(outcome) = step {
-                super::apply_attempt::<VesselKind, _, _>(
+            match step {
+                Step::Attempted(outcome) => super::apply_attempt::<VesselKind, _, _>(
                     placements,
                     outcome,
                     |placements| placements.get(&id).map(|resource| resource.state().clone()),
                     |placements, edge| placements.apply(&id, edge, &world, at).map(|_| ()),
-                )?;
-            } else {
-                placements.apply(&id, edge, &world, at)?;
+                )?,
+                Step::FailedEarly { cause, retryable } => {
+                    if let Some(edge) = super::failed_early(placements.get(&id).map(Resource::state), cause, *retryable) {
+                        placements.apply(&id, edge.into(), &world, at)?;
+                    }
+                }
+                Step::Realised { identity } => {
+                    placements.apply(&id, Realise { identity: identity.clone(), observed: Ref::new(name) }.into(), &world, at)?;
+                }
+                Step::Released => {
+                    placements.apply(&id, Release { teardown: Ref::new(name) }.into(), &world, at)?;
+                }
+                Step::Vanished { cause } => {
+                    placements.apply(&id, Vanish { cause: cause.clone(), observed: Ref::new(name) }.into(), &world, at)?;
+                }
             }
             placements
                 .get(&id)

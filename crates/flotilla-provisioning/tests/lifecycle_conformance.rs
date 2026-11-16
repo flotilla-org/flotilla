@@ -41,8 +41,8 @@ use flotilla_schema_sqlite::{Store, StoreHandle};
 use flotilla_state_machines::{
     edge_event,
     machines::lifecycle::{
-        Attempted, GiveUp, Lifecycle, LifecycleEdge, LifecycleKind, LifecycleRefusal, LifecycleState, MemoryLifecycleWorld, Observed,
-        Realise, Release, Vanish,
+        attempt_history, Attempted, FailedEarly, GiveUp, Lifecycle, LifecycleKind, LifecycleRefusal, LifecycleState, MemoryLifecycleWorld,
+        Observed, Realise, Release, Vanish,
     },
     AttemptPolicy, Cause, CauseCategory, Home, Log, Outcome, Ref, Resource, WriteError,
 };
@@ -168,13 +168,13 @@ where
     Resource<Machine<K>>: Kind,
     StoreLog: Log<Machine<K>>,
 {
-    /// The resource as the store holds it, and the outcomes of its `Attempted` log entries in order.
+    /// The resource as the store holds it, and the attempt history its log entries record.
     fn read_back(&self) -> (Resource<Machine<K>>, u64, Vec<Outcome>) {
         let mut store = self.store.lock().expect("store");
         let mut read = store.read().expect("read");
         let id = read.resolve(Resource::<Machine<K>>::CODE, NAME, HOME).expect("resolve").expect("stored");
         let loaded = read.load::<Resource<Machine<K>>>(id).expect("load").expect("current row");
-        let mut attempts = Vec::new();
+        let mut edges = Vec::new();
         let mut after = 0;
         loop {
             let entries = read.changes(id, after, 64).expect("changes");
@@ -183,13 +183,11 @@ where
             for entry in &entries {
                 let at = read.change(HOME, entry.change).expect("read").expect("its change").at;
                 if let Some(event) = edge_event::<Machine<K>>(entry, at).expect("entry decodes") {
-                    if let LifecycleEdge::Attempted(attempted) = event.arguments {
-                        attempts.push(attempted.outcome);
-                    }
+                    edges.push(event.arguments);
                 }
             }
         }
-        (loaded.value.with_identity(&loaded.name, loaded.version), loaded.version, attempts)
+        (loaded.value.with_identity(&loaded.name, loaded.version), loaded.version, attempt_history(&edges))
     }
 }
 
@@ -291,6 +289,9 @@ where
                     }
                 };
                 outcome(home.apply(NAME, Attempted { outcome: attempted }, &world, at))
+            }
+            "FailedEarly" => {
+                outcome(home.apply(NAME, FailedEarly { cause: cause(text(&o["cause"])), retryable: boolean(&o["retryable"]) }, &world, at))
             }
             "GiveUp" => outcome(home.apply(NAME, GiveUp { cause: cause(text(&o["cause"])) }, &world, at)),
             other => panic!("lifecycle event {other}"),

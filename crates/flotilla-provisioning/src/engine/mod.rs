@@ -51,12 +51,12 @@ use flotilla_schema::Timestamp;
 use flotilla_state_machines::{
     machines::{
         lifecycle::{
-            Attempted, GiveUp, Lifecycle, LifecycleEdge, LifecycleKind, LifecycleRefusal, LifecycleState, MemoryLifecycleWorld, Observed,
-            Realise, Release, Vanish,
+            Attempted, FailedEarly, GiveUp, Lifecycle, LifecycleEdge, LifecycleKind, LifecycleRefusal, LifecycleState,
+            MemoryLifecycleWorld, Observed, Realise, Release, Vanish,
         },
         vessel::VesselKind,
     },
-    Home, Log, Outcome, Ref, Resource, WriteError,
+    Cause, Home, Log, Outcome, Ref, Resource, WriteError,
 };
 
 use crate::stored::{
@@ -102,6 +102,9 @@ pub enum Step {
     /// One try at realising it ended so. A failure is followed by a give-up with its cause,
     /// which the engine accepts once the kind's policy is spent.
     Attempted(Outcome),
+    /// A try made before its pending retry was due failed so; it is not counted. Nothing is
+    /// written when the pending failure already says this.
+    FailedEarly { cause: Cause, retryable: bool },
     /// It is observed under `identity`.
     Realised { identity: String },
     /// Its teardown completed.
@@ -210,9 +213,18 @@ fn evidence(name: &str, step: &Step) -> MemoryLifecycleWorld {
         Step::Vanished { .. } => {
             world.absences.put(&Ref::new(name), true);
         }
-        Step::Attempted(_) => {}
+        Step::Attempted(_) | Step::FailedEarly { .. } => {}
     }
     world
+}
+
+/// The edge an early failure writes over `state`: none when its pending failure already has
+/// this cause, so a burst of early tries failing alike writes nothing.
+fn failed_early(state: Option<&LifecycleState>, cause: &Cause, retryable: bool) -> Option<FailedEarly> {
+    match state {
+        Some(LifecycleState::Requested { last_failure: Some(last), .. }) if last.cause == *cause && last.retryable == retryable => None,
+        _ => Some(FailedEarly { cause: cause.clone(), retryable }),
+    }
 }
 
 /// Ends launch `name`'s predecessor, the newest launch of its name numbered below it, when it is
@@ -326,6 +338,11 @@ where
                     |home| home.get(name).map(|resource| resource.state().clone()),
                     |home, edge| home.apply(name, edge, &world, at).map(|_| ()),
                 )?;
+            }
+            Step::FailedEarly { cause, retryable } => {
+                if let Some(edge) = failed_early(home.get(name).map(Resource::state), cause, *retryable) {
+                    home.apply(name, edge, &world, at)?;
+                }
             }
             Step::Realised { identity } => {
                 home.apply(name, Realise { identity: identity.clone(), observed: Ref::new(name) }, &world, at)?;

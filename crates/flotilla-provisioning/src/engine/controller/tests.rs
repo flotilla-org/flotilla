@@ -16,16 +16,18 @@ use std::{
 
 use async_trait::async_trait;
 use flotilla_engine_store::{open_home, open_home_with, StoreLog};
-use flotilla_resources::SystemClock;
+use flotilla_resources::{Clock, SystemClock};
 use flotilla_schema::{Frozen, Identity, Kind, KindCode, Timestamp};
 use flotilla_schema_sqlite::{
     stream::{CommitListener, Service},
     Read, StoreError,
 };
 use flotilla_state_machines::{
-    machines::lifecycle::{Lifecycle, LifecycleState},
-    Cause, CauseCategory, Resource,
+    edge_event,
+    machines::lifecycle::{Lifecycle, LifecycleEdgeKind, LifecycleState},
+    Cause, CauseCategory, Edge, Resource,
 };
+use flotilla_store_testkit::VirtualClock;
 use tokio::sync::{mpsc, Notify};
 
 use super::{Actuator, Backing, BackingEvent, Controller, Holding, Holdings, ProviderFailure, Usability};
@@ -103,14 +105,29 @@ struct Script {
     records: Option<Arc<LifecycleHome<ImageBuildKind, StoreLog>>>,
     /// While set, a release tells the notify that it runs and waits for a permit.
     release_gate: Option<(Arc<Notify>, Arc<tokio::sync::Semaphore>)>,
+    /// How many times the controller has read a holder, as it does for each resource it looks at.
+    reads: usize,
+    /// `reads` at the latest try at realising: a later read is the look the try's end leads to.
+    reads_at_try: usize,
 }
 
 #[derive(Default)]
-struct Scripted(Mutex<Script>);
+struct Scripted {
+    script: Mutex<Script>,
+    /// Told at each try at realising and each holder read, neither of which need write anything.
+    progress: Notify,
+}
 
 impl Scripted {
     fn script(&self) -> std::sync::MutexGuard<'_, Script> {
-        self.0.lock().expect("script")
+        self.script.lock().expect("script")
+    }
+
+    /// Whether the latest try has ended and been recorded: the controller has looked at a
+    /// resource since.
+    fn settled(&self) -> bool {
+        let script = self.script();
+        script.reads > script.reads_at_try
     }
 }
 
@@ -125,9 +142,14 @@ impl Actuator<EnvironmentKind> for Scripted {
 
     async fn realise(&self, _: &str, request: &EnvironmentRequest) -> Result<String, ProviderFailure> {
         let key = key(request);
-        let mut script = self.script();
-        script.realised.push(key.clone());
-        script.realise.get_mut(&key).and_then(VecDeque::pop_front).unwrap_or_else(|| Ok(format!("id-{key}")))
+        let realised = {
+            let mut script = self.script();
+            script.realised.push(key.clone());
+            script.reads_at_try = script.reads;
+            script.realise.get_mut(&key).and_then(VecDeque::pop_front).unwrap_or_else(|| Ok(format!("id-{key}")))
+        };
+        self.progress.notify_waiters();
+        realised
     }
 
     async fn release(&self, _: &str, request: &EnvironmentRequest, identity: Option<&str>) -> Result<(), ProviderFailure> {
@@ -150,6 +172,8 @@ impl Actuator<EnvironmentKind> for Scripted {
     }
 
     fn holder(&self, read: &mut Read<'_>, _: &str, request: &EnvironmentRequest) -> Result<Holding, StoreError> {
+        self.script().reads += 1;
+        self.progress.notify_waiters();
         Ok(Holding::ended(state_of(read, &format!("holder-{}", key(request)))?.is_some_and(|state| state.gone())))
     }
 
@@ -240,10 +264,15 @@ impl World {
 
     /// Starts the controller over the records as they are now.
     fn start(&mut self) {
+        self.start_with(Arc::new(SystemClock));
+    }
+
+    /// Starts the controller over the records as they are now, its time read from `clock`.
+    fn start_with(&mut self, clock: Arc<dyn Clock>) {
         let controller = Controller::start(
             Arc::clone(&self.environments) as Arc<dyn Lifecycles<EnvironmentKind>>,
             Arc::clone(&self.actuator),
-            Arc::new(SystemClock),
+            clock,
             Arc::clone(&self.service),
         )
         .expect("controller");
@@ -269,21 +298,48 @@ impl World {
         self.records.step(&launch, &step, Self::now()).expect("record step");
     }
 
+    /// The edges environment `name`'s log entries record, in order.
+    fn edges(&self, name: &str) -> Vec<LifecycleEdgeKind> {
+        type Environment = Resource<Lifecycle<EnvironmentKind>>;
+        let store = self.service.store();
+        let mut store = store.lock().expect("store");
+        let mut read = store.read().expect("read");
+        let id = read.resolve(<Environment as Kind>::CODE, name, HOME).expect("resolve").expect("stored");
+        let (mut edges, mut after) = (Vec::new(), 0);
+        loop {
+            let entries = read.changes(id, after, 64).expect("changes");
+            let Some(last) = entries.last() else { return edges };
+            after = last.home_seq;
+            for entry in &entries {
+                let at = read.change(HOME, entry.change).expect("read").expect("its change").at;
+                if let Some(event) = edge_event::<Lifecycle<EnvironmentKind>>(entry, at).expect("entry decodes") {
+                    edges.push(event.arguments.kind());
+                }
+            }
+        }
+    }
+
     fn state(&self, name: &str) -> LifecycleState {
         self.environments.get(name).expect("held").state().clone()
     }
 
-    /// Waits for `holds` to hold of the environments, rechecked at each commit.
+    /// Waits for `holds` to hold of the environments, rechecked at each commit, each try and
+    /// each look the controller takes.
     async fn until(&self, what: &str, holds: impl Fn(&Self) -> bool) {
         let wait = async {
             loop {
                 let committed = self.commits.notified();
-                tokio::pin!(committed);
+                let progressed = self.actuator.progress.notified();
+                tokio::pin!(committed, progressed);
                 committed.as_mut().enable();
+                progressed.as_mut().enable();
                 if holds(self) {
                     return;
                 }
-                committed.await;
+                tokio::select! {
+                    () = committed => {}
+                    () = progressed => {}
+                }
             }
         };
         tokio::time::timeout(Duration::from_secs(10), wait).await.unwrap_or_else(|_| panic!("timed out waiting for {what}"));
@@ -389,34 +445,54 @@ async fn a_final_failure_gives_up_at_once() {
     assert_eq!(world.actuator.script().realised, ["a"]);
 }
 
-// The failure limit bounds retries even when every event retries: a flapping input cannot loop.
+// The failure limit counts the kind's retry schedule, not wakes. A burst of input changes before
+// the pending retry is due tries again at each, so an arrival is used at once, but counts none
+// and writes nothing while the cause stays; a changed cause is written once. A try once the
+// retry is due counts, so a flapping input still reaches the limit, a backoff at a time.
 #[tokio::test]
-async fn the_failure_limit_bounds_retries() {
+async fn early_tries_count_none_and_the_limit_counts_due_ones() {
+    let clock = Arc::new(VirtualClock::new(chrono::Utc::now()));
     let mut world = World::open();
-    let failing = (0..10).map(|_| Err(failure("flapping", true))).collect();
+    let failing = (0..20)
+        .map(|_| Err(failure("flapping", true)))
+        .chain([Err(failure("flapping harder", true))])
+        .chain((0..10).map(|_| Err(failure("flapping", true))))
+        .collect();
     world.actuator.script().realise.insert("a".into(), failing);
     world.record("input-a");
-    world.start();
+    world.start_with(Arc::clone(&clock) as Arc<dyn Clock>);
     world.request("a");
     world.until("a tried", |world| failures(&world.state("a")) == Some(1)).await;
-    let gave_up = |world: &World| matches!(world.state("a"), LifecycleState::GaveUp { .. });
-    for _ in 0..10 {
-        if gave_up(&world) {
-            break;
-        }
-        // Each input change is one more chance, until the policy's limit.
-        let tried = world.actuator.script().realised.len();
-        world.record_step("input-a", Step::Attempted(flotilla_state_machines::Outcome::Succeeded));
-        world.until("a tried again or gave up", |world| world.actuator.script().realised.len() > tried || gave_up(world)).await;
+    let tries = |world: &World| world.actuator.script().realised.len();
+    let wake = |world: &World| world.record_step("input-a", Step::Attempted(flotilla_state_machines::Outcome::Succeeded));
+
+    // A wake while a try runs is not one for that try, so each waits for the last to settle.
+    for _ in 0..20 {
+        let tried = tries(&world);
+        wake(&world);
+        world.until("a tried again and settled", |world| tries(world) > tried && world.actuator.settled()).await;
+    }
+    let changed = |world: &World| match world.state("a") {
+        LifecycleState::Requested { last_failure: Some(last), .. } => last.cause.detail == "flapping harder",
+        _ => false,
+    };
+    world.until("the changed cause recorded", changed).await;
+    assert_eq!(tries(&world), 21);
+    assert_eq!(failures(&world.state("a")), Some(1), "early tries count none");
+    assert_eq!(world.edges("a"), [LifecycleEdgeKind::Attempted, LifecycleEdgeKind::FailedEarly], "only the changed cause is written");
+
+    let limit = <EnvironmentKind as flotilla_state_machines::machines::lifecycle::LifecycleKind>::policy();
+    for counted in 2..=limit.max_failures {
+        clock.advance(chrono::Duration::microseconds(limit.cap));
+        wake(&world);
         world
-            .until("the try recorded", |world| {
-                failures(&world.state("a")) == Some(world.actuator.script().realised.len() as u32) || gave_up(world)
+            .until("a due try counted", |world| {
+                failures(&world.state("a")) == Some(counted) || matches!(world.state("a"), LifecycleState::GaveUp { .. })
             })
             .await;
     }
-    assert!(gave_up(&world), "the limit stops the retries");
-    let limit = <EnvironmentKind as flotilla_state_machines::machines::lifecycle::LifecycleKind>::policy().max_failures;
-    assert_eq!(world.actuator.script().realised.len() as u32, limit);
+    world.until("a gave up", |world| matches!(world.state("a"), LifecycleState::GaveUp { .. })).await;
+    assert_eq!(tries(&world) as u32, 21 + limit.max_failures - 1);
 }
 
 /// A retryable failure whose provider names when time alone could fix it.

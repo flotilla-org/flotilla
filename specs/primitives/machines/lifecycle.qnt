@@ -10,7 +10,7 @@ module lifecycle {
   type State = Requested(List[AttemptOutcome]) | Realised(str) | Gone(Ending) | GaveUp(str)
   type Event = Realise({ present: bool, matches: bool, identity: str })
     | Release({ teardownComplete: bool }) | Vanish({ absent: bool, cause: VanishCause })
-    | Attempted(AttemptOutcome) | GiveUp({ cause: str })
+    | Attempted(AttemptOutcome) | FailedEarly({ retryable: bool, cause: str }) | GiveUp({ cause: str })
   type Refusal = Ended | WrongState | MissingEvidence
   type Next = Moved(State) | Refused(Refusal)
   pure def failed(o: AttemptOutcome): bool = match o { | AttemptFailed(_) => true | Succeeded => false }
@@ -23,6 +23,9 @@ module lifecycle {
   // The cause of the last attempt, when it failed.
   pure def lastCauseIs(h: List[AttemptOutcome], cause: str): bool =
     h.length() > 0 and (match h[h.length() - 1] { | AttemptFailed(f) => f.cause == cause | _ => false })
+  // A retry is pending: the last attempt failed, and the failures are not spent.
+  // A try made before it was due (timing is the caller's) fails without counting.
+  pure def pending(h: List[AttemptOutcome]): bool = h.length() > 0 and failed(h[h.length() - 1]) and not(exhausted(h))
   pure def step(s: State, e: Event): Next = match s {
     | Gone(_) => Refused(Ended)
     | GaveUp(_) => Refused(Ended)
@@ -38,6 +41,10 @@ module lifecycle {
         }
       | Attempted(o) => match s {
           | Requested(h) => Moved(Requested(h.append(o)))
+          | _ => Refused(WrongState)
+        }
+      | FailedEarly(o) => match s {
+          | Requested(h) => if (pending(h)) Moved(Requested(h.replaceAt(h.length() - 1, AttemptFailed(o)))) else Refused(MissingEvidence)
           | _ => Refused(WrongState)
         }
       | GiveUp(o) => match s {
@@ -56,7 +63,8 @@ module lifecycle {
     val probes = Set(
       Realise({ present: true, matches: true, identity: "model" }),
       Release({ teardownComplete: true }), Vanish({ absent: true, cause: Lost }),
-      Attempted(AttemptFailed({ retryable: false, cause: "failure" })), GiveUp({ cause: "failure" }))
+      Attempted(AttemptFailed({ retryable: false, cause: "failure" })), FailedEarly({ retryable: true, cause: "failure" }),
+      GiveUp({ cause: "failure" }))
     match s {
       | Gone(_) => probes.forall(e => not(moved(step(s, e))))
       | GaveUp(_) => probes.forall(e => not(moved(step(s, e))))
@@ -84,6 +92,7 @@ module lifecycle {
   action release(id: int, complete: bool): bool = fire(id, Release({ teardownComplete: complete }))
   action vanish(id: int, absent: bool, cause: VanishCause): bool = fire(id, Vanish({ absent: absent, cause: cause }))
   action attempt(id: int, outcome: AttemptOutcome): bool = fire(id, Attempted(outcome))
+  action failEarly(id: int, early: { retryable: bool, cause: str }): bool = fire(id, FailedEarly(early))
   action giveUp(id: int, cause: str): bool = fire(id, GiveUp({ cause: cause }))
   // The attempts a Requested resource has made; none in any other state.
   pure def attempts(s: Slot): List[AttemptOutcome] = match s {

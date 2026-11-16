@@ -40,8 +40,9 @@
 //!   recorded". The spec's `receipt` is false on every drop it can reach (an
 //!   undeliverable drop is refused with a receipt), and Rust has no field.
 //! - **Lifecycle attempts.** The model's `Requested(history)` is the
-//!   resource's `Attempted` log entries, and Rust keeps their tally in
-//!   Requested; rendering checks it.
+//!   resource's `Attempted` log entries, each `FailedEarly` entry replacing
+//!   the failure before it, and Rust keeps their tally in Requested;
+//!   rendering checks it.
 //! - **Receipts.** In `inbox_delivery` a receipt is a session's `Receive`
 //!   edge about the message, and its stream row is that entry on its way to
 //!   the message's home: the message reads the entries whose row has applied.
@@ -329,15 +330,9 @@ fn lifecycle_outcome_value(outcome: &Outcome) -> Value {
 fn lifecycle_value<K: LifecycleKind>(home: &Home<Lifecycle<K>>, resource: &Resource<Lifecycle<K>>) -> Value {
     match resource.state() {
         LifecycleState::Requested { failures, last_failure } => {
-            let attempts: Vec<&Outcome> = home
-                .log()
-                .history(resource.name(), Version(0), usize::MAX)
-                .into_iter()
-                .filter_map(|(_, event)| match &event.arguments.edge {
-                    LifecycleEdge::Attempted(attempted) => Some(&attempted.outcome),
-                    _ => None,
-                })
-                .collect();
+            let attempts = lifecycle::attempt_history(
+                home.log().history(resource.name(), Version(0), usize::MAX).into_iter().map(|(_, event)| &event.arguments.edge),
+            );
             let since_success = attempts.iter().rev().take_while(|o| matches!(o, Outcome::Failed { .. })).count();
             assert_eq!(*failures as usize, since_success, "{}: the tally counts the failures since the last success", resource.name());
             let last = attempts.last().and_then(|o| match o {
@@ -350,7 +345,7 @@ fn lifecycle_value<K: LifecycleKind>(home: &Home<Lifecycle<K>>, resource: &Resou
                 "{}: the tally keeps the last failure",
                 resource.name()
             );
-            variant("Requested", Value::Array(attempts.into_iter().map(lifecycle_outcome_value).collect()))
+            variant("Requested", Value::Array(attempts.iter().map(lifecycle_outcome_value).collect()))
         }
         LifecycleState::Realised { identity } => variant("Realised", json!(identity)),
         LifecycleState::Gone { ending } => variant("Gone", flotilla_quint_testkit::lifecycle::ending_value(ending)),
@@ -424,6 +419,7 @@ fn lifecycle_end_refuses<K: LifecycleKind>(
             .into(),
         lifecycle::GiveUp { cause: cause("failure") }.into(),
         lifecycle::Attempted { outcome: Outcome::Succeeded }.into(),
+        lifecycle::FailedEarly { cause: cause("failure"), retryable: true }.into(),
     ];
     assert_end_refuses(home, name, probes, &world, now, step, tally);
 }
@@ -479,6 +475,11 @@ fn machine_edges(trace: &Trace, tally: &mut Tally) {
                     other => panic!("{step}: attempt outcome {other}"),
                 };
                 accept(&mut things, ONE, lifecycle::Attempted { outcome }, &MemoryLifecycleWorld::default(), now, &step, tally);
+            }
+            "failEarly" => {
+                let early = step.pick("early");
+                let edge = lifecycle::FailedEarly { cause: cause(text(&early["cause"])), retryable: boolean(&early["retryable"]) };
+                accept(&mut things, ONE, edge, &MemoryLifecycleWorld::default(), now, &step, tally);
             }
             "giveUp" => {
                 let edge = lifecycle::GiveUp { cause: cause(text(step.pick("cause"))) };

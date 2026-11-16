@@ -17,6 +17,7 @@ module lifecycle_conformance {
     .union(Set(true, false).map(c => L::Release({ teardownComplete: c })))
     .union(Set(true, false).map(a => Set(L::Lost).union(causes.map(c => L::Failed(c))).map(c => L::Vanish({ absent: a, cause: c }))).flatten())
     .union(causes.map(c => L::GiveUp({ cause: c })))
+    .union(Set(true, false).map(r => causes.map(c => L::FailedEarly({ retryable: r, cause: c }))).flatten())
     .union(attempts(s))
   action init = all { state' = L::Requested([]), probe' = Started }
   action step = {

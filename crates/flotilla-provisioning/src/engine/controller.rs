@@ -635,9 +635,7 @@ where
         let Some(resource) = self.lifecycles.get(name) else { return };
         let state = resource.state().clone();
         // A new try ran: what it found decides any later one.
-        if !matches!(done, Done::Observed(..) | Done::Held(Ok(_))) {
-            self.retries.remove(name);
-        }
+        let scheduled = if matches!(done, Done::Observed(..) | Done::Held(Ok(_))) { None } else { self.retries.remove(name) };
         if let Done::Observed(_, Some(holdings)) = &done {
             self.holdings.insert(name.to_owned(), holdings.clone());
         }
@@ -645,11 +643,7 @@ where
             (Done::Held(Ok(holdings)), _) => {
                 self.holdings.insert(name.to_owned(), holdings);
             }
-            (Done::Held(Err(failure)), LifecycleState::Requested { .. }) => {
-                let retry_at = failure.retry_at.filter(|_| failure.retryable);
-                self.write(name, Step::Attempted(Outcome::Failed { cause: failure.cause, retryable: failure.retryable })).await;
-                self.schedule(name, retry_at);
-            }
+            (Done::Held(Err(failure)), LifecycleState::Requested { .. }) => self.failed(name, &state, failure, scheduled).await,
             // A realised resource's holdings read again: its observation, not this read, ends it.
             (Done::Held(Err(failure)), _) => warn!(kind = K::NAME, name, cause = ?failure.cause, "holdings could not be read"),
             (Done::Realised(Ok(identity)), _) => {
@@ -667,20 +661,14 @@ where
                     }
                 }
             }
-            (Done::Realised(Err(failure)), _) => {
-                let retry_at = failure.retry_at.filter(|_| failure.retryable);
-                self.write(name, Step::Attempted(Outcome::Failed { cause: failure.cause, retryable: failure.retryable })).await;
-                self.schedule(name, retry_at);
-            }
+            (Done::Realised(Err(failure)), _) => self.failed(name, &state, failure, scheduled).await,
             (Done::Released(Ok(())), state) if state.live() => {
                 self.release_failed.remove(name);
                 self.write(name, Step::Released).await;
             }
             (Done::Released(Err(failure)), LifecycleState::Requested { .. }) => {
                 self.release_failed.insert(name.to_owned());
-                let retry_at = failure.retry_at.filter(|_| failure.retryable);
-                self.write(name, Step::Attempted(Outcome::Failed { cause: failure.cause, retryable: failure.retryable })).await;
-                self.schedule(name, retry_at);
+                self.failed(name, &state, failure, scheduled).await;
             }
             (Done::Released(Err(failure)), _) => {
                 // A realised resource has no failed-teardown edge yet, so the failure is not
@@ -700,6 +688,26 @@ where
             }
             (Done::Observed(Err(cause), _), _) => warn!(kind = K::NAME, name, ?cause, "observation failed"),
             _ => {}
+        }
+    }
+
+    /// Records a try at `name`, made in `state`, that failed so, and schedules the next. A try
+    /// made before the pending retry was due, as a wake makes, is not counted and leaves that
+    /// retry where it was (`scheduled`): the failure limit counts the kind's retry schedule, not
+    /// how often something woke the resource.
+    async fn failed(&mut self, name: &str, state: &LifecycleState, failure: ProviderFailure, scheduled: Option<Timestamp>) {
+        let retry_at = failure.retry_at.filter(|_| failure.retryable);
+        let (cause, retryable) = (failure.cause, failure.retryable);
+        let now = Timestamp::from_datetime(&self.clock.now());
+        match judge::<K>(state) {
+            Judgement::Retrying { next, .. } if now < next => {
+                self.write(name, Step::FailedEarly { cause, retryable }).await;
+                self.schedule(name, retry_at.or(scheduled));
+            }
+            _ => {
+                self.write(name, Step::Attempted(Outcome::Failed { cause, retryable })).await;
+                self.schedule(name, retry_at);
+            }
         }
     }
 

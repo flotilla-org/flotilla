@@ -16,8 +16,8 @@ use std::collections::{BTreeMap, BTreeSet};
 use flotilla_schema::{Edge, Frozen, Ref, State, Stored};
 use flotilla_state_machines::{
     machines::lifecycle::{
-        Absence, Attempted, GiveUp, Lifecycle, LifecycleKind, LifecycleState, LifecycleWorld, MemoryLifecycleWorld, Observed, Realisation,
-        Realise, Release, Teardown, Vanish,
+        Absence, Attempted, FailedEarly, GiveUp, Lifecycle, LifecycleKind, LifecycleState, LifecycleWorld, MemoryLifecycleWorld, Observed,
+        Realisation, Realise, Release, Teardown, Vanish,
     },
     machines::vessel::Vessel,
     Cause, CauseCategory, Failure, Outcome, Resource,
@@ -176,8 +176,8 @@ fn boxed(world: MemoryLifecycleWorld) -> Box<dyn LifecycleWorld> {
 }
 
 /// Every edge a live lifecycle resource in `state` may take: realising under an observed identity,
-/// releasing once torn down, vanishing when observed absent, an attempt of either outcome, and
-/// giving up with its last failure's cause.
+/// releasing once torn down, vanishing when observed absent, an attempt of either outcome, an
+/// early failure, and giving up with its last failure's cause.
 pub fn candidates<K: LifecycleKind>(tc: &TestCase, state: &LifecycleState) -> Vec<Candidate<Lifecycle<K>>> {
     let now = timestamp(tc);
     let mut candidates = Vec::new();
@@ -206,6 +206,8 @@ pub fn candidates<K: LifecycleKind>(tc: &TestCase, state: &LifecycleState) -> Ve
         now,
     ));
     candidates.push((Attempted { outcome: outcome(tc, Pick::Draw) }.into(), boxed(MemoryLifecycleWorld::default()), now));
+    let early = FailedEarly { cause: cause(tc, Pick::Draw), retryable: Pick::Draw.some(tc, 8) };
+    candidates.push((early.into(), boxed(MemoryLifecycleWorld::default()), now));
     let last = match state {
         LifecycleState::Requested { last_failure, .. } => last_failure.as_ref().map(|failure| failure.cause.clone()),
         _ => None,
