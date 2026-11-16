@@ -58,4 +58,8 @@ impl<C: Send> flotilla_resources::lifecycle_reads::ChangeCursor<C> for LogCursor
         }
         Ok(followed.map_err(|error| error.to_string())?.into_iter().map(self.change).collect())
     }
+
+    fn position(&self) -> u64 {
+        self.follower.position()
+    }
 }

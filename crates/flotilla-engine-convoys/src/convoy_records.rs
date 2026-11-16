@@ -182,6 +182,10 @@ impl ChangeCursor<ConvoyChange> for ConvoyCursor {
             .with_store(|store| changes_of(&mut store.read()?, followed))
             .map_err(|error| format!("engine convoys' changes: {error}"))
     }
+
+    fn position(&self) -> u64 {
+        self.followed.position()
+    }
 }
 
 /// The launches what one pass followed changed: a stall record names the seat it is about, under

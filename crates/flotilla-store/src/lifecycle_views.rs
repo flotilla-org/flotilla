@@ -14,11 +14,7 @@
 //! Installed as the backend's [`KindRecords`] for `Clone`, `Environment`, `Checkout` and
 //! `ImageBuild`.
 
-use std::{
-    collections::BTreeMap,
-    hash::{Hash, Hasher},
-    sync::Arc,
-};
+use std::{collections::BTreeMap, sync::Arc};
 
 use futures::{stream::BoxStream, StreamExt};
 
@@ -30,7 +26,7 @@ use flotilla_resources::{
     clone_records::{launched, CloneRecord},
     engine_records::{KindRecords, Record},
     environment_records::EnvironmentRecord,
-    lifecycle_reads::{LifecycleReads, RecordSet},
+    lifecycle_reads::{ChangeCursor, LifecycleReads, RecordSet},
     Checkout, ClonePhase, CloneStatus, Environment, EnvironmentPhase, EnvironmentStatus, ImageBuild, Resource,
 };
 
@@ -45,11 +41,76 @@ see an image's builds with `flotilla image check`";
 #[derive(Clone)]
 pub struct LifecycleViews {
     reads: Arc<dyn LifecycleReads>,
+    clones: Arc<tokio::sync::Mutex<Versions<flotilla_resources::Clone>>>,
+    environments: Arc<tokio::sync::Mutex<Versions<Environment>>>,
+    checkouts: Arc<tokio::sync::Mutex<Versions<Checkout>>>,
+}
+
+/// A kind's views as last handed out, by home and name, each with the launch it showed, and the
+/// cursor whose position versions a view that changed. Each read reads every record, so what it
+/// does not read again leaves.
+struct Versions<R: Resource> {
+    /// Started at the first read; none where no log is held.
+    cursor: Option<Box<dyn Position>>,
+    started: bool,
+    held: BTreeMap<(String, String), (Record<R>, String)>,
+}
+
+impl<R: Resource> Default for Versions<R> {
+    fn default() -> Self {
+        Self { cursor: None, started: false, held: BTreeMap::new() }
+    }
+}
+
+/// A cursor read only for how far it has read.
+trait Position: Send {
+    /// Passes the changes since the last pass; how far it has read. A pass that fails leaves it
+    /// where it was.
+    fn pass(&mut self) -> u64;
+}
+
+impl<C: Send> Position for Box<dyn ChangeCursor<C>> {
+    fn pass(&mut self) -> u64 {
+        if let Err(error) = ChangeCursor::pass(self.as_mut()) {
+            tracing::debug!(%error, "a lifecycle view's cursor did not pass; its versions move past the last");
+        }
+        self.position()
+    }
 }
 
 impl LifecycleViews {
     pub fn new(reads: Arc<dyn LifecycleReads>) -> Self {
-        Self { reads }
+        Self { reads, clones: Arc::default(), environments: Arc::default(), checkouts: Arc::default() }
+    }
+
+    /// `R`'s records, each at the version it is handed out at: the version last handed out under
+    /// its home and name while it shows the same, else how far the log was read before them.
+    async fn versioned<R: LifecycleKind>(&self) -> Result<Vec<Record<R>>, String> {
+        let Some(versions) = R::versions(self) else { return Ok(R::records(self).await?.into_iter().map(|(record, _)| record).collect()) };
+        let mut versions = versions.lock().await;
+        let (cursor, started) = (versions.cursor.take(), versions.started);
+        // The position before the records: every entry it counts is read into them.
+        let (cursor, position) = self
+            .blocking(move |reads| {
+                let mut cursor = if started { cursor } else { R::cursor(reads)? };
+                let position = cursor.as_mut().map_or(0, |cursor| cursor.pass());
+                Ok((cursor, position))
+            })
+            .await?;
+        versions.cursor = cursor;
+        versions.started = true;
+        let mut held = BTreeMap::new();
+        let mut records = Vec::new();
+        for (mut record, launch) in R::records(self).await? {
+            let key = (record.home.clone(), record.name.clone());
+            let before = versions.held.get(&key);
+            let same = before.is_some_and(|(before, shown)| *shown == launch && crate::held_listing::shows_the_same(&record, before));
+            record.version = crate::held_listing::version(before.map(|(before, _)| before.version), same, position)?;
+            held.insert(key, (record.clone(), launch));
+            records.push(record);
+        }
+        versions.held = held;
+        Ok(records)
     }
 
     async fn blocking<T: Send + 'static>(
@@ -74,12 +135,23 @@ impl std::fmt::Debug for LifecycleViews {
 
 /// A kind the lifecycle views serve.
 #[async_trait::async_trait]
-trait LifecycleKind: Resource + Sized {
+trait LifecycleKind: Resource<Spec: PartialEq, Status: PartialEq> + Sized {
     /// The records its views are read from; none for a kind served only to refuse.
     const SET: Option<RecordSet>;
 
-    /// Every home's record of every name.
-    async fn records(views: &LifecycleViews) -> Result<Vec<Record<Self>>, String>;
+    /// Every home's record of every name, each with the launch it shows where a later launch
+    /// showing the same is still a change.
+    async fn records(views: &LifecycleViews) -> Result<Vec<(Record<Self>, String)>, String>;
+
+    /// Where its views' versions are kept; none for a kind served only to refuse.
+    fn versions(_views: &LifecycleViews) -> Option<&tokio::sync::Mutex<Versions<Self>>> {
+        None
+    }
+
+    /// A cursor over the log its records are read from; none where no log is held.
+    fn cursor(_reads: &dyn LifecycleReads) -> Result<Option<Box<dyn Position>>, String> {
+        Ok(None)
+    }
 
     /// Why a write of `name` is refused.
     fn written(name: &str) -> String {
@@ -101,9 +173,17 @@ trait LifecycleKind: Resource + Sized {
 impl LifecycleKind for flotilla_resources::Clone {
     const SET: Option<RecordSet> = Some(RecordSet::Clones);
 
-    async fn records(views: &LifecycleViews) -> Result<Vec<Record<Self>>, String> {
+    async fn records(views: &LifecycleViews) -> Result<Vec<(Record<Self>, String)>, String> {
         let records = views.blocking(|reads| reads.clones()?.every()).await?;
-        newest_launches(records).into_iter().filter_map(|record| clone_object(record).transpose()).collect()
+        Ok(newest_launches(records).into_iter().filter_map(clone_object).map(|record| (record, String::new())).collect())
+    }
+
+    fn versions(views: &LifecycleViews) -> Option<&tokio::sync::Mutex<Versions<Self>>> {
+        Some(&views.clones)
+    }
+
+    fn cursor(reads: &dyn LifecycleReads) -> Result<Option<Box<dyn Position>>, String> {
+        Ok(reads.clones()?.cursor().map(|cursor| Box::new(cursor) as Box<dyn Position>))
     }
 }
 
@@ -111,9 +191,17 @@ impl LifecycleKind for flotilla_resources::Clone {
 impl LifecycleKind for Environment {
     const SET: Option<RecordSet> = Some(RecordSet::Environments);
 
-    async fn records(views: &LifecycleViews) -> Result<Vec<Record<Self>>, String> {
+    async fn records(views: &LifecycleViews) -> Result<Vec<(Record<Self>, String)>, String> {
         let records = views.blocking(|reads| reads.environments()?.every()).await?;
-        records.into_iter().filter_map(|record| environment_object(record).transpose()).collect()
+        Ok(records.into_iter().filter_map(environment_object).map(|record| (record, String::new())).collect())
+    }
+
+    fn versions(views: &LifecycleViews) -> Option<&tokio::sync::Mutex<Versions<Self>>> {
+        Some(&views.environments)
+    }
+
+    fn cursor(reads: &dyn LifecycleReads) -> Result<Option<Box<dyn Position>>, String> {
+        Ok(reads.environments()?.cursor().map(|cursor| Box::new(cursor) as Box<dyn Position>))
     }
 }
 
@@ -121,9 +209,24 @@ impl LifecycleKind for Environment {
 impl LifecycleKind for Checkout {
     const SET: Option<RecordSet> = Some(RecordSet::Checkouts);
 
-    async fn records(views: &LifecycleViews) -> Result<Vec<Record<Self>>, String> {
+    /// A checkout's later launch showing the same spec and status is still a change.
+    async fn records(views: &LifecycleViews) -> Result<Vec<(Record<Self>, String)>, String> {
         let records = views.blocking(|reads| reads.checkouts()?.every()).await?;
-        newest_checkout_launches(records).into_iter().map(checkout_object).collect()
+        Ok(newest_checkout_launches(records)
+            .into_iter()
+            .map(|record| {
+                let launch = record.name.clone();
+                (checkout_object(record), launch)
+            })
+            .collect())
+    }
+
+    fn versions(views: &LifecycleViews) -> Option<&tokio::sync::Mutex<Versions<Self>>> {
+        Some(&views.checkouts)
+    }
+
+    fn cursor(reads: &dyn LifecycleReads) -> Result<Option<Box<dyn Position>>, String> {
+        Ok(reads.checkouts()?.cursor().map(|cursor| Box::new(cursor) as Box<dyn Position>))
     }
 }
 
@@ -131,7 +234,7 @@ impl LifecycleKind for Checkout {
 impl LifecycleKind for ImageBuild {
     const SET: Option<RecordSet> = None;
 
-    async fn records(_: &LifecycleViews) -> Result<Vec<Record<Self>>, String> {
+    async fn records(_: &LifecycleViews) -> Result<Vec<(Record<Self>, String)>, String> {
         Err(format!("{} is not read through the resource commands; {IMAGE_BUILDS_HELD_AS}", Self::API_PATHS.kind))
     }
 
@@ -175,15 +278,11 @@ fn newest_checkout_launches(records: Vec<CheckoutRecord>) -> Vec<CheckoutRecord>
 }
 
 /// `record`'s launch as its read view shows it, under the checkout's name.
-fn checkout_object(record: CheckoutRecord) -> Result<Record<Checkout>, String> {
+fn checkout_object(record: CheckoutRecord) -> Record<Checkout> {
     let view = record.read_view();
-    let mut object = object::<Checkout>(view.metadata.name, record.home, record.requested_at, view.spec, view.status)?;
-    // A later launch showing the same spec and status is still a change.
-    let mut digest = std::hash::DefaultHasher::new();
-    (object.version, &record.name, &view.metadata.labels).hash(&mut digest);
-    object.version = digest.finish();
+    let mut object = object::<Checkout>(view.metadata.name, record.home, record.requested_at, view.spec, view.status);
     object.labels = view.metadata.labels;
-    Ok(object)
+    object
 }
 
 /// Why `reading` is not yet, or no longer, ready, when it says.
@@ -199,9 +298,9 @@ fn cause(reading: &LifecycleReading) -> Option<String> {
 }
 
 /// `record`'s launch as the old Clone it shows: none once released.
-fn clone_object(record: CloneRecord) -> Result<Option<Record<flotilla_resources::Clone>>, String> {
+fn clone_object(record: CloneRecord) -> Option<Record<flotilla_resources::Clone>> {
     let phase = match &record.reading {
-        LifecycleReading::Released => return Ok(None),
+        LifecycleReading::Released => return None,
         LifecycleReading::InProgress | LifecycleReading::Retrying { .. } | LifecycleReading::Exhausted { .. } => ClonePhase::Cloning,
         LifecycleReading::Ready { .. } => ClonePhase::Ready,
         LifecycleReading::Lost { .. } | LifecycleReading::Failed { .. } | LifecycleReading::GaveUp { .. } => ClonePhase::Failed,
@@ -209,14 +308,14 @@ fn clone_object(record: CloneRecord) -> Result<Option<Record<flotilla_resources:
     let status =
         CloneStatus { phase, default_branch: record.default_branch.clone(), message: cause(&record.reading), ..Default::default() };
     let name = launched(&record.name).to_owned();
-    object::<flotilla_resources::Clone>(name, record.home, record.requested_at, record.spec, Some(status)).map(Some)
+    Some(object::<flotilla_resources::Clone>(name, record.home, record.requested_at, record.spec, Some(status)))
 }
 
 /// `record` as the old Environment it shows: none once released. Its identity reads as the
 /// backing it is realised under.
-fn environment_object(record: EnvironmentRecord) -> Result<Option<Record<Environment>>, String> {
+fn environment_object(record: EnvironmentRecord) -> Option<Record<Environment>> {
     let phase = match &record.reading {
-        LifecycleReading::Released => return Ok(None),
+        LifecycleReading::Released => return None,
         LifecycleReading::InProgress | LifecycleReading::Retrying { .. } | LifecycleReading::Exhausted { .. } => {
             EnvironmentPhase::Provisioning
         }
@@ -237,24 +336,18 @@ fn environment_object(record: EnvironmentRecord) -> Result<Option<Record<Environ
         message: cause(&record.reading),
         ..Default::default()
     };
-    object::<Environment>(record.name, record.home, record.requested_at, record.spec, Some(status)).map(Some)
+    Some(object::<Environment>(record.name, record.home, record.requested_at, record.spec, Some(status)))
 }
 
-/// A record of `spec` and `status`, created at `created_at`, its version a digest of what it
-/// shows, so a watcher sees each change. The digest encodes what it shows; R4 replaces it with
-/// the record's log position.
+/// A record of `spec` and `status`, created at `created_at`. Its version is the views' to give.
 fn object<R: Resource>(
     name: String,
     home: String,
     created_at: chrono::DateTime<chrono::Utc>,
     spec: R::Spec,
     status: Option<R::Status>,
-) -> Result<Record<R>, String> {
-    let shown = |value: serde_json::Result<String>| value.map_err(|error| format!("{} {name}: {error}", R::API_PATHS.kind));
-    let mut digest = std::hash::DefaultHasher::new();
-    (shown(serde_json::to_string(&spec))?, status.as_ref().map(|status| shown(serde_json::to_string(status))).transpose()?)
-        .hash(&mut digest);
-    Ok(Record { name, home, version: digest.finish(), created_at, labels: BTreeMap::new(), annotations: BTreeMap::new(), spec, status })
+) -> Record<R> {
+    Record { name, home, version: 0, created_at, labels: BTreeMap::new(), annotations: BTreeMap::new(), spec, status }
 }
 
 impl crate::EnginePort for LifecycleViews {
@@ -288,7 +381,7 @@ impl<R: LifecycleKind> KindRecords<R> for LifecycleViews {
     async fn list(&self) -> Result<Vec<Record<R>>, String> {
         let home = self.here();
         let mut chosen = BTreeMap::<String, Record<R>>::new();
-        for object in R::records(self).await? {
+        for object in self.versioned::<R>().await? {
             let keep = chosen.get(&object.name).is_some_and(|held| held.home == home || (object.home != home && held.home <= object.home));
             if !keep {
                 chosen.insert(object.name.clone(), object);
@@ -298,7 +391,7 @@ impl<R: LifecycleKind> KindRecords<R> for LifecycleViews {
     }
 
     async fn sources(&self) -> Result<Vec<Record<R>>, String> {
-        R::records(self).await
+        self.versioned::<R>().await
     }
 
     async fn apply(

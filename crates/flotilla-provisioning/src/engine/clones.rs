@@ -66,8 +66,15 @@ fn record(read: &mut Read<'_>, view: View<CloneKind>) -> Result<CloneRecord, Rea
 pub struct EngineClones {
     lifecycles: Arc<dyn Lifecycles<CloneKind>>,
     reads: StoreReads,
-    homes: Box<dyn Fn() -> Vec<String> + Send + Sync>,
+    homes: Arc<dyn Fn() -> Vec<String> + Send + Sync>,
     changes: tokio::sync::broadcast::Sender<CloneChange>,
+}
+
+fn clone_change(followed: flotilla_engine_store::follow::Followed) -> CloneChange {
+    match followed {
+        flotilla_engine_store::follow::Followed::Changed(identity) => CloneChange::Changed(identity.name),
+        flotilla_engine_store::follow::Followed::Rescan(_) => CloneChange::Rescanned,
+    }
 }
 
 /// How many changes a slow follower may fall behind by; one that lags rereads everything.
@@ -83,7 +90,7 @@ impl EngineClones {
         store: Arc<StoreHandle>,
         homes: impl Fn() -> Vec<String> + Send + Sync + 'static,
     ) -> Self {
-        Self { lifecycles, reads: StoreReads::new(store), homes: Box::new(homes), changes: tokio::sync::broadcast::channel(CHANGES).0 }
+        Self { lifecycles, reads: StoreReads::new(store), homes: Arc::new(homes), changes: tokio::sync::broadcast::channel(CHANGES).0 }
     }
 
     /// The port over `service`'s store and homes.
@@ -118,17 +125,7 @@ impl EngineClones {
         let changes = self.changes.clone();
         Ok(tokio::spawn(async move {
             loop {
-                let followed = watch
-                    .next(|_, followed| {
-                        Ok(followed
-                            .into_iter()
-                            .map(|followed| match followed {
-                                flotilla_engine_store::follow::Followed::Changed(identity) => CloneChange::Changed(identity.name),
-                                flotilla_engine_store::follow::Followed::Rescan(_) => CloneChange::Rescanned,
-                            })
-                            .collect::<Vec<_>>())
-                    })
-                    .await;
+                let followed = watch.next(|_, followed| Ok(followed.into_iter().map(clone_change).collect::<Vec<_>>())).await;
                 match followed {
                     // No follower is no reason to stop: one may subscribe later.
                     Ok(followed) => followed.into_iter().for_each(|change| drop(changes.send(change))),
@@ -170,6 +167,17 @@ impl CloneRecords for EngineClones {
 
     fn changes(&self) -> tokio::sync::broadcast::Receiver<CloneChange> {
         self.changes.subscribe()
+    }
+
+    fn cursor(&self) -> Option<Box<dyn flotilla_resources::lifecycle_reads::ChangeCursor<CloneChange>>> {
+        let cursor = super::log_cursor::LogCursor::start(self.reads.clone(), Arc::clone(&self.homes), self.codes(), clone_change);
+        match cursor {
+            Ok(cursor) => Some(Box::new(cursor)),
+            Err(error) => {
+                tracing::warn!(%error, "the log could not be followed from here; readers read afresh");
+                None
+            }
+        }
     }
 
     fn get(&self, name: &str, home: Option<&str>) -> Result<Option<CloneRecord>, String> {

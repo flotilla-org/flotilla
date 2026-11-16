@@ -202,6 +202,70 @@ async fn next_session(
     }
 }
 
+/// The next change a watcher of the sessions hears, added or modified, and its version.
+async fn next_version(
+    watch: &mut futures::stream::BoxStream<
+        'static,
+        Result<flotilla_resources::ReadWatchEvent<flotilla_resources::TerminalSession>, flotilla_resources::ResourceError>,
+    >,
+) -> (&'static str, u64) {
+    use flotilla_resources::ReadWatchEvent;
+    use futures::StreamExt;
+    let event = tokio::time::timeout(std::time::Duration::from_secs(5), watch.next()).await.expect("a change").expect("watching");
+    let (told, read) = match event.expect("read") {
+        ReadWatchEvent::Added(read) => ("added", read),
+        ReadWatchEvent::Modified(read) => ("modified", read),
+        other => panic!("not an added or modified session: {other:?}"),
+    };
+    (told, read.object.metadata.resource_version.parse().expect("a version"))
+}
+
+// Behaviour (#3108): a session's next launch in place of one that ended is a Modified change at a
+// version past every version the ended launch was told at, though the new launch's own record has
+// been written once and the ended one three times: a view's version follows how far the log was
+// read, never the record it shows.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_sessions_next_launch_moves_its_version_past_the_last() {
+    use std::sync::Arc;
+
+    use flotilla_resources::{environment_records::LaunchFacts, EnvironmentSpec, HostDirectEnvironmentSpec, TerminalSession};
+    use flotilla_store::{ResourceBackend, TerminalViews};
+
+    let store = flotilla_provisioning_testkit::OtherHome::open("home");
+    let engine = flotilla_provisioning_testkit::EngineFixture::over_service(store.service());
+    let _followers = [
+        engine.terminals.terminals.follow(Arc::clone(store.service())).expect("follow sessions"),
+        engine.environments.environments.follow(Arc::clone(store.service())).expect("follow environments"),
+        engine.vessels.vessels.follow(Arc::clone(store.service())).expect("follow vessels"),
+    ];
+    let backend = ResourceBackend::new(flotilla_store_memory::InMemoryBackend::default());
+    backend.install_engine_records(Arc::new(TerminalViews::new("flotilla", engine.reads())));
+    backend.serve_engine_in("flotilla");
+    let mut watch = backend.including_replicas::<TerminalSession>("flotilla").watch().await.expect("watch sessions");
+
+    let spec = EnvironmentSpec {
+        host_direct: Some(HostDirectEnvironmentSpec { host_ref: "home".into(), repo_default_dir: "/work".into() }),
+        ..EnvironmentSpec::default()
+    };
+    engine.environments.request("env", &spec, None);
+    engine.environments.ready("env", "backing", LaunchFacts::default());
+    let vessel = engine.vessels.request("c", "work", "host");
+    let request = TerminalsFixture::agent(&vessel, "coder", "env");
+    let first = engine.terminals.request(&request);
+    let (told, requested) = next_version(&mut watch).await;
+    assert_eq!(told, "added");
+    engine.terminals.ready(&first, "sid", &facts());
+    let (_, running) = next_version(&mut watch).await;
+    engine.terminals.exited(&first, "agent exited");
+    let (_, stopped) = next_version(&mut watch).await;
+    assert!(requested < running && running < stopped, "each change of the launch moves the version on");
+
+    let TerminalRenewal::Started(_) = engine.terminals.terminals.renew(&request.session).expect("renew") else { panic!("next launch") };
+    let (told, starting) = next_version(&mut watch).await;
+    assert_eq!(told, "modified", "the next launch is a change of the session");
+    assert!(starting > stopped, "the next launch's version {starting} is past the ended one's {stopped}");
+}
+
 // Behaviour (#3108): the session listing a watcher reads keeps up with each change its passes
 // compose: a launch's edges, its environment's end, its next launch in its place, and its release.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

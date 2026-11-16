@@ -51,6 +51,35 @@ struct Listing {
     sessions: BTreeMap<Session, Entry>,
 }
 
+impl Listing {
+    /// How far the listing has read: the log and this home's observations, by its cursors.
+    fn position(&self) -> u64 {
+        self.cursors.as_ref().map_or(0, Cursors::position)
+    }
+
+    /// `view`, of launch `launch` of `session`, at the version it is handed out at: the held
+    /// view's while it is of the same launch and shows the same.
+    fn version(&self, session: &Session, launch: &str, view: &Record<TerminalSession>, position: u64) -> Result<u64, String> {
+        let held = self.sessions.get(session).and_then(|held| Some((held.record.name == launch, held.view.as_ref()?)));
+        let same = held.is_some_and(|(same_launch, held)| same_launch && crate::held_listing::shows_the_same(view, held));
+        crate::held_listing::version(held.map(|(_, held)| held.version), same, position)
+    }
+
+    /// `entries`, composed again, with the versions their views are handed out at.
+    fn stamped(&self, entries: Vec<(Session, Entry)>) -> Result<Vec<(Session, Entry)>, ResourceError> {
+        let position = self.position();
+        entries
+            .into_iter()
+            .map(|(session, mut entry)| {
+                if let Some(view) = entry.view.as_mut() {
+                    view.version = self.version(&session, &entry.record.name, view, position).map_err(ResourceError::other)?;
+                }
+                Ok((session, entry))
+            })
+            .collect()
+    }
+}
+
 /// A session's newest launch.
 struct Entry {
     record: TerminalRecord,
@@ -82,6 +111,8 @@ struct Cursors {
     vessels: Option<Box<dyn ChangeCursor<VesselChange>>>,
     /// What this home observes is in memory, told as it changes.
     observed: tokio::sync::broadcast::Receiver<String>,
+    /// How many observation changes have been read.
+    observed_read: u64,
 }
 
 impl Cursors {
@@ -94,7 +125,17 @@ impl Cursors {
             environments: reads.environments().ok().and_then(|environments| environments.cursor()),
             vessels: reads.vessels().ok().and_then(|vessels| vessels.cursor()),
             observed: terminals.observations().subscribe(),
+            observed_read: 0,
         }))
+    }
+
+    /// How far the cursors have read: the log, and this home's observations.
+    fn position(&self) -> u64 {
+        [self.terminals.position(), self.observed_read]
+            .into_iter()
+            .chain(self.environments.as_ref().map(|environments| environments.position()))
+            .chain(self.vessels.as_ref().map(|vessels| vessels.position()))
+            .fold(0, u64::saturating_add)
     }
 
     /// What changed since the last pass; a change that could not be read marks everything.
@@ -131,7 +172,9 @@ impl Cursors {
                 Err(_) => dirt.all = true,
             }
         }
+        let observed_read = &mut self.observed_read;
         dirt.all |= drained(&mut self.observed, |name| {
+            *observed_read = observed_read.saturating_add(1);
             dirt.observed.insert(name);
             false
         });
@@ -175,7 +218,11 @@ impl TerminalViews {
         if dirt.all || !follows {
             let records = self.blocking(|reads| reads.terminals()?.every()).await;
             let sessions = match records {
-                Ok(records) => self.entries(newest_launches(records).into_values().collect()).await,
+                // Each view read again keeps its version while it shows the same.
+                Ok(records) => match self.entries(newest_launches(records).into_values().collect()).await {
+                    Ok(entries) => listing.stamped(entries),
+                    Err(error) => Err(error),
+                },
                 Err(error) => Err(error),
             };
             match sessions {
@@ -231,7 +278,9 @@ impl TerminalViews {
             records.insert(session, record);
         }
         records.extend(again.into_iter().filter_map(|session| listing.sessions.get(&session).map(|entry| (session, entry.record.clone()))));
-        listing.sessions.extend(self.entries(records.into_values().collect()).await?);
+        let entries = self.entries(records.into_values().collect()).await?;
+        let entries = listing.stamped(entries)?;
+        listing.sessions.extend(entries);
         Ok(())
     }
 
@@ -246,7 +295,8 @@ impl TerminalViews {
                 ResourceProvenance::Local => here.clone(),
                 ResourceProvenance::Replica { origin_root, .. } => origin_root.as_str().to_owned(),
             };
-            let view = view_record(view, home).map_err(ResourceError::other)?;
+            // Its version is the listing's to give.
+            let view = crate::held_listing::view_record(view.object, home, 0);
             let unresolved = record.vessel.is_some() && !view.labels.contains_key(flotilla_resources::VESSEL_LABEL);
             entries.push(((record.home.clone(), record.session_name().to_owned()), Entry { record, view: Some(view), unresolved }));
         }
@@ -397,15 +447,21 @@ impl std::fmt::Debug for TerminalViews {
     }
 }
 
-/// `source` as the engine port hands it out: a change of the launch or of what its home observes
-/// of it moves its version.
-fn view_record(source: ReadResourceObject<TerminalSession>, home: String) -> Result<Record<TerminalSession>, String> {
-    crate::held_listing::view_object(source.object, home)
-}
-
 impl TerminalViews {
     fn terminals(&self) -> Result<&dyn TerminalRecords, String> {
         self.reads.terminals()
+    }
+
+    /// This home's launch `record`, composed afresh, as the engine port hands it out: at the
+    /// listing's version for its launch, or the next where the listing has not read it again.
+    async fn here_record(&self, record: TerminalRecord) -> Result<Option<Record<TerminalSession>>, String> {
+        let launch = record.name.clone();
+        let session = (record.home.clone(), record.session_name().to_owned());
+        let Some(view) = self.compose(vec![record]).await.map_err(|error| error.to_string())?.pop() else { return Ok(None) };
+        let mut view = crate::held_listing::view_record(view.object, session.0.clone(), 0);
+        let listing = self.listing.lock().await;
+        view.version = listing.version(&session, &launch, &view, listing.position())?;
+        Ok(Some(view))
     }
 
     async fn engine_sources(&self) -> Result<Vec<Record<TerminalSession>>, String> {
@@ -445,8 +501,7 @@ impl KindRecords<TerminalSession> for TerminalViews {
             if record.reading == LifecycleReading::Released {
                 return Ok(None);
             }
-            let view = self.compose(vec![record]).await.map_err(|error| error.to_string())?.pop();
-            return view.map(|view| view_record(view, here)).transpose();
+            return self.here_record(record).await;
         }
         let named = self.listed_where(|object| object.name == name && object.home != here).await.map_err(|error| error.to_string())?;
         Ok(named.into_iter().min_by(|a, b| a.home.cmp(&b.home)))
@@ -475,8 +530,10 @@ impl KindRecords<TerminalSession> for TerminalViews {
         let here = self.home();
         let mut copies = self.listed_where(|object| object.name == name).await.map_err(|error| error.to_string())?;
         if !copies.iter().any(|object| object.home == here) {
-            if let Some(found) = self.find(name, None).await.map_err(|error| error.to_string())? {
-                copies.push(view_record(found, here)?);
+            let owned = name.to_owned();
+            let record = self.blocking(move |reads| reads.terminals()?.get(&owned, None)).await.map_err(|error| error.to_string())?;
+            if let Some(record) = record {
+                copies.extend(self.here_record(record).await?);
             }
         }
         Ok(copies)

@@ -53,12 +53,15 @@ struct Held {
 }
 
 struct HeldViews {
-    views: BTreeMap<(String, String), ReadResourceObject<Convoy>>,
+    views: BTreeMap<(String, String), HeldView>,
     /// Where the next read takes the records' changes from; none where no log is held, and each
     /// read then reads every launch afresh.
     cursors: Option<Cursors>,
     /// This home's note changes not yet read into the views.
     notes: tokio::sync::broadcast::Receiver<String>,
+    /// How many note changes have been read, missed ones counted: with the cursors' positions,
+    /// how far the views have read.
+    notes_read: u64,
     /// The launches the cursors have passed whose views are not yet composed again. A read
     /// dropped while it composes leaves them here for the next, since the cursors will not name
     /// them again.
@@ -67,6 +70,13 @@ struct HeldViews {
     refill_owed: bool,
     /// The launches held as unreadable, by `(home, launch)`, at the version last told.
     unreadable: BTreeMap<(String, String), u64>,
+}
+
+/// A launch's view and the version it is handed out at.
+#[derive(Clone)]
+struct HeldView {
+    view: ReadResourceObject<Convoy>,
+    version: u64,
 }
 
 /// Cursors over the changes of the records a convoy's view is composed from.
@@ -85,6 +95,11 @@ impl Cursors {
             return Ok(None);
         };
         Ok(Some(Self { convoys, vessels, terminals }))
+    }
+
+    /// How far the cursors have read the log.
+    fn position(&self) -> u64 {
+        self.convoys.position().saturating_add(self.vessels.position()).saturating_add(self.terminals.position())
     }
 
     /// The launches, by `(home, name)`, whose records or joins changed since the last pass; none
@@ -139,14 +154,16 @@ impl ConvoyViews {
     /// Every launch at every home, as read sources: this home's are local, other homes' replicas
     /// of their home.
     pub async fn sources(&self) -> Result<Vec<ReadResourceObject<Convoy>>, ResourceError> {
-        self.with_held(|held| held.views.values().cloned().collect()).await
+        self.with_held(|held| held.views.values().map(|held| held.view.clone()).collect()).await
     }
 
     /// This home's launches.
     pub async fn here(&self) -> Result<Vec<ResourceObject<Convoy>>, ResourceError> {
         let here = self.convoys().map_err(ResourceError::other)?.home().to_owned();
-        self.with_held(move |held| held.views.iter().filter(|((home, _), _)| *home == here).map(|(_, view)| view.object.clone()).collect())
-            .await
+        self.with_held(move |held| {
+            held.views.iter().filter(|((home, _), _)| *home == here).map(|(_, held)| held.view.object.clone()).collect()
+        })
+        .await
     }
 
     /// Launch `name` at this home, as a resolver's `get` reads it.
@@ -156,6 +173,11 @@ impl ConvoyViews {
 
     /// Launch `name` held at `home`, or at this home when `None`.
     pub async fn find(&self, name: &str, home: Option<&str>) -> Result<Option<ReadResourceObject<Convoy>>, ResourceError> {
+        Ok(self.find_held(name, home).await?.map(|held| held.view))
+    }
+
+    /// Launch `name` held at `home`, or at this home when `None`, with its version.
+    async fn find_held(&self, name: &str, home: Option<&str>) -> Result<Option<HeldView>, ResourceError> {
         let home = match home {
             Some(home) => home.to_owned(),
             None => self.convoys().map_err(ResourceError::other)?.home().to_owned(),
@@ -185,6 +207,7 @@ impl ConvoyViews {
                 views: BTreeMap::new(),
                 cursors,
                 notes,
+                notes_read: 0,
                 owed: BTreeSet::new(),
                 refill_owed: false,
                 unreadable: BTreeMap::new(),
@@ -252,8 +275,14 @@ impl ConvoyViews {
         let here = self.convoys().map_err(ResourceError::other)?.home().to_owned();
         loop {
             match held.notes.try_recv() {
-                Ok(name) => drop(held.owed.insert((here.clone(), name))),
-                Err(TryRecvError::Lagged(_)) => return self.refill(held).await,
+                Ok(name) => {
+                    held.notes_read = held.notes_read.saturating_add(1);
+                    held.owed.insert((here.clone(), name));
+                }
+                Err(TryRecvError::Lagged(missed)) => {
+                    held.notes_read = held.notes_read.saturating_add(missed);
+                    return self.refill(held).await;
+                }
                 Err(TryRecvError::Empty | TryRecvError::Closed) => break,
             }
         }
@@ -274,9 +303,9 @@ impl ConvoyViews {
                 None => None,
             };
             let key = (home, name);
-            held.remove(&key);
-            if let Some(composed) = composed {
-                held.insert(composed);
+            match composed {
+                Some(composed) => held.insert(composed).map_err(ResourceError::other)?,
+                None => held.remove(&key),
             }
             held.owed.remove(&key);
         }
@@ -304,10 +333,13 @@ impl ConvoyViews {
                 unreadable: Some((launch.version, launch.reason.clone())),
             }
         }));
-        held.views.clear();
+        // Each view read again keeps its version while it shows the same; the rest leave.
+        let read =
+            composed.iter().map(|composed| (composed.home.clone(), composed.view.object.metadata.name.clone())).collect::<BTreeSet<_>>();
+        held.views.retain(|key, _| read.contains(key));
         let listed = listing.unreadable.iter().map(|launch| (launch.home.clone(), launch.name.clone())).collect::<BTreeSet<_>>();
         held.unreadable.retain(|key, _| listed.contains(key));
-        held.insert(composed);
+        held.insert(composed).map_err(ResourceError::other)?;
         held.owed.clear();
         held.refill_owed = false;
         self.convoys().map_err(ResourceError::other)?.memory().set_unreadable(held.unreadable.len() as u64);
@@ -368,34 +400,24 @@ impl ConvoyViews {
     }
 
     async fn engine_sources(&self) -> Result<Vec<Record<Convoy>>, String> {
-        let sources = self.sources().await.map_err(|error| error.to_string())?;
-        self.view_records(sources)
+        self.engine_records(|_| true).await
     }
 
     /// Every home's launch `name`, as the engine port's records: only those are converted.
     async fn engine_copies(&self, name: &str) -> Result<Vec<Record<Convoy>>, String> {
         let name = name.to_owned();
-        let copies = self
+        self.engine_records(move |held_name| held_name == name).await
+    }
+
+    /// The launches `named` selects, as the engine port's records, each at its home.
+    async fn engine_records(&self, named: impl Fn(&str) -> bool + Send + 'static) -> Result<Vec<Record<Convoy>>, String> {
+        let held: Vec<(String, HeldView)> = self
             .with_held(move |held| {
-                held.views.iter().filter(|((_, held_name), _)| *held_name == name).map(|(_, view)| view.clone()).collect()
+                held.views.iter().filter(|((_, name), _)| named(name)).map(|((home, _), held)| (home.clone(), held.clone())).collect()
             })
             .await
             .map_err(|error| error.to_string())?;
-        self.view_records(copies)
-    }
-
-    /// `sources` as the engine port's records, each at its home.
-    fn view_records(&self, sources: Vec<ReadResourceObject<Convoy>>) -> Result<Vec<Record<Convoy>>, String> {
-        sources
-            .into_iter()
-            .map(|source| {
-                let home = match &source.provenance {
-                    ResourceProvenance::Local => self.convoys()?.home().to_owned(),
-                    ResourceProvenance::Replica { origin_root, .. } => origin_root.as_str().to_owned(),
-                };
-                view_record(source, home)
-            })
-            .collect()
+        Ok(held.into_iter().map(|(home, held)| view_record(held, home)).collect())
     }
 }
 
@@ -405,11 +427,11 @@ impl std::fmt::Debug for ConvoyViews {
     }
 }
 
-/// `source` as the engine port hands it out: a change of the launch, of what it joins, or of its
-/// home's notes moves its version. Each is counted as a Convoy converted to the port's shape.
-fn view_record(source: ReadResourceObject<Convoy>, home: String) -> Result<Record<Convoy>, String> {
+/// `held`, held at `home`, as the engine port hands it out. Each is counted as a Convoy converted
+/// to the port's shape.
+fn view_record(held: HeldView, home: String) -> Record<Convoy> {
     flotilla_schema::reads::converted("Convoy", 1);
-    crate::held_listing::view_object(source.object, home)
+    crate::held_listing::view_record(held.view.object, home, held.version)
 }
 
 impl crate::EnginePort for ConvoyViews {
@@ -436,8 +458,8 @@ impl KindRecords<Convoy> for ConvoyViews {
 
     async fn get(&self, name: &str) -> Result<Option<Record<Convoy>>, String> {
         let home = self.home();
-        match self.find(name, None).await.map_err(|error| error.to_string())? {
-            Some(source) => view_record(source, home).map(Some),
+        match self.find_held(name, None).await.map_err(|error| error.to_string())? {
+            Some(held) => Ok(Some(view_record(held, home))),
             // Another home's launch of this name reads where this home holds none: the lexically
             // first home's, as a listing chooses.
             None => Ok(self.engine_copies(name).await?.into_iter().min_by(|a, b| a.home.cmp(&b.home))),
@@ -508,7 +530,15 @@ struct Composed {
 }
 
 impl HeldViews {
-    fn insert(&mut self, composed: Vec<Composed>) {
+    /// How far the views have read: the log, by their cursors, and this home's notes.
+    fn position(&self) -> u64 {
+        self.cursors.as_ref().map_or(0, Cursors::position).saturating_add(self.notes_read)
+    }
+
+    /// Holds each of `composed`, keeping the version of a view that shows what its held one shows:
+    /// all of it, its launch's write in its resource version among it.
+    fn insert(&mut self, composed: Vec<Composed>) -> Result<(), String> {
+        let position = self.position();
         for Composed { home, view, unreadable } in composed {
             let key = (home, view.object.metadata.name.clone());
             match unreadable {
@@ -520,8 +550,16 @@ impl HeldViews {
                 }
                 None => drop(self.unreadable.remove(&key)),
             }
-            self.views.insert(key, view);
+            let held = self.views.get(&key);
+            let same = held.is_some_and(|held| {
+                held.view.object.metadata == view.object.metadata
+                    && held.view.object.spec == view.object.spec
+                    && held.view.object.status == view.object.status
+            });
+            let version = crate::held_listing::version(held.map(|held| held.version), same, position)?;
+            self.views.insert(key, HeldView { view, version });
         }
+        Ok(())
     }
 
     fn remove(&mut self, key: &(String, String)) {

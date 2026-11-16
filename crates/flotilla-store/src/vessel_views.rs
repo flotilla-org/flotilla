@@ -70,6 +70,38 @@ struct Listing {
     works: BTreeMap<Work, Entry>,
     /// The work of each launch in `works`, by its name.
     names: BTreeMap<String, Work>,
+    /// How many convoy changes their watch has told: with the cursors' positions, how far the
+    /// listing has read.
+    told: u64,
+}
+
+impl Listing {
+    /// How far the listing has read: the log, by its cursors, and the convoys' changes told.
+    fn position(&self) -> u64 {
+        self.cursors.as_ref().map_or(0, Cursors::position).saturating_add(self.told)
+    }
+
+    /// `view`, of launch `launch` of `work`, at the version it is handed out at: the held view's
+    /// while it is of the same launch and shows the same.
+    fn version(&self, work: &Work, launch: &str, view: &Record<Vessel>, position: u64) -> Result<u64, String> {
+        let held = self.works.get(work).and_then(|held| Some((held.record.name == launch, held.view.as_ref()?)));
+        let same = held.is_some_and(|(same_launch, held)| same_launch && crate::held_listing::shows_the_same(view, held));
+        crate::held_listing::version(held.map(|(_, held)| held.version), same, position)
+    }
+
+    /// `entries`, composed again, with the versions their views are handed out at.
+    fn stamped(&self, entries: Vec<(Work, Entry)>) -> Result<Vec<(Work, Entry)>, ResourceError> {
+        let position = self.position();
+        entries
+            .into_iter()
+            .map(|(work, mut entry)| {
+                if let Some(view) = entry.view.as_mut() {
+                    view.version = self.version(&work, &entry.record.name, view, position).map_err(ResourceError::other)?;
+                }
+                Ok((work, entry))
+            })
+            .collect()
+    }
 }
 
 /// A work's newest launch.
@@ -95,6 +127,8 @@ struct Dirt {
     terminals: BTreeSet<(String, String)>,
     checkouts: BTreeSet<String>,
     convoys: BTreeSet<String>,
+    /// How many convoy changes the watch told.
+    told: u64,
 }
 
 /// Cursors over the changes of the records a vessel's view is composed from.
@@ -118,6 +152,14 @@ impl Cursors {
         };
         let convoys = reads.convoys().ok().and_then(|convoys| convoys.cursor());
         Ok(Some(Self { vessels, environments, terminals, checkouts, convoys }))
+    }
+
+    /// How far the cursors have read the log.
+    fn position(&self) -> u64 {
+        [self.vessels.position(), self.environments.position(), self.terminals.position(), self.checkouts.position()]
+            .into_iter()
+            .chain(self.convoys.as_ref().map(|convoys| convoys.position()))
+            .fold(0, u64::saturating_add)
     }
 
     /// Marks in `dirt` what changed since the last pass; a change that could not be read marks
@@ -229,6 +271,7 @@ impl VesselViews {
             held.watching = watching;
             (dirt, watching > 0)
         };
+        listing.told = listing.told.saturating_add(dirt.told);
         let cursors = listing.cursors.take();
         let (cursors, dirt) = self
             .blocking(move |reads| match cursors {
@@ -264,6 +307,8 @@ impl VesselViews {
     async fn fresh(&self, listing: &mut Listing, keep: bool) -> Result<(), ResourceError> {
         let records = newest(self.blocking(|reads| reads.vessels()?.every()).await?);
         let entries = self.entries(records).await?;
+        // Each view read again keeps its version while it shows the same.
+        let entries = listing.stamped(entries)?;
         listing.current = keep;
         listing.works.clear();
         listing.names.clear();
@@ -322,7 +367,8 @@ impl VesselViews {
             records.insert(work, record);
         }
         records.extend(again.into_iter().filter_map(|work| listing.works.get(&work).map(|entry| (work, entry.record.clone()))));
-        for (work, entry) in self.entries(records.into_values().collect()).await? {
+        let entries = self.entries(records.into_values().collect()).await?;
+        for (work, entry) in listing.stamped(entries)? {
             if let Some(replaced) = listing.works.get(&work).filter(|held| held.record.name != entry.record.name) {
                 listing.names.remove(&replaced.record.name);
             }
@@ -360,7 +406,8 @@ impl VesselViews {
                 ResourceProvenance::Local => here.clone(),
                 ResourceProvenance::Replica { origin_root, .. } => origin_root.as_str().to_owned(),
             };
-            let view = view_record(view, home).map_err(ResourceError::other)?;
+            // Its version is the listing's to give.
+            let view = crate::held_listing::view_record(view.object, home, 0);
             entries.push((work_of(&record), Entry { record, holder, view: Some(view) }));
         }
         entries.extend(hidden.into_iter().map(|record| (work_of(&record), Entry { record, holder: None, view: None })));
@@ -510,12 +557,6 @@ fn join(reads: &dyn LifecycleReads, record: &VesselRecord, holder: Option<&Check
     }
 }
 
-/// `source` as the engine port hands it out: a change of the launch or of what it is joined with
-/// moves its version.
-fn view_record(source: ReadResourceObject<Vessel>, home: String) -> Result<Record<Vessel>, String> {
-    crate::held_listing::view_object(source.object, home)
-}
-
 impl crate::EnginePort for VesselViews {
     fn install(self: Arc<Self>, backend: &crate::ResourceBackend) {
         backend.install_engine_kind::<Vessel>(self);
@@ -547,7 +588,17 @@ impl KindRecords<Vessel> for VesselViews {
             ResourceProvenance::Local => here,
             ResourceProvenance::Replica { origin_root, .. } => origin_root.as_str().to_owned(),
         };
-        view_record(source, home).map(Some)
+        let mut view = crate::held_listing::view_record(source.object, home, 0);
+        // Read afresh, it is handed out at the listing's version for its launch: a view the
+        // listing has not yet read again takes its next.
+        let listing = self.listing.lock().await;
+        let work = listing.names.get(name).cloned();
+        let position = listing.position();
+        view.version = match work {
+            Some(work) => listing.version(&work, name, &view, position)?,
+            None => crate::held_listing::version(None, false, position)?,
+        };
+        Ok(Some(view))
     }
 
     /// Each work's newest launch at each home; launch names are unique, so each is listed once.
@@ -609,6 +660,7 @@ impl KindRecords<Vessel> for VesselViews {
             convoys
                 .map(move |event| {
                     let mut dirt = dirt.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+                    dirt.told = dirt.told.saturating_add(1);
                     match event {
                         Ok(ReadWatchEvent::Added(read) | ReadWatchEvent::Modified(read) | ReadWatchEvent::Deleted(read)) => {
                             dirt.convoys.insert(read.object.metadata.name);

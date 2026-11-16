@@ -6,6 +6,9 @@
 /// a reader that passes before it reads reads its own and its peers' writes.
 pub trait ChangeCursor<C>: Send {
     fn pass(&mut self) -> Result<Vec<C>, String>;
+    /// How far its passes have read the log: it never falls, and moves with every entry a pass
+    /// reads.
+    fn position(&self) -> u64;
 }
 
 /// A provisioning kind whose lifecycle the engine can hold.

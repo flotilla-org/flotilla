@@ -44,6 +44,12 @@ impl Follower {
         Ok(())
     }
 
+    /// How far it has read: the sum over homes of the sequence each pass read through. Every
+    /// entry it reads moves it, of whatever kind.
+    pub fn position(&self) -> u64 {
+        self.cursors.values().fold(0, |sum, read| sum.saturating_add(*read))
+    }
+
     /// The resources of the followed kinds written on any of `homes` since the last pass, in
     /// each home's order. A home not seen before is named for a rescan and followed from now.
     pub fn pass(&mut self, read: &mut Read<'_>, homes: &[String]) -> Result<Vec<Followed>, StoreError> {

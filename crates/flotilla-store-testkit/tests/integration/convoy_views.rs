@@ -130,14 +130,27 @@ impl<C> ChangeCursor<C> for Unchanging {
     fn pass(&mut self) -> Result<Vec<C>, String> {
         Ok(Vec::new())
     }
+
+    fn position(&self) -> u64 {
+        0
+    }
 }
 
-/// A cursor that passes the changes a test writes into it, each once.
-struct Written(Arc<Mutex<Vec<ConvoyChange>>>);
+/// A cursor that passes the changes a test writes into it, each once, each moving it on.
+struct Written {
+    changes: Arc<Mutex<Vec<ConvoyChange>>>,
+    passed: u64,
+}
 
 impl ChangeCursor<ConvoyChange> for Written {
     fn pass(&mut self) -> Result<Vec<ConvoyChange>, String> {
-        Ok(std::mem::take(&mut *self.0.lock().expect("written changes")))
+        let changes = std::mem::take(&mut *self.changes.lock().expect("written changes"));
+        self.passed += changes.len() as u64;
+        Ok(changes)
+    }
+
+    fn position(&self) -> u64 {
+        self.passed
     }
 }
 
@@ -207,7 +220,7 @@ impl ConvoyRecords for Convoys {
         &self.memory
     }
     fn cursor(&self) -> Option<Box<dyn ChangeCursor<ConvoyChange>>> {
-        Some(Box::new(Written(Arc::clone(&self.written))))
+        Some(Box::new(Written { changes: Arc::clone(&self.written), passed: 0 }))
     }
 }
 
@@ -434,6 +447,66 @@ async fn a_dropped_read_leaves_its_changes_for_the_next() {
     reads.convoys.set_gate(false);
 
     assert!(views.get("fix-it#1").await.is_err(), "the next read composes the launch the dropped one owed");
+}
+
+/// Views over launches `names`, held here, joined with nothing.
+fn views_of(names: &[&str]) -> (Arc<Reads>, ConvoyViews) {
+    let reads = Arc::new(Reads {
+        convoys: Convoys::new(names.iter().map(|name| launch(name, HERE)).collect()),
+        terminals: Terminals { records: Vec::new(), observations: TerminalObservations::default() },
+        vessels: Vessels { records: Vec::new() },
+    });
+    let views = ConvoyViews::new("flotilla", reads.clone());
+    (reads, views)
+}
+
+/// Each launch's version as the engine port lists it, by name.
+async fn versions(views: &ConvoyViews) -> BTreeMap<String, u64> {
+    KindRecords::list(views).await.expect("list").into_iter().map(|record| (record.name, record.version)).collect()
+}
+
+fn attention(notes: &mut ConvoyNotes) {
+    notes.attention = Some(ConvoyAttention { source: "turn".into(), reason: "queued".into(), raised_at: at(120) });
+}
+
+// Behaviour (#3108): a note on one launch moves that launch's version alone. Another launch read
+// again in the same pass, as a write to a record it joins makes it, shows the same and keeps its
+// version: this home's notes are no part of a version they do not change.
+#[tokio::test]
+async fn a_note_on_one_launch_moves_only_its_version() {
+    let (reads, views) = views_of(&["fix-it#1", "other#1"]);
+    let before = versions(&views).await;
+
+    reads.convoys.written.lock().expect("written").push(ConvoyChange::Changed { name: "other#1".into(), home: HERE.into() });
+    assert!(reads.convoys.memory.update("fix-it#1", attention).1);
+    let after = versions(&views).await;
+    assert_ne!(after["fix-it#1"], before["fix-it#1"], "the noted launch changed");
+    assert_eq!(after["other#1"], before["other#1"], "a launch read again that shows the same keeps its version");
+}
+
+// Behaviour (#3108): a launch that changes and changes back is told at three versions: a watcher
+// that read the first sees the last as a change, as it is one.
+#[tokio::test]
+async fn a_change_and_its_undoing_are_each_told_at_their_own_version() {
+    let (reads, views) = views_of(&["fix-it#1"]);
+    let first = versions(&views).await["fix-it#1"];
+    assert!(reads.convoys.memory.update("fix-it#1", attention).1);
+    let noted = versions(&views).await["fix-it#1"];
+    assert!(reads.convoys.memory.update("fix-it#1", |notes: &mut ConvoyNotes| *notes = ConvoyNotes::default()).1);
+    let undone = versions(&views).await["fix-it#1"];
+    assert!(first < noted && noted < undone, "versions {first}, {noted}, {undone} each move on");
+}
+
+// Behaviour (#3108): a launch read again at each of several passes, its record named by the log
+// each time but showing the same, keeps the version it was first told at while the log moves on.
+#[tokio::test]
+async fn an_unchanged_launch_keeps_its_version_across_passes() {
+    let (reads, views) = views_of(&["fix-it#1"]);
+    let first = versions(&views).await["fix-it#1"];
+    for _ in 0..3 {
+        reads.convoys.written.lock().expect("written").push(ConvoyChange::Changed { name: "fix-it#1".into(), home: HERE.into() });
+        assert_eq!(versions(&views).await["fix-it#1"], first);
+    }
 }
 
 /// The views converted by a read of one launch by name, with `others` unrelated launches held:

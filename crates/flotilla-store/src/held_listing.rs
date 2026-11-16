@@ -3,32 +3,54 @@
 
 use std::sync::{Arc, Mutex, PoisonError};
 
+use flotilla_resources::engine_records::Record;
 use futures::{stream::BoxStream, StreamExt};
 
-/// `object`, read at `home`, as the engine port hands it out: its version a digest of what it
-/// shows, so a watcher sees each change of the record, of what it joins, or of what its home holds
-/// of it in memory. The digest encodes what it shows; R4 replaces it with the contributors' log
-/// positions.
-pub(crate) fn view_object<R: flotilla_resources::Resource>(
+/// The version a held view is handed out at (#3108): `held`, the version it was last handed out
+/// at under its key, while it shows the `same`; otherwise `position`, how far the reads it was
+/// composed after had read the log and this home's memory, so versions follow the log as a
+/// kind's do. A view can be composed from a write its reads have not yet passed, so a changed
+/// view never takes a version at or below the one it replaces: a watcher tells a change by its
+/// version alone.
+pub(crate) fn version(held: Option<u64>, same: bool, position: u64) -> Result<u64, String> {
+    match held {
+        Some(held) if same => Ok(held),
+        Some(held) => held.checked_add(1).map(|next| next.max(position)).ok_or_else(|| format!("a view's version {held} cannot move")),
+        None => Ok(position),
+    }
+}
+
+/// Whether `record` shows what `held` shows: all of it but its version.
+pub(crate) fn shows_the_same<R: flotilla_resources::Resource>(record: &Record<R>, held: &Record<R>) -> bool
+where
+    R::Spec: PartialEq,
+    R::Status: PartialEq,
+{
+    record.name == held.name
+        && record.home == held.home
+        && record.created_at == held.created_at
+        && record.labels == held.labels
+        && record.annotations == held.annotations
+        && record.spec == held.spec
+        && record.status == held.status
+}
+
+/// `object`, read at `home` and handed out at `version`, as the engine port's record.
+pub(crate) fn view_record<R: flotilla_resources::Resource>(
     object: flotilla_resources::ResourceObject<R>,
     home: String,
-) -> Result<flotilla_resources::engine_records::Record<R>, String> {
-    let shown =
-        |value: serde_json::Result<String>| value.map_err(|error| format!("{} {}: {error}", R::API_PATHS.kind, object.metadata.name));
-    let spec = shown(serde_json::to_string(&object.spec))?;
-    let status = object.status.as_ref().map(|status| shown(serde_json::to_string(status))).transpose()?;
-    let mut digest = std::hash::DefaultHasher::new();
-    std::hash::Hash::hash(&(&object.metadata.resource_version, spec, status, &object.metadata.labels), &mut digest);
-    Ok(flotilla_resources::engine_records::Record {
+    version: u64,
+) -> Record<R> {
+    Record {
         name: object.metadata.name,
         home,
-        version: std::hash::Hasher::finish(&digest),
+        version,
         created_at: object.metadata.creation_timestamp,
         labels: object.metadata.labels,
         annotations: object.metadata.annotations,
         spec: object.spec,
         status: object.status,
-    })
+    }
 }
 
 /// A tick per message on `changes`, and one when it lagged: a reader reads everything again.

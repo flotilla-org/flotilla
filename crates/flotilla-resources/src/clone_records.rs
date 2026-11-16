@@ -107,6 +107,11 @@ pub trait CloneRecords: Send + Sync {
     fn changes(&self) -> tokio::sync::broadcast::Receiver<CloneChange> {
         tokio::sync::broadcast::channel(1).1
     }
+    /// A cursor over the clones' changes from now on, read from the log; none where no log is
+    /// held.
+    fn cursor(&self) -> Option<Box<dyn crate::lifecycle_reads::ChangeCursor<CloneChange>>> {
+        None
+    }
 }
 
 #[cfg(test)]
