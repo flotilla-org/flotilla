@@ -14,7 +14,7 @@ use flotilla_resources::vessel_records::VesselRecord;
 use flotilla_resources::{
     message_record_name, vessel_placement_pin, Convoy, EnvironmentMount, EnvironmentMountMode, FulfilmentKind, Message, MessageReference,
     MessageRelation, MessageSpec, ResourceError, ResourceObject, ResourceRef, TerminalSession, TerminalSessionPhase, TerminalSessionSource,
-    TerminalSessionSpec, Vessel, VESSEL_PLACEMENTS_ANNOTATION,
+    TerminalSessionSpec, Vessel,
 };
 use flotilla_store::ResourceBackend;
 use sha2::{Digest, Sha256};
@@ -321,9 +321,6 @@ pub fn card_delta(previous: &str, current: &str) -> String {
 pub struct CapabilityCardTracker(
     Mutex<BTreeMap<(String, String), SessionCardObservation>>,
     crate::ports::MessagePath,
-    /// By namespace and convoy, the digest of what the cards last read of the convoy
-    /// ([`convoy_card_digest`]); none while a card holds a reading not yet compared.
-    std::sync::Mutex<BTreeMap<(String, String), Option<String>>>,
     /// By namespace, the sessions whose last card refresh failed.
     std::sync::Mutex<BTreeMap<String, BTreeSet<String>>>,
 );
@@ -333,25 +330,15 @@ type SessionCardObservation = Arc<Mutex<CardObservation>>;
 impl CapabilityCardTracker {
     /// A tracker publishing through `path` (the composition root's slot).
     pub fn with_message_path(path: crate::ports::MessagePath) -> Self {
-        Self(Mutex::default(), path, std::sync::Mutex::default(), std::sync::Mutex::default())
-    }
-
-    fn convoys_read(&self) -> std::sync::MutexGuard<'_, BTreeMap<(String, String), Option<String>>> {
-        self.2.lock().unwrap_or_else(|poisoned| poisoned.into_inner())
+        Self(Mutex::default(), path, std::sync::Mutex::default())
     }
 
     fn failed(&self, namespace: &str) -> BTreeSet<String> {
-        self.3.lock().unwrap_or_else(|poisoned| poisoned.into_inner()).get(namespace).cloned().unwrap_or_default()
+        self.2.lock().unwrap_or_else(|poisoned| poisoned.into_inner()).get(namespace).cloned().unwrap_or_default()
     }
 
     fn set_failed(&self, namespace: &str, failed: BTreeSet<String>) {
-        self.3.lock().unwrap_or_else(|poisoned| poisoned.into_inner()).insert(namespace.to_owned(), failed);
-    }
-
-    /// The convoys whose cards this tracker holds a reading of, in `namespace`: those a change
-    /// may make a card stale.
-    pub fn convoys(&self, namespace: &str) -> Vec<String> {
-        self.convoys_read().keys().filter(|(space, _)| space == namespace).map(|(_, convoy)| convoy.clone()).collect()
+        self.2.lock().unwrap_or_else(|poisoned| poisoned.into_inner()).insert(namespace.to_owned(), failed);
     }
 
     fn primitives(&self) -> Result<Arc<dyn flotilla_messaging::EngineMessages>, ResourceError> {
@@ -574,53 +561,11 @@ pub async fn observe_launch_card(
 ) -> Result<(), String> {
     let session = backend.clone().using::<TerminalSession>(namespace).get(name).await.map_err(|error| error.to_string())?;
     observe_card(backend, namespace, &session, card, tracker).await?;
-    if let TerminalSessionSource::Agent { context, .. } = &session.spec.source {
-        // The card read its convoy, though no refresh has: the convoy's next change is compared.
-        tracker.convoys_read().entry((namespace.to_owned(), context.convoy.clone())).or_insert(None);
-    }
     let observation = tracker.observation(namespace, name).await;
     let mut observation = observation.lock().await;
     observation.delivered = Some(card.to_string());
     observation.pending.clear();
     Ok(())
-}
-
-/// What a card reads of its convoy: a change to anything else in the convoy changes no card.
-fn convoy_card_digest(convoy: &ResourceObject<Convoy>) -> String {
-    let status = convoy.status.as_ref();
-    let read = serde_json::json!({
-        "project": convoy.spec.project_ref,
-        "repositories": convoy.spec.repositories,
-        "ref": convoy.spec.r#ref,
-        "pins": convoy.metadata.annotations.get(VESSEL_PLACEMENTS_ANNOTATION),
-        "decision": status.and_then(|status| status.placement_decision.as_ref()).map(|decision| &decision.kind),
-        "vessels": status.and_then(|status| status.workflow_snapshot.as_ref()).map(|workflow| {
-            workflow.vessels.iter().map(|vessel| (&vessel.name, &vessel.repository_refs, &vessel.credential_refs)).collect::<Vec<_>>()
-        }),
-    });
-    format!("{:x}", Sha256::digest(read.to_string()))
-}
-
-/// Whether what the cards read of convoy `convoy` changed since they last read it, remembering
-/// what they read now. A convoy no card has read counts as changed; one that is gone, as not.
-pub async fn convoy_card_changed(
-    backend: &ResourceBackend,
-    namespace: &str,
-    tracker: &CapabilityCardTracker,
-    convoy: &str,
-) -> Result<bool, String> {
-    let key = (namespace.to_owned(), convoy.to_owned());
-    let read = match backend.including_replicas::<Convoy>(namespace).get(convoy).await {
-        Ok(read) => read.object,
-        Err(ResourceError::NotFound { .. }) => {
-            tracker.convoys_read().remove(&key);
-            return Ok(false);
-        }
-        Err(error) => return Err(format!("read convoy {convoy}: {error}")),
-    };
-    let digest = convoy_card_digest(&read);
-    let before = tracker.convoys_read().insert(key, Some(digest.clone()));
-    Ok(before != Some(Some(digest)))
 }
 
 /// Which of this home's sessions' cards a refresh reads.
@@ -716,34 +661,15 @@ pub async fn refresh_cards(
         .retain(|(space, name), _| space != namespace || live.contains(name.as_str()) || (!scope.every && !named.contains(name.as_str())));
     let mut errors = Vec::new();
     let mut failed = BTreeSet::new();
-    // What each convoy's cards read of it: none once one of its cards failed.
-    let mut read_convoys = BTreeMap::<String, Option<String>>::new();
     for record in &sessions {
         if !record.is_agent() || phase(record) != Some(TerminalSessionPhase::Running) {
             continue;
         }
         let refreshed = refresh_record_card(backend, namespace, source, tracker, Arc::clone(&reads), accounts, record, &mut vessels).await;
-        let digest = refreshed.result.as_ref().ok().cloned();
-        if let Some(convoy) = refreshed.convoy {
-            let held = read_convoys.entry(convoy).or_insert_with(|| digest.clone());
-            if digest.is_none() {
-                *held = None;
-            }
-        }
-        if let Err(error) = refreshed.result {
+        if let Err(error) = refreshed {
             warn!(session = %record.session_name(), %error, "failed to refresh session capability card");
             errors.push(format!("{}: {error}", record.session_name()));
             failed.insert(record.session_name().to_owned());
-        }
-    }
-    {
-        let mut held = tracker.convoys_read();
-        if scope.every {
-            // A convoy no running card read is compared again only once a card reads it.
-            held.retain(|(space, convoy), digest| space != namespace || read_convoys.contains_key(convoy) || digest.is_none());
-        }
-        for (convoy, digest) in read_convoys {
-            held.insert((namespace.to_owned(), convoy), digest);
         }
     }
     // A failed card is tried again at the next refresh, whatever it names; one that ended is not.
@@ -753,13 +679,6 @@ pub async fn refresh_cards(
     } else {
         Err(errors.join("; "))
     }
-}
-
-/// How refreshing one card went, and the convoy it read, once known: the digest of what the card
-/// read of the convoy, or why it was not refreshed.
-struct Refreshed {
-    convoy: Option<String>,
-    result: Result<String, String>,
 }
 
 /// Refreshes the card of running crew launch `record`, reading its vessel from `vessels` when a
@@ -774,7 +693,7 @@ async fn refresh_record_card(
     accounts: &dyn AccountRecords,
     record: &TerminalRecord,
     vessels: &mut BTreeMap<String, VesselRecord>,
-) -> Refreshed {
+) -> Result<(), String> {
     let name = record.vessel.clone().unwrap_or_default();
     let vessel = match vessels.get(&name) {
         Some(vessel) => Ok(Some(vessel.clone())),
@@ -785,11 +704,11 @@ async fn refresh_record_card(
     };
     let vessel = match vessel {
         Ok(Some(vessel)) => vessel,
-        Ok(None) => return Refreshed { convoy: None, result: Err(format!("read vessel {name}: not found")) },
-        Err(error) => return Refreshed { convoy: None, result: Err(format!("read vessel {name}: {error}")) },
+        Ok(None) => return Err(format!("read vessel {name}: not found")),
+        Err(error) => return Err(format!("read vessel {name}: {error}")),
     };
     vessels.insert(name, vessel.clone());
-    let result = async {
+    {
         let convoy = backend
             .including_replicas::<Convoy>(namespace)
             .get(&vessel.convoy)
@@ -815,11 +734,8 @@ async fn refresh_record_card(
             work,
             &session.spec.role,
         );
-        observe(backend, namespace, &session, &card, tracker, Some(&receiver)).await?;
-        Ok(convoy_card_digest(&convoy))
+        observe(backend, namespace, &session, &card, tracker, Some(&receiver)).await
     }
-    .await;
-    Refreshed { convoy: Some(vessel.convoy), result }
 }
 
 #[cfg(test)]

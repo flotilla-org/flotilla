@@ -1243,3 +1243,32 @@ async fn a_built_image_reaches_a_running_sessions_card_with_no_other_event() {
 
     cards.card_naming(0, "Verified tools and runtimes: tool:verified.").await;
 }
+
+// Behaviour: a convoy's change after admission refreshes no card, and reads no card's convoy: what
+// a card reads of its convoy is frozen at admission. The change here is a subject linked through
+// the Convoy path, after the crew's launch rendered its card.
+#[tokio::test]
+async fn a_convoy_change_refreshes_no_card() {
+    let cards = RunningCards::start().await;
+    cards.source.settled("cards-session-0", 1).await;
+    cards
+        .daemon
+        .observe_launch_capability_card(NAMESPACE, "cards-session-0", "the card the launch rendered")
+        .await
+        .expect("the launch observes its card");
+    let read = cards.source.settled("cards-session-0", 0).await;
+
+    let convoy = cards.daemon.resource_backend().using::<Convoy>(NAMESPACE).get(&cards.convoys[0]).await.expect("convoy");
+    let subject = flotilla_protocol::Subject {
+        kind: flotilla_protocol::SubjectKind::ChangeRequest,
+        source: flotilla_protocol::IssueSource { service: "github.com".into(), scope: "flotilla-org/flotilla".into() },
+        id: "1".into(),
+    };
+    let path = cards.daemon.convoy_engine_path().get().cloned().expect("the Convoy path");
+    path.link(&convoy, &subject, flotilla_resources::SubjectDiscoverySource::Operator, "operator").await.expect("link a subject");
+    let linked = cards.daemon.resource_backend().using::<Convoy>(NAMESPACE).get(&cards.convoys[0]).await.expect("convoy");
+    assert_ne!(linked.metadata.resource_version, convoy.metadata.resource_version, "the convoy changed");
+
+    tokio::time::sleep(Duration::from_secs(2)).await;
+    assert_eq!(cards.source.readings("cards-session-0"), read, "no card of the changed convoy is read again");
+}

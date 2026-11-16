@@ -29,7 +29,6 @@ use flotilla_credentials::{CredentialStore, GithubAppRefreshWake, GithubAppScope
 use flotilla_crew::crew_capabilities::CardScope;
 use flotilla_resources::{
     account_access::AccountChange,
-    convoy_records::ConvoyChange,
     environment_records::EnvironmentChange,
     image_build_records::ImageBuildChange,
     vessel_records::{environment_vessels, EnvironmentVessel, EnvironmentVessels, VesselWithoutConvoy},
@@ -72,10 +71,6 @@ struct Pending {
     codex_rotated: bool,
     /// Capability cards to refresh besides those of the environments delivered.
     cards: CardScope,
-    /// Convoys that changed: their sessions' cards are refreshed when what a card reads of them did.
-    convoys: BTreeSet<String>,
-    /// Convoys may have changed unheard: every one a card has read is compared.
-    convoys_rescanned: bool,
 }
 
 /// A request to deliver one environment now, answered once it has been tried.
@@ -221,7 +216,6 @@ impl CredentialDelivery {
             pending.definitions = true;
         }));
         sources.spawn(watch_bindings(Arc::clone(&self.state), self.namespace.clone(), Arc::clone(&self.events)));
-        sources.spawn(watch_convoys(Arc::clone(&self.state), Arc::clone(&self.events)));
         sources.spawn(watch_fulfilment_kinds(self.state.daemon.resource_backend(), self.namespace.clone(), Arc::clone(&self.events)));
         sources.spawn(watch_image_builds(Arc::clone(&self.state), Arc::clone(&self.events)));
         loop {
@@ -270,9 +264,6 @@ impl CredentialDelivery {
         let mut cards = std::mem::take(&mut pending.cards);
         cards.every |= pending.all || pending.definitions || pending.codex_rotated;
         cards.environments.extend(environments.iter().cloned());
-        if !cards.every {
-            self.changed_convoys(&mut pending, &mut cards).await;
-        }
         let result = if pending.all || pending.definitions {
             if pending.definitions {
                 self.failures.clear();
@@ -335,31 +326,6 @@ impl CredentialDelivery {
                     rotated.then(|| tokio::time::Instant::now() + RETRY_INITIAL)
                 }
             };
-        }
-    }
-
-    /// Adds to `cards` each changed convoy whose cards read something of it that changed, each
-    /// read once by name: those `pending` names, or every convoy a card has read after a rescan.
-    async fn changed_convoys(&self, pending: &mut Pending, cards: &mut CardScope) {
-        let mut convoys = std::mem::take(&mut pending.convoys);
-        if pending.convoys_rescanned {
-            convoys.extend(self.state.daemon.card_convoys(&self.namespace));
-        }
-        for convoy in convoys {
-            if cards.convoys.contains(&convoy) {
-                continue;
-            }
-            match self.state.daemon.convoy_card_changed(&self.namespace, &convoy).await {
-                Ok(false) => {}
-                Ok(true) => {
-                    cards.convoys.insert(convoy);
-                }
-                Err(error) => {
-                    // Unread, it may have changed: its cards read it themselves.
-                    debug!(%convoy, %error, "credential delivery could not compare a convoy with its cards");
-                    cards.convoys.insert(convoy);
-                }
-            }
         }
     }
 
@@ -682,28 +648,6 @@ async fn watch_bindings(state: Arc<ControllerRuntimeState>, namespace: String, e
             return;
         }
         tokio::time::sleep(RETRY_INITIAL.min(Duration::from_secs(u64::from(failures)))).await;
-    }
-}
-
-/// Names each convoy whose record changed, at any home, and tells of a rescan.
-async fn watch_convoys(state: Arc<ControllerRuntimeState>, events: Arc<CredentialEvents>) {
-    let mut changes = match state.daemon.lifecycle_reads().convoys() {
-        Ok(convoys) => convoys.changes(),
-        Err(error) => {
-            warn!(%error, "credential delivery cannot follow convoys; other events still wake it");
-            return;
-        }
-    };
-    loop {
-        match changes.recv().await {
-            Ok(ConvoyChange::Changed { name, .. }) => events.record(|pending| {
-                pending.convoys.insert(name);
-            }),
-            Ok(ConvoyChange::Rescanned) | Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => {
-                events.record(|pending| pending.convoys_rescanned = true)
-            }
-            Err(tokio::sync::broadcast::error::RecvError::Closed) => return,
-        }
     }
 }
 

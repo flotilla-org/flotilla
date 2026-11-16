@@ -11,7 +11,7 @@ use chrono::Utc;
 use flotilla_capability_contract::{CredentialCapability, SessionCapabilitySource};
 use flotilla_crew::{
     convoy::ConvoyReconciler,
-    crew_capabilities::{convoy_card_changed, refresh_cards, CapabilityCardTracker, CardScope},
+    crew_capabilities::{refresh_cards, CapabilityCardTracker, CardScope},
     reconcilers::vessel::ConvoyVesselWake,
 };
 use flotilla_engine_convoys_testkit::{convoy, single_agent, EngineConvoysHome, KeyedGets};
@@ -332,7 +332,6 @@ impl SessionCapabilitySource for NothingDelivered {
 /// The terminal and vessel launches read, and the keyed gets made, refreshing the capability
 /// cards `scope` names of the convoys launched, with `others` other convoys each holding a running
 /// crew in an environment of its own. The first two convoys' crews run in the shared environment.
-/// The refresh then compares the first convoy with what its cards read: unchanged.
 async fn read_by_cards(others: usize, scope: impl FnOnce(&[String]) -> CardScope) -> (u64, u64, KeyedGets) {
     let store = OtherHome::open("home");
     let engine = EngineFixture::over_service(store.service());
@@ -366,14 +365,11 @@ async fn read_by_cards(others: usize, scope: impl FnOnce(&[String]) -> CardScope
     refresh_cards(&backend, NAMESPACE, &NothingDelivered, &tracker, Arc::clone(convoys.reads()), &accounts, &scope)
         .await
         .expect("the cards are refreshed");
-    let read = (
+    (
         engine.terminals.terminals.launches_read() - before.0,
         engine.vessels.vessels.launches_read() - before.1,
         keyed_gets(&convoys, &engine) - before.2,
-    );
-    let changed = convoy_card_changed(&backend, NAMESPACE, &tracker, &launches[0]).await.expect("compare the convoy");
-    assert!(!changed, "the first convoy's cards read it as it is");
-    read
+    )
 }
 
 // Behaviour: refreshing one environment's capability cards reads that environment's sessions
@@ -396,8 +392,7 @@ async fn an_environments_cards_are_refreshed_without_the_others() {
     assert_eq!(large_gets, small_gets, "the keyed gets do not grow with the other convoys");
 }
 
-// Behaviour: refreshing one convoy's capability cards, as its account binding or a change to what
-// its cards read wakes it, reads its vessels through its works' launch index and its sessions
+// Behaviour: refreshing one convoy's capability cards, as its account binding wakes it, reads its vessels through its works' launch index and its sessions
 // through each vessel's, not every session at this home.
 #[tokio::test]
 async fn a_convoys_cards_are_refreshed_without_the_others() {

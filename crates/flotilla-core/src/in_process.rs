@@ -4798,16 +4798,6 @@ impl InProcessDaemon {
         .await
     }
 
-    /// Whether what the capability cards read of convoy `convoy` changed since they read it.
-    pub async fn convoy_card_changed(&self, namespace: &str, convoy: &str) -> Result<bool, String> {
-        flotilla_crew::crew_capabilities::convoy_card_changed(&self.resource_backend, namespace, self.crew.capability_cards(), convoy).await
-    }
-
-    /// The convoys the capability cards hold a reading of.
-    pub fn card_convoys(&self, namespace: &str) -> Vec<String> {
-        self.crew.capability_cards().convoys(namespace)
-    }
-
     pub async fn crew_list_internal(&self, requested: &CrewCommandContext) -> Result<CrewListResponse, String> {
         self.crew.crew_list_internal(requested).await
     }
