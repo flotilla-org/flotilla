@@ -155,6 +155,11 @@ impl CommitsSeen {
     pub fn give_back(&self) {
         self.dirty.store(true, std::sync::atomic::Ordering::SeqCst);
     }
+
+    /// The flag and the listener that sets it, for a reader that holds them itself.
+    pub fn into_parts(self) -> (Arc<std::sync::atomic::AtomicBool>, Arc<CommitListener>) {
+        (self.dirty, self._listener)
+    }
 }
 
 /// One follower of some kinds shared by every watcher of them on this store: each watcher gets a

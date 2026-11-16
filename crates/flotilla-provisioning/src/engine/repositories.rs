@@ -18,7 +18,7 @@ use flotilla_engine_store::{
 };
 use flotilla_resources::{
     definition_provenance::{SUPERSEDED_BY_ANNOTATION, VERIFICATION_PROJECT_ANNOTATION, VERIFICATION_PROVENANCE_ANNOTATION},
-    engine_records::{KindRecords, LogPosition, Record, Since, Ticks},
+    engine_records::{CommitMark, KindRecords, LogPosition, Record, Since, Ticks},
     Repository, RepositoryKey, RepositorySpec, RepositoryStatus,
 };
 use flotilla_schema::{Kind, KindCode, NewChange, Timestamp};
@@ -243,6 +243,10 @@ impl KindRecords<Repository> for EngineRepositories {
     /// From the shared follower of the log.
     fn ticks(&self) -> Ticks {
         Ticks::Followed
+    }
+
+    fn commit_mark(&self) -> Option<CommitMark> {
+        Some(super::commit_mark(&self.service, self.codes()))
     }
 
     fn home(&self) -> String {

@@ -49,6 +49,8 @@ pub use flotilla_engine_store::watch;
 
 use std::sync::{Arc, Mutex};
 
+use flotilla_resources::engine_records::{CommitMark, KindCode};
+
 use flotilla_schema::Timestamp;
 use flotilla_state_machines::{
     machines::{
@@ -69,6 +71,12 @@ use crate::stored::{
     terminal_facts::TerminalLaunchFacts,
     terminal_session::TerminalSessionKind,
 };
+
+/// A port's [`CommitMark`]: set by each commit to `service` that writes any of `codes`.
+pub(crate) fn commit_mark(service: &flotilla_schema_sqlite::stream::Service, codes: Vec<KindCode>) -> CommitMark {
+    let (set, setter) = watch::CommitsSeen::follow(service, codes).into_parts();
+    CommitMark::new(set, setter)
+}
 
 /// The provisioning kinds' engine homes at this home, behind `[primitives]`.
 #[derive(Clone)]

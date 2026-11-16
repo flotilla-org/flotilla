@@ -80,6 +80,11 @@ impl KindRecords<OldMessage> for MessageRecords {
         flotilla_resources::engine_records::Ticks::Followed
     }
 
+    fn commit_mark(&self) -> Option<flotilla_resources::engine_records::CommitMark> {
+        let (set, setter) = flotilla_engine_store::watch::CommitsSeen::follow(self.primitives.service(), self.codes()).into_parts();
+        Some(flotilla_resources::engine_records::CommitMark::new(set, setter))
+    }
+
     fn home(&self) -> String {
         self.primitives.home().to_owned()
     }

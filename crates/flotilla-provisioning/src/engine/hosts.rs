@@ -30,7 +30,7 @@ use flotilla_protocol::{
     EnvironmentId, HostSummary, NodeId, NodeInfo, SystemInfo,
 };
 use flotilla_resources::{
-    engine_records::{KindRecords, LogPosition, Record, Since, Ticks, UnloggedJournal},
+    engine_records::{CommitMark, KindRecords, LogPosition, Record, Since, Ticks, UnloggedJournal},
     CredentialExpiry, FulfilmentFacts, HarnessFacts, Host, HostCondition, HostConnection, HostSpec, HostStatus, LocalImageInventories,
     AGENT_ADAPTERS_CAPABILITY, CODEX_CENTRAL_LOGIN_CAPABILITY, CREDENTIAL_EXPIRY_CAPABILITY, ENVIRONMENT_PROVIDERS_CAPABILITY,
     HELD_CREDENTIALS_CAPABILITY, IMAGE_DIGESTS_CAPABILITY, OWNING_DAEMON_CAPABILITY, PLACEMENT_CAPABILITY, SSH_HOST_CAPABILITY,
@@ -504,6 +504,11 @@ impl KindRecords<Host> for EngineHosts {
     /// From the shared follower of the log.
     fn ticks(&self) -> Ticks {
         Ticks::Followed
+    }
+
+    /// Heard times move outside the log, but no read of what changed names them.
+    fn commit_mark(&self) -> Option<CommitMark> {
+        Some(super::commit_mark(&self.service, self.codes()))
     }
 
     /// None counted: what moves outside the log is when each home was last heard, from this

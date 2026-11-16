@@ -10,7 +10,7 @@ use std::{
     sync::{Arc, Mutex, MutexGuard, PoisonError},
 };
 
-use flotilla_resources::engine_records::{KindRecords, LogPosition, Record, Since, Ticks};
+use flotilla_resources::engine_records::{CommitMark, KindRecords, LogPosition, Record, Since, Ticks};
 use flotilla_schema::reads::{attributed, caller};
 use futures::{FutureExt, StreamExt};
 
@@ -90,6 +90,8 @@ impl<R: Resource> EngineFeed<R> {
     /// between the two is lost.
     pub(crate) async fn start(records: Arc<dyn KindRecords<R>>) -> Result<Self, String> {
         let ticks = records.ticks();
+        // Taken before the listing, so a commit after the mark is in the next pass.
+        let mark = records.commit_mark();
         let mut changes = records.changes().await?;
         let (listed, position) = port_reads::positioned(&*records).await?;
         let state = Arc::new(Mutex::new(FeedState { records: by_name(listed), position, serial: 0, batches: VecDeque::new() }));
@@ -111,20 +113,32 @@ impl<R: Resource> EngineFeed<R> {
                 // A tick says only that something changed: the ticks already queued behind it are
                 // answered by the same pass, not one pass each. A catch-up passes only when a tick
                 // is queued, unless it is forced.
-                let mut changed = caught_up.is_none() || forced;
+                let mut ticked = caught_up.is_none();
                 let mut ended = false;
                 while let Some(next) = changes.next().now_or_never() {
                     match next {
-                        Some(()) => changed = true,
+                        Some(()) => ticked = true,
                         None => {
                             ended = true;
                             break;
                         }
                     }
                 }
+                // A pass reads every commit made before it, so it takes the port's mark; a forced
+                // catch-up with no tick queued passes only where the mark shows a commit since.
+                let changed = (ticked || forced) && (mark.as_ref().is_none_or(CommitMark::take) || ticked);
                 if changed {
-                    if let Some(serial) = follow(&*records, &following).await {
-                        publish.send_replace(serial);
+                    match follow(&*records, &following).await {
+                        Passed::Unchanged => {}
+                        Passed::Read(serial) => {
+                            publish.send_replace(serial);
+                        }
+                        Passed::Failed(serial) => {
+                            publish.send_replace(serial);
+                            if let Some(mark) = &mark {
+                                mark.give_back();
+                            }
+                        }
                     }
                 }
                 if let Some(caught_up) = caught_up {
@@ -152,13 +166,15 @@ impl<R: Resource> EngineFeed<R> {
 
     /// Returns once the published records hold every change committed before the call. A port
     /// that ticks at commit has a write's tick queued by then, so this passes only when a tick
-    /// is queued; over a followed port a tick may still be on its way, so this always passes.
+    /// is queued; over a followed port a tick may still be on its way, so this passes unless the
+    /// port's commit mark shows nothing committed since the last pass.
     pub(crate) async fn catch_up(&self) {
         self.request(self.ticks == Ticks::Followed).await;
     }
 
     /// Returns once the published records hold every change committed before the call, whether
-    /// or not its tick has reached the feed: a pass reads the log from the feed's position.
+    /// or not its tick has reached the feed: a pass reads the log from the feed's position,
+    /// unless the port's commit mark shows nothing committed since the last.
     pub(crate) async fn read_through_now(&self) {
         self.request(true).await;
     }
@@ -179,6 +195,16 @@ struct CatchUp {
     forced: bool,
 }
 
+/// What one pass of the feed read.
+enum Passed {
+    /// Nothing changed since the feed's position.
+    Unchanged,
+    /// The batch with this serial.
+    Read(u64),
+    /// The failed batch with this serial; the records stand as they were.
+    Failed(u64),
+}
+
 fn locked<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
     mutex.lock().unwrap_or_else(PoisonError::into_inner)
 }
@@ -193,14 +219,13 @@ fn by_name<R: Resource>(listed: Vec<Record<R>>) -> Copies<R> {
 }
 
 /// Reads what changed since `state`'s position into it: each changed name's copies by name, or
-/// every record where the position cannot be resumed from. Returns the batch's serial; none
-/// where nothing changed.
-async fn follow<R: Resource>(records: &dyn KindRecords<R>, state: &Mutex<FeedState<R>>) -> Option<u64> {
+/// every record where the position cannot be resumed from.
+async fn follow<R: Resource>(records: &dyn KindRecords<R>, state: &Mutex<FeedState<R>>) -> Passed {
     let position = locked(state).position.clone();
     let batch = match records.changed_since(&position).await {
         Ok(Since::Changed { names, through }) if names.is_empty() => {
             locked(state).position = through;
-            return None;
+            return Passed::Unchanged;
         }
         Ok(Since::Changed { names, through }) => {
             let mut read = Vec::with_capacity(names.len());
@@ -227,7 +252,7 @@ async fn follow<R: Resource>(records: &dyn KindRecords<R>, state: &Mutex<FeedSta
                     }
                     state.position = through;
                     state.push(Batch::Changed(Arc::new(names)));
-                    return Some(state.serial);
+                    return Passed::Read(state.serial);
                 }
             }
         }
@@ -239,7 +264,7 @@ async fn follow<R: Resource>(records: &dyn KindRecords<R>, state: &Mutex<FeedSta
                     state.records = by_name(listed);
                     state.position = position;
                     state.push(Batch::Relisted);
-                    return Some(state.serial);
+                    return Passed::Read(state.serial);
                 }
                 Err(error) => Batch::Failed(error),
             }
@@ -248,7 +273,7 @@ async fn follow<R: Resource>(records: &dyn KindRecords<R>, state: &Mutex<FeedSta
     };
     let mut state = locked(state);
     state.push(batch);
-    Some(state.serial)
+    Passed::Failed(state.serial)
 }
 
 #[cfg(test)]
@@ -281,6 +306,11 @@ mod tests {
         subscribers: Mutex<Vec<futures::channel::mpsc::UnboundedSender<()>>>,
         /// When the records say their ticks arrive; each test sends them itself.
         ticks: Ticks,
+        /// Whether the records keep commit marks, each set as a write lands.
+        marked: bool,
+        marks: Mutex<Vec<Arc<std::sync::atomic::AtomicBool>>>,
+        /// How many times a reader asked what changed: each a read of the log.
+        passes: AtomicUsize,
     }
 
     impl<R: Resource> std::fmt::Debug for Counted<R> {
@@ -298,6 +328,9 @@ mod tests {
                 written: Mutex::default(),
                 subscribers: Mutex::default(),
                 ticks: Ticks::AtCommit,
+                marked: false,
+                marks: Mutex::default(),
+                passes: AtomicUsize::default(),
             }
         }
     }
@@ -333,6 +366,9 @@ mod tests {
             records.retain(|held| held.name != name);
             records.push(record);
             self.written.lock().expect("written").push(name.into());
+            for mark in self.marks.lock().expect("marks").iter() {
+                mark.store(true, Ordering::SeqCst);
+            }
         }
 
         fn tick(&self) {
@@ -353,6 +389,13 @@ mod tests {
         }
         fn ticks(&self) -> Ticks {
             self.ticks
+        }
+        fn commit_mark(&self) -> Option<CommitMark> {
+            self.marked.then(|| {
+                let mark = Arc::new(std::sync::atomic::AtomicBool::new(true));
+                self.marks.lock().expect("marks").push(Arc::clone(&mark));
+                CommitMark::new(mark, ())
+            })
         }
         fn home(&self) -> String {
             "kiwi".into()
@@ -378,6 +421,7 @@ mod tests {
             Ok(self.at())
         }
         async fn changed_since(&self, position: &LogPosition) -> Result<Since, String> {
+            self.passes.fetch_add(1, Ordering::SeqCst);
             let from = position.homes.get("kiwi").copied().unwrap_or(0) as usize;
             let written = self.written.lock().expect("written");
             let names = written.get(from..).ok_or("ahead of the log")?.iter().cloned().collect();
@@ -482,15 +526,17 @@ mod tests {
 
     // Behaviour: over records whose ticks come from a follower, a view's read holds every write
     // committed before it, whether that write's tick has reached the feed yet, comes later or
-    // never comes. Generated: an interleaving of writes, late ticks and reads.
+    // never comes. Over records that keep commit marks, a read with nothing written or ticked
+    // since the last reads no log. Generated: an interleaving of writes, late ticks and reads.
     #[hegel::test]
     fn a_view_of_followed_records_reads_each_write_before_its_tick(tc: hegel::TestCase) {
         use hegel::generators as gs;
         let steps = tc.draw(gs::vecs(gs::integers::<u8>().min_value(0).max_value(2)).min_size(1).max_size(24));
         let names = tc.draw(gs::integers::<usize>().min_value(1).max_value(3));
+        let marked = tc.draw(gs::booleans());
         let runtime = tokio::runtime::Builder::new_current_thread().enable_all().build().expect("runtime");
         runtime.block_on(async {
-            let records = Arc::new(Counted::<Vessel> { ticks: Ticks::Followed, ..Counted::default() });
+            let records = Arc::new(Counted::<Vessel> { ticks: Ticks::Followed, marked, ..Counted::default() });
             let spec = |version: u64| VesselSpec {
                 convoy_ref: "c".into(),
                 vessel_name: format!("w{version}"),
@@ -503,6 +549,8 @@ mod tests {
             let view = crate::WatchView::<Vessel>::start(backend, "flotilla").await.expect("view");
             let mut written = BTreeMap::from([("v#0".to_owned(), "w0".to_owned())]);
             let (mut version, mut unticked) = (0, 0);
+            // Whether nothing was written or ticked since the last read.
+            let mut quiet = false;
             for (index, step) in steps.into_iter().chain([2]).enumerate() {
                 match step {
                     0 => {
@@ -511,13 +559,16 @@ mod tests {
                         records.put_spec(&name, version, spec(version));
                         written.insert(name, format!("w{version}"));
                         unticked += 1;
+                        quiet = false;
                     }
                     1 if unticked > 0 => {
                         unticked -= 1;
                         records.tick();
+                        quiet = false;
                     }
                     1 => {}
                     _ => {
+                        let passes = records.passes.load(Ordering::SeqCst);
                         let read: BTreeMap<_, _> = view
                             .list()
                             .await
@@ -527,6 +578,10 @@ mod tests {
                             .map(|read| (read.object.metadata.name, read.object.spec.vessel_name))
                             .collect();
                         assert_eq!(read, written, "a read holds every write before it");
+                        if marked && quiet {
+                            assert_eq!(records.passes.load(Ordering::SeqCst), passes, "a read with nothing committed reads no log");
+                        }
+                        quiet = true;
                     }
                 }
             }

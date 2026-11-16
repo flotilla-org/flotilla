@@ -23,7 +23,7 @@ use flotilla_engine_store::{
 };
 use flotilla_resources::{
     definitions::{origin, stamp, DefinitionOrigin},
-    engine_records::{KindRecords, LogPosition, Record, Since, Ticks, UnloggedJournal},
+    engine_records::{CommitMark, KindRecords, LogPosition, Record, Since, Ticks, UnloggedJournal},
     DeclarationRefusedCondition, DispatchQueueAttention, DispatchQueueEntry, OperationalEntriesCondition, Project, ProjectSpec,
     ProjectStatus,
 };
@@ -438,6 +438,11 @@ impl KindRecords<Project> for EngineProjects {
     /// From the shared follower of the log, and from the judge of dispatch.
     fn ticks(&self) -> Ticks {
         Ticks::Followed
+    }
+
+    /// A judgement ticks as it changes.
+    fn commit_mark(&self) -> Option<CommitMark> {
+        Some(super::commit_mark(&self.service, self.codes()))
     }
 
     /// This home's dispatch judgements.

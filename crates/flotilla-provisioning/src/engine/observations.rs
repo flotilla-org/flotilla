@@ -26,7 +26,8 @@ use flotilla_engine_store::{
 use flotilla_resources::{
     address::record_name,
     engine_records::{
-        BranchChangeRequest, ChangeRequestBranches, KindRecords, LogPosition, ObservationFailures, Record, Since, SourceObservers, Ticks,
+        BranchChangeRequest, ChangeRequestBranches, CommitMark, KindRecords, LogPosition, ObservationFailures, Record, Since,
+        SourceObservers, Ticks,
     },
     ChangeRequest, ChangeRequestSpec, ChangeRequestStatus, Issue, IssueSpec, IssueStatus, Resource,
 };
@@ -599,6 +600,10 @@ impl<R: ObservedAs> KindRecords<R> for EngineObservations {
     /// From the shared follower of the log.
     fn ticks(&self) -> Ticks {
         Ticks::Followed
+    }
+
+    fn commit_mark(&self) -> Option<CommitMark> {
+        Some(super::commit_mark(&self.service, KindRecords::<R>::codes(self)))
     }
 
     fn home(&self) -> String {

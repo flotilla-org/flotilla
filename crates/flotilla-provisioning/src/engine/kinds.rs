@@ -21,7 +21,7 @@ use flotilla_engine_store::{
 use flotilla_resources::{
     definition_provenance::SEEDING_MANAGER,
     definitions::{origin, stamp},
-    engine_records::{KindRecords, LogPosition, Record, Since, Ticks},
+    engine_records::{CommitMark, KindRecords, LogPosition, Record, Since, Ticks},
     FulfilmentKind, FulfilmentKindSpec, CONVOY_LABEL, MANAGED_BY_LABEL, PLACEMENT_SNAPSHOT_KIND, PREPARED_SNAPSHOT_LABEL,
 };
 use flotilla_schema::{ChangeHeader, ChangeItem, Identity, Kind, KindCode, NewChange, Timestamp};
@@ -312,6 +312,10 @@ impl KindRecords<FulfilmentKind> for EngineKinds {
     /// From the shared follower of the log.
     fn ticks(&self) -> Ticks {
         Ticks::Followed
+    }
+
+    fn commit_mark(&self) -> Option<CommitMark> {
+        Some(super::commit_mark(&self.service, self.codes()))
     }
 
     fn home(&self) -> String {

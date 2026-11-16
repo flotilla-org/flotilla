@@ -203,6 +203,38 @@ pub enum Ticks {
     Followed,
 }
 
+/// Set as each commit that can change a port's records lands, before the write returns, so a
+/// reader that must see committed writes reads the log only when one has landed since it last did.
+pub struct CommitMark {
+    set: std::sync::Arc<std::sync::atomic::AtomicBool>,
+    // What sets it, held while the mark is: a commit listener the store holds weakly.
+    _setter: Box<dyn std::any::Any + Send + Sync>,
+}
+
+impl CommitMark {
+    /// A mark that `setter` sets through `set`, held with it.
+    pub fn new(set: std::sync::Arc<std::sync::atomic::AtomicBool>, setter: impl std::any::Any + Send + Sync) -> Self {
+        Self { set, _setter: Box::new(setter) }
+    }
+
+    /// Whether a commit has landed since the last take. A commit landing after this call sets it
+    /// again, so a read that follows never misses one.
+    pub fn take(&self) -> bool {
+        self.set.swap(false, std::sync::atomic::Ordering::SeqCst)
+    }
+
+    /// Puts back a commit taken by a read that failed, so the next one reads.
+    pub fn give_back(&self) {
+        self.set.store(true, std::sync::atomic::Ordering::SeqCst);
+    }
+}
+
+impl std::fmt::Debug for CommitMark {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("CommitMark").field("set", &self.set).finish_non_exhaustive()
+    }
+}
+
 /// An engine port serving resource kind `R`. A name several homes hold reads as this home's
 /// record, else the lexically first home's; writes are this home's alone.
 #[async_trait::async_trait]
@@ -212,6 +244,13 @@ pub trait KindRecords<R: crate::Resource>: Send + Sync + std::fmt::Debug {
     fn codes(&self) -> Vec<KindCode>;
     /// When [`KindRecords::changes`] ticks for a change.
     fn ticks(&self) -> Ticks;
+    /// A new mark of the commits of [`KindRecords::codes`], set from the call on, starting set: a
+    /// reader that must see committed writes reads only when it is set or a tick is queued. A
+    /// port whose records also change outside the log keeps one only if it queues a tick for
+    /// such a change as it is made. `None` where it keeps none, and such a reader always reads.
+    fn commit_mark(&self) -> Option<CommitMark> {
+        None
+    }
     /// How many times these records, as this port reads them, changed outside the log since this
     /// home started: this home's state held in memory, lost on restart. Counted after each change
     /// is in place, and each such change ticks [`KindRecords::changes`]. `None` where every change

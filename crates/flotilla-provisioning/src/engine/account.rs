@@ -26,7 +26,7 @@ use flotilla_resources::account_access::{
     BindingState as OldState, EpochEntry, GrantName, GrantScope, PendingBinding, ProvisionRecord, ProvisionWrite, ACCOUNT_BINDING_LABEL,
     ACCOUNT_CREDENTIAL_LABEL,
 };
-use flotilla_resources::engine_records::{KindRecords, LogPosition, Record, Since, Ticks};
+use flotilla_resources::engine_records::{CommitMark, KindRecords, LogPosition, Record, Since, Ticks};
 use flotilla_resources::CONVOY_LABEL;
 use flotilla_schema::{CreatedAt, Identity, Kind, KindCode, NewChange, Ref, State, Timestamp};
 use flotilla_schema_sqlite::{stream::Service, Read, StoreError};
@@ -888,6 +888,10 @@ impl KindRecords<BindingResource> for EngineAccounts {
         Ticks::Followed
     }
 
+    fn commit_mark(&self) -> Option<CommitMark> {
+        Some(super::commit_mark(&self.service, KindRecords::<BindingResource>::codes(self)))
+    }
+
     fn home(&self) -> String {
         self.home.clone()
     }
@@ -960,6 +964,10 @@ impl KindRecords<ProvisionResource> for EngineAccounts {
     /// From a watch that reads the log after each commit.
     fn ticks(&self) -> Ticks {
         Ticks::Followed
+    }
+
+    fn commit_mark(&self) -> Option<CommitMark> {
+        Some(super::commit_mark(&self.service, KindRecords::<ProvisionResource>::codes(self)))
     }
 
     fn home(&self) -> String {

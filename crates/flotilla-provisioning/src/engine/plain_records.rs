@@ -20,7 +20,7 @@ use flotilla_engine_store::{
     plain::{PendingChange, PlainError, PlainLog},
 };
 use flotilla_resources::{
-    engine_records::{KindRecords, LogPosition, Record, Since, Ticks},
+    engine_records::{CommitMark, KindRecords, LogPosition, Record, Since, Ticks},
     Resource,
 };
 use flotilla_schema::{Kind, NewChange, Timestamp};
@@ -237,6 +237,10 @@ impl<K: PlainKind> KindRecords<K::Resource> for PlainRecords<K> {
     /// From the shared follower of the log.
     fn ticks(&self) -> Ticks {
         Ticks::Followed
+    }
+
+    fn commit_mark(&self) -> Option<CommitMark> {
+        Some(super::commit_mark(&self.service, self.codes()))
     }
 
     fn home(&self) -> String {

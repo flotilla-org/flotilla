@@ -634,6 +634,11 @@ impl flotilla_resources::engine_records::KindRecords<flotilla_resources::Manifes
         flotilla_resources::engine_records::Ticks::Followed
     }
 
+    /// A judgement ticks as it changes.
+    fn commit_mark(&self) -> Option<flotilla_resources::engine_records::CommitMark> {
+        Some(super::commit_mark(&self.service, self.codes()))
+    }
+
     /// This home's judgements of its roots' documents.
     fn unlogged_changes(&self) -> Option<u64> {
         Some(locked(&self.unlogged).count())
