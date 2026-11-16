@@ -874,6 +874,13 @@ pub async fn driverless_ensure_home_case(
     passes: &[usize],
 ) {
     use flotilla_resources::manifest_roots::RootDeclaration;
+    type EnsureFixture = (Arc<InProcessDaemon>, ResourceBackend, Arc<VirtualClock>, tempfile::TempDir);
+    const MANIFEST_STAMPS: [&str; 4] = [
+        "flotilla.work/manifest-reconciler-root",
+        "flotilla.work/manifest-source",
+        "flotilla.work/manifest-path",
+        "flotilla.work/manifest-revision",
+    ];
 
     let home = standing_ensure_fixture_for(factory, "kiwi", true).await;
     let peer_a = standing_ensure_fixture_for(factory, "feta", false).await;
@@ -883,7 +890,29 @@ pub async fn driverless_ensure_home_case(
     let acting_home = usize::from(declared);
     let home_backend = &home.1;
     let acting_backend = &hosts[acting_home].1;
-    let ensures = home_backend.definitions::<ConvoyEnsure>("flotilla");
+    // One host's log replayed into another's decided store, as replication carries it.
+    let replicate = |from: &EnsureFixture, to: &EnsureFixture| {
+        flotilla_provisioning_testkit::replicate_home(
+            &from.0.decided_store().expect("source decided store"),
+            from.0.node_id().as_str(),
+            &to.0.decided_store().expect("target decided store"),
+        );
+    };
+    // Each peer registers its own Project copy before any of the home's records reach it.
+    let project = home_backend.definitions::<Project>("flotilla").get("standing-project").await.expect("home project");
+    for peer in [&peer_a, &peer_b] {
+        peer.1
+            .definitions::<Project>("flotilla")
+            .create(&InputMeta::from(&project.metadata), &project.spec)
+            .await
+            .expect("each host registers its own Project copy");
+    }
+    // Manifest stamps are written only at the root's home: the declared ensure is the root's
+    // home's copy of the home's ensure, which then replicates to the other hosts.
+    if declared {
+        replicate(&home, hosts[acting_home]);
+    }
+    let ensures = acting_backend.definitions::<ConvoyEnsure>("flotilla");
     let mut ensure = ensures.get("quartermaster").await.expect("home ensure");
     if declared {
         let declaration =
@@ -895,29 +924,58 @@ pub async fn driverless_ensure_home_case(
         meta.annotations.insert("flotilla.work/manifest-path".into(), "ensures/quartermaster.yaml".into());
         meta.annotations.insert("flotilla.work/manifest-revision".into(), "rev-1".into());
         ensure = ensures.apply(&meta, &ensure.spec).await.expect("declared ensure");
+        // The reconciler then records its pass, whose baseline gives the document's path back.
+        let key = flotilla_resources::DocumentKey {
+            path: "ensures/quartermaster.yaml".into(),
+            kind: "ConvoyEnsure".into(),
+            namespace: "flotilla".into(),
+            name: "quartermaster".into(),
+        };
+        let state = flotilla_resources::DocumentState {
+            phase: flotilla_resources::DocumentPhase::Applied,
+            reason: None,
+            live_hash: Some("h".into()),
+            desired_hash: Some("h".into()),
+            baseline_hash: Some("h".into()),
+            observed_at: chrono::Utc::now(),
+            resolved_token: None,
+            resolution_outcome: None,
+            removed_in: None,
+        };
+        let pass = flotilla_resources::manifest_roots::PassReport {
+            revision: "rev-1".into(),
+            complete: true,
+            documents: [(key, state)].into(),
+            at: chrono::Utc::now(),
+        };
+        hosts[acting_home].0.manifest_roots().record_pass("flotilla", "declaring-root", pass).await.expect("record the pass");
     }
     if refused {
         let mut spec = ensure.spec.clone();
         spec.workflow_ref = "missing-workflow".into();
         ensures.apply(&InputMeta::from(&ensure.metadata), &spec).await.expect("refused ensure config");
     }
-    let project = home_backend.definitions::<Project>("flotilla").get("standing-project").await.expect("home project");
+    if declared {
+        replicate(hosts[acting_home], &home);
+        replicate(hosts[acting_home], &peer_b);
+    }
     for peer in [&peer_a, &peer_b] {
         let backend = &peer.1;
-        backend
-            .definitions::<Project>("flotilla")
-            .create(&InputMeta::from(&project.metadata), &project.spec)
-            .await
-            .expect("each host registers its own Project copy");
         // The home's ensure reaches each peer through the home's log.
-        flotilla_provisioning_testkit::replicate_home(
-            &home.0.decided_store().expect("home decided store"),
-            home.0.node_id().as_str(),
-            &peer.0.decided_store().expect("peer decided store"),
-        );
+        replicate(&home, peer);
         let copy = backend.definitions::<ConvoyEnsure>("flotilla").get("quartermaster").await.expect("replicated ensure");
         let mut meta = InputMeta::from(&copy.metadata);
         meta.labels.insert("local-copy".into(), peer.0.node_id().to_string());
+        // Udder holds no root, and only the root's home may write manifest stamps: in the declared
+        // rows udder's later copy is an operator's apply there, the same spec without the stamps.
+        // A stamped apply at a home without the root is refused, which the provisioning test
+        // `an_apply_stamped_with_a_root_another_home_holds_is_refused` covers.
+        if declared && std::ptr::eq(peer, &peer_b) {
+            for stamp in MANIFEST_STAMPS {
+                meta.annotations.remove(stamp);
+            }
+            meta.labels.remove(flotilla_resources::MANAGED_BY_LABEL);
+        }
         backend.definitions::<ConvoyEnsure>("flotilla").apply(&meta, &copy.spec).await.expect("local definition copy does not confer home");
     }
     let mut before = Vec::new();

@@ -563,6 +563,30 @@ fn the_import_carries_each_definition_to_the_homes_that_declare_it() {
     assert_eq!(report.dropped.values().sum::<usize>(), 3, "{:?}", report.dropped);
 }
 
+// Behaviour (#3108): a copy stamped with a root its home does not hold is refused and reported by
+// reason, as the engine's apply refuses it: the record is declared at the root's home. A copy of
+// the same name at the root's home still imports there.
+#[test]
+fn a_copy_stamped_with_another_homes_root_is_refused() {
+    let at_home = |home: &str| {
+        let (labels, annotations) = manifest_stamp("b-root");
+        copy::<flotilla_resources::Forge>("f", home, labels, annotations, forge_spec("https://x"))
+    };
+    let mut report = ImportReport::default();
+    let records = import_kind::<ForgeDefinition>(&[at_home("alpha"), at_home("beta")], &held_roots(), &mut report);
+    assert_eq!(records.into_iter().map(|record| record.home).collect::<Vec<_>>(), ["beta"]);
+    let refused: Vec<_> = report.refused.iter().map(|refusal| (refusal.kind, refusal.record.as_str(), refusal.reason.as_str())).collect();
+    assert_eq!(
+        refused,
+        [(
+            "Forge",
+            "f",
+            "at `alpha`: its manifest stamp names root `b-root`, which this home does not hold: the record is declared at the root's home (beta)"
+        )],
+        "{report:?}"
+    );
+}
+
 // Behaviour (#3108, the rehearsal's ensures): project ops materialise a ConvoyEnsure or a
 // WorkflowTemplate at each home that refreshes the project, so a name held there is imported
 // there whichever home created its copy first, with or without the ops root's stamp. An

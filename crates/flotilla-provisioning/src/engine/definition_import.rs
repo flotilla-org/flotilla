@@ -43,7 +43,7 @@ use flotilla_store::{definition_is_live, merge_definition_copies};
 use super::{
     import::{ImportRefusal, ImportReport, RowOutcome},
     project_import::write_project_ops,
-    provenance::{change_of, legacy_root, stamped_root, DeclaringRoot},
+    provenance::{change_of, declared_elsewhere, legacy_root, stamped_root, DeclaringRoot},
 };
 use crate::stored::{
     definition::{
@@ -364,13 +364,20 @@ where
     written
 }
 
-/// [`legacy_root`] for a copy at `home`: the stamp of a root `roots` holds at any home is left as
-/// it is; else it is matched against the live roots `roots` holds at `home`, imported in this run
-/// or not, so the outcome does not depend on the order kinds import.
+/// The root a copy at `home` is stamped with, as the engine's apply reads it: the stamp of a root
+/// `roots` holds at `home` is left as it is; a root `roots` holds only at other homes is refused,
+/// since the record is declared there; else the stamp is a previous-generation host, matched
+/// ([`legacy_root`]) against the live roots `roots` holds at `home`. `roots` are every home's, in
+/// this run or not, so the outcome does not depend on the order kinds import.
 fn legacy_root_at(origin: DefinitionOrigin, home: &str, roots: &[(ResourceObject<OldRoot>, String)]) -> Result<DefinitionOrigin, String> {
     let Some(root) = stamped_root(&origin) else { return Ok(origin) };
-    if roots.iter().any(|(held, _)| held.metadata.name == root) {
+    if roots.iter().any(|(held, held_home)| held.metadata.name == root && held_home == home) {
         return Ok(origin);
+    }
+    let elsewhere: Vec<&str> =
+        roots.iter().filter(|(held, _)| held.metadata.name == root).map(|(_, held_home)| held_home.as_str()).collect();
+    if !elsewhere.is_empty() {
+        return Err(declared_elsewhere(root, &elsewhere));
     }
     let here: Vec<_> = roots
         .iter()

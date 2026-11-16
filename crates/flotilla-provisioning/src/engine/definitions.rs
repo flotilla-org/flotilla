@@ -507,7 +507,7 @@ impl EngineRecords for EngineDefinitions {
         annotations: &BTreeMap<String, String>,
         spec: Value,
     ) -> Result<EngineObject, String> {
-        let origin = provenance::resolve_legacy_root(&self.service, &self.home, origin(labels, annotations)?)?;
+        let origin = provenance::resolve_stamped_root(&self.service, &self.home, origin(labels, annotations)?)?;
         if kind == ImageLayerDefinition::NAME && decode::<ImageLayerResourceSpec>(kind, spec.clone())?.is_retired() {
             // ADR 0053's retired layers stay admissible for one roll, so that previous-generation
             // manifests still apply, and are inert for resolution. The import drops them; so does

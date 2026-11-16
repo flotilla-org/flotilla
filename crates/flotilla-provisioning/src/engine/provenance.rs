@@ -162,16 +162,45 @@ pub(crate) fn legacy_root(mut origin: DefinitionOrigin, here: &[DeclaringRoot]) 
     }
 }
 
-/// [`legacy_root`] against `service`'s store, for a record written at `home`: a root of the
-/// stamped name at any home is a root, and leaves `origin` as it is; else this home's bound roots
-/// are read, which only a previous-generation stamp does.
-pub(crate) fn resolve_legacy_root(service: &Service, home: &str, origin: DefinitionOrigin) -> Result<DefinitionOrigin, String> {
+/// Why a record stamped with `root` is refused at a home that does not hold that root, which
+/// `homes` hold: manifest stamps belong to the manifest reconciler at the root's home.
+pub(crate) fn declared_elsewhere(root: &str, homes: &[&str]) -> String {
+    format!(
+        "its manifest stamp names root `{root}`, which this home does not hold: the record is declared at the root's home ({})",
+        homes.join(", ")
+    )
+}
+
+/// What a record's manifest stamp names, read at the home writing it.
+enum Stamped {
+    /// A root this home holds.
+    Here,
+    /// A root only these other homes hold.
+    Elsewhere(Vec<String>),
+    /// No root: a previous-generation host stamp, with this home's bound roots.
+    Legacy(Vec<DeclaringRoot>),
+}
+
+/// The manifest root `origin` names, against `service`'s store, for a record written at `home`.
+/// A root this home holds leaves `origin` as it is; a root only other homes hold is refused,
+/// since the record is declared there; a name no home holds as a root is read as a
+/// previous-generation host stamp ([`legacy_root`]) against this home's bound roots.
+pub(crate) fn resolve_stamped_root(service: &Service, home: &str, origin: DefinitionOrigin) -> Result<DefinitionOrigin, String> {
     let Some(root) = stamped_root(&origin) else { return Ok(origin) };
-    let here = service
+    let stamped = service
         .with_store(|store| {
             let mut read = store.read()?;
-            if !read.resolve_named(ROOT, root)?.is_empty() {
-                return Ok(None);
+            if read.resolve(ROOT, root, home)?.is_some() {
+                return Ok(Stamped::Here);
+            }
+            let mut elsewhere = Vec::new();
+            for id in read.resolve_named(ROOT, root)? {
+                if let Some(loaded) = read.load::<Resource<ManifestRoot>>(id)? {
+                    elsewhere.push(loaded.home);
+                }
+            }
+            if !elsewhere.is_empty() {
+                return Ok(Stamped::Elsewhere(elsewhere));
             }
             let mut here = Vec::new();
             let mut after = None;
@@ -190,14 +219,15 @@ pub(crate) fn resolve_legacy_root(service: &Service, home: &str, origin: Definit
                 }
                 after = page.next;
                 if after.is_none() {
-                    return Ok(Some(here));
+                    return Ok(Stamped::Legacy(here));
                 }
             }
         })
         .map_err(|error| error.to_string())?;
-    match here {
-        Some(here) => legacy_root(origin, &here),
-        None => Ok(origin),
+    match stamped {
+        Stamped::Here => Ok(origin),
+        Stamped::Elsewhere(homes) => Err(declared_elsewhere(root, &homes.iter().map(String::as_str).collect::<Vec<_>>())),
+        Stamped::Legacy(here) => legacy_root(origin, &here),
     }
 }
 

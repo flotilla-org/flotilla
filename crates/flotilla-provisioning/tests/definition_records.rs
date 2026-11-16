@@ -318,6 +318,71 @@ async fn an_apply_stamped_with_a_host_names_the_root_that_host_declares() {
     assert!(doubled.to_string().contains("2 live roots at its home declare host `feta`"), "{doubled}");
 }
 
+// Behaviour (#3108): manifest stamps belong to the manifest reconciler at the root's home. An
+// apply stamped with a root only another home holds is refused, naming the root and the home it
+// is declared at; at the root's home the reconciler's write passes, and so does a re-apply of the
+// document it reads back.
+#[tokio::test]
+async fn an_apply_stamped_with_a_root_another_home_holds_is_refused() {
+    use flotilla_provisioning::engine::manifest_root::EngineManifestRoots;
+    use flotilla_resources::{
+        manifest_roots::{ManifestRoots, PassReport, RootDeclaration},
+        DocumentKey, DocumentPhase, DocumentState,
+    };
+
+    let directory = tempfile::tempdir().expect("temp dir");
+    let open = |home: &str| {
+        let mut kinds = flotilla_schema::KindRegistry::new();
+        flotilla_provisioning::stored::definition::register(&mut kinds).expect("register");
+        flotilla_provisioning::stored::manifest_root::register(&mut kinds).expect("register roots");
+        flotilla_provisioning::stored::repository::register(&mut kinds).expect("register repositories");
+        flotilla_provisioning::stored::project::register(&mut kinds).expect("register projects");
+        let service = Arc::new(Service::open(&directory.path().join(format!("{home}.sqlite")), home, kinds).expect("store"));
+        let backend = ResourceBackend::new(InMemoryBackend::default());
+        backend.install_engine_records(Arc::new(
+            EngineDefinitions::open(Arc::clone(&service), Arc::new(SystemClock) as Arc<dyn Clock>).expect("open"),
+        ));
+        (service, backend)
+    };
+    let (alpha, alpha_backend) = open("alpha");
+    let (beta, beta_backend) = open("beta");
+    let roots = EngineManifestRoots::open(Arc::clone(&beta), Arc::new(SystemClock) as Arc<dyn Clock>).expect("open roots");
+    let declaration =
+        RootDeclaration { host: "beta".into(), path: "/manifests".into(), source: "project-map".into(), binding: None, ops: false };
+    roots.declare(NS, "manifest-0011223344556677", declaration).await.expect("declare");
+    flotilla_provisioning_testkit::replicate_home(&beta, "beta", &alpha);
+
+    let refused =
+        alpha_backend.definitions::<Forge>(NS).apply(&meta("lab", &manifest("r1")), &forge("lab")).await.expect_err("not this home's root");
+    assert!(
+        refused.to_string().contains(
+            "names root `manifest-0011223344556677`, which this home does not hold: the record is declared at the root's home (beta)"
+        ),
+        "{refused}"
+    );
+
+    let forges = beta_backend.definitions::<Forge>(NS);
+    forges.apply(&meta("lab", &manifest("r1")), &forge("lab")).await.expect("the reconciler's write");
+    // The reconciler then records its pass, whose baseline gives the document's path back.
+    let key = DocumentKey { path: "forges/lab.yaml".into(), kind: "Forge".into(), namespace: NS.into(), name: "lab".into() };
+    let state = DocumentState {
+        phase: DocumentPhase::Applied,
+        reason: None,
+        live_hash: Some("h".into()),
+        desired_hash: Some("h".into()),
+        baseline_hash: Some("h".into()),
+        observed_at: chrono::Utc::now(),
+        resolved_token: None,
+        resolution_outcome: None,
+        removed_in: None,
+    };
+    let pass = PassReport { revision: "r1".into(), complete: true, documents: [(key, state)].into(), at: chrono::Utc::now() };
+    roots.record_pass(NS, "manifest-0011223344556677", pass).await.expect("record the pass");
+    let read = forges.get("lab").await.expect("get");
+    forges.apply(&InputMeta::from(&read.metadata), &read.spec).await.expect("a re-apply of the read document");
+    assert_manifest(&forges.get("lab").await.expect("get"), "r1");
+}
+
 // Behaviour (#3108 item B): every watcher of the definitions on a daemon is woken by one shared
 // follower. Each watcher gets the tick for a write after it subscribed, and once every watcher has
 // gone a new one is still woken.
