@@ -21,7 +21,7 @@ use flotilla_engine_store::{
 use flotilla_resources::{
     definition_provenance::SEEDING_MANAGER,
     definitions::{origin, stamp},
-    engine_records::{KindRecords, LogPosition, Record, Since},
+    engine_records::{KindRecords, LogPosition, Record, Since, Ticks},
     FulfilmentKind, FulfilmentKindSpec, CONVOY_LABEL, MANAGED_BY_LABEL, PLACEMENT_SNAPSHOT_KIND, PREPARED_SNAPSHOT_LABEL,
 };
 use flotilla_schema::{ChangeHeader, ChangeItem, Identity, Kind, KindCode, NewChange, Timestamp};
@@ -307,6 +307,11 @@ impl flotilla_store::EnginePort for EngineKinds {
 impl KindRecords<FulfilmentKind> for EngineKinds {
     fn codes(&self) -> Vec<KindCode> {
         vec![CODE, ROOT]
+    }
+
+    /// From the shared follower of the log.
+    fn ticks(&self) -> Ticks {
+        Ticks::Followed
     }
 
     fn home(&self) -> String {

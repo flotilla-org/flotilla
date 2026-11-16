@@ -629,6 +629,11 @@ impl flotilla_resources::engine_records::KindRecords<flotilla_resources::Manifes
         vec![ROOT]
     }
 
+    /// From a watch that reads the log after each commit, and from the judge of documents.
+    fn ticks(&self) -> flotilla_resources::engine_records::Ticks {
+        flotilla_resources::engine_records::Ticks::Followed
+    }
+
     /// This home's judgements of its roots' documents.
     fn unlogged_changes(&self) -> Option<u64> {
         Some(locked(&self.unlogged).count())

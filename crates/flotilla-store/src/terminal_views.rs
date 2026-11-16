@@ -522,6 +522,11 @@ impl KindRecords<TerminalSession> for TerminalViews {
         record_codes(self.reads.as_ref(), &[RecordSet::Terminals, RecordSet::Environments, RecordSet::Vessels])
     }
 
+    /// From the followers of the sessions, environments and vessels it joins.
+    fn ticks(&self) -> flotilla_resources::engine_records::Ticks {
+        flotilla_resources::engine_records::Ticks::Followed
+    }
+
     /// This home's observations of its launches.
     fn unlogged_changes(&self) -> Option<u64> {
         Some(self.reads.terminals().map_or(0, |terminals| terminals.observations().changed()))

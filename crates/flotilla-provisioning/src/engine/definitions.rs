@@ -23,7 +23,7 @@ use flotilla_engine_store::{
 };
 use flotilla_resources::{
     definitions::{origin, stamp, DefinitionOrigin},
-    engine_records::{KindRecords, LogPosition, Record, Since},
+    engine_records::{KindRecords, LogPosition, Record, Since, Ticks},
     ConvoyEnsure, CredentialGrant, CredentialSpec, CrewDefaults, FleetDesignation, Forge, ImageLayer, ImageLayerResourceSpec, Resource,
     WorkflowTemplate,
 };
@@ -462,6 +462,11 @@ impl flotilla_store::EnginePort for EngineDefinitions {
 impl<R: Defined> KindRecords<R> for EngineDefinitions {
     fn codes(&self) -> Vec<KindCode> {
         vec![R::Stored::CODE, ROOT]
+    }
+
+    /// From the shared follower of the log.
+    fn ticks(&self) -> Ticks {
+        Ticks::Followed
     }
 
     fn home(&self) -> String {

@@ -506,6 +506,11 @@ impl<R: LifecycleKind> KindRecords<R> for LifecycleViews {
         R::SET.map_or_else(Vec::new, |set| flotilla_resources::lifecycle_reads::record_codes(self.reads.as_ref(), &[set]))
     }
 
+    /// From the followers of the clones, environments and checkouts.
+    fn ticks(&self) -> flotilla_resources::engine_records::Ticks {
+        flotilla_resources::engine_records::Ticks::Followed
+    }
+
     fn reads(&self) -> bool {
         R::SET.is_some()
     }

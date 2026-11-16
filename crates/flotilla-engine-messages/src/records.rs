@@ -75,6 +75,11 @@ impl KindRecords<OldMessage> for MessageRecords {
         vec![Resource::<Message>::CODE]
     }
 
+    /// From a watch that reads the log after each commit.
+    fn ticks(&self) -> flotilla_resources::engine_records::Ticks {
+        flotilla_resources::engine_records::Ticks::Followed
+    }
+
     fn home(&self) -> String {
         self.primitives.home().to_owned()
     }

@@ -20,7 +20,7 @@ use flotilla_engine_store::{
     plain::{PendingChange, PlainError, PlainLog},
 };
 use flotilla_resources::{
-    engine_records::{KindRecords, LogPosition, Record, Since},
+    engine_records::{KindRecords, LogPosition, Record, Since, Ticks},
     Resource,
 };
 use flotilla_schema::{Kind, NewChange, Timestamp};
@@ -232,6 +232,11 @@ impl<K: PlainKind> flotilla_store::EnginePort for PlainRecords<K> {
 impl<K: PlainKind> KindRecords<K::Resource> for PlainRecords<K> {
     fn codes(&self) -> Vec<flotilla_schema::KindCode> {
         vec![K::CODE]
+    }
+
+    /// From the shared follower of the log.
+    fn ticks(&self) -> Ticks {
+        Ticks::Followed
     }
 
     fn home(&self) -> String {

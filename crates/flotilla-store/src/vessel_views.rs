@@ -608,6 +608,11 @@ impl KindRecords<Vessel> for VesselViews {
         record_codes(self.reads.as_ref(), &sets)
     }
 
+    /// From the followers of the records it joins, and from a watch of the convoys.
+    fn ticks(&self) -> flotilla_resources::engine_records::Ticks {
+        flotilla_resources::engine_records::Ticks::Followed
+    }
+
     /// The notes of the convoys the views join.
     fn unlogged_changes(&self) -> Option<u64> {
         Some(self.reads.convoys().map_or(0, |convoys| convoys.memory().changed()))

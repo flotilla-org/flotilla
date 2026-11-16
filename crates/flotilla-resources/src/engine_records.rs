@@ -170,6 +170,18 @@ pub enum Since {
     Expired(String),
 }
 
+/// When a port's [`KindRecords::changes`] ticks for a change, which decides how a reader that
+/// must see a committed write waits for it.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Ticks {
+    /// Queued as the write commits, before it returns: a reader that saw the write finds its tick
+    /// queued.
+    AtCommit,
+    /// Sent by a follower after it reads the commit: a tick may not yet be queued when the
+    /// write returns, so a reader that must see the write reads what changed itself.
+    Followed,
+}
+
 /// An engine port serving resource kind `R`. A name several homes hold reads as this home's
 /// record, else the lexically first home's; writes are this home's alone.
 #[async_trait::async_trait]
@@ -177,6 +189,8 @@ pub trait KindRecords<R: crate::Resource>: Send + Sync + std::fmt::Debug {
     /// The stored kinds whose log entries can change these records as this port reads them: the
     /// kind's own and every kind it joins or follows. A table's position counts only these.
     fn codes(&self) -> Vec<KindCode>;
+    /// When [`KindRecords::changes`] ticks for a change.
+    fn ticks(&self) -> Ticks;
     /// How many times these records, as this port reads them, changed outside the log since this
     /// home started: this home's state held in memory, lost on restart. Counted after each change
     /// is in place, and each such change ticks [`KindRecords::changes`]. `None` where every change

@@ -23,7 +23,7 @@ use flotilla_engine_store::{
 };
 use flotilla_resources::{
     definitions::{origin, stamp, DefinitionOrigin},
-    engine_records::{KindRecords, LogPosition, Record, Since, UnloggedJournal},
+    engine_records::{KindRecords, LogPosition, Record, Since, Ticks, UnloggedJournal},
     DeclarationRefusedCondition, DispatchQueueAttention, DispatchQueueEntry, OperationalEntriesCondition, Project, ProjectSpec,
     ProjectStatus,
 };
@@ -433,6 +433,11 @@ impl flotilla_store::EnginePort for EngineProjects {
 impl KindRecords<Project> for EngineProjects {
     fn codes(&self) -> Vec<KindCode> {
         vec![PROJECT, OPS, ROOT]
+    }
+
+    /// From the shared follower of the log, and from the judge of dispatch.
+    fn ticks(&self) -> Ticks {
+        Ticks::Followed
     }
 
     /// This home's dispatch judgements.

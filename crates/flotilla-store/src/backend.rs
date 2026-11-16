@@ -1100,6 +1100,9 @@ mod tests {
         fn codes(&self) -> Vec<flotilla_resources::engine_records::KindCode> {
             Vec::new()
         }
+        fn ticks(&self) -> flotilla_resources::engine_records::Ticks {
+            flotilla_resources::engine_records::Ticks::AtCommit
+        }
         fn reads(&self) -> bool {
             self.reads
         }

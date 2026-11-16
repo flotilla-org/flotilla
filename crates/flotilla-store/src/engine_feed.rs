@@ -10,7 +10,7 @@ use std::{
     sync::{Arc, Mutex, MutexGuard, PoisonError},
 };
 
-use flotilla_resources::engine_records::{KindRecords, LogPosition, Record, Since};
+use flotilla_resources::engine_records::{KindRecords, LogPosition, Record, Since, Ticks};
 use flotilla_schema::reads::{attributed, caller};
 use futures::{FutureExt, StreamExt};
 
@@ -74,6 +74,8 @@ pub(crate) struct EngineFeed<R: Resource> {
     state: Arc<Mutex<FeedState<R>>>,
     serials: tokio::sync::watch::Receiver<u64>,
     catch_ups: tokio::sync::mpsc::Sender<CatchUp>,
+    /// When the port's ticks arrive: a catch-up over a followed port reads what changed itself.
+    ticks: Ticks,
     task: tokio::task::JoinHandle<()>,
 }
 
@@ -87,6 +89,7 @@ impl<R: Resource> EngineFeed<R> {
     /// Subscribes to `records`' changes, then lists them with their position, so no change
     /// between the two is lost.
     pub(crate) async fn start(records: Arc<dyn KindRecords<R>>) -> Result<Self, String> {
+        let ticks = records.ticks();
         let mut changes = records.changes().await?;
         let (listed, position) = port_reads::positioned(&*records).await?;
         let state = Arc::new(Mutex::new(FeedState { records: by_name(listed), position, serial: 0, batches: VecDeque::new() }));
@@ -132,7 +135,7 @@ impl<R: Resource> EngineFeed<R> {
                 }
             }
         }));
-        Ok(Self { state, serials, catch_ups, task })
+        Ok(Self { state, serials, catch_ups, ticks, task })
     }
 
     /// The feed's state, for a watcher to read its records and batches.
@@ -147,11 +150,11 @@ impl<R: Resource> EngineFeed<R> {
         serials
     }
 
-    /// Returns once the published records hold every change ticked before the call: a write's
-    /// tick is queued when the write commits, so a reader that saw the write reads it. Passes
-    /// again only when a tick is queued.
+    /// Returns once the published records hold every change committed before the call. A port
+    /// that ticks at commit has a write's tick queued by then, so this passes only when a tick
+    /// is queued; over a followed port a tick may still be on its way, so this always passes.
     pub(crate) async fn catch_up(&self) {
-        self.request(false).await;
+        self.request(self.ticks == Ticks::Followed).await;
     }
 
     /// Returns once the published records hold every change committed before the call, whether
@@ -276,6 +279,8 @@ mod tests {
         /// Each write's name, in order: the log the position counts.
         written: Mutex<Vec<String>>,
         subscribers: Mutex<Vec<futures::channel::mpsc::UnboundedSender<()>>>,
+        /// When the records say their ticks arrive; each test sends them itself.
+        ticks: Ticks,
     }
 
     impl<R: Resource> std::fmt::Debug for Counted<R> {
@@ -292,6 +297,7 @@ mod tests {
                 records: Mutex::default(),
                 written: Mutex::default(),
                 subscribers: Mutex::default(),
+                ticks: Ticks::AtCommit,
             }
         }
     }
@@ -344,6 +350,9 @@ mod tests {
     impl<R: Resource> KindRecords<R> for Counted<R> {
         fn codes(&self) -> Vec<flotilla_resources::engine_records::KindCode> {
             Vec::new()
+        }
+        fn ticks(&self) -> Ticks {
+            self.ticks
         }
         fn home(&self) -> String {
             "kiwi".into()
@@ -469,6 +478,59 @@ mod tests {
         let listings = records.listings.load(Ordering::SeqCst);
         assert_eq!(names().await, ["v#1", "v#2"]);
         assert_eq!(records.listings.load(Ordering::SeqCst), listings, "an unchanged kind is not listed again");
+    }
+
+    // Behaviour: over records whose ticks come from a follower, a view's read holds every write
+    // committed before it, whether that write's tick has reached the feed yet, comes later or
+    // never comes. Generated: an interleaving of writes, late ticks and reads.
+    #[hegel::test]
+    fn a_view_of_followed_records_reads_each_write_before_its_tick(tc: hegel::TestCase) {
+        use hegel::generators as gs;
+        let steps = tc.draw(gs::vecs(gs::integers::<u8>().min_value(0).max_value(2)).min_size(1).max_size(24));
+        let names = tc.draw(gs::integers::<usize>().min_value(1).max_value(3));
+        let runtime = tokio::runtime::Builder::new_current_thread().enable_all().build().expect("runtime");
+        runtime.block_on(async {
+            let records = Arc::new(Counted::<Vessel> { ticks: Ticks::Followed, ..Counted::default() });
+            let spec = |version: u64| VesselSpec {
+                convoy_ref: "c".into(),
+                vessel_name: format!("w{version}"),
+                fulfilment_kind_ref: "k".into(),
+                adopted_checkout_refs: BTreeMap::new(),
+            };
+            records.put_spec("v#0", 0, spec(0));
+            let backend = crate::test_store::memory_backend();
+            backend.install_engine_kind::<Vessel>(records.clone());
+            let view = crate::WatchView::<Vessel>::start(backend, "flotilla").await.expect("view");
+            let mut written = BTreeMap::from([("v#0".to_owned(), "w0".to_owned())]);
+            let (mut version, mut unticked) = (0, 0);
+            for (index, step) in steps.into_iter().chain([2]).enumerate() {
+                match step {
+                    0 => {
+                        version += 1;
+                        let name = format!("v#{}", index % names);
+                        records.put_spec(&name, version, spec(version));
+                        written.insert(name, format!("w{version}"));
+                        unticked += 1;
+                    }
+                    1 if unticked > 0 => {
+                        unticked -= 1;
+                        records.tick();
+                    }
+                    1 => {}
+                    _ => {
+                        let read: BTreeMap<_, _> = view
+                            .list()
+                            .await
+                            .expect("list")
+                            .items
+                            .into_iter()
+                            .map(|read| (read.object.metadata.name, read.object.spec.vessel_name))
+                            .collect();
+                        assert_eq!(read, written, "a read holds every write before it");
+                    }
+                }
+            }
+        });
     }
 
     // Behaviour (#3108): the feed lists its kind once, at its position; one change among many

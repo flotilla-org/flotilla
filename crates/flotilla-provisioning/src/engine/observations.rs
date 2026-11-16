@@ -26,7 +26,7 @@ use flotilla_engine_store::{
 use flotilla_resources::{
     address::record_name,
     engine_records::{
-        BranchChangeRequest, ChangeRequestBranches, KindRecords, LogPosition, ObservationFailures, Record, Since, SourceObservers,
+        BranchChangeRequest, ChangeRequestBranches, KindRecords, LogPosition, ObservationFailures, Record, Since, SourceObservers, Ticks,
     },
     ChangeRequest, ChangeRequestSpec, ChangeRequestStatus, Issue, IssueSpec, IssueStatus, Resource,
 };
@@ -594,6 +594,11 @@ impl flotilla_store::EnginePort for EngineObservations {
 impl<R: ObservedAs> KindRecords<R> for EngineObservations {
     fn codes(&self) -> Vec<KindCode> {
         vec![R::Record::CODE]
+    }
+
+    /// From the shared follower of the log.
+    fn ticks(&self) -> Ticks {
+        Ticks::Followed
     }
 
     fn home(&self) -> String {

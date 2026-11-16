@@ -26,7 +26,7 @@ use flotilla_resources::account_access::{
     BindingState as OldState, EpochEntry, GrantName, GrantScope, PendingBinding, ProvisionRecord, ProvisionWrite, ACCOUNT_BINDING_LABEL,
     ACCOUNT_CREDENTIAL_LABEL,
 };
-use flotilla_resources::engine_records::{KindRecords, LogPosition, Record, Since};
+use flotilla_resources::engine_records::{KindRecords, LogPosition, Record, Since, Ticks};
 use flotilla_resources::CONVOY_LABEL;
 use flotilla_schema::{CreatedAt, Identity, Kind, KindCode, NewChange, Ref, State, Timestamp};
 use flotilla_schema_sqlite::{stream::Service, Read, StoreError};
@@ -883,6 +883,11 @@ impl KindRecords<BindingResource> for EngineAccounts {
         vec![BINDING, PROVISION]
     }
 
+    /// From a watch that reads the log after each commit.
+    fn ticks(&self) -> Ticks {
+        Ticks::Followed
+    }
+
     fn home(&self) -> String {
         self.home.clone()
     }
@@ -950,6 +955,11 @@ impl KindRecords<ProvisionResource> for EngineAccounts {
     /// A provision reads with its binding's convoy.
     fn codes(&self) -> Vec<KindCode> {
         vec![BINDING, PROVISION]
+    }
+
+    /// From a watch that reads the log after each commit.
+    fn ticks(&self) -> Ticks {
+        Ticks::Followed
     }
 
     fn home(&self) -> String {

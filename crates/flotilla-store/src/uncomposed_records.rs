@@ -36,6 +36,11 @@ impl<R: Resource> KindRecords<R> for Uncomposed<R> {
         Vec::new()
     }
 
+    /// Never: it holds no records, and refuses its changes.
+    fn ticks(&self) -> flotilla_resources::engine_records::Ticks {
+        flotilla_resources::engine_records::Ticks::AtCommit
+    }
+
     fn home(&self) -> String {
         String::new()
     }

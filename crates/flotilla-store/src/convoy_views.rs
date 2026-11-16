@@ -533,6 +533,11 @@ impl KindRecords<Convoy> for ConvoyViews {
         record_codes(self.reads.as_ref(), &[RecordSet::Convoys, RecordSet::Vessels, RecordSet::Terminals])
     }
 
+    /// From the views' follower, which composes them after the log and this home's notes change.
+    fn ticks(&self) -> flotilla_resources::engine_records::Ticks {
+        flotilla_resources::engine_records::Ticks::Followed
+    }
+
     /// This home's notes on its launches.
     fn unlogged_changes(&self) -> Option<u64> {
         Some(self.reads.convoys().map_or(0, |convoys| convoys.memory().changed()))

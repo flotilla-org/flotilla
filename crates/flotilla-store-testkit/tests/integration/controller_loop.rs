@@ -2090,6 +2090,9 @@ impl KindRecords<PrimaryResource> for HeldListingPort {
     fn codes(&self) -> Vec<flotilla_resources::engine_records::KindCode> {
         Vec::new()
     }
+    fn ticks(&self) -> flotilla_resources::engine_records::Ticks {
+        flotilla_resources::engine_records::Ticks::AtCommit
+    }
     fn home(&self) -> String {
         "kiwi".into()
     }
