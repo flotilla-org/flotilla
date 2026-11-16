@@ -319,3 +319,33 @@ fn joining_touch_and_last_change() {
     assert_eq!(log.last_change::<Sample>("one", HOME).expect("read").expect("changed").seq, third.seq, "joined the newest");
     assert_eq!(log.last_change::<Sample>("absent", HOME).expect("read"), None);
 }
+
+// Behaviour (#3108): a create that joins an earlier change is created at its own time, not the
+// joined change's, and its create entry carries that time, so a replica reads the same.
+#[test]
+fn a_create_joining_an_earlier_change_is_created_at_its_own_time() {
+    use flotilla_schema::{ChangeItem, CreatedAt, Identity};
+    let mut kinds = KindRegistry::new();
+    register_plain::<Sample>(&mut kinds).expect("register");
+    let (home, replica) = (open(HOME, &kinds), open(REPLICA, &kinds));
+    let log = PlainLog::new(Arc::clone(&home));
+    let spec = Sample { title: "a".into(), owner: "b".into(), limit: None, tags: Vec::new() };
+    let root = Identity { kind: <Sample as Kind>::CODE, name: "root".into(), home: HOME.into() };
+    let reason = |at: i64| {
+        PendingChange::joining(
+            NewChange::new("manifest", Timestamp::from_micros(at))
+                .with_items([ChangeItem { record: root.clone(), revision: Some("r1".into()) }]),
+        )
+    };
+    log.create("one", &spec, &reason(1)).expect("one");
+    log.create("two", &spec, &reason(2)).expect("two");
+    let joined = log.last_change::<Sample>("two", HOME).expect("read").expect("changed");
+    assert_eq!(joined.seq, log.last_change::<Sample>("one", HOME).expect("read").expect("changed").seq, "one change");
+    assert_eq!(log.created::<Sample>("one", HOME).expect("one"), CreatedAt::from(Timestamp::from_micros(1)));
+    assert_eq!(log.created::<Sample>("two", HOME).expect("two"), CreatedAt::from(Timestamp::from_micros(2)), "its own time");
+
+    follow(&home, &replica, 0);
+    let mirror = PlainLog::new(replica);
+    assert_eq!(mirror.created::<Sample>("one", HOME).expect("one"), CreatedAt::from(Timestamp::from_micros(1)));
+    assert_eq!(mirror.created::<Sample>("two", HOME).expect("two"), CreatedAt::from(Timestamp::from_micros(2)), "as the home");
+}

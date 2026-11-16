@@ -98,6 +98,13 @@ impl PendingChange {
         &self.change
     }
 
+    /// When a resource this change creates was created, for its create entry to carry: the change's
+    /// `created` when set, and a joining change's own time, since a joined change keeps an earlier
+    /// write's time. None for a change of its own, whose time is the creation time.
+    pub fn created(&self) -> Option<CreatedAt> {
+        self.change.created.or_else(|| self.joins.then(|| CreatedAt::from(self.change.at)))
+    }
+
     /// The change, once a write has opened it.
     pub fn opened(&self) -> Option<ChangeId> {
         *self.opened.lock().unwrap_or_else(std::sync::PoisonError::into_inner)
@@ -182,7 +189,11 @@ impl PlainLog {
             return Err(PlainError::Exists { kind: K::KIND, name: name.to_owned() });
         }
         in_change(&self.store, change, |write, id| {
-            let stamp = write.insert(name, spec, id).map_err(|error| match error {
+            let inserted = match change.created() {
+                Some(created) => write.insert_created(name, spec, id, created),
+                None => write.insert(name, spec, id),
+            };
+            let stamp = inserted.map_err(|error| match error {
                 StoreError::Exists { .. } => PlainError::Exists { kind: K::KIND, name: name.to_owned() },
                 error => PlainError::Store(error),
             })?;
