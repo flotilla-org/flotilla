@@ -6,6 +6,7 @@
 use std::sync::{Arc, OnceLock};
 
 mod counted;
+mod home;
 
 pub use counted::KeyedGets;
 use counted::{Meter, WithConvoys};
@@ -18,6 +19,7 @@ use flotilla_resources::{
 };
 use flotilla_schema_sqlite::stream::Service;
 use flotilla_store::{ConvoyViews, ResourceBackend};
+pub use home::EngineHome;
 
 /// One home's engine Convoy path; a decided store it opened lives as long as this value.
 pub struct EngineConvoysHome {

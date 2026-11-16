@@ -8,12 +8,7 @@ use std::{
     sync::Arc,
 };
 
-use flotilla_provisioning::engine::{
-    access_deliveries::EngineAccessDeliveries, account::EngineAccounts, artifacts::EngineArtifacts, definitions::EngineDefinitions,
-    hosts::EngineHosts, kinds::EngineKinds, manifest_root::EngineManifestRoots, observations::EngineObservations, projects::EngineProjects,
-    repositories::EngineRepositories,
-};
-use flotilla_store::EnginePort;
+use flotilla_provisioning::engine::decided::{open_ports, DecidedPorts};
 
 use super::{ComposedEngine, EngineIdentity, EngineOpener};
 
@@ -81,35 +76,14 @@ pub fn open(state_dir: &Path, identity: EngineIdentity) -> Result<ComposedEngine
         flotilla_schema_sqlite::stream::Service::open(&path, &home, registry)
             .map_err(|error| format!("open decided store {}: {error}{}", path.display(), remedy(&error)))?,
     );
-    let clock = || Arc::clone(&identity.clock);
-    // #3824 layers 1 and 2c: the account kinds and ManifestRoot, which the generic resource verbs
-    // reach through their records as well.
-    let accounts = Arc::new(EngineAccounts::open(Arc::clone(&service), clock())?);
-    let manifest_roots = Arc::new(EngineManifestRoots::open(Arc::clone(&service), clock())?);
-    let records: Vec<Arc<dyn EnginePort>> = vec![
-        Arc::clone(&accounts) as Arc<dyn EnginePort>,
-        Arc::clone(&manifest_roots) as Arc<dyn EnginePort>,
-        // #3824 layer 2b-ii: the definition kinds.
-        Arc::new(EngineDefinitions::open(Arc::clone(&service), clock())?),
-        // #3824 layer 3a and 3b: Repository, and Project with its operations' record.
-        Arc::new(EngineRepositories::open(Arc::clone(&service), clock())?),
-        Arc::new(EngineProjects::open(Arc::clone(&service), clock())?),
-        Arc::new(EngineArtifacts::open(Arc::clone(&service), clock())?),
-        Arc::new(EngineAccessDeliveries::open(Arc::clone(&service), clock())?),
-        // FulfilmentKind, which admission and the vessel reconciler read and admission's snapshots write.
-        Arc::new(EngineKinds::open(Arc::clone(&service), clock())?),
-        // Host, which every placement reads and this daemon's observers write only on change.
-        Arc::new(EngineHosts::open(Arc::clone(&service), own_host, clock())?),
-    ];
-    // ChangeRequest and Issue: written by their source's observer, read at every home.
-    let source_observers = Arc::new(flotilla_resources::engine_records::LateSourceObservers::default());
-    let observations = Arc::new(EngineObservations::open(Arc::clone(&service), clock())?.observed_by(source_observers.clone()));
+    let DecidedPorts { records, observations, observation_failures, change_request_branches, source_observers, accounts, manifest_roots } =
+        open_ports(&service, &own_host, identity.clock)?;
     Ok(ComposedEngine {
         service,
         records,
-        observations: observations.clone(),
-        observation_failures: observations.clone(),
-        change_request_branches: observations,
+        observations,
+        observation_failures,
+        change_request_branches,
         source_observers,
         accounts,
         manifest_roots,

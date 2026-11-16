@@ -13,6 +13,7 @@ pub mod checkouts;
 pub mod clone_actuator;
 pub mod clones;
 pub mod controller;
+pub mod decided;
 pub mod definition_import;
 pub mod definitions;
 pub mod environment_actuator;

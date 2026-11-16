@@ -69,7 +69,8 @@ impl EngineMessagesHome {
         Self::over_with_clock(service, namespace, backend, Arc::new(SystemClock))
     }
 
-    fn over_with_clock(service: Arc<Service>, namespace: &str, backend: &ResourceBackend, clock: Arc<dyn Clock>) -> Self {
+    /// [`Self::over`], its messages stamped by `clock`.
+    pub fn over_with_clock(service: Arc<Service>, namespace: &str, backend: &ResourceBackend, clock: Arc<dyn Clock>) -> Self {
         let primitives =
             Arc::new(MessagePrimitives::open(service.home(), Arc::clone(&service), backend.clone(), clock).expect("engine Message path"));
         backend.install_attentions(Arc::clone(&primitives) as Arc<dyn Attentions>);

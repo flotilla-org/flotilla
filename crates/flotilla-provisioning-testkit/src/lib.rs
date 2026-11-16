@@ -2,6 +2,7 @@
 pub mod agent_sessions;
 pub mod checkouts;
 pub mod clones;
+pub mod engine_backend;
 pub mod environments;
 pub mod image_build;
 mod memory_store;
@@ -11,6 +12,7 @@ pub mod vessels;
 pub use agent_sessions::AgentSessionsFixture;
 pub use checkouts::CheckoutFixture;
 pub use clones::CloneFixture;
+pub use engine_backend::{EngineBackend, ENGINE_NAMESPACE};
 pub use environments::EnvironmentFixture;
 pub use memory_store::memory_store;
 pub use other_home::{
