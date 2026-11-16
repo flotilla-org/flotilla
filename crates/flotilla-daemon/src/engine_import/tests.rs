@@ -1159,6 +1159,59 @@ fn snapshots_only_an_ended_convoy_references_are_dropped() {
     }
 }
 
+// Behaviour (#3108): a live convoy's labelled placement snapshot is labelled with the launch the
+// convoy imported as, so the release its teardown makes when it ends collects the snapshot. With
+// the old convoy's name kept, nothing on the engine would ever release it.
+#[tokio::test]
+async fn an_imported_live_convoys_labelled_snapshot_is_collected_when_it_ends() {
+    use std::sync::Arc;
+
+    use flotilla_provisioning::engine::kinds::EngineKinds;
+    use flotilla_resources::{CONVOY_LABEL, PLACEMENT_SNAPSHOT_ANNOTATION, PREPARED_SNAPSHOT_LABEL};
+    use flotilla_state_machines::{machines::convoy::Convoy as EngineConvoy, Resource as Record};
+
+    let mut snapshot = document(
+        "FulfilmentKind",
+        "placement-live",
+        json!({"grants": ["platform:linux"], "host_ref": HERE, "pool": "cleat", "realisation": "host_direct"}),
+        Value::Null,
+    );
+    snapshot["metadata"]["labels"] = json!({ (PREPARED_SNAPSHOT_LABEL): "placement", (CONVOY_LABEL): "live" });
+    let mut convoy = live_convoy("live");
+    convoy["metadata"]["annotations"][PLACEMENT_SNAPSHOT_ANNOTATION] = json!("placement-live");
+    let dir = tempfile::tempdir().expect("tempdir");
+    let path = dir.path().join(ENGINE_STORE);
+    let mut target = Import::create(&path, HERE, crate::runtime::decided_registry().expect("registry")).expect("target");
+    let summary = import(&rows(vec![snapshot, convoy]), &mut target);
+    drop(target);
+    assert!(summary.refusals.is_empty(), "{summary:?}");
+    assert_eq!(summary.kinds["FulfilmentKind"].imported, 1, "{summary:?}");
+    let launch = {
+        let mut store = engine(dir.path());
+        let mut read = store.read().expect("read");
+        let page = read.scan::<Record<EngineConvoy>>(HERE, None, 8).expect("scan");
+        let names: Vec<_> =
+            page.ids.into_iter().filter_map(|id| read.load::<Record<EngineConvoy>>(id).expect("load")).map(|loaded| loaded.name).collect();
+        let [launch] = names.as_slice() else { panic!("one imported launch: {names:?}") };
+        launch.clone()
+    };
+
+    let service = Arc::new(
+        flotilla_schema_sqlite::stream::Service::open(&path, HERE, crate::runtime::decided_registry().expect("registry")).expect("store"),
+    );
+    let backend = flotilla_store::ResourceBackend::new(flotilla_store_memory::InMemoryBackend::default());
+    backend.install_engine_records(Arc::new(
+        EngineKinds::open(service, Arc::new(flotilla_resources::SystemClock) as Arc<dyn flotilla_resources::Clock>).expect("kinds"),
+    ));
+    let kinds = backend.using::<FulfilmentKind>(NS);
+    assert!(kinds.get("placement-live").await.is_ok(), "the live convoy's snapshot is imported");
+    // The release an ended launch's teardown makes.
+    let released =
+        flotilla_store::PreparedSnapshotGarbageCollector::new(backend.clone(), NS).collect(Some(&launch)).await.expect("release");
+    assert_eq!(released.placements_deleted, 1, "{launch} releases its snapshot");
+    assert!(kinds.get("placement-live").await.is_err(), "collected");
+}
+
 // Behaviour (ADR 0047, #3108): a previous-generation manifest stamp named the declaring host, not
 // its root. Imported at its home with the root in the same import, the record names the root that
 // host and its source declare, and reads back with the root's source and the document's path; a

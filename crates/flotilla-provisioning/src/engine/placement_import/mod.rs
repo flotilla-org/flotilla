@@ -6,8 +6,9 @@
 //! | FulfilmentKind | the kind, written as its stamps' writer: admission's snapshot, seeding, or the definition's origin |
 //! | PlacementPolicy with a kind of its name at its home | dropped: the kind is the daemon's migration of it |
 //! | PlacementPolicy without one | the kind its topology describes; its settings are the code constants |
-//! | A placement snapshot no live convoy references | dropped: an ended convoy never tears down on the engine |
-//! | A placement snapshot no convoy label owns | labelled with the one live convoy referencing it; refused when several do |
+//! | A placement snapshot no live imported convoy references | dropped: an ended convoy never tears down on the engine |
+//! | A placement snapshot its labelled convoy references | labelled with the launch that convoy imported as |
+//! | Any other placement snapshot | labelled with the launch of the one live convoy referencing it; refused when several do |
 //! | Deleted | dropped |
 //! | One name in several namespaces at one home | refused: the engine has no namespaces |
 
@@ -45,8 +46,9 @@ pub struct PlacementCopy<O> {
 pub struct PlacementCopies {
     pub kinds: Vec<PlacementCopy<ResourceObject<FulfilmentKind>>>,
     pub policies: Vec<PlacementCopy<RetiredPolicy>>,
-    /// The live convoys, by old name, that reference each placement snapshot, by home and name.
-    pub live_references: BTreeMap<(String, String), BTreeSet<String>>,
+    /// The live convoys that reference each placement snapshot, by home and name: each convoy's
+    /// old name and the launch it imported as, which releases the snapshot on the engine.
+    pub live_references: BTreeMap<(String, String), BTreeMap<String, String>>,
 }
 
 /// A kind to write at its home, with the stamps its change is made from.
@@ -91,34 +93,32 @@ type Stamps = (BTreeMap<String, String>, &'static str);
 /// What a copy's stamps say wrote it, as the engine's kinds read it back; `None` for a snapshot
 /// with no live convoy to release it.
 ///
-/// A snapshot is released with the convoy its label names, and an ended convoy never tears down
-/// on the engine, so a snapshot no live convoy references (`live`) is dropped. One written before
-/// admission labelled it takes the one live convoy that references it.
+/// A snapshot is released with the launch its label names, and an ended convoy never tears down
+/// on the engine, so a snapshot no live convoy references (`live`) is dropped. The label names the
+/// launch its convoy imported as; one written before admission labelled it, or labelled for a
+/// convoy that does not reference it, takes the one live convoy that does.
 fn stamped(
     labels: &BTreeMap<String, String>,
     annotations: &BTreeMap<String, String>,
-    live: Option<&BTreeSet<String>>,
+    live: Option<&BTreeMap<String, String>>,
 ) -> Result<Option<Stamps>, String> {
     let mut labels = labels.clone();
     if is_prepared_snapshot(&labels, PLACEMENT_SNAPSHOT_KIND) {
-        let live: Vec<_> = live.into_iter().flatten().collect();
-        if live.is_empty() {
-            return Ok(None);
-        }
-        if !labels.contains_key(CONVOY_LABEL) {
-            match live.as_slice() {
-                [convoy] => {
-                    labels.insert(CONVOY_LABEL.to_owned(), (*convoy).clone());
-                }
-                several => {
-                    let names: Vec<&str> = several.iter().map(|convoy| convoy.as_str()).collect();
+        let Some(live) = live.filter(|live| !live.is_empty()) else { return Ok(None) };
+        let launch = match labels.get(CONVOY_LABEL).and_then(|convoy| live.get(convoy)) {
+            Some(launch) => launch.clone(),
+            None => match live.values().collect::<Vec<_>>().as_slice() {
+                [launch] => (*launch).clone(),
+                _ => {
+                    let names: Vec<&str> = live.keys().map(String::as_str).collect();
                     return Err(format!(
                         "a snapshot no convoy owns is shared by live convoys `{}`, and only one can release it",
                         names.join("`, `")
                     ));
                 }
-            }
-        }
+            },
+        };
+        labels.insert(CONVOY_LABEL.to_owned(), launch);
         return Ok(Some((labels, label(&DefinitionOrigin::Snapshot))));
     }
     if labels.get(MANAGED_BY_LABEL).is_some_and(|manager| manager == SEEDING_MANAGER) {

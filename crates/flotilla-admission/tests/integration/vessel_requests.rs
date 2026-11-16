@@ -388,18 +388,22 @@ async fn launched_for(
     vessels: &VesselsFixture,
     convoy: &str,
 ) {
-    loop {
-        tokio::select! {
-            change = changes.recv() => {
-                if let VesselChange::Changed { name, .. } = change.expect("vessel changes") {
-                    if vessels.vessels.get(&name, None).expect("read").is_some_and(|launch| launch.convoy == convoy) {
-                        return;
+    let launched = async {
+        loop {
+            tokio::select! {
+                change = changes.recv() => {
+                    if let VesselChange::Changed { name, .. } = change.expect("vessel changes") {
+                        if vessels.vessels.get(&name, None).expect("read").is_some_and(|launch| launch.convoy == convoy) {
+                            return;
+                        }
                     }
                 }
+                stopped = &mut *running => panic!("the requester stopped: {stopped:?}"),
             }
-            stopped = &mut *running => panic!("the requester stopped: {stopped:?}"),
         }
-    }
+    };
+    // A bound, not a wait: a requester that never launches the work fails here.
+    tokio::time::timeout(std::time::Duration::from_secs(30), launched).await.unwrap_or_else(|_| panic!("a launch of {convoy}"));
 }
 
 /// A gate that refuses until opened, and tells whether it was open each time it is asked.
@@ -443,7 +447,8 @@ async fn a_checkout_change_judges_a_refused_release_again() {
     let gate = Arc::new(Switch { open: false.into(), asked });
     let requests = VesselRequests::new(held, Arc::clone(&vessels.reads), gate.clone(), CanonicalHostId::resolved("home-host"), []);
     let mut running = tokio::spawn(async move { requests.run().await });
-    assert_eq!(answers.next().await, Some(false), "the first pass asks the gate, which refuses");
+    let asked = tokio::time::timeout(std::time::Duration::from_secs(30), answers.next()).await.expect("the first pass asks the gate");
+    assert_eq!(asked, Some(false), "the first pass asks the gate, which refuses");
 
     gate.open.store(true, std::sync::atomic::Ordering::SeqCst);
     let checkout = CheckoutSpec::Observed(ObservedCheckoutSpec {
@@ -454,17 +459,21 @@ async fn a_checkout_change_judges_a_refused_release_again() {
         is_main: false,
     });
     followed.checkouts.request("main", &checkout, Some(&CheckoutHolder::Convoy(convoy)));
-    loop {
-        tokio::select! {
-            change = changes.recv() => {
-                if matches!(change.expect("vessel changes"), VesselChange::Changed { ref name, .. } if *name == launch)
-                    && vessels.vessels.get(&launch, None).expect("read").expect("launch").reading == LifecycleReading::Released
-                {
-                    break;
+    let released = async {
+        loop {
+            tokio::select! {
+                change = changes.recv() => {
+                    if matches!(change.expect("vessel changes"), VesselChange::Changed { ref name, .. } if *name == launch)
+                        && vessels.vessels.get(&launch, None).expect("read").expect("launch").reading == LifecycleReading::Released
+                    {
+                        break;
+                    }
                 }
+                stopped = &mut running => panic!("the requester stopped: {stopped:?}"),
             }
-            stopped = &mut running => panic!("the requester stopped: {stopped:?}"),
         }
-    }
+    };
+    // A bound, not a wait: a requester that never judges the release again fails here.
+    tokio::time::timeout(std::time::Duration::from_secs(30), released).await.expect("the launch is released after the checkout change");
     running.abort();
 }

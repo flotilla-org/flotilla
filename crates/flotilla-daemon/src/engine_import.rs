@@ -211,6 +211,14 @@ struct Carried {
     vessels: flotilla_provisioning::engine::import::VesselLaunches,
 }
 
+impl Carried {
+    /// The launch old convoy `convoy`, homed at `home`, imported as: what releases the records
+    /// held for it.
+    fn launch(&self, home: &str, convoy: &str) -> Option<String> {
+        self.convoys.get(&(home.to_owned(), convoy.to_owned())).map(|(launch, _)| launch.clone())
+    }
+}
+
 /// One importer: the old kinds it imports, by plural, and its writes.
 pub struct Step {
     pub name: &'static str,
@@ -225,7 +233,6 @@ pub const STEPS: &[Step] = &[
     Step { name: "definitions", kinds: &definitions::KINDS, run: definitions::definitions },
     Step { name: "repositories", kinds: &["repositories"], run: records::repositories },
     Step { name: "hosts", kinds: &["hosts"], run: records::hosts },
-    Step { name: "fulfilment kinds", kinds: &records::PLACEMENT_KINDS, run: records::placement },
     Step { name: "artifacts", kinds: &["artifacts"], run: records::artifacts },
     Step { name: "forge observations", kinds: &observations::KINDS, run: observations::observations },
     Step { name: "accounts", kinds: &records::ACCOUNT_KINDS, run: records::accounts },
@@ -234,6 +241,8 @@ pub const STEPS: &[Step] = &[
     Step { name: "messages", kinds: &["messages"], run: messages::messages },
     Step { name: "attentions", kinds: &["demands"], run: attentions::attentions },
     Step { name: "convoys", kinds: &["convoys"], run: convoys::convoys },
+    // After the convoys: a placement snapshot is labelled with the launch that releases it.
+    Step { name: "fulfilment kinds", kinds: &records::PLACEMENT_KINDS, run: records::placement },
     Step { name: "access deliveries", kinds: &["accessdeliveries"], run: records::access_deliveries },
     Step { name: "lifecycles", kinds: &lifecycle::KINDS, run: lifecycle::lifecycles },
 ];

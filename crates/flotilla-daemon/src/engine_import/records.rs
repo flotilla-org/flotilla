@@ -2,7 +2,7 @@
 //! Artifact, AccessDelivery, FulfilmentKind (with each PlacementPolicy as a kind of its name) and the
 //! account kinds.
 
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::BTreeMap;
 
 use flotilla_engine_store::Import;
 use flotilla_provisioning::engine::{
@@ -63,7 +63,7 @@ pub(super) fn hosts(source: &Source, target: &mut Import, _: &mut Carried, repor
 
 /// Every namespace's at once: the engine has no namespaces. Every home's copies are read, as a
 /// snapshot takes its platform from its host's kind wherever that is homed.
-pub(super) fn placement(source: &Source, target: &mut Import, _: &mut Carried, report: &mut ImportReport) {
+pub(super) fn placement(source: &Source, target: &mut Import, carried: &mut Carried, report: &mut ImportReport) {
     let kinds = source
         .owned::<FulfilmentKind>("fulfilmentkinds", None, "FulfilmentKind", target, report)
         .into_iter()
@@ -74,7 +74,7 @@ pub(super) fn placement(source: &Source, target: &mut Import, _: &mut Carried, r
         .into_iter()
         .map(|(namespace, object, home)| PlacementCopy { namespace, object, home })
         .collect();
-    let live_references = live_placement_references(source);
+    let live_references = live_placement_references(source, carried);
     write_placement(&PlacementCopies { kinds, policies, live_references }, target, report);
 }
 
@@ -88,11 +88,14 @@ pub(super) fn live_convoys(source: &Source) -> Vec<Decoded<Convoy>> {
     convoys
 }
 
-/// The placement snapshots each live convoy references, by home and snapshot.
-fn live_placement_references(source: &Source) -> BTreeMap<(String, String), BTreeSet<String>> {
-    let mut references = BTreeMap::<(String, String), BTreeSet<String>>::new();
+/// The placement snapshots each live convoy references, by home and snapshot, with each such
+/// convoy's old name and the launch it imported as. A convoy the import did not write releases
+/// nothing on the engine.
+fn live_placement_references(source: &Source, carried: &Carried) -> BTreeMap<(String, String), BTreeMap<String, String>> {
+    let mut references = BTreeMap::<(String, String), BTreeMap<String, String>>::new();
     for convoy in live_convoys(source) {
         let object = &convoy.object;
+        let Some(launch) = carried.launch(&convoy.home, &object.metadata.name) else { continue };
         let annotations = &object.metadata.annotations;
         let pins = annotations
             .get(VESSEL_PLACEMENTS_ANNOTATION)
@@ -105,7 +108,7 @@ fn live_placement_references(source: &Source) -> BTreeMap<(String, String), BTre
             .chain(object.spec.placement_policy.clone())
             .chain(pins.into_values().map(|pin| pin.kind_ref));
         for snapshot in named {
-            references.entry((convoy.home.clone(), snapshot)).or_default().insert(object.metadata.name.clone());
+            references.entry((convoy.home.clone(), snapshot)).or_default().insert(object.metadata.name.clone(), launch.clone());
         }
     }
     references
@@ -145,6 +148,5 @@ pub(super) fn access_deliveries(source: &Source, target: &mut Import, carried: &
         .into_iter()
         .map(|copy| AccessDeliveryCopy { namespace: copy.namespace, object: copy.object, home: copy.home })
         .collect();
-    let launch = |home: &str, convoy: &str| carried.convoys.get(&(home.to_owned(), convoy.to_owned())).map(|(launch, _)| launch.clone());
-    import_access_deliveries(&copies, launch, target, report);
+    import_access_deliveries(&copies, |home: &str, convoy: &str| carried.launch(home, convoy), target, report);
 }

@@ -1,7 +1,4 @@
-use std::{
-    collections::{BTreeMap, BTreeSet},
-    sync::Arc,
-};
+use std::{collections::BTreeMap, sync::Arc};
 
 use chrono::Utc;
 use flotilla_engine_store::Import;
@@ -90,12 +87,17 @@ fn migrated_kind() -> Value {
         "grants": ["platform:linux", "network:scoped", "toolchain:rust"], "realisation": "docker_per_vessel"})
 }
 
-/// The live convoys referencing each snapshot, by home and name.
-fn live(references: &[(&str, &str, &[&str])]) -> BTreeMap<(String, String), BTreeSet<String>> {
+/// The launch old convoy `convoy` imported as.
+fn launch(convoy: &str) -> String {
+    format!("{convoy}#7")
+}
+
+/// The live convoys referencing each snapshot, by home and name, each with its launch.
+fn live(references: &[(&str, &str, &[&str])]) -> BTreeMap<(String, String), BTreeMap<String, String>> {
     references
         .iter()
         .map(|(home, snapshot, convoys)| {
-            (((*home).to_owned(), (*snapshot).to_owned()), convoys.iter().map(|convoy| (*convoy).to_owned()).collect())
+            (((*home).to_owned(), (*snapshot).to_owned()), convoys.iter().map(|convoy| ((*convoy).to_owned(), launch(convoy))).collect())
         })
         .collect()
 }
@@ -160,7 +162,7 @@ fn policies_become_kinds_and_their_settings_are_constants() {
     assert_eq!(placed("placement-snapshot-ba9876543210").writer, "snapshot");
     let snapshot = placed("placement-snapshot-0123456789ab");
     assert_eq!(snapshot.writer, "snapshot");
-    assert_eq!(snapshot.labels.get(CONVOY_LABEL).map(String::as_str), Some("convoy-0002"), "its one live convoy releases it");
+    assert_eq!(snapshot.labels.get(CONVOY_LABEL), Some(&launch("convoy-0002")), "its one live convoy releases it");
     assert_eq!(
         snapshot.record.realisation,
         KindRealisation::DockerBuilt { identity: "sha256:abc".into(), image_build_ref: "image-abc-amd64".into() }
@@ -306,7 +308,7 @@ fn a_snapshot_no_convoy_owns_takes_its_one_live_convoy() {
     let imported = import_placement(&copies, &mut report);
     let names: Vec<_> = imported.kinds.iter().map(|placed| placed.name.as_str()).collect();
     assert_eq!(names, ["placement-snapshot-000000000001"]);
-    assert_eq!(imported.kinds[0].labels.get(CONVOY_LABEL).map(String::as_str), Some("convoy-0001"));
+    assert_eq!(imported.kinds[0].labels.get(CONVOY_LABEL), Some(&launch("convoy-0001")));
     for kind in ["FulfilmentKind", "PlacementPolicy"] {
         assert_eq!(report.dropped.get(&(kind, "a snapshot no live convoy references")), Some(&1), "{kind}");
     }
@@ -453,10 +455,10 @@ async fn imported_kinds_read_back_through_the_engine() {
     assert_eq!(seeded.metadata.labels.get(MANAGED_BY_LABEL).map(String::as_str), Some(SEEDING_MANAGER));
     assert_eq!(seeded.spec, serde_json::from_value::<FulfilmentKindSpec>(host_direct_kind()).expect("spec"));
     let snapshot = read("placement-snapshot-ba9876543210").await;
-    assert_eq!(snapshot.metadata.labels.get(CONVOY_LABEL).map(String::as_str), Some("convoy-0001"));
+    assert_eq!(snapshot.metadata.labels.get(CONVOY_LABEL), Some(&launch("convoy-0001")), "the launch its convoy imported as releases it");
     let unowned = read("placement-snapshot-0123456789ab").await;
     assert_eq!(unowned.metadata.labels.get(PREPARED_SNAPSHOT_LABEL).map(String::as_str), Some(PLACEMENT_SNAPSHOT_KIND));
-    assert_eq!(unowned.metadata.labels.get(CONVOY_LABEL).map(String::as_str), Some("convoy-0002"), "its live convoy releases it");
+    assert_eq!(unowned.metadata.labels.get(CONVOY_LABEL), Some(&launch("convoy-0002")), "its live convoy releases it");
     let converted = read("crew-image").await;
     assert!(converted.metadata.labels.is_empty(), "{:?}", converted.metadata.labels);
     assert_eq!(converted.spec.realisation, FulfilmentRealisation::DockerPerVessel { image: None });
