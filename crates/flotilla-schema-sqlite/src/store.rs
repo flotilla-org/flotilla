@@ -356,6 +356,10 @@ pub struct Read<'s> {
 }
 
 impl Read<'_> {
+    /// The home this store writes as.
+    pub fn home(&self) -> &str {
+        &self.runtime.home
+    }
     /// Applied prefix, or zero/epoch for an unseen home.
     pub fn watermark(&mut self, home: &str) -> Result<crate::stream::Watermark, StoreError> {
         self.ctx().watermark(home)

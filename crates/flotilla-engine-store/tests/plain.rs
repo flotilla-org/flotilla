@@ -252,6 +252,37 @@ fn a_follower_names_written_resources_and_rescans_after_a_snapshot() {
     assert_eq!(pass(&mut follower), vec![Followed::Rescan(HOME.into())], "a snapshot leaves no entries to read");
 }
 
+// Behaviour: a follower of the store's own home passes over an empty change (a reserved launch
+// number, which moves the home's sequence and logs nothing) without a rescan, whether the pass
+// comes before or after the next write.
+#[test]
+fn a_follower_of_its_own_home_passes_over_an_empty_change() {
+    use flotilla_engine_store::follow::{Followed, Follower};
+    use flotilla_schema::Identity;
+    let mut kinds = KindRegistry::new();
+    register_plain::<Sample>(&mut kinds).expect("register");
+    let home = open(HOME, &kinds);
+    let log = PlainLog::new(Arc::clone(&home));
+    let spec = Sample { title: "a".into(), owner: "b".into(), limit: None, tags: Vec::new() };
+    let homes = [HOME.to_owned()];
+    let mut follower = Follower::new([<Sample as Kind>::CODE]);
+    let pass = |follower: &mut Follower| follower.pass(&mut home.lock().expect("home").read().expect("read"), &homes).expect("pass");
+    let reserve = || {
+        let mut store = home.lock().expect("home");
+        let mut write = store.write().expect("write");
+        write.open_change(&NewChange::new("writer", Timestamp::from_micros(1))).expect("empty change");
+        write.commit().expect("commit");
+    };
+    let named = |name: &str| Followed::Changed(Identity { kind: <Sample as Kind>::CODE, name: name.into(), home: HOME.into() });
+    log.create("one", &spec, &change(1)).expect("create");
+    assert_eq!(pass(&mut follower), vec![Followed::Rescan(HOME.into())], "a home first seen is rescanned");
+    reserve();
+    assert_eq!(pass(&mut follower), Vec::new(), "the empty change at the end of the log names nothing");
+    reserve();
+    log.create("two", &spec, &change(2)).expect("create");
+    assert_eq!(pass(&mut follower), vec![named("two")], "an empty change before a write names only the write");
+}
+
 // Behaviour (#4024): a joining change is one change for every write of one reason; another writer's
 // change naming the same record in between starts a new one; an unchanged record declared again
 // is written under the new change by `touch`, and `last_change` names it.

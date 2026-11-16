@@ -59,7 +59,13 @@ impl Follower {
             while after < last {
                 let page = read.changes_since(home, after, PAGE)?;
                 let Some(end) = page.last().map(|event| event.home_seq) else {
-                    // The sequence moved past entries this store does not hold: a snapshot.
+                    // This home's own sequence moves without entries only for an empty change (a
+                    // launch number reserved), which wrote nothing, unless an expunge passed the
+                    // cursor. Another home's moves so by a snapshot, which wrote what it holds.
+                    if home == read.home() && read.resume_floor(home)? <= after {
+                        after = last;
+                        break;
+                    }
                     followed.push(Followed::Rescan(home.clone()));
                     after = last;
                     break;
