@@ -8,86 +8,93 @@ use crate::leaf_engine::turn_delivery::{DeliveryError, FailureWriter, PendingFai
 
 // #2684: queue acceptance remains queued for every attention state. Only the
 // queued Message's delivery confirms it; age raises advisory attention.
+// The ages at the bound, for every rung and attention state, so shrinking cannot hide them.
+#[tokio::test]
+async fn queued_turn_bound_boundaries() {
+    for rung in [TurnDeliveryRung::WarmSession, TurnDeliveryRung::FreshAgent] {
+        for state in 0..=3 {
+            for age in [-1, 0, 299, 300, 301] {
+                queued_turn_case(rung, state, age).await;
+            }
+        }
+    }
+}
+
 #[hegel::test]
 fn queued_turn_waits_for_receipt_and_exposes_bound(tc: hegel::TestCase) {
     use hegel::generators as gs;
-    // All attention states, missing sessions and ages
-    // across the bound; pin the boundary cases too so shrinking cannot hide them.
+    // All attention states, missing sessions and ages across the bound.
     let rung = if tc.draw(gs::booleans()) { TurnDeliveryRung::WarmSession } else { TurnDeliveryRung::FreshAgent };
     let state = tc.draw(gs::integers::<usize>().min_value(0).max_value(3));
     let age = tc.draw(gs::integers::<i64>().min_value(-1).max_value(601));
     let runtime = tokio::runtime::Builder::new_current_thread().enable_all().build().expect("runtime");
-    runtime.block_on(async {
-        for age in [-1, 0, 299, 300, 301, age] {
-            let case = idle_nudge_scenario().await;
-            let start = Utc::now();
-            let now = start + chrono::Duration::seconds(age);
-            // The original firing need not remain eligible: health still follows receipts.
-            interrupt(&case);
-            let mut status = case.status().await;
-            assert_eq!(status.phase, ConvoyPhase::Interrupted);
-            status.attention = None;
-            status.stalled = None;
-            status.turn_deliveries.insert("review".into(), queued_turn(rung, start, start, "turn"));
-            // Episodes, including their original age, survive the status's wire form.
-            let status: ConvoyStatus = serde_json::from_value(serde_json::to_value(status).unwrap()).unwrap();
-            case.note(|noted| *noted = status).await;
-            message_to_coder(&case, "turn", "review wake").await;
-            let attention = TerminalAttention {
-                state: [
-                    TerminalAttentionState::Unobservable,
-                    TerminalAttentionState::Working,
-                    TerminalAttentionState::Idle,
-                    TerminalAttentionState::NeedsInput,
-                ][state],
-                source: TerminalAttentionSource::Screen,
-                as_of: now,
-            };
-            observe_session(&case.home, "resumed-coder", Some(attention));
-            let mut notes = case.home.engine().memory().subscribe();
-            for repeat in 0..2 {
-                notes_changed(&mut notes);
-                case.wake.judge_stalls_at("flotilla", &case.objects().await, now).await.unwrap();
-                if repeat == 1 {
-                    assert!(!notes_changed(&mut notes), "unchanged queue evidence must not write every tick");
-                }
-                let status = case.status().await;
-                assert!(
-                    matches!(status.turn_deliveries["review"].episodes[0].outcome, TurnDeliveryOutcome::Queued { .. }),
-                    "repeat {repeat}"
-                );
-                assert_eq!(
-                    status.attention.as_ref().map(|attention| attention.source.as_str()),
-                    (age > 300).then_some(ConvoyAttention::QUEUED_TURN_SOURCE)
-                );
-                let TurnDeliveryOutcome::Queued { queued_at, blocking_reason, .. } = &status.turn_deliveries["review"].episodes[0].outcome
-                else {
-                    panic!("queued")
-                };
-                assert_eq!(*queued_at, start);
-                assert!(blocking_reason.contains("waiting for its consumer"), "{blocking_reason}");
-            }
-            // Terminal settlement can race a submission receipt. It must neither
-            // strand the episode nor retain its queued-turn advisory.
-            let terminal_phase = [ConvoyPhase::Landed, ConvoyPhase::Failed, ConvoyPhase::Abandoned][state % 3];
-            if terminal_phase == ConvoyPhase::Landed {
-                // A launch is delivered once what it owes is kept.
-                case.home.keep(&case.backend, &case.work, "work", "coder").await;
-            }
-            case.home.end(&case.backend, &case.work, terminal_phase).await;
-            deliver_to_coder(&case, "turn", now).await;
-            case.caught_up(&case.wake).await;
-            case.wake.judge_stalls_at("flotilla", &case.objects().await, now).await.unwrap();
-            let status = case.status().await;
-            assert!(matches!(status.turn_deliveries["review"].episodes[0].outcome, TurnDeliveryOutcome::Delivered {
+    runtime.block_on(queued_turn_case(rung, state, age));
+}
+
+async fn queued_turn_case(rung: TurnDeliveryRung, state: usize, age: i64) {
+    let case = idle_nudge_scenario().await;
+    let start = Utc::now();
+    let now = start + chrono::Duration::seconds(age);
+    // The original firing need not remain eligible: health still follows receipts.
+    interrupt(&case);
+    let mut status = case.status().await;
+    assert_eq!(status.phase, ConvoyPhase::Interrupted);
+    status.attention = None;
+    status.stalled = None;
+    status.turn_deliveries.insert("review".into(), queued_turn(rung, start, start, "turn"));
+    // Episodes, including their original age, survive the status's wire form.
+    let status: ConvoyStatus = serde_json::from_value(serde_json::to_value(status).unwrap()).unwrap();
+    case.note(|noted| *noted = status).await;
+    message_to_coder(&case, "turn", "review wake").await;
+    let attention = TerminalAttention {
+        state: [
+            TerminalAttentionState::Unobservable,
+            TerminalAttentionState::Working,
+            TerminalAttentionState::Idle,
+            TerminalAttentionState::NeedsInput,
+        ][state],
+        source: TerminalAttentionSource::Screen,
+        as_of: now,
+    };
+    observe_session(&case.home, "resumed-coder", Some(attention));
+    let mut notes = case.home.engine().memory().subscribe();
+    for repeat in 0..2 {
+        notes_changed(&mut notes);
+        case.wake.judge_stalls_at("flotilla", &case.objects().await, now).await.unwrap();
+        if repeat == 1 {
+            assert!(!notes_changed(&mut notes), "unchanged queue evidence must not write every tick");
+        }
+        let status = case.status().await;
+        assert!(matches!(status.turn_deliveries["review"].episodes[0].outcome, TurnDeliveryOutcome::Queued { .. }), "repeat {repeat}");
+        assert_eq!(
+            status.attention.as_ref().map(|attention| attention.source.as_str()),
+            (age > 300).then_some(ConvoyAttention::QUEUED_TURN_SOURCE)
+        );
+        let TurnDeliveryOutcome::Queued { queued_at, blocking_reason, .. } = &status.turn_deliveries["review"].episodes[0].outcome else {
+            panic!("queued")
+        };
+        assert_eq!(*queued_at, start);
+        assert!(blocking_reason.contains("waiting for its consumer"), "{blocking_reason}");
+    }
+    // Terminal settlement can race a submission receipt. It must neither
+    // strand the episode nor retain its queued-turn advisory.
+    let terminal_phase = [ConvoyPhase::Landed, ConvoyPhase::Failed, ConvoyPhase::Abandoned][state % 3];
+    if terminal_phase == ConvoyPhase::Landed {
+        // A launch is delivered once what it owes is kept.
+        case.home.keep(&case.backend, &case.work, "work", "coder").await;
+    }
+    case.home.end(&case.backend, &case.work, terminal_phase).await;
+    deliver_to_coder(&case, "turn", now).await;
+    case.caught_up(&case.wake).await;
+    case.wake.judge_stalls_at("flotilla", &case.objects().await, now).await.unwrap();
+    let status = case.status().await;
+    assert!(matches!(status.turn_deliveries["review"].episodes[0].outcome, TurnDeliveryOutcome::Delivered {
                 rung: delivered_rung, ..
             } if delivered_rung == rung));
-            assert!(status.attention.is_none());
-            assert_eq!(status.phase, terminal_phase, "receipt observations must preserve the terminal outcome");
-            assert_eq!(status.turn_deliveries["review"].episodes.len(), 1);
-            assert_eq!(queued_turn_evidence(None, None), (false, "terminal session unavailable".into()));
-        }
-    });
+    assert!(status.attention.is_none());
+    assert_eq!(status.phase, terminal_phase, "receipt observations must preserve the terminal outcome");
+    assert_eq!(status.turn_deliveries["review"].episodes.len(), 1);
+    assert_eq!(queued_turn_evidence(None, None), (false, "terminal session unavailable".into()));
 }
 
 // A health tick applies all queued observations atomically, with one resource
@@ -951,115 +958,118 @@ impl ReplicaTurnSource {
 
 // A demand on the convoy home writes no record there; another host's observation reaches it
 // as a replica, and triggering and delivery must agree, including a stalled merge.
-#[hegel::test]
-fn replica_status_turn_delivery(tc: hegel::TestCase) {
+#[tokio::test]
+async fn replica_status_turn_delivery() {
     use super::super::routing::{ObjectAddress, ObjectKind};
     // Cross both timestamp orders: observed now, or between the launch's judgement and now.
-    let observed_since_judgement = tc.draw(hegel::generators::booleans());
-    // Both terminal check outcomes satisfy the stock checks-settled rule.
-    let failed_checks = tc.draw(hegel::generators::booleans());
-    tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap().block_on(async {
-        for case in [
-            ReplicaTurnSource::new("merged", ".state", "merged"),
-            ReplicaTurnSource::new("checks-settled", ".checks", "pending"),
-            ReplicaTurnSource::new("review", ".review.actionable-at-head", "true"),
-            ReplicaTurnSource::new("issue", ".state", "closed"),
-        ] {
-            let source = case.name;
-            let home = ResourceBackend::new(InMemoryBackend::default());
-            let observer = ResourceBackend::new(InMemoryBackend::default());
-            let (tx, _) = broadcast::channel(4);
-            // External forge boundary: provider reads are unavailable; demand and replication are real.
-            let refresher =
-                ChangeRequestRefresher::new(home.clone(), "home".into(), Arc::new(UnavailableChangeRequests), Default::default());
-            let issues = IssueRefresher::new(home.clone(), "home".into(), Arc::new(UnavailableIssues), Default::default());
-            let engine = EngineHome::install(&home, "flotilla", "home");
-            let table = engine_table(home.clone(), &engine, broadcast_test_sink(tx), refresher.clone());
-            let actuator = Arc::new(RecordingTurnDelivery::default());
-            table.set_turn_delivery_actuator(actuator.clone()).await;
-            let base = Utc::now() - chrono::Duration::seconds(10);
-            let id = uuid::Uuid::new_v4();
-            let is_issue = case.is_issue();
-            let leaf = case.leaf();
-            let name = flotilla_resources::address::leaf_record_name(&leaf.address, &[]).unwrap();
-            let rule = case.rule(&leaf);
-            let convoys = home.using::<Convoy>("flotilla");
-            let merged = source == "merged";
-            // A merge reaches a coder stalled at work; the other observations a coder that is done.
-            let phase = if merged { ConvoyPhase::Active } else { ConvoyPhase::Landing };
-            let launch = launch_at(&home, &engine, "remote-turn", ledger_owed(), phase).await;
-            let launch = launch.as_str();
-            if merged {
-                let vessel = engine.engine.vessels.request(launch, "work", "home");
-                engine.session(&vessel, "coder", "remote-turn-coder", "env");
-                engine
-                    .note(&home, launch, |status| {
-                        external_patches::mark_crew_stalled(
-                            launch.into(),
-                            "work".into(),
-                            "coder".into(),
-                            base,
-                            flotilla_resources::StallReason::Infra,
-                            None,
-                            "waiting on PR".into(),
-                        )
-                        .apply(status)
-                    })
-                    .await;
+    for observed_since_judgement in [false, true] {
+        // Both terminal check outcomes satisfy the stock checks-settled rule.
+        for failed_checks in [false, true] {
+            for case in [
+                ReplicaTurnSource::new("merged", ".state", "merged"),
+                ReplicaTurnSource::new("checks-settled", ".checks", "pending"),
+                ReplicaTurnSource::new("review", ".review.actionable-at-head", "true"),
+                ReplicaTurnSource::new("issue", ".state", "closed"),
+            ] {
+                let source = case.name;
+                let home = ResourceBackend::new(InMemoryBackend::default());
+                let observer = ResourceBackend::new(InMemoryBackend::default());
+                let (tx, _) = broadcast::channel(4);
+                // External forge boundary: provider reads are unavailable; demand and replication are real.
+                let refresher =
+                    ChangeRequestRefresher::new(home.clone(), "home".into(), Arc::new(UnavailableChangeRequests), Default::default());
+                let issues = IssueRefresher::new(home.clone(), "home".into(), Arc::new(UnavailableIssues), Default::default());
+                let engine = EngineHome::install(&home, "flotilla", "home");
+                let table = engine_table(home.clone(), &engine, broadcast_test_sink(tx), refresher.clone());
+                let actuator = Arc::new(RecordingTurnDelivery::default());
+                table.set_turn_delivery_actuator(actuator.clone()).await;
+                let base = Utc::now() - chrono::Duration::seconds(10);
+                let id = uuid::Uuid::new_v4();
+                let is_issue = case.is_issue();
+                let leaf = case.leaf();
+                let name = flotilla_resources::address::leaf_record_name(&leaf.address, &[]).unwrap();
+                let rule = case.rule(&leaf);
+                let convoys = home.using::<Convoy>("flotilla");
+                let merged = source == "merged";
+                // A merge reaches a coder stalled at work; the other observations a coder that is done.
+                let phase = if merged { ConvoyPhase::Active } else { ConvoyPhase::Landing };
+                let launch = launch_at(&home, &engine, "remote-turn", ledger_owed(), phase).await;
+                let launch = launch.as_str();
+                if merged {
+                    let vessel = engine.engine.vessels.request(launch, "work", "home");
+                    engine.session(&vessel, "coder", "remote-turn-coder", "env");
+                    engine
+                        .note(&home, launch, |status| {
+                            external_patches::mark_crew_stalled(
+                                launch.into(),
+                                "work".into(),
+                                "coder".into(),
+                                base,
+                                flotilla_resources::StallReason::Infra,
+                                None,
+                                "waiting on PR".into(),
+                            )
+                            .apply(status)
+                        })
+                        .await;
+                    let status = convoys.get(launch).await.unwrap().status.unwrap();
+                    assert_eq!(status.crew_work["work"]["coder"].phase, CrewWorkPhase::Stalled);
+                }
+                // A launch starts, and its coder claims, when admitted: evidence older than that is
+                // never a turn, so an observation from between the judgement and now still follows it.
                 let status = convoys.get(launch).await.unwrap().status.unwrap();
-                assert_eq!(status.crew_work["work"]["coder"].phase, CrewWorkPhase::Stalled);
+                let judged = status.crew_work["work"]["coder"].finished_at.or(status.started_at).expect("launch started");
+                let setup = ReplicaTurnSetup {
+                    home: &home,
+                    observer: &observer,
+                    name: &name,
+                    id,
+                    observed_after: observed_since_judgement.then_some(judged),
+                };
+                let (kind, observed_at) = if is_issue {
+                    (ObjectKind::Issue, setup.observe_issue(&issues).await)
+                } else {
+                    (ObjectKind::ChangeRequest, setup.observe_change_request(&refresher, merged, failed_checks).await)
+                };
+                let row = LeafSubscriptionRow {
+                    id,
+                    namespace: "flotilla".into(),
+                    leaves: vec![leaf.clone()],
+                    watcher: LeafWatcher::TurnDelivery { convoy: launch.into(), source: source.into(), rule: Box::new(rule.clone()) },
+                    maker: LeafMaker::Observed { refresher: "test".into(), external_party: "forge".into() },
+                    freshness_demand: Some(base),
+                    created_at: base,
+                    episode_key: Default::default(),
+                };
+                table.inner.rows.lock().await.insert(id, row.clone());
+                let subjects = table
+                    .load_subjects("flotilla", &std::collections::HashSet::from([ObjectAddress { kind, name: name.clone() }]))
+                    .await
+                    .unwrap();
+                let firing = super::super::subscriptions::evaluate_row(
+                    &row,
+                    &subjects.borrowed(),
+                    &HashMap::from([(leaf.address.clone(), name)]),
+                    super::super::sources::LeafObservationStaleness {
+                        change_request: Duration::from_secs(60),
+                        issue: Duration::from_secs(60),
+                    },
+                )
+                .unwrap()
+                .unwrap_or_else(|| panic!("replica triggers {source} rule"));
+                table.fire(id, firing.clone()).await;
+                assert_eq!(actuator.requests.lock().unwrap().len(), 1, "{source} must deliver from replica status");
+                let subject = actuator.requests.lock().unwrap()[0].message_subject.clone().unwrap();
+                case.assert_message_subject(subject, observed_at);
+                table.fire(id, firing).await;
+                assert_eq!(actuator.requests.lock().unwrap().len(), 1, "duplicate {source} is idempotent");
+                let status = convoys.get(launch).await.unwrap().status.unwrap();
+                assert!(status.turn_deliveries[source].failure.is_none());
+                refresher.release(id).await;
+                issues.release(id).await;
             }
-            // A launch starts, and its coder claims, when admitted: evidence older than that is
-            // never a turn, so an observation from between the judgement and now still follows it.
-            let status = convoys.get(launch).await.unwrap().status.unwrap();
-            let judged = status.crew_work["work"]["coder"].finished_at.or(status.started_at).expect("launch started");
-            let setup = ReplicaTurnSetup {
-                home: &home,
-                observer: &observer,
-                name: &name,
-                id,
-                observed_after: observed_since_judgement.then_some(judged),
-            };
-            let (kind, observed_at) = if is_issue {
-                (ObjectKind::Issue, setup.observe_issue(&issues).await)
-            } else {
-                (ObjectKind::ChangeRequest, setup.observe_change_request(&refresher, merged, failed_checks).await)
-            };
-            let row = LeafSubscriptionRow {
-                id,
-                namespace: "flotilla".into(),
-                leaves: vec![leaf.clone()],
-                watcher: LeafWatcher::TurnDelivery { convoy: launch.into(), source: source.into(), rule: Box::new(rule.clone()) },
-                maker: LeafMaker::Observed { refresher: "test".into(), external_party: "forge".into() },
-                freshness_demand: Some(base),
-                created_at: base,
-                episode_key: Default::default(),
-            };
-            table.inner.rows.lock().await.insert(id, row.clone());
-            let subjects = table
-                .load_subjects("flotilla", &std::collections::HashSet::from([ObjectAddress { kind, name: name.clone() }]))
-                .await
-                .unwrap();
-            let firing = super::super::subscriptions::evaluate_row(
-                &row,
-                &subjects.borrowed(),
-                &HashMap::from([(leaf.address.clone(), name)]),
-                super::super::sources::LeafObservationStaleness { change_request: Duration::from_secs(60), issue: Duration::from_secs(60) },
-            )
-            .unwrap()
-            .unwrap_or_else(|| panic!("replica triggers {source} rule"));
-            table.fire(id, firing.clone()).await;
-            assert_eq!(actuator.requests.lock().unwrap().len(), 1, "{source} must deliver from replica status");
-            let subject = actuator.requests.lock().unwrap()[0].message_subject.clone().unwrap();
-            case.assert_message_subject(subject, observed_at);
-            table.fire(id, firing).await;
-            assert_eq!(actuator.requests.lock().unwrap().len(), 1, "duplicate {source} is idempotent");
-            let status = convoys.get(launch).await.unwrap().status.unwrap();
-            assert!(status.turn_deliveries[source].failure.is_none());
-            refresher.release(id).await;
-            issues.release(id).await;
         }
-    });
+    }
 }
 
 /// The review rounds: an active stock-workflow launch whose coder produced a PR, with its turn

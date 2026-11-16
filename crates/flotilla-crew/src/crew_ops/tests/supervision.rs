@@ -39,17 +39,25 @@ fn with_member(snapshot: &mut WorkflowSnapshot, member: &str) {
     snapshot.vessels[0].crew.push(crew);
 }
 
-#[hegel::test]
-fn cross_vessel_handoff_publishes_typed_messages(tc: hegel::TestCase) {
+// Every combination of receiver home, publication outcome, receiver phase and repeat count.
+#[tokio::test]
+async fn cross_vessel_handoff_publishes_typed_messages() {
+    for remote in [false, true] {
+        for publication_fails in [false, true] {
+            for receiver_phase in [CrewWorkPhase::Done, CrewWorkPhase::Pending] {
+                for repeats in 1..=3 {
+                    cross_vessel_handoff_case(remote, publication_fails, receiver_phase, repeats).await;
+                }
+            }
+        }
+    }
+}
+
+async fn cross_vessel_handoff_case(remote: bool, publication_fails: bool, receiver_phase: CrewWorkPhase, repeats: usize) {
     use flotilla_messaging::MessageInbox;
     use flotilla_resources::{Message, MessageReference, MessageRelation, MessageSpec};
-    use hegel::generators as gs;
 
     use crate::leaf_engine::ResourceIntentPublisher;
-    let remote = tc.draw(gs::booleans());
-    let publication_fails = tc.draw(gs::booleans());
-    let receiver_phase = if tc.draw(gs::booleans()) { CrewWorkPhase::Done } else { CrewWorkPhase::Pending };
-    let repeats = tc.draw(gs::integers::<usize>().min_value(1).max_value(3));
     // Stand-in for the cross-host resource mutation endpoint; admission uses the real inbox.
     struct ReceiverHome {
         inbox: MessageInbox,
@@ -79,65 +87,61 @@ fn cross_vessel_handoff_publishes_typed_messages(tc: hegel::TestCase) {
             Ok(ResourceRef::new("flotilla.work/v1", "Message", namespace, record.metadata.name))
         }
     }
-    tokio::runtime::Builder::new_current_thread().enable_all().build().expect("runtime").block_on(async {
-        let (crew, backend, probe, held) = shaped_fixture(CrewWorkPhase::Working, with_review(receiver_phase == CrewWorkPhase::Done)).await;
-        probe.fail.store(false, Ordering::SeqCst);
-        let launch = held.launch.clone();
-        if receiver_phase == CrewWorkPhase::Done {
-            held.engine.keep(&backend, &launch, "review", "reviewer").await;
+    let (crew, backend, probe, held) = shaped_fixture(CrewWorkPhase::Working, with_review(receiver_phase == CrewWorkPhase::Done)).await;
+    probe.fail.store(false, Ordering::SeqCst);
+    let launch = held.launch.clone();
+    if receiver_phase == CrewWorkPhase::Done {
+        held.engine.keep(&backend, &launch, "review", "reviewer").await;
+    }
+    assert_eq!(held.convoy(&backend).await.status.expect("status").crew_work["review"]["reviewer"].phase, receiver_phase);
+    let home = if remote { ResourceBackend::new(flotilla_store_memory::InMemoryBackend::default()) } else { backend.clone() };
+    let publisher: Arc<dyn ResourceIntentPublisher> =
+        Arc::new(ReceiverHome { inbox: MessageInbox::new(home.clone(), "flotilla"), fail: publication_fails });
+    if remote || publication_fails {
+        crew.set_resource_intent_publisher(Arc::downgrade(&publisher));
+    }
+    let context = CrewCommandContext::builder().convoy(launch.clone()).vessel_ref(held.vessel.clone()).role("coder".into()).build();
+    let convoy = held.convoy(&backend).await;
+    let carry = MessageReference::ControlRecord {
+        resource: ResourceRef::new("flotilla.work/v1", "Convoy", "flotilla", &launch),
+        revision: convoy.metadata.resource_version.clone(),
+    };
+    let reviewer = held.receiver("review", "reviewer");
+    let short = format!("{launch}/review/reviewer");
+    if publication_fails {
+        let before = held.convoy(&backend).await.status;
+        for _ in 0..repeats {
+            crew.handoff_with_carries(&context, &short, "review this", vec![carry.clone()]).await.expect_err("receiver publication fails");
+            assert_eq!(held.convoy(&backend).await.status, before);
+            assert!(home.using::<Message>("flotilla").list().await.expect("inbox").items.is_empty());
         }
-        assert_eq!(held.convoy(&backend).await.status.expect("status").crew_work["review"]["reviewer"].phase, receiver_phase);
-        let home = if remote { ResourceBackend::new(flotilla_store_memory::InMemoryBackend::default()) } else { backend.clone() };
-        let publisher: Arc<dyn ResourceIntentPublisher> =
-            Arc::new(ReceiverHome { inbox: MessageInbox::new(home.clone(), "flotilla"), fail: publication_fails });
-        if remote || publication_fails {
-            crew.set_resource_intent_publisher(Arc::downgrade(&publisher));
-        }
-        let context = CrewCommandContext::builder().convoy(launch.clone()).vessel_ref(held.vessel.clone()).role("coder".into()).build();
-        let convoy = held.convoy(&backend).await;
-        let carry = MessageReference::ControlRecord {
-            resource: ResourceRef::new("flotilla.work/v1", "Convoy", "flotilla", &launch),
-            revision: convoy.metadata.resource_version.clone(),
+        return;
+    }
+    for index in 0..repeats {
+        let target = if index % 2 == 0 { short.as_str() } else { reviewer.as_str() };
+        crew.handoff_with_carries(&context, target, "review this", vec![carry.clone()]).await.expect("handoff");
+        // The handoff delivers the reviewer its task: it is wanted running, and its vessel starts it.
+        assert!(held.convoy(&backend).await.status.expect("status").crew_work["review"]["reviewer"].task_assigned);
+        // The crew's view of a local Message spells its receiver by the vessel that holds it.
+        let records: Vec<_> = if remote {
+            home.using::<Message>("flotilla").list().await.expect("receiver inbox").items
+        } else {
+            held.messages().views().await.expect("receiver inbox").into_iter().map(|read| read.object).collect()
         };
-        let reviewer = held.receiver("review", "reviewer");
-        let short = format!("{launch}/review/reviewer");
-        if publication_fails {
-            let before = held.convoy(&backend).await.status;
-            for _ in 0..repeats {
-                crew.handoff_with_carries(&context, &short, "review this", vec![carry.clone()])
-                    .await
-                    .expect_err("receiver publication fails");
-                assert_eq!(held.convoy(&backend).await.status, before);
-                assert!(home.using::<Message>("flotilla").list().await.expect("inbox").items.is_empty());
-            }
-            return;
+        assert_eq!(records.len(), index + 1, "each handoff is distinct even when its body repeats");
+        for record in records {
+            assert_eq!(record.spec.sender, held.receiver("work", "coder"));
+            assert_eq!(record.spec.receiver, reviewer);
+            assert_eq!(record.spec.relation, MessageRelation::Peer);
+            assert_eq!(record.spec.references, vec![carry.clone()]);
+            assert_eq!(record.spec.body, "review this");
         }
-        for index in 0..repeats {
-            let target = if index % 2 == 0 { short.as_str() } else { reviewer.as_str() };
-            crew.handoff_with_carries(&context, target, "review this", vec![carry.clone()]).await.expect("handoff");
-            // The handoff delivers the reviewer its task: it is wanted running, and its vessel starts it.
-            assert!(held.convoy(&backend).await.status.expect("status").crew_work["review"]["reviewer"].task_assigned);
-            // The crew's view of a local Message spells its receiver by the vessel that holds it.
-            let records: Vec<_> = if remote {
-                home.using::<Message>("flotilla").list().await.expect("receiver inbox").items
-            } else {
-                held.messages().views().await.expect("receiver inbox").into_iter().map(|read| read.object).collect()
-            };
-            assert_eq!(records.len(), index + 1, "each handoff is distinct even when its body repeats");
-            for record in records {
-                assert_eq!(record.spec.sender, held.receiver("work", "coder"));
-                assert_eq!(record.spec.receiver, reviewer);
-                assert_eq!(record.spec.relation, MessageRelation::Peer);
-                assert_eq!(record.spec.references, vec![carry.clone()]);
-                assert_eq!(record.spec.body, "review this");
-            }
-        }
-        for invalid in [format!("{launch}/missing/reviewer"), "other/review/reviewer".into(), "principal:operator".into(), "coder".into()] {
-            crew.handoff(&context, &invalid, "review").await.expect_err("invalid crew target");
-        }
-        crew.handoff(&context, &short, "").await.expect_err("empty handoff");
-        assert_eq!(home.using::<Message>("flotilla").list().await.expect("inbox").items.len(), repeats);
-    });
+    }
+    for invalid in [format!("{launch}/missing/reviewer"), "other/review/reviewer".into(), "principal:operator".into(), "coder".into()] {
+        crew.handoff(&context, &invalid, "review").await.expect_err("invalid crew target");
+    }
+    crew.handoff(&context, &short, "").await.expect_err("empty handoff");
+    assert_eq!(home.using::<Message>("flotilla").list().await.expect("inbox").items.len(), repeats);
 }
 
 // b0's relaunch: the reviewer's session of a superseded vessel launch gave up (its environment

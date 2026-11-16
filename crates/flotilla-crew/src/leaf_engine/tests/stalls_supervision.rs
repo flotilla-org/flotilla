@@ -171,6 +171,17 @@ fn turn_inactivity_tracks_meaningful_evidence(tc: hegel::TestCase) {
 
 // #2634: a hook-capable crew with no hook after the first-turn grace gets
 // advisory attention. Screen activity does not hide it; a real hook clears it.
+// The boundary, pinned with unoccupied attention so generated preservation
+// cases cannot hide an off-by-one regression, for both harnesses.
+#[tokio::test]
+async fn missing_turn_hook_grace_boundary() {
+    for claude in [false, true] {
+        for (age, other_attention) in [(899, false), (900, false), (901, false), (900, true)] {
+            missing_turn_hook_case(age, claude, other_attention).await;
+        }
+    }
+}
+
 #[hegel::test]
 fn missing_turn_hook_is_visible_and_recovers(tc: hegel::TestCase) {
     use hegel::generators as gs;
@@ -180,40 +191,38 @@ fn missing_turn_hook_is_visible_and_recovers(tc: hegel::TestCase) {
     let claude = tc.draw(gs::booleans());
     let other_attention = tc.draw(gs::booleans());
     let runtime = tokio::runtime::Builder::new_current_thread().enable_all().build().expect("runtime");
-    runtime.block_on(async {
-        // Pin the boundary with unoccupied attention so generated preservation
-        // cases cannot hide an off-by-one regression.
-        for (age, other_attention) in [(899, false), (900, false), (901, false), (900, true), (age, other_attention)] {
-            let case = project_supervision_case(&[]).await;
-            case.note(|status| status.stalled = None).await;
-            resume_coder_under(&case, if claude { "claude-code" } else { "codex" });
-            let start = coder_session_started(&case).await;
-            let now = start + chrono::Duration::seconds(age);
-            let other = ConvoyAttention { source: "settlement".into(), reason: "keep this".into(), raised_at: start };
-            if other_attention {
-                case.note(|status| status.attention = Some(other.clone())).await;
+    runtime.block_on(missing_turn_hook_case(age, claude, other_attention));
+}
+
+async fn missing_turn_hook_case(age: i64, claude: bool, other_attention: bool) {
+    let case = project_supervision_case(&[]).await;
+    case.note(|status| status.stalled = None).await;
+    resume_coder_under(&case, if claude { "claude-code" } else { "codex" });
+    let start = coder_session_started(&case).await;
+    let now = start + chrono::Duration::seconds(age);
+    let other = ConvoyAttention { source: "settlement".into(), reason: "keep this".into(), raised_at: start };
+    if other_attention {
+        case.note(|status| status.attention = Some(other.clone())).await;
+    }
+    for _ in 0..2 {
+        observe_actor(&case, &case.wake, TerminalAttentionState::Working, now).await;
+        let status = case.status().await;
+        if other_attention {
+            assert_eq!(status.attention, Some(other.clone()));
+        } else {
+            assert_eq!(status.attention.as_ref().map(|a| a.source.as_str()), (age >= 900).then_some("missing-turn-hook"));
+            if let Some(attention) = status.attention {
+                assert_eq!(attention.raised_at, now);
+                assert!(attention.reason.contains("no hook"));
             }
-            for _ in 0..2 {
-                observe_actor(&case, &case.wake, TerminalAttentionState::Working, now).await;
-                let status = case.status().await;
-                if other_attention {
-                    assert_eq!(status.attention, Some(other.clone()));
-                } else {
-                    assert_eq!(status.attention.as_ref().map(|a| a.source.as_str()), (age >= 900).then_some("missing-turn-hook"));
-                    if let Some(attention) = status.attention {
-                        assert_eq!(attention.raised_at, now);
-                        assert!(attention.reason.contains("no hook"));
-                    }
-                }
-                assert!(status.stalled.is_none(), "missing hooks alone never stall a working crew");
-            }
-            let hook_at = now + chrono::Duration::seconds(1);
-            observe_actor_source(&case, &case.wake, TerminalAttentionState::Idle, TerminalAttentionSource::Hook, hook_at).await;
-            assert_eq!(case.status().await.attention, other_attention.then_some(other));
-            observe_actor(&case, &case.wake, TerminalAttentionState::Working, hook_at + chrono::Duration::seconds(120)).await;
-            assert!(case.status().await.attention.is_none_or(|a| a.source != "missing-turn-hook"));
         }
-    });
+        assert!(status.stalled.is_none(), "missing hooks alone never stall a working crew");
+    }
+    let hook_at = now + chrono::Duration::seconds(1);
+    observe_actor_source(&case, &case.wake, TerminalAttentionState::Idle, TerminalAttentionSource::Hook, hook_at).await;
+    assert_eq!(case.status().await.attention, other_attention.then_some(other));
+    observe_actor(&case, &case.wake, TerminalAttentionState::Working, hook_at + chrono::Duration::seconds(120)).await;
+    assert!(case.status().await.attention.is_none_or(|a| a.source != "missing-turn-hook"));
 }
 
 // A real crew stall resolves the supervision topic through an unoccupied
@@ -1346,14 +1355,11 @@ async fn resumed_explicit_stall_without_claim_still_owes_a_report() {
 
 // #3572: standing convoys never owe settlement claims. For ordinary convoys,
 // terminal promises alone owe nothing; tasks and completion conditions still do.
-#[hegel::test]
-fn settlement_claim_arming_respects_exit_and_pending_promises(tc: hegel::TestCase) {
-    use hegel::generators as gs;
-    // Generate duplicate promise counts, including an empty history. Pin every
-    // state and obligation combination so each eligibility boundary is exercised.
-    let count = tc.draw(gs::integers::<usize>().min_value(0).max_value(3));
-    let runtime = tokio::runtime::Builder::new_current_thread().enable_all().build().expect("runtime");
-    runtime.block_on(async {
+// Every combination: duplicate promise counts including an empty history, each
+// state and each obligation, so every eligibility boundary is exercised.
+#[tokio::test]
+async fn settlement_claim_arming_respects_exit_and_pending_promises() {
+    for count in 0..=3usize {
         for standing in [false, true] {
             for state in [PromiseState::Open, PromiseState::Submitted, PromiseState::Kept, PromiseState::Retracted] {
                 for (task, completion) in [(false, false), (true, false), (false, true)] {
@@ -1404,7 +1410,7 @@ fn settlement_claim_arming_respects_exit_and_pending_promises(tc: hegel::TestCas
                 }
             }
         }
-    });
+    }
 }
 
 // #3572: explicit stalls do not make standing roles owe settlement claims.

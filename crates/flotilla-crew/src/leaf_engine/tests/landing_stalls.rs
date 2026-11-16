@@ -110,129 +110,131 @@ async fn satisfied_landing_names_stuck_controller_and_recovers() {
 // #3412: freshness demands are unknown through the observer's grace and
 // become observer lag afterward. Fresh evidence clears the episode; Merged
 // evidence stays final even when older than both demand and age thresholds.
+const FORGE_FIELDS: [&str; 4] = [".state", ".ready", ".checks", ".review.actionable-at-head"];
+
+// The grace boundary (19, 20, 21 seconds), absent values and Merged evidence
+// older than the 180s stale threshold, for each field.
+#[tokio::test]
+async fn forge_grace_boundaries_and_merged_finality() {
+    for field in FORGE_FIELDS {
+        for (age, missing, merged) in [(0, false, false), (19, false, false), (20, false, false), (21, true, false), (400, false, true)] {
+            forge_grace_case(field, age, missing, merged).await;
+        }
+    }
+}
+
 #[hegel::test]
 fn forge_grace_and_merged_finality(tc: hegel::TestCase) {
     use hegel::generators as gs;
-    // Ages cross the 20s grace boundary; include absent values and Merged
-    // evidence older than the 180s stale threshold.
+    // Ages cross the 20s grace boundary, with absent values and Merged evidence.
+    let field = tc.draw(gs::sampled_from(FORGE_FIELDS.to_vec()));
     let age = tc.draw(gs::integers::<i64>().min_value(0).max_value(40));
     let missing = tc.draw(gs::booleans());
     let merged = tc.draw(gs::booleans());
-    tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap().block_on(async {
-        for field in [".state", ".ready", ".checks", ".review.actionable-at-head"] {
-            for (age, missing, merged) in
-                [(0, false, false), (19, false, false), (20, false, false), (21, true, false), (400, false, true), (age, missing, merged)]
-            {
-                let (backend, home) = engine_backend().await;
-                let wake = supervision_wake(&backend, &home);
-                let launch = landing_launch(&backend, &home, "forge", convoy_spec(), ExitDeclaration::standard_table()).await;
-                let start = Utc::now();
-                let records = backend.using::<ChangeRequest>("flotilla");
-                let name = cr_name("github.com", "team/one", 1);
-                let created = records
-                    .create(
-                        &InputMeta::builder().name(name.clone()).build(),
-                        &flotilla_resources::ChangeRequestSpec::builder()
-                            .service("github.com".into())
-                            .scope("team/one".into())
-                            .number(1)
-                            .observing_authority("owner".into())
-                            .build(),
-                    )
-                    .await
-                    .unwrap();
-                let mut observation = flotilla_resources::ChangeRequestStatus {
-                    title: Default::default(),
-                    author: Default::default(),
-                    review_decision: Default::default(),
-                    review_requested_from_owner: Default::default(),
-                    state: flotilla_resources::Observation::known(
-                        if merged {
-                            flotilla_resources::ObservedChangeRequestState::Merged
-                        } else {
-                            flotilla_resources::ObservedChangeRequestState::Open
-                        },
-                        start - chrono::Duration::seconds(300),
-                    ),
-                    head_sha: Default::default(),
-                    checks: flotilla_resources::Observation::known(
-                        flotilla_resources::ObservedChecks::Pass,
-                        start - chrono::Duration::seconds(300),
-                    ),
-                    review: flotilla_resources::ChangeRequestReviewObservation {
-                        actionable_at_head: flotilla_resources::Observation::known(false, start - chrono::Duration::seconds(300)),
-                    },
-                    mergeable: Default::default(),
-                };
-                if !missing {
-                    records.update_status(&name, &created.metadata.resource_version, &observation).await.unwrap();
+    tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap().block_on(forge_grace_case(field, age, missing, merged));
+}
+
+async fn forge_grace_case(field: &str, age: i64, missing: bool, merged: bool) {
+    let (backend, home) = engine_backend().await;
+    let wake = supervision_wake(&backend, &home);
+    let launch = landing_launch(&backend, &home, "forge", convoy_spec(), ExitDeclaration::standard_table()).await;
+    let start = Utc::now();
+    let records = backend.using::<ChangeRequest>("flotilla");
+    let name = cr_name("github.com", "team/one", 1);
+    let created = records
+        .create(
+            &InputMeta::builder().name(name.clone()).build(),
+            &flotilla_resources::ChangeRequestSpec::builder()
+                .service("github.com".into())
+                .scope("team/one".into())
+                .number(1)
+                .observing_authority("owner".into())
+                .build(),
+        )
+        .await
+        .unwrap();
+    let mut observation = flotilla_resources::ChangeRequestStatus {
+        title: Default::default(),
+        author: Default::default(),
+        review_decision: Default::default(),
+        review_requested_from_owner: Default::default(),
+        state: flotilla_resources::Observation::known(
+            if merged {
+                flotilla_resources::ObservedChangeRequestState::Merged
+            } else {
+                flotilla_resources::ObservedChangeRequestState::Open
+            },
+            start - chrono::Duration::seconds(300),
+        ),
+        head_sha: Default::default(),
+        checks: flotilla_resources::Observation::known(flotilla_resources::ObservedChecks::Pass, start - chrono::Duration::seconds(300)),
+        review: flotilla_resources::ChangeRequestReviewObservation {
+            actionable_at_head: flotilla_resources::Observation::known(false, start - chrono::Duration::seconds(300)),
+        },
+        mergeable: Default::default(),
+    };
+    if !missing {
+        records.update_status(&name, &created.metadata.resource_version, &observation).await.unwrap();
+    }
+    let id = uuid::Uuid::new_v4();
+    wake.subscriptions.inner.rows.lock().await.insert(
+        id,
+        LeafSubscriptionRow {
+            id,
+            namespace: "flotilla".into(),
+            leaves: vec![format!(
+                "cr/github.com/team/one/1 {field} == {}",
+                match field {
+                    ".ready" => "true",
+                    ".checks" => "pass",
+                    ".review.actionable-at-head" => "false",
+                    _ => "merged",
                 }
-                let id = uuid::Uuid::new_v4();
-                wake.subscriptions.inner.rows.lock().await.insert(
-                    id,
-                    LeafSubscriptionRow {
-                        id,
-                        namespace: "flotilla".into(),
-                        leaves: vec![format!(
-                            "cr/github.com/team/one/1 {field} == {}",
-                            match field {
-                                ".ready" => "true",
-                                ".checks" => "pass",
-                                ".review.actionable-at-head" => "false",
-                                _ => "merged",
-                            }
-                        )
-                        .parse()
-                        .unwrap()],
-                        watcher: LeafWatcher::ReconcilerWake { convoy: launch.clone() },
-                        maker: LeafMaker::Observed { refresher: "change_request".into(), external_party: "forge".into() },
-                        freshness_demand: Some(start),
-                        created_at: start,
-                        episode_key: Default::default(),
-                    },
-                );
-                for _ in 0..2 {
-                    let objects = heard(&backend, &home, &wake, &launch).await;
-                    wake.judge_stalls_at("flotilla", &objects, start + chrono::Duration::seconds(age)).await.unwrap();
-                    let stall = status_of(&backend, &home, &launch).await.stalled;
-                    assert_eq!(stall.is_some(), age >= 20 && !(merged && !missing));
-                    if let Some(stall) = stall {
-                        assert!(stall.evidence.contains("change_request observer"));
-                        assert!(stall.evidence.contains("observer behind scheduled refresh grace"));
-                    }
-                }
-                // #3419: losing address resolution clears a pinned grace entry,
-                // even if the standing row has not yet been unsubscribed.
-                let original_leaf = {
-                    let mut rows = wake.subscriptions.inner.rows.lock().await;
-                    let row = rows.get_mut(&id).unwrap();
-                    let original = row.leaves[0].clone();
-                    row.leaves[0].address =
-                        LeafAddress::ChangeRequest { service: "unconfigured.invalid".into(), scope: "team/one".into(), number: 1 };
-                    original
-                };
-                let objects = heard(&backend, &home, &wake, &launch).await;
-                wake.judge_stalls_at("flotilla", &objects, start + chrono::Duration::seconds(age)).await.unwrap();
-                assert!(wake.subscriptions.inner.observer_grace.lock().await.keys().all(|(row, _)| *row != id));
-                wake.subscriptions.inner.rows.lock().await.get_mut(&id).unwrap().leaves[0] = original_leaf;
-                observation.state = flotilla_resources::Observation::known(
-                    flotilla_resources::ObservedChangeRequestState::Open,
-                    start + chrono::Duration::seconds(age),
-                );
-                observation.checks = flotilla_resources::Observation::known(
-                    flotilla_resources::ObservedChecks::Pass,
-                    start + chrono::Duration::seconds(age),
-                );
-                observation.review.actionable_at_head =
-                    flotilla_resources::Observation::known(false, start + chrono::Duration::seconds(age));
-                let current = records.get(&name).await.unwrap();
-                records.update_status(&name, &current.metadata.resource_version, &observation).await.unwrap();
-                let objects = heard(&backend, &home, &wake, &launch).await;
-                wake.judge_stalls_at("flotilla", &objects, start + chrono::Duration::seconds(age)).await.unwrap();
-                assert!(status_of(&backend, &home, &launch).await.stalled.is_none());
-            }
+            )
+            .parse()
+            .unwrap()],
+            watcher: LeafWatcher::ReconcilerWake { convoy: launch.clone() },
+            maker: LeafMaker::Observed { refresher: "change_request".into(), external_party: "forge".into() },
+            freshness_demand: Some(start),
+            created_at: start,
+            episode_key: Default::default(),
+        },
+    );
+    for _ in 0..2 {
+        let objects = heard(&backend, &home, &wake, &launch).await;
+        wake.judge_stalls_at("flotilla", &objects, start + chrono::Duration::seconds(age)).await.unwrap();
+        let stall = status_of(&backend, &home, &launch).await.stalled;
+        assert_eq!(stall.is_some(), age >= 20 && !(merged && !missing));
+        if let Some(stall) = stall {
+            assert!(stall.evidence.contains("change_request observer"));
+            assert!(stall.evidence.contains("observer behind scheduled refresh grace"));
         }
-    });
+    }
+    // #3419: losing address resolution clears a pinned grace entry,
+    // even if the standing row has not yet been unsubscribed.
+    let original_leaf = {
+        let mut rows = wake.subscriptions.inner.rows.lock().await;
+        let row = rows.get_mut(&id).unwrap();
+        let original = row.leaves[0].clone();
+        row.leaves[0].address = LeafAddress::ChangeRequest { service: "unconfigured.invalid".into(), scope: "team/one".into(), number: 1 };
+        original
+    };
+    let objects = heard(&backend, &home, &wake, &launch).await;
+    wake.judge_stalls_at("flotilla", &objects, start + chrono::Duration::seconds(age)).await.unwrap();
+    assert!(wake.subscriptions.inner.observer_grace.lock().await.keys().all(|(row, _)| *row != id));
+    wake.subscriptions.inner.rows.lock().await.get_mut(&id).unwrap().leaves[0] = original_leaf;
+    observation.state = flotilla_resources::Observation::known(
+        flotilla_resources::ObservedChangeRequestState::Open,
+        start + chrono::Duration::seconds(age),
+    );
+    observation.checks =
+        flotilla_resources::Observation::known(flotilla_resources::ObservedChecks::Pass, start + chrono::Duration::seconds(age));
+    observation.review.actionable_at_head = flotilla_resources::Observation::known(false, start + chrono::Duration::seconds(age));
+    let current = records.get(&name).await.unwrap();
+    records.update_status(&name, &current.metadata.resource_version, &observation).await.unwrap();
+    let objects = heard(&backend, &home, &wake, &launch).await;
+    wake.judge_stalls_at("flotilla", &objects, start + chrono::Duration::seconds(age)).await.unwrap();
+    assert!(status_of(&backend, &home, &launch).await.stalled.is_none());
 }
 
 // #3428: finished crews do not owe another turn while branch discovery is
@@ -469,41 +471,40 @@ fn landing_session_teardown_does_not_stall(tc: hegel::TestCase) {
     // Repeat judgements across the debounce and idle grace, with generated
     // extra residence after teardown. No sleeps or process doubles.
     let residence = tc.draw(gs::integers::<i64>().min_value(1).max_value(600));
+    let ending = tc.draw(gs::sampled_from(vec!["exited", "released"]));
     tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap().block_on(async {
-        for ending in ["exited", "released"] {
-            let case = actor_nudge_scenario(&[]).await;
-            let start = Utc::now();
-            observe_actor(&case, &case.wake, TerminalAttentionState::Working, start).await;
-            // The coder's work is complete: the launch is Landing.
-            case.home.keep(&case.backend, &case.work, "work", "coder").await;
-            assert_eq!(case.status().await.phase, ConvoyPhase::Landing);
-            let session = case.launch("resumed-coder");
-            match ending {
-                "exited" => case.home.engine.terminals.exited(&session, "the agent exited"),
-                _ => case.home.engine.terminals.release(&session),
-            }
-            for seconds in [1, 10, 60, 120, 180, 240, 300, 300 + residence] {
-                case.caught_up(&case.wake).await;
-                case.wake.sync_rows("flotilla", &case.objects().await).await.expect("derive the Landing launch's rows");
-                case.judge(&case.wake, start + chrono::Duration::seconds(seconds)).await;
-                let status = case.status().await;
-                assert!(status.stalled.is_none(), "Landing/{ending} at {seconds}s: {:?}", status.stalled);
-            }
-            // Retiring a stale actor must not hide a real controller failure.
-            let id = uuid::Uuid::new_v4();
-            let mut row = case.wake.subscriptions.rows().await.into_iter().next().unwrap();
-            row.id = id;
-            row.maker = LeafMaker::Controller {
-                resource_kind: "CredentialDelivery".into(),
-                name: Some("env".into()),
-                retry: ControllerRetry::terminal(None, start, "credential controller refused"),
-                ceiling: RetryCeiling::default(),
-            };
-            case.wake.subscriptions.inner.rows.lock().await.insert(id, row);
-            case.judge(&case.wake, start + chrono::Duration::hours(1)).await;
-            let stall = case.status().await.stalled.unwrap();
-            assert!(stall.evidence.contains("credential controller refused"), "{}", stall.evidence);
+        let case = actor_nudge_scenario(&[]).await;
+        let start = Utc::now();
+        observe_actor(&case, &case.wake, TerminalAttentionState::Working, start).await;
+        // The coder's work is complete: the launch is Landing.
+        case.home.keep(&case.backend, &case.work, "work", "coder").await;
+        assert_eq!(case.status().await.phase, ConvoyPhase::Landing);
+        let session = case.launch("resumed-coder");
+        match ending {
+            "exited" => case.home.engine.terminals.exited(&session, "the agent exited"),
+            _ => case.home.engine.terminals.release(&session),
         }
+        for seconds in [1, 10, 60, 120, 180, 240, 300, 300 + residence] {
+            case.caught_up(&case.wake).await;
+            case.wake.sync_rows("flotilla", &case.objects().await).await.expect("derive the Landing launch's rows");
+            case.judge(&case.wake, start + chrono::Duration::seconds(seconds)).await;
+            let status = case.status().await;
+            assert!(status.stalled.is_none(), "Landing/{ending} at {seconds}s: {:?}", status.stalled);
+        }
+        // Retiring a stale actor must not hide a real controller failure.
+        let id = uuid::Uuid::new_v4();
+        let mut row = case.wake.subscriptions.rows().await.into_iter().next().unwrap();
+        row.id = id;
+        row.maker = LeafMaker::Controller {
+            resource_kind: "CredentialDelivery".into(),
+            name: Some("env".into()),
+            retry: ControllerRetry::terminal(None, start, "credential controller refused"),
+            ceiling: RetryCeiling::default(),
+        };
+        case.wake.subscriptions.inner.rows.lock().await.insert(id, row);
+        case.judge(&case.wake, start + chrono::Duration::hours(1)).await;
+        let stall = case.status().await.stalled.unwrap();
+        assert!(stall.evidence.contains("credential controller refused"), "{}", stall.evidence);
     });
 }
 

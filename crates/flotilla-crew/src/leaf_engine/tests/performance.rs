@@ -45,93 +45,90 @@ fn team_one_request(number: u64) -> flotilla_protocol::Subject {
 
 // #3710: every merged field and empty claim exits remain final. Unchanged
 // evidence is evaluated once; a change of the launch invalidates its cached proof.
-#[hegel::test]
-fn final_settlement_cache_preserves_freshness_and_input_changes(tc: hegel::TestCase) {
-    let field = tc.draw(hegel::generators::integers::<usize>().min_value(0).max_value(4));
-    tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap().block_on(async {
-        for field in [0, 1, 2, 3, 4, field] {
-            let (backend, home) = engine_backend().await;
-            let mut wake = supervision_wake(&backend, &home);
-            let now = Utc::now();
-            let clock = Arc::new(flotilla_store_testkit::VirtualClock::new(now));
-            wake.subscriptions = wake.subscriptions.with_clock(clock.clone());
-            let repo = RepositoryKey("repo".into());
-            let mut spec = convoy_spec();
-            if field != 3 {
-                spec.repositories = vec![ConvoyRepositorySpec::builder()
-                    .url("https://github.com/team/one".into())
-                    .repo_ref(repo.clone())
-                    .source_ref("branch".into())
-                    .target_ref("main".into())
-                    .workspace_slug("repo".into())
-                    .subpaths(vec![])
-                    .build()];
-                spec.change_request = Some(BoundChangeRequest::builder().id("1".into()).repository_ref(repo).title("test".into()).build());
-            }
-            let convoys = backend.using::<Convoy>("flotilla");
-            let exit = if field == 3 {
-                ExitDeclaration::standard_table()
-            } else {
-                ExitDeclaration::Table(indexmap::IndexMap::from([(
-                    "shipped".into(),
-                    flotilla_resources::parse_leaf_template(match field {
-                        0 => "$cr.state == merged",
-                        1 => "$cr.ready == true",
-                        2 => "$cr.checks == pass",
-                        _ => "$cr.review.actionable-at-head == false",
-                    })
-                    .unwrap(),
-                )]))
-            };
-            let cached = landing_launch(&backend, &home, "cached", spec, exit).await;
-            if field != 3 {
-                let records = backend.using::<ChangeRequest>("flotilla");
-                let name = cr_name("github.com", "team/one", 1);
-                let created = records
-                    .create(
-                        &InputMeta::builder().name(name.clone()).build(),
-                        &flotilla_resources::ChangeRequestSpec::builder()
-                            .service("github.com".into())
-                            .scope("team/one".into())
-                            .number(1)
-                            .observing_authority("test-host".into())
-                            .build(),
-                    )
-                    .await
-                    .unwrap();
-                records
-                    .update_status(
-                        &name,
-                        &created.metadata.resource_version,
-                        &observed_request(flotilla_resources::ObservedChangeRequestState::Merged, now),
-                    )
-                    .await
-                    .unwrap();
-            }
-            assert!(sync_snapshot(&backend, &wake).await);
-            let cell = wake.views("flotilla").await.unwrap();
-            let calls = || cell.get().unwrap().settlement_evaluations.load(Ordering::Relaxed);
-            assert_eq!(calls(), 1);
-            // Arming demand records the convoy link in the CR spec. Observe
-            // that legitimate revision change before checking steady state.
-            assert!(sync_snapshot(&backend, &wake).await);
-            let before = calls();
-            assert!(sync_snapshot(&backend, &wake).await);
-            assert_eq!(calls(), before);
-            clock.advance(chrono::Duration::seconds(181));
-            assert!(sync_snapshot(&backend, &wake).await);
-            assert_eq!(calls(), before);
-            // The launch changes: an operator links another change request and unlinks it. Its
-            // exit is fixed at admission, so the settlement stays final, evaluated once again.
-            let other = team_one_request(2);
-            let current = convoys.get(&cached).await.unwrap();
-            home.engine().link(&current, &other, SubjectDiscoverySource::Operator, "operator").await.unwrap();
-            let current = convoys.get(&cached).await.unwrap();
-            home.engine().unlink(&current, &other, "operator").await.unwrap();
-            assert!(sync_snapshot(&backend, &wake).await);
-            assert_eq!(calls(), before + 1);
+#[tokio::test]
+async fn final_settlement_cache_preserves_freshness_and_input_changes() {
+    for field in 0..=4 {
+        let (backend, home) = engine_backend().await;
+        let mut wake = supervision_wake(&backend, &home);
+        let now = Utc::now();
+        let clock = Arc::new(flotilla_store_testkit::VirtualClock::new(now));
+        wake.subscriptions = wake.subscriptions.with_clock(clock.clone());
+        let repo = RepositoryKey("repo".into());
+        let mut spec = convoy_spec();
+        if field != 3 {
+            spec.repositories = vec![ConvoyRepositorySpec::builder()
+                .url("https://github.com/team/one".into())
+                .repo_ref(repo.clone())
+                .source_ref("branch".into())
+                .target_ref("main".into())
+                .workspace_slug("repo".into())
+                .subpaths(vec![])
+                .build()];
+            spec.change_request = Some(BoundChangeRequest::builder().id("1".into()).repository_ref(repo).title("test".into()).build());
         }
-    });
+        let convoys = backend.using::<Convoy>("flotilla");
+        let exit = if field == 3 {
+            ExitDeclaration::standard_table()
+        } else {
+            ExitDeclaration::Table(indexmap::IndexMap::from([(
+                "shipped".into(),
+                flotilla_resources::parse_leaf_template(match field {
+                    0 => "$cr.state == merged",
+                    1 => "$cr.ready == true",
+                    2 => "$cr.checks == pass",
+                    _ => "$cr.review.actionable-at-head == false",
+                })
+                .unwrap(),
+            )]))
+        };
+        let cached = landing_launch(&backend, &home, "cached", spec, exit).await;
+        if field != 3 {
+            let records = backend.using::<ChangeRequest>("flotilla");
+            let name = cr_name("github.com", "team/one", 1);
+            let created = records
+                .create(
+                    &InputMeta::builder().name(name.clone()).build(),
+                    &flotilla_resources::ChangeRequestSpec::builder()
+                        .service("github.com".into())
+                        .scope("team/one".into())
+                        .number(1)
+                        .observing_authority("test-host".into())
+                        .build(),
+                )
+                .await
+                .unwrap();
+            records
+                .update_status(
+                    &name,
+                    &created.metadata.resource_version,
+                    &observed_request(flotilla_resources::ObservedChangeRequestState::Merged, now),
+                )
+                .await
+                .unwrap();
+        }
+        assert!(sync_snapshot(&backend, &wake).await);
+        let cell = wake.views("flotilla").await.unwrap();
+        let calls = || cell.get().unwrap().settlement_evaluations.load(Ordering::Relaxed);
+        assert_eq!(calls(), 1);
+        // Arming demand records the convoy link in the CR spec. Observe
+        // that legitimate revision change before checking steady state.
+        assert!(sync_snapshot(&backend, &wake).await);
+        let before = calls();
+        assert!(sync_snapshot(&backend, &wake).await);
+        assert_eq!(calls(), before);
+        clock.advance(chrono::Duration::seconds(181));
+        assert!(sync_snapshot(&backend, &wake).await);
+        assert_eq!(calls(), before);
+        // The launch changes: an operator links another change request and unlinks it. Its
+        // exit is fixed at admission, so the settlement stays final, evaluated once again.
+        let other = team_one_request(2);
+        let current = convoys.get(&cached).await.unwrap();
+        home.engine().link(&current, &other, SubjectDiscoverySource::Operator, "operator").await.unwrap();
+        let current = convoys.get(&cached).await.unwrap();
+        home.engine().unlink(&current, &other, "operator").await.unwrap();
+        assert!(sync_snapshot(&backend, &wake).await);
+        assert_eq!(calls(), before + 1);
+    }
 }
 
 // One stale episode consults the observer schedule only once. Lag evidence is
