@@ -185,7 +185,6 @@ async fn every_registered_kind_is_served_by_the_engine_or_refused() {
                 }),
             },
             CommandAction::ResourceStatusPatch {
-                expected_resource_version: None,
                 namespace: "flotilla".into(),
                 kind: kind.clone(),
                 name: name.clone(),
@@ -224,7 +223,6 @@ async fn the_resource_commands_refuse_writes_through_another_namespace() {
     };
     refused(daemon.execute(apply).await);
     let patch = CommandAction::ResourceStatusPatch {
-        expected_resource_version: None,
         namespace: "elsewhere".into(),
         kind: "AccessDelivery".into(),
         name: "access-a".into(),

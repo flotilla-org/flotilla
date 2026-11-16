@@ -84,16 +84,6 @@ pub trait ResourceIntentPublisher: Send + Sync {
     ) -> Result<(flotilla_protocol::ResourceRef, Option<String>), String> {
         Ok((self.publish(namespace, document).await?, None))
     }
-    async fn patch_status(
-        self: Arc<Self>,
-        _namespace: &str,
-        _kind: &str,
-        _name: &str,
-        _status: serde_json::Value,
-        _expected_resource_version: &str,
-    ) -> Result<(), String> {
-        Err("resource status mutation router unavailable".into())
-    }
 }
 
 #[async_trait]

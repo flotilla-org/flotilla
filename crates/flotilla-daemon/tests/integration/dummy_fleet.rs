@@ -792,7 +792,6 @@ where
     patch.apply(&mut status);
     let patched = fleet
         .execute(CommandAction::ResourceStatusPatch {
-            expected_resource_version: None,
             namespace: NAMESPACE.into(),
             kind: T::API_PATHS.kind.into(),
             name: name.into(),

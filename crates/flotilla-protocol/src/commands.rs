@@ -1291,8 +1291,6 @@ pub enum CommandAction {
         body: String,
     },
     ResourceStatusPatch {
-        #[serde(default, skip_serializing_if = "Option::is_none")]
-        expected_resource_version: Option<String>,
         namespace: String,
         kind: String,
         name: String,
@@ -1951,7 +1949,6 @@ mod tests {
                 .build(),
             Command::builder()
                 .action(CommandAction::ResourceStatusPatch {
-                    expected_resource_version: None,
                     namespace: "flotilla".into(),
                     kind: "usages".into(),
                     name: "usage-account".into(),

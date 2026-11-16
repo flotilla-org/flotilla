@@ -507,26 +507,7 @@ pub async fn patch_resource_status(
     name: &str,
     status: Value,
 ) -> Result<DynamicResourceObject, ResourceError> {
-    dispatch_resource_kind!(
-        lookup_resource_kind(requested_kind)?.resource,
-        patch_status_typed(backend, namespace, name, status, None).await
-    )
-}
-
-/// Replace status only while the caller's observed version is still current.
-/// A stale replica must not overwrite receiver-side submission evidence.
-pub async fn patch_resource_status_if_version(
-    backend: &ResourceBackend,
-    namespace: &str,
-    requested_kind: &str,
-    name: &str,
-    status: Value,
-    expected_resource_version: &str,
-) -> Result<DynamicResourceObject, ResourceError> {
-    dispatch_resource_kind!(
-        lookup_resource_kind(requested_kind)?.resource,
-        patch_status_typed(backend, namespace, name, status, Some(expected_resource_version)).await
-    )
+    dispatch_resource_kind!(lookup_resource_kind(requested_kind)?.resource, patch_status_typed(backend, namespace, name, status).await)
 }
 
 pub async fn watch_resource_kind(
@@ -1135,7 +1116,6 @@ async fn patch_status_typed<T: Resource>(
     namespace: &str,
     name: &str,
     status: Value,
-    expected_resource_version: Option<&str>,
 ) -> Result<DynamicResourceObject, ResourceError> {
     validate_observation_decisions::<T>(&status)?;
     let status = serde_json::from_value::<T::Status>(status)
@@ -1146,9 +1126,6 @@ async fn patch_status_typed<T: Resource>(
             Err(ResourceError::NotFound { .. }) => return Err(resolver.not_held_here(name, "write").await?),
             current => current?,
         };
-        if expected_resource_version.is_some_and(|expected| expected != current.metadata.resource_version) {
-            return Err(ResourceError::conflict(name, "guarded status patch refused: status changed since the caller's observation"));
-        }
         match resolver.update_status(name, &current.metadata.resource_version, &status).await {
             Ok(object) => {
                 return Ok(DynamicResourceObject {
@@ -1158,13 +1135,7 @@ async fn patch_status_typed<T: Resource>(
                     value: object_value(&object)?,
                 });
             }
-            Err(ResourceError::Conflict { .. }) if expected_resource_version.is_none() => continue,
-            Err(error @ ResourceError::Conflict { .. }) => {
-                return Err(ResourceError::conflict(
-                    name,
-                    format!("guarded status patch refused: status changed during the update; {error}"),
-                ));
-            }
+            Err(ResourceError::Conflict { .. }) => continue,
             Err(error) => return Err(error),
         }
     }

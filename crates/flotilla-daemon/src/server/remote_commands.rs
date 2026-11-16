@@ -259,30 +259,6 @@ impl flotilla_crew::leaf_engine::ResourceIntentPublisher for RemoteCommandRouter
             value => Err(format!("unexpected resource intent admission result: {value:?}")),
         }
     }
-    async fn patch_status(
-        self: Arc<Self>,
-        namespace: &str,
-        kind: &str,
-        name: &str,
-        status: serde_json::Value,
-        expected_resource_version: &str,
-    ) -> Result<(), String> {
-        let router = RemoteCommandRouter { inner: self };
-        let command = Command::builder()
-            .action(CommandAction::ResourceStatusPatch {
-                namespace: namespace.into(),
-                kind: kind.into(),
-                name: name.into(),
-                status,
-                expected_resource_version: Some(expected_resource_version.into()),
-            })
-            .build();
-        match off_frame(|| router.dispatch_and_wait(command, uuid::Uuid::nil())).await? {
-            CommandValue::ResourceObject(_) => Ok(()),
-            CommandValue::Error { message } => Err(message),
-            value => Err(format!("unexpected resource status mutation result: {value:?}")),
-        }
-    }
 }
 
 impl RemoteCommandRouter {

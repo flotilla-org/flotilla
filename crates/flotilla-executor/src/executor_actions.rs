@@ -182,15 +182,9 @@ impl ExecutorActions<'_> {
     }
 
     pub async fn execute_action_resource_status_patch(&self, id: u64, command: &Command) -> Result<u64, String> {
-        if let CommandAction::ResourceStatusPatch { namespace, kind, name, status, expected_resource_version } = &command.action {
+        if let CommandAction::ResourceStatusPatch { namespace, kind, name, status } = &command.action {
             let empty_identity = self.events.start(id, command.description().to_string());
-            let patched = match expected_resource_version {
-                Some(expected) => {
-                    flotilla_store::patch_resource_status_if_version(self.resource_backend, namespace, kind, name, status.clone(), expected)
-                        .await
-                }
-                None => flotilla_store::patch_resource_status(self.resource_backend, namespace, kind, name, status.clone()).await,
-            };
+            let patched = flotilla_store::patch_resource_status(self.resource_backend, namespace, kind, name, status.clone()).await;
             let result = match patched {
                 Ok(patched) => CommandValue::ResourceObject(Box::new(ResourceJsonResponse {
                     kind: patched.kind,

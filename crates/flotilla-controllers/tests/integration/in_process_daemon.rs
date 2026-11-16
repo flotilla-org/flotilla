@@ -1609,7 +1609,6 @@ async fn deleting_a_replica_from_another_host_refuses_with_its_origin() {
 
     for action in [
         CommandAction::ResourceStatusPatch {
-            expected_resource_version: None,
             namespace: "flotilla".to_string(),
             kind: "artifacts".to_string(),
             name: "remote-artifact".to_string(),
@@ -9619,12 +9618,11 @@ async fn message_apply_uses_document_namespace_and_status_patches_are_refused() 
                     kind: "Message".into(),
                     name: "namespace-message".into(),
                     status: serde_json::to_value(&observed.status).expect("status"),
-                    expected_resource_version: Some(observed.metadata.resource_version.clone()),
                 })
                 .build(),
         )
         .await
-        .expect("guarded status command");
+        .expect("status command");
     let result = recv_command_finished(&mut events, id).await;
     assert!(
         matches!(&result, CommandValue::Error { message } if message.contains("moves only through delivery and receipts")),
