@@ -5,7 +5,7 @@
 use std::{
     collections::BTreeMap,
     sync::{
-        atomic::{AtomicUsize, Ordering},
+        atomic::{AtomicBool, AtomicUsize, Ordering},
         Arc, Condvar, Mutex,
     },
     time::Duration,
@@ -160,16 +160,20 @@ impl Gate {
 }
 
 /// A cursor that passes the changes a test writes into it, each once, each moving it on, after
-/// its gate.
+/// its gate; while failing is set, its next pass fails instead and clears it.
 struct Written {
     changes: Arc<Mutex<Vec<ConvoyChange>>>,
     passed: u64,
     gate: Arc<Gate>,
+    failing: Arc<AtomicBool>,
 }
 
 impl ChangeCursor<ConvoyChange> for Written {
     fn pass(&mut self) -> Result<Vec<ConvoyChange>, String> {
         self.gate.pass();
+        if self.failing.swap(false, Ordering::SeqCst) {
+            return Err("the log did not read".into());
+        }
         let changes = std::mem::take(&mut *self.changes.lock().expect("written changes"));
         self.passed += changes.len() as u64;
         Ok(changes)
@@ -191,6 +195,8 @@ struct Convoys {
     written: Arc<Mutex<Vec<ConvoyChange>>>,
     /// Where the cursor waits as it passes.
     passing: Arc<Gate>,
+    /// The cursor's next pass fails.
+    failing: Arc<AtomicBool>,
     /// While closed, a launch's record read waits, after it tells `reading`.
     gate: (Mutex<bool>, Condvar),
     reading: tokio::sync::Notify,
@@ -205,6 +211,7 @@ impl Convoys {
             listed: AtomicUsize::new(0),
             written: Arc::default(),
             passing: Arc::default(),
+            failing: Arc::default(),
             gate: (Mutex::new(false), Condvar::new()),
             reading: tokio::sync::Notify::new(),
         }
@@ -253,7 +260,12 @@ impl ConvoyRecords for Convoys {
         &self.memory
     }
     fn cursor(&self) -> Option<Box<dyn ChangeCursor<ConvoyChange>>> {
-        Some(Box::new(Written { changes: Arc::clone(&self.written), passed: 0, gate: Arc::clone(&self.passing) }))
+        Some(Box::new(Written {
+            changes: Arc::clone(&self.written),
+            passed: 0,
+            gate: Arc::clone(&self.passing),
+            failing: Arc::clone(&self.failing),
+        }))
     }
 }
 
@@ -574,6 +586,33 @@ async fn a_read_dropped_while_the_cursors_pass_keeps_them() {
     views.get("other#1").await.expect("read");
     views.get("other#1").await.expect("read again");
     assert_eq!(reads.convoys.listed.load(Ordering::SeqCst), listed, "no read lists every launch again");
+}
+
+// Behaviour: a pass that fails is read again in full once, since what it passed is not known, and
+// keeps the cursors: later reads take changes from them instead of listing every launch again.
+#[tokio::test]
+async fn a_failed_pass_keeps_the_cursors() {
+    let reads = Arc::new(Reads {
+        convoys: Convoys::new(vec![launch("fix-it#1", HERE), launch("other#1", HERE)]),
+        terminals: Terminals { records: Vec::new(), observations: TerminalObservations::default() },
+        vessels: Vessels { records: Vec::new() },
+    });
+    let views = ConvoyViews::new("flotilla", reads.clone());
+    views.get("fix-it#1").await.expect("held");
+    let listed = reads.convoys.listed.load(Ordering::SeqCst);
+
+    // The launch's record goes and the next pass fails: the read lists every launch instead.
+    reads.convoys.failing.store(true, Ordering::SeqCst);
+    reads.convoys.records.lock().expect("records").retain(|record| record.name != "fix-it#1");
+    assert!(views.get("fix-it#1").await.is_err(), "the failed pass's read lists the launch gone");
+    assert_eq!(reads.convoys.listed.load(Ordering::SeqCst), listed + 1, "the failed pass's read lists every launch");
+
+    // The other launch's record goes and only the cursor names it.
+    reads.convoys.records.lock().expect("records").clear();
+    reads.convoys.written.lock().expect("written").push(ConvoyChange::Changed { name: "other#1".into(), home: HERE.into() });
+    assert!(views.get("other#1").await.is_err(), "the next read takes the change from the cursor");
+    assert!(views.get("other#1").await.is_err(), "read again");
+    assert_eq!(reads.convoys.listed.load(Ordering::SeqCst), listed + 1, "no later read lists every launch again");
 }
 
 /// The views converted by a read of one launch by name, with `others` unrelated launches held:
