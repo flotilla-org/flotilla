@@ -467,6 +467,7 @@ impl TerminalControllerRuntime {
                         Ok(card) => card,
                         Err(error) => {
                             warn!(session = %name, %error, "failed to construct advisory launch capability card");
+                            self.state.daemon.retry_capability_card(&context.namespace, name);
                             format!("{}\n\nCapabilities are currently unavailable. Run `flotilla crew capabilities` when unsure or after the service recovers.\n", flotilla_agent::adapter::CAPABILITIES_HEADING.trim_start())
                         }
                     };

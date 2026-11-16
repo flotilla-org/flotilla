@@ -4773,6 +4773,12 @@ impl InProcessDaemon {
         *self.crew.capability_source().write().await = Some(source);
     }
 
+    /// Session `name`'s launch could not render its card: the next card refresh of any scope tries
+    /// it again.
+    pub fn retry_capability_card(&self, namespace: &str, name: &str) {
+        self.crew.capability_cards().retry(namespace, name);
+    }
+
     pub async fn observe_launch_capability_card(&self, namespace: &str, name: &str, card: &str) -> Result<(), String> {
         flotilla_crew::crew_capabilities::observe_launch_card(&self.resource_backend, namespace, name, card, self.crew.capability_cards())
             .await

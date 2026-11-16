@@ -337,8 +337,19 @@ impl CapabilityCardTracker {
         self.2.lock().unwrap_or_else(|poisoned| poisoned.into_inner()).get(namespace).cloned().unwrap_or_default()
     }
 
-    fn set_failed(&self, namespace: &str, failed: BTreeSet<String>) {
-        self.2.lock().unwrap_or_else(|poisoned| poisoned.into_inner()).insert(namespace.to_owned(), failed);
+    /// Settles a refresh that tried `retried` again: those it tried leave the set unless `failed`
+    /// names them, and a card that failed since the refresh read the set stays in it.
+    fn settle_failed(&self, namespace: &str, retried: &BTreeSet<String>, failed: BTreeSet<String>) {
+        let mut held = self.2.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+        let set = held.entry(namespace.to_owned()).or_default();
+        set.retain(|session| !retried.contains(session));
+        set.extend(failed);
+    }
+
+    /// Session `session`'s launch could not render its card: the next refresh of any scope tries
+    /// it again.
+    pub fn retry(&self, namespace: &str, session: &str) {
+        self.2.lock().unwrap_or_else(|poisoned| poisoned.into_inner()).entry(namespace.to_owned()).or_default().insert(session.to_owned());
     }
 
     fn primitives(&self) -> Result<Arc<dyn flotilla_messaging::EngineMessages>, ResourceError> {
@@ -662,6 +673,13 @@ pub async fn refresh_cards(
     let mut errors = Vec::new();
     let mut failed = BTreeSet::new();
     for record in &sessions {
+        if record.is_agent() && phase(record).is_none_or(|phase| phase == TerminalSessionPhase::Starting) {
+            // A card to try again stays to try once its session runs.
+            if retried.contains(record.session_name()) {
+                failed.insert(record.session_name().to_owned());
+            }
+            continue;
+        }
         if !record.is_agent() || phase(record) != Some(TerminalSessionPhase::Running) {
             continue;
         }
@@ -673,7 +691,7 @@ pub async fn refresh_cards(
         }
     }
     // A failed card is tried again at the next refresh, whatever it names; one that ended is not.
-    tracker.set_failed(namespace, failed);
+    tracker.settle_failed(namespace, &retried, failed);
     if errors.is_empty() {
         Ok(())
     } else {

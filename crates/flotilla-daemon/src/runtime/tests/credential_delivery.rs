@@ -1244,6 +1244,34 @@ async fn a_built_image_reaches_a_running_sessions_card_with_no_other_event() {
     cards.card_naming(0, "Verified tools and runtimes: tool:verified.").await;
 }
 
+// Behaviour: a launch whose card could not be rendered gets its card at the next credential pass,
+// whatever woke it: here a binding of the other convoy's crew.
+#[tokio::test]
+async fn a_launch_whose_card_failed_gets_it_at_the_next_pass() {
+    let cards = RunningCards::start().await;
+    cards.source.settled("cards-session-1", 1).await;
+    // What a launch does when its card does not render: it marks the card to try again, and
+    // observes the advisory card its brief carries.
+    cards.daemon.retry_capability_card(NAMESPACE, "cards-session-0");
+    cards
+        .daemon
+        .observe_launch_capability_card(NAMESPACE, "cards-session-0", "Capabilities are currently unavailable.")
+        .await
+        .expect("the launch observes its card");
+    let read = cards.source.settled("cards-session-0", 0).await;
+
+    bind_account(&cards.daemon, &cards.convoys[1], "coder", "claude-max", "a@example.com").await;
+
+    tokio::time::timeout(Duration::from_secs(10), async {
+        while cards.source.readings("cards-session-0") == read {
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+    })
+    .await
+    .expect("the failed launch's card is read at the next pass");
+    cards.card_naming(0, "credential `claude-max` (account a@example.com)").await;
+}
+
 // Behaviour: a convoy's change after admission refreshes no card, and reads no card's convoy: what
 // a card reads of its convoy is frozen at admission. The change here is a subject linked through
 // the Convoy path, after the crew's launch rendered its card.
