@@ -16,6 +16,7 @@ pub mod awaiting;
 pub mod convert;
 pub mod keyed_reads;
 pub mod ports;
+mod principal_roles;
 pub mod records;
 pub mod roles;
 pub mod sweep;
@@ -399,6 +400,8 @@ pub struct MessagePrimitives {
     conditions: Arc<dyn ports::ConditionReads>,
     /// The observers' freshness windows the conditions judge by, once installed.
     observation_staleness: Arc<std::sync::OnceLock<(std::time::Duration, std::time::Duration)>>,
+    /// The person roles' inboxes under each declared project, followed from the Projects' changes.
+    principal_roles: principal_roles::PrincipalRoles,
     home_reads: std::sync::OnceLock<Arc<dyn ports::HomeReads>>,
     /// The records messages name, each read by its key; the ports read through them too.
     keyed: Arc<keyed_reads::KeyedReads>,
@@ -489,6 +492,7 @@ impl MessagePrimitives {
                 clock: Arc::clone(&clock),
             }),
             observation_staleness,
+            principal_roles: principal_roles::PrincipalRoles::default(),
             home_reads: std::sync::OnceLock::new(),
             keyed,
             attention_changes,
@@ -904,30 +908,12 @@ impl MessagePrimitives {
     /// under the fleet and under every declared project, and each role a
     /// project's charter declares a principal holds. A convoy with no project
     /// is addressed under its namespace, so the namespace counts as one. The
-    /// person consumer is bound to all of them.
+    /// person consumer is bound to all of them. The projects' inboxes are held,
+    /// followed from the Projects' changes: no Project is listed.
     pub async fn person_inboxes(&self, namespace: &str) -> Result<BTreeSet<Address>, String> {
         let roles = self.roles(namespace).await?;
-        // Only the projects' charters name person roles: no other record is read.
-        let declared: Vec<ResourceObject<Project>> =
-            self.backend()?.definitions::<Project>(namespace).list().await.map_err(|error| error.to_string())?;
-        let records = OldStoreRecords::from_records(namespace, Vec::new(), Vec::new(), Vec::new(), Vec::new(), Vec::new(), declared);
         let mut inboxes: BTreeSet<Address> = roles::PERSON_ROLES.iter().filter_map(|role| roles.person(role.name)).collect();
-        let projects: BTreeSet<&str> = records.projects().chain([namespace]).collect();
-        for project in projects {
-            let Ok(address) = Address::project(project) else {
-                tracing::debug!(%project, "a project with no address has no person inboxes");
-                continue;
-            };
-            let declared = records.principal_backed(project).map(|(role, _)| role);
-            for role in roles::PERSON_ROLES.iter().map(|role| role.name).chain(declared) {
-                match address.child(AddressKind::Role, role) {
-                    Ok(inbox) => {
-                        inboxes.insert(inbox);
-                    }
-                    Err(error) => tracing::debug!(%project, %role, %error, "a person role with no address"),
-                }
-            }
-        }
+        inboxes.extend(self.principal_roles.inboxes(&self.backend()?, namespace).await.map_err(|error| error.to_string())?);
         Ok(inboxes)
     }
 
@@ -2382,11 +2368,6 @@ impl OldStoreRecords {
             read: Wanted::default(),
             asked: Mutex::default(),
         }
-    }
-
-    /// Every project declared in this namespace, by name.
-    pub fn projects(&self) -> impl Iterator<Item = &str> {
-        self.projects.keys().map(String::as_str)
     }
 
     /// The roles `project`'s own charter declares a principal holds, with
