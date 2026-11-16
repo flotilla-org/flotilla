@@ -382,22 +382,12 @@ fn row(value: &Value, table: &Table) -> Row {
         })
         .collect()
 }
-fn snapshot_sequence(document: &Value) -> Result<u64, String> {
-    document
-        .pointer("/metadata/resourceVersion")
-        .and_then(Value::as_str)
-        .ok_or("missing snapshot position")?
-        .parse()
-        .map_err(|_| "non-numeric snapshot position".into())
-}
-
 /// A complete source snapshot. The carrier never sees backend ids or watch tokens.
 #[derive(Clone)]
 pub(crate) struct Snapshot {
     pub rows: Vec<Row>,
     pub sequence: u64,
     pub incarnation: String,
-    start: WatchStart,
 }
 /// Tables computed from code rather than stored, such as `verbs` (#4197): a description and
 /// every row of each table, in the set's table order, fixed for the daemon's life.
@@ -515,11 +505,6 @@ impl TableSource {
             Self::Query(source) => source.name(),
         }
     }
-    /// Whether this is a resource kind's table the engine serves.
-    fn engine_served(&self) -> bool {
-        let Self::Resource { backend, name, .. } = self else { return false };
-        resource_tables().find(|kind| kind.plural == *name).is_some_and(|kind| backend.engine_serves(kind.kind))
-    }
     pub(crate) async fn describe(&self) -> Result<Description, Failure> {
         match self {
             Self::Resource { name, .. } => {
@@ -620,61 +605,39 @@ impl TableSource {
                 let queryable = declared.map_or(&[][..], |entry| entry.queryable_fields);
                 let filter = filter::pushdown(query.filter.as_ref(), &query.fields, queryable);
                 let document = query_resource_kind(backend, &query.namespace, name, &filter).await.map_err(source_failure)?;
-                if self.engine_served() {
-                    // The engine's listing carries no position, so a resume cannot be honoured: the
-                    // sequence counts this subscription's reads, and the incarnation names the
-                    // subscription, so another one's cursor gets a fresh snapshot.
-                    return Ok(Snapshot {
-                        rows: resource_rows(&document, table)?.into_iter().filter(|row| query.keeps(row)).collect(),
-                        sequence: reads.fetch_add(1, AtomicOrdering::Relaxed) + 1,
-                        incarnation: subscription.clone(),
-                        start: WatchStart::Now,
-                    });
-                }
-                let sequence = snapshot_sequence(&document)?;
-                let generation = document.pointer("/metadata/generation").and_then(Value::as_str).map(str::to_owned);
-                let start = generation.clone().map_or_else(
-                    || WatchStart::FromVersion(sequence.to_string()),
-                    |generation| WatchStart::FromVersionInGeneration { generation, resource_version: sequence.to_string() },
-                );
+                // The engine's listing carries no position, so a resume cannot be honoured: the
+                // sequence counts this subscription's reads, and the incarnation names the
+                // subscription, so another one's cursor gets a fresh snapshot.
                 Ok(Snapshot {
                     rows: resource_rows(&document, table)?.into_iter().filter(|row| query.keeps(row)).collect(),
-                    sequence,
-                    incarnation: generation.unwrap_or_else(|| "durable".into()),
-                    start,
+                    sequence: reads.fetch_add(1, AtomicOrdering::Relaxed) + 1,
+                    incarnation: subscription.clone(),
                 })
             }
             Self::Decided { service, name } => {
                 let (sequence, _, rows) = decided::read(service, name, query).await?;
-                Ok(Snapshot { rows, sequence, incarnation: "durable".into(), start: WatchStart::Now })
+                Ok(Snapshot { rows, sequence, incarnation: "durable".into() })
             }
             Self::Derived { derived, name, incarnation } => {
                 let rows =
                     derived.rows[derived.table(name).expect("opened table")].iter().filter(|row| query.keeps(row)).cloned().collect();
                 // Derived rows change only with the daemon, so one snapshot serves its life. A catalog
                 // that reloads (verbs from `verbs/*.yaml`, #4198) needs events here.
-                Ok(Snapshot { rows, sequence: 1, incarnation: incarnation.clone(), start: WatchStart::Now })
+                Ok(Snapshot { rows, sequence: 1, incarnation: incarnation.clone() })
             }
             Self::Query(source) => {
                 let (rows, sequence, incarnation) = source.rows().await?;
-                Ok(Snapshot {
-                    rows: rows.into_iter().filter(|row| query.keeps(row)).collect(),
-                    sequence,
-                    incarnation,
-                    start: WatchStart::Now,
-                })
+                Ok(Snapshot { rows: rows.into_iter().filter(|row| query.keeps(row)).collect(), sequence, incarnation })
             }
         }
     }
-    /// A snapshot and the events that follow it. An engine-served kind's events cannot resume from
-    /// a snapshot, so they are opened before it: a change committed during the read wakes a read.
+    /// A snapshot and the events that follow it. A resource kind's events cannot resume from a
+    /// snapshot, so they are opened before it: a change committed during the read wakes a read.
     async fn watched(&self, table: &Table, query: &Query) -> Result<(Snapshot, BoxStream<'static, Result<(), String>>), Failure> {
         if let Self::Resource { backend, name, .. } = self {
-            if self.engine_served() {
-                let watch = watch_resource_kind_from(backend, &query.namespace, name, WatchStart::Now).await.map_err(source_failure)?;
-                let snapshot = self.snapshot(table, query).await?;
-                return Ok((snapshot, self.resource_events(query, WatchStart::Now, Some(watch.stream))));
-            }
+            let watch = watch_resource_kind_from(backend, &query.namespace, name, WatchStart::Now).await.map_err(source_failure)?;
+            let snapshot = self.snapshot(table, query).await?;
+            return Ok((snapshot, self.resource_events(query, watch.stream)));
         }
         let snapshot = self.snapshot(table, query).await?;
         let events = self.events(query, &snapshot);
@@ -683,20 +646,20 @@ impl TableSource {
     fn resource_events(
         &self,
         query: &Query,
-        start: WatchStart,
-        opened: Option<BoxStream<'static, Result<Value, flotilla_resources::ResourceError>>>,
+        opened: BoxStream<'static, Result<Value, flotilla_resources::ResourceError>>,
     ) -> BoxStream<'static, Result<(), String>> {
         let Self::Resource { backend, name, .. } = self else { unreachable!("a resource table's events") };
         let (backend, name, namespace) = (backend.clone(), name.clone(), query.namespace.clone());
-        let opener: Opener = Box::new(move |start| {
+        let opener: Opener = Box::new(move || {
             let (backend, name, namespace) = (backend.clone(), name.clone(), namespace.clone());
-            Box::pin(async move { watch_resource_kind_from(&backend, &namespace, &name, start).await })
+            Box::pin(async move { watch_resource_kind_from(&backend, &namespace, &name, WatchStart::Now).await })
         });
-        resource_events(opener, start, opened, !self.engine_served()).boxed()
+        resource_events(opener, opened).boxed()
     }
+    /// The events of a source whose snapshot comes first; a resource table's open in `watched`.
     fn events(&self, query: &Query, snapshot: &Snapshot) -> BoxStream<'static, Result<(), String>> {
         match self {
-            Self::Resource { .. } => self.resource_events(query, snapshot.start.clone(), None),
+            Self::Resource { .. } => unreachable!("a resource table's events open before its snapshot"),
             Self::Decided { service, .. } => {
                 // The store's commit wake: each commit moving the table's home wakes a read of its
                 // sequence. The first read covers commits between the snapshot and the listener.
@@ -974,67 +937,40 @@ fn diff(previous: &Snapshot, next: &Snapshot, query: &Query) -> Result<Vec<Messa
     Ok(messages)
 }
 type WatchReply = Result<flotilla_store::DynamicResourceWatch, flotilla_resources::ResourceError>;
-type Opener = Box<dyn FnMut(WatchStart) -> futures::future::BoxFuture<'static, WatchReply> + Send>;
-/// A resource kind's change events, from `opened` when the watch is already open. A watch that is
-/// not `resumable` reopens from now and wakes a read, which covers whatever the gap held.
+type Opener = Box<dyn FnMut() -> futures::future::BoxFuture<'static, WatchReply> + Send>;
+/// A resource kind's change events, from the already `opened` watch. A failed watch reopens from
+/// now and wakes a read, which covers whatever the gap held.
 fn resource_events(
     opener: Opener,
-    start: WatchStart,
-    opened: Option<BoxStream<'static, Result<Value, flotilla_resources::ResourceError>>>,
-    resumable: bool,
+    opened: BoxStream<'static, Result<Value, flotilla_resources::ResourceError>>,
 ) -> impl futures::Stream<Item = Result<(), String>> + Send {
-    futures::stream::unfold(
-        (opener, start, opened, 0u8, false),
-        move |(mut opener, mut start, mut stream, mut failures, mut done)| async move {
-            if done {
-                return None;
-            }
-            loop {
-                if stream.is_none() {
-                    match opener(start.clone()).await {
-                        Ok(watch) => stream = Some(watch.stream),
-                        Err(error) => return Some((Err(error.to_string()), (opener, start, stream, failures, true))),
-                    }
-                    if !resumable && failures > 0 {
-                        return Some((Ok(()), (opener, start, stream, failures, false)));
-                    }
+    futures::stream::unfold((opener, Some(opened), 0u8, false), move |(mut opener, mut stream, mut failures, mut done)| async move {
+        if done {
+            return None;
+        }
+        loop {
+            if stream.is_none() {
+                match opener().await {
+                    Ok(watch) => stream = Some(watch.stream),
+                    Err(error) => return Some((Err(error.to_string()), (opener, stream, failures, true))),
                 }
-                match stream.as_mut().expect("opened").next().await {
-                    Some(Ok(_)) if !resumable => return Some((Ok(()), (opener, start, stream, 0, false))),
-                    Some(Ok(event)) => {
-                        if let Some(version) = event["object"].pointer("/metadata/resourceVersion").and_then(Value::as_str) {
-                            let previous = match &start {
-                                WatchStart::FromVersion(value) | WatchStart::FromVersionInGeneration { resource_version: value, .. } => {
-                                    value.parse::<u64>().ok()
-                                }
-                                WatchStart::Now => None,
-                            };
-                            if version.parse::<u64>().ok().zip(previous).is_some_and(|(value, previous)| value <= previous) {
-                                continue;
-                            }
-                            start = match &start {
-                                WatchStart::FromVersionInGeneration { generation, .. } => {
-                                    WatchStart::FromVersionInGeneration { generation: generation.clone(), resource_version: version.into() }
-                                }
-                                _ => WatchStart::FromVersion(version.into()),
-                            };
-                        }
-                        return Some((Ok(()), (opener, start, stream, 0, false)));
-                    }
-                    Some(Err(error)) => {
-                        failures += 1;
-                        if failures >= 3 {
-                            done = true;
-                            return Some((Err(error.to_string()), (opener, start, stream, failures, done)));
-                        }
-                        tokio::time::sleep(Duration::from_millis(100)).await;
-                        stream = None;
-                    }
-                    None => return Some((Err("table watch ended".into()), (opener, start, stream, failures, true))),
-                }
+                return Some((Ok(()), (opener, stream, failures, false)));
             }
-        },
-    )
+            match stream.as_mut().expect("opened").next().await {
+                Some(Ok(_)) => return Some((Ok(()), (opener, stream, 0, false))),
+                Some(Err(error)) => {
+                    failures += 1;
+                    if failures >= 3 {
+                        done = true;
+                        return Some((Err(error.to_string()), (opener, stream, failures, done)));
+                    }
+                    tokio::time::sleep(Duration::from_millis(100)).await;
+                    stream = None;
+                }
+                None => return Some((Err("table watch ended".into()), (opener, stream, failures, true))),
+            }
+        }
+    })
 }
 #[cfg(test)]
 pub(crate) fn test_ordering() {
@@ -1078,80 +1014,57 @@ mod properties {
         }
     }
 
+    fn watch_of(stream: BoxStream<'static, Result<Value, flotilla_resources::ResourceError>>) -> flotilla_store::DynamicResourceWatch {
+        flotilla_store::DynamicResourceWatch::builder()
+            .kind("Convoy".into())
+            .plural("convoys".into())
+            .namespace("test".into())
+            .resource_version("0".into())
+            .initial(vec![])
+            .stream(stream)
+            .build()
+    }
+
+    // A lost feed cannot resume, so the reopened watch's first item is a wake: the read it
+    // starts covers whatever the gap held.
     #[tokio::test(start_paused = true)]
-    async fn resource_feed_reopens_after_the_last_delivered_position() {
-        let attempts = Arc::new(std::sync::Mutex::new(Vec::new()));
-        let observed = attempts.clone();
-        let opener: Opener = Box::new(move |start| {
-            let attempt = {
-                let mut attempts = observed.lock().unwrap();
-                attempts.push(start);
-                attempts.len()
-            };
-            Box::pin(async move {
-                let stream: BoxStream<'static, Result<Value, flotilla_resources::ResourceError>> = if attempt == 1 {
-                    futures::stream::iter(vec![
-                        Ok(json!({"object":{"metadata":{"resourceVersion":"1"}}})),
-                        Err(flotilla_resources::ResourceError::other("lost feed")),
-                    ])
-                    .boxed()
-                } else {
-                    futures::stream::once(async { Ok(json!({"object":{"metadata":{"resourceVersion":"2"}}})) })
-                        .chain(futures::stream::pending())
-                        .boxed()
-                };
-                Ok(flotilla_store::DynamicResourceWatch::builder()
-                    .kind("Convoy".into())
-                    .plural("convoys".into())
-                    .namespace("test".into())
-                    .resource_version("0".into())
-                    .initial(vec![])
-                    .stream(stream)
-                    .build())
+    async fn a_lost_resource_feed_reopens_from_now_and_wakes_a_read() {
+        use std::sync::atomic::AtomicUsize;
+        let opens = Arc::new(AtomicUsize::new(0));
+        let observed = opens.clone();
+        let opener: Opener = Box::new(move || {
+            observed.fetch_add(1, AtomicOrdering::SeqCst);
+            Box::pin(async {
+                Ok(watch_of(futures::stream::once(async { Ok(json!({"type":"MODIFIED"})) }).chain(futures::stream::pending()).boxed()))
             })
         });
-        let events = resource_events(
-            opener,
-            WatchStart::FromVersionInGeneration { generation: "same".into(), resource_version: "0".into() },
-            None,
-            true,
-        );
+        let opened = futures::stream::iter(vec![Ok(json!({"type":"ADDED"})), Err(flotilla_resources::ResourceError::other("lost feed"))]);
+        let events = resource_events(opener, opened.boxed());
         futures::pin_mut!(events);
-        assert!(events.next().await.unwrap().is_ok());
-        assert!(events.next().await.unwrap().is_ok());
-        assert!(
-            matches!(&attempts.lock().unwrap()[1],WatchStart::FromVersionInGeneration{generation,resource_version}if generation=="same"&&resource_version=="1")
-        );
+        for _ in 0..3 {
+            assert!(events.next().await.unwrap().is_ok());
+        }
+        assert_eq!(opens.load(AtomicOrdering::SeqCst), 1);
     }
 
     // The watch opener stands in for the store subscription boundary. Even if every
     // open succeeds and its stream immediately fails, retries are delayed and bounded.
     #[tokio::test(start_paused = true)]
     async fn immediately_failing_reopened_watches_stop_after_three_attempts() {
-        use std::sync::{
-            atomic::{AtomicUsize, Ordering as AtomicOrdering},
-            Arc,
-        };
+        use std::sync::atomic::AtomicUsize;
         let opens = Arc::new(AtomicUsize::new(0));
         let observed = opens.clone();
-        let opener: Opener = Box::new(move |_| {
+        let broken = || futures::stream::once(async { Err(flotilla_resources::ResourceError::other("broken watch")) }).boxed();
+        let opener: Opener = Box::new(move || {
             observed.fetch_add(1, AtomicOrdering::SeqCst);
-            Box::pin(async {
-                Ok(flotilla_store::DynamicResourceWatch::builder()
-                    .kind("Convoy".into())
-                    .plural("convoys".into())
-                    .namespace("test".into())
-                    .resource_version("0".into())
-                    .initial(vec![])
-                    .stream(futures::stream::once(async { Err(flotilla_resources::ResourceError::other("broken watch")) }).boxed())
-                    .build())
-            })
+            Box::pin(async move { Ok(watch_of(broken())) })
         });
-        let stream = resource_events(opener, WatchStart::FromVersion("0".into()), None, true);
-        futures::pin_mut!(stream);
+        let stream = resource_events(opener, broken());
         let started = tokio::time::Instant::now();
-        assert!(tokio::time::timeout(Duration::from_secs(1), stream.next()).await.expect("bounded retries").unwrap().is_err());
-        assert_eq!(opens.load(AtomicOrdering::SeqCst), 3);
+        let items: Vec<_> = tokio::time::timeout(Duration::from_secs(1), stream.collect()).await.expect("bounded retries");
+        // Each reopen wakes a read; the third failure ends the stream.
+        assert_eq!(items.iter().map(Result::is_ok).collect::<Vec<_>>(), [true, true, false]);
+        assert_eq!(opens.load(AtomicOrdering::SeqCst), 2, "two reopens after the first watch");
         assert!(started.elapsed() >= Duration::from_millis(200));
     }
 
@@ -1240,7 +1153,7 @@ mod properties {
         let mut seen = Vec::new();
         let mut page_query = query.clone();
         loop {
-            let snapshot = Snapshot { rows: rows.clone(), sequence: 1, incarnation: "same".into(), start: WatchStart::Now };
+            let snapshot = Snapshot { rows: rows.clone(), sequence: 1, incarnation: "same".into() };
             let messages = page("convoys", json!({"fields": []}), &page_query, &snapshot).unwrap();
             let mut cursor = None;
             for message in messages {
@@ -1284,13 +1197,26 @@ mod source_contract_tests {
         let mut kinds = flotilla_schema::KindRegistry::new();
         kinds.register::<FeedSample>().unwrap();
         let service = Arc::new(flotilla_schema_sqlite::stream::Service::open(&directory.path().join("feed.db"), "home", kinds).unwrap());
+        // Convoys are served from the engine, composed with its vessels, as on the daemon.
+        let backend = ResourceBackend::new(flotilla_store_memory::InMemoryBackend::default());
+        let decided = Arc::new(
+            flotilla_schema_sqlite::stream::Service::open(
+                &directory.path().join("decided.sqlite"),
+                "home",
+                flotilla_provisioning::stored::decided_registry().unwrap(),
+            )
+            .unwrap(),
+        );
+        let engine = flotilla_provisioning_testkit::EngineFixture::over_service(&decided);
+        let _convoys = flotilla_engine_convoys_testkit::EngineConvoysHome::over(
+            &decided,
+            "default",
+            &backend,
+            Arc::new(flotilla_resources::SystemClock),
+            engine.reads(),
+        );
         for source in [
-            TableSource::Resource {
-                backend: ResourceBackend::new(flotilla_store_memory::InMemoryBackend::default()),
-                name: "convoys".into(),
-                subscription: "test".into(),
-                reads: Arc::default(),
-            },
+            TableSource::Resource { backend: backend.clone(), name: "convoys".into(), subscription: "test".into(), reads: Arc::default() },
             TableSource::Decided { service: service.clone(), name: "feed_sample".into() },
         ] {
             let description = source.describe().await.unwrap();
@@ -1357,10 +1283,10 @@ mod source_contract_tests {
         let table = descriptor("convoys");
         let query = Query::parse(&[("columns".into(), "spec".into())], &table).unwrap();
         let row = Row::from([(KEY.into(), json!("one")), ("spec".into(), json!({})), ("metadata.labels".into(), json!({"group":"a"}))]);
-        let before = Snapshot { rows: vec![row.clone()], sequence: 1, incarnation: "same".into(), start: WatchStart::Now };
+        let before = Snapshot { rows: vec![row.clone()], sequence: 1, incarnation: "same".into() };
         let mut row = row;
         row.insert("metadata.labels".into(), json!({"group":"b"}));
-        let after = Snapshot { rows: vec![row], sequence: 2, incarnation: "same".into(), start: WatchStart::Now };
+        let after = Snapshot { rows: vec![row], sequence: 2, incarnation: "same".into() };
         assert!(matches!(diff(&before, &after, &query).unwrap().as_slice(), [Message::Progress { sequence: 2 }]));
     }
 }

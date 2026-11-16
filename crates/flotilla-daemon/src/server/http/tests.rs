@@ -17,7 +17,7 @@ use axum::{
 };
 use chrono::{DateTime, Utc};
 use flotilla_protocol::EnvironmentId;
-use flotilla_resources::{Clock, Convoy, ConvoySpec, InputMeta};
+use flotilla_resources::{AccessDelivery, Clock, InputMeta, CONVOY_LABEL};
 use flotilla_store::ResourceBackend;
 use flotilla_store_memory::InMemoryBackend;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
@@ -25,6 +25,7 @@ use tower::ServiceExt;
 
 use super::{
     login::{LOGIN_CODE_LIFETIME, SESSION_LIFETIME, SESSION_LIMIT},
+    table_tests::{delivery, engine_backend_in},
     tcp::{TOKEN_DIRECTORY, TOKEN_FILE},
     CallerAuth, HttpRouter, ListenAddress, ListenerOrigin, LoginStore, TcpListener,
 };
@@ -52,6 +53,8 @@ struct Incarnation {
     logins: Arc<LoginStore>,
     origin: ListenerOrigin,
     router: Router,
+    /// The decided store an engine-served backend reads, when this incarnation opened one.
+    _store: Option<tempfile::TempDir>,
 }
 
 impl Incarnation {
@@ -59,8 +62,10 @@ impl Incarnation {
         Self::with_origin(ListenerOrigin::known(ORIGIN))
     }
 
+    /// Over the engine's home, as the daemon composes its backend (see `engine_backend`).
     fn with_origin(origin: ListenerOrigin) -> Self {
-        Self::over(ResourceBackend::new(InMemoryBackend::default()), origin)
+        let (backend, store) = engine_backend_in("flotilla");
+        Self { _store: Some(store), ..Self::over(backend, origin) }
     }
 
     fn over(backend: ResourceBackend, origin: ListenerOrigin) -> Self {
@@ -68,7 +73,7 @@ impl Incarnation {
         let logins = Arc::new(LoginStore::new(clock.clone()));
         let router =
             HttpRouter::builder().backend(backend.clone()).logins(Arc::clone(&logins)).tcp_origin(origin.clone()).build().into_router();
-        Self { backend, clock, logins, origin, router }
+        Self { backend, clock, logins, origin, router, _store: None }
     }
 
     /// The router as a listener serves it: the listener attaches the caller.
@@ -155,11 +160,11 @@ async fn resource_api_serves_user_callers_with_its_existing_contract() {
     let daemon = Incarnation::new();
     daemon
         .backend
-        .using::<Convoy>("flotilla")
-        .create(&InputMeta::builder().name("listed".into()).build(), &ConvoySpec::builder().workflow_ref("workflow".into()).build())
+        .using::<AccessDelivery>("flotilla")
+        .create(&InputMeta::builder().name("listed".into()).build(), &delivery("demo"))
         .await
-        .expect("seed convoy");
-    let path = "/apis/flotilla.work/v1/namespaces/flotilla/convoys";
+        .expect("seed delivery");
+    let path = "/apis/flotilla.work/v1/namespaces/flotilla/accessdeliveries";
     for caller in [CallerAuth::Socket(None), CallerAuth::Bearer] {
         let reply = daemon.call(caller, get(path)).await;
         assert_eq!(reply.status, StatusCode::OK);
@@ -184,20 +189,14 @@ async fn resource_api_serves_user_callers_with_its_existing_contract() {
 #[tokio::test]
 async fn resource_watch_streams_newline_delimited_events() {
     let daemon = Incarnation::new();
-    let convoys = daemon.backend.using::<Convoy>("flotilla");
-    convoys
-        .create(&InputMeta::builder().name("before".into()).build(), &ConvoySpec::builder().workflow_ref("workflow".into()).build())
-        .await
-        .expect("seed convoy");
-    let mut request = get("/apis/flotilla.work/v1/namespaces/flotilla/convoys?watch=true");
+    let deliveries = daemon.backend.using::<AccessDelivery>("flotilla");
+    deliveries.create(&InputMeta::builder().name("before".into()).build(), &delivery("demo")).await.expect("seed delivery");
+    let mut request = get("/apis/flotilla.work/v1/namespaces/flotilla/accessdeliveries?watch=true");
     request.extensions_mut().insert(CallerAuth::Socket(None));
     let response = daemon.router.clone().oneshot(request).await.expect("router");
     assert_eq!(response.status(), StatusCode::OK);
     let mut body = response.into_body().into_data_stream();
-    convoys
-        .create(&InputMeta::builder().name("after".into()).build(), &ConvoySpec::builder().workflow_ref("workflow".into()).build())
-        .await
-        .expect("watched convoy");
+    deliveries.create(&InputMeta::builder().name("after".into()).build(), &delivery("demo")).await.expect("watched delivery");
     let mut received = Vec::new();
     while !String::from_utf8_lossy(&received).contains("\"after\"") {
         let chunk = tokio::time::timeout(std::time::Duration::from_secs(2), futures::StreamExt::next(&mut body))
@@ -354,7 +353,7 @@ async fn resource_http_honors_declared_selectors() {
         let router = daemon.router.clone();
         async move {
             let request = format!(
-                "GET /apis/flotilla.work/v1/namespaces/flotilla/convoys?{parameters} HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n"
+                "GET /apis/flotilla.work/v1/namespaces/flotilla/accessdeliveries?{parameters} HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n"
             );
             through_front_door(router, CallerAuth::Socket(None), &request).await
         }
@@ -363,19 +362,27 @@ async fn resource_http_honors_declared_selectors() {
         let body = response.split_once("\r\n\r\n").expect("HTTP response").1;
         serde_json::from_str::<serde_json::Value>(body).expect("JSON body")["items"].clone()
     };
+    // An AccessDelivery's one label is its convoy, read back from the record.
     for (name, label) in [("selected", "target"), ("excluded", "other"), ("punctuation()!", "a+b")] {
-        let meta =
-            InputMeta::builder().name(name.to_owned()).labels(std::collections::BTreeMap::from([("team".into(), label.into())])).build();
-        backend.using::<Convoy>("flotilla").create(&meta, &ConvoySpec::builder().workflow_ref("workflow".into()).build()).await.unwrap();
+        backend
+            .using::<AccessDelivery>("flotilla")
+            .create(&InputMeta::builder().name(name.to_owned()).build(), &delivery(label))
+            .await
+            .unwrap();
     }
-    for parameters in ["labelSelector=team%3Dtarget", "fieldSelector=metadata.name%3Dselected"] {
-        let response = request(parameters.into()).await;
+    let by_label = |selector: &str| {
+        url::form_urlencoded::Serializer::new(String::new()).append_pair("labelSelector", &format!("{CONVOY_LABEL}={selector}")).finish()
+    };
+    for parameters in [by_label("target"), "fieldSelector=metadata.name%3Dselected".into()] {
+        let response = request(parameters).await;
         assert!(response.starts_with("HTTP/1.1 200"), "{response}");
         assert_eq!(items(&response).as_array().unwrap().len(), 1);
         assert_eq!(items(&response)[0]["metadata"]["name"], "selected");
     }
-    for (parameter, selector) in [("labelSelector", "team=a+b"), ("fieldSelector", "metadata.name=punctuation()!")] {
-        let parameters = url::form_urlencoded::Serializer::new(String::new()).append_pair(parameter, selector).finish();
+    for (parameter, selector) in
+        [("labelSelector", format!("{CONVOY_LABEL}=a+b")), ("fieldSelector", "metadata.name=punctuation()!".into())]
+    {
+        let parameters = url::form_urlencoded::Serializer::new(String::new()).append_pair(parameter, &selector).finish();
         let response = request(parameters).await;
         assert!(response.starts_with("HTTP/1.1 200"), "{response}");
         assert_eq!(items(&response).as_array().unwrap().len(), 1);
@@ -390,10 +397,11 @@ async fn resource_http_honors_declared_selectors() {
     ] {
         assert!(request(parameters.into()).await.starts_with("HTTP/1.1 400"), "{parameters}");
     }
-    let query = flotilla_store::StoreQuery::labels(&std::collections::BTreeMap::from([("team".into(), "target".into())]), false, true);
+    let query =
+        flotilla_store::StoreQuery::labels(&std::collections::BTreeMap::from([(CONVOY_LABEL.into(), "target".into())]), false, true);
     let parameters: String = url::form_urlencoded::Serializer::new(String::new())
         .append_pair("storeQuery", &serde_json::to_string(&query).unwrap())
-        .append_pair("labelSelector", "team=target")
+        .append_pair("labelSelector", &format!("{CONVOY_LABEL}=target"))
         .finish();
     assert!(request(parameters).await.starts_with("HTTP/1.1 400"), "duplicate merged selector key is refused");
     let parameters: String = url::form_urlencoded::Serializer::new(String::new())
@@ -763,7 +771,7 @@ async fn tcp_origin_rules_close_rebinding_hijacking_and_csrf() {
     assert_ne!(send("GET", "/v1/hello", upgrade(vec![("Authorization", bearer.clone())])).await, 403, "bearer upgrade needs no Origin");
 
     let cookie = tcp.daemon.login_cookie().await;
-    let resources = "/apis/flotilla.work/v1/namespaces/flotilla/convoys";
+    let resources = "/apis/flotilla.work/v1/namespaces/flotilla/accessdeliveries";
     assert_eq!(send("GET", resources, vec![("Cookie", cookie.clone())]).await, 200, "cookie GET");
     assert_eq!(send("POST", resources, vec![("Cookie", cookie.clone())]).await, 403, "cookie POST without Origin");
     assert_eq!(send("POST", resources, vec![("Cookie", cookie.clone()), ("Origin", origin.clone())]).await, 405, "admitted to the route");

@@ -391,34 +391,8 @@ pub async fn query_resource_kind(
     query: &crate::StoreQuery,
 ) -> Result<Value, ResourceError> {
     let registered = lookup_resource_kind(requested_kind)?;
-    if backend.engine_records(registered.kind).is_some() {
-        // The engine serves this kind: its records are read through their views, as its typed
-        // readers read them, never the old store's rows.
-        return dispatch_resource_kind!(registered.resource, query_engine_typed(backend, namespace, query).await);
-    }
-    let descriptor = declared_resource_kinds().into_iter().find(|kind| kind.paths.kind == registered.kind).expect("registered descriptor");
-    let listed = backend.store().query_raw(descriptor, namespace, query).await?;
-    let position = listed.position;
-    let local_root = listed.local_root;
-    let items = listed.items;
-    let items = items
-        .iter()
-        .map(|item| {
-            let mut value = read_object_value(item)?;
-            value["apiVersion"] = json!(api_version(descriptor.paths));
-            value["kind"] = json!(descriptor.paths.kind);
-            Ok(value)
-        })
-        .collect::<Result<Vec<_>, ResourceError>>()?;
-
-    let mut document = json!({"apiVersion": api_version(descriptor.paths), "kind": format!("{}List", descriptor.paths.kind), "metadata": {"resourceVersion":position.resource_version}, "items":items});
-    if let Some(root) = local_root {
-        document["metadata"]["localRoot"] = json!(root);
-    }
-    if let Some(generation) = position.generation {
-        document["metadata"]["generation"] = json!(generation);
-    }
-    Ok(document)
+    // Records are read through their views, as the kind's typed readers read them.
+    dispatch_resource_kind!(registered.resource, query_engine_typed(backend, namespace, query).await)
 }
 
 pub async fn list_resource_kind(
@@ -904,10 +878,13 @@ async fn query_engine_typed<T: Resource>(
             Ok(value)
         })
         .collect::<Result<Vec<_>, ResourceError>>()?;
+    // The engine has no store-wide version or generation for a query: "overlay" is the list
+    // sentinel the other engine reads send, and generation stays absent. The local root is the
+    // authority a remote definitions query merges against.
     Ok(json!({
         "apiVersion": api_version(T::API_PATHS),
         "kind": format!("{}List", T::API_PATHS.kind),
-        "metadata": {"resourceVersion": "overlay"},
+        "metadata": {"resourceVersion": "overlay", "localRoot": backend.local_root()?},
         "items": items,
     }))
 }
