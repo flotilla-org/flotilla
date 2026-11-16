@@ -39,6 +39,7 @@ libc.workspace = true
 rigging-http-serve.workspace = true
 
 [dev-dependencies]
+flotilla-client = { path = "../flotilla-client" }
 flotilla-terminal = { path = "../flotilla-terminal" }
 flotilla-replay-testkit = { path = "../flotilla-replay-testkit" }
 flotilla-discovery-testkit = { path = "../flotilla-discovery-testkit" }

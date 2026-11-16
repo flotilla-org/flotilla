@@ -13,8 +13,7 @@ pub async fn convoy_routing_falls_back_to_a_unique_terminal_generation_and_refus
     seed_convoy_routing_row(&daemon, "convoy-two", Some("reviewer"), Some("flotilla"), flotilla_protocol::ConvoyPhase::Failed).await;
     assert_eq!(
         daemon.resolve_existing_convoy_target(&action).await,
-        Err("convoy address `reviewer@flotilla` matches multiple terminal records; use an exact record name: convoy-one, convoy-two"
-            .to_string())
+        Err("convoy `reviewer@flotilla` is held by several records; name one by its record: convoy-one, convoy-two".to_string())
     );
 }
 
@@ -109,19 +108,26 @@ pub async fn convoy_explain_refuses_multiple_terminal_generations(factory: &dyn 
 
     assert_eq!(
         daemon.explain_convoy_internal(None, "reviewer@flotilla").await,
-        Err(format!("convoy address `reviewer@flotilla` matches multiple terminal records; use an exact record name: {one}, {two}"))
+        Err(format!("convoy `reviewer@flotilla` is held by several records; name one by its record: {one}, {two}"))
     );
 }
 
-pub async fn convoy_explain_rejects_projectless_and_project_bound_role_ambiguity(factory: &dyn EnsureScenarioController) {
+// #4272: the lookup is exact. A bare role names the convoy of no project holding it, not one in
+// any project; the client completes a role from its context before sending it. The engine holds a
+// convoy admitted without a project under its namespace's project, so a bare role names none.
+pub async fn convoy_explain_names_a_bare_role_only_without_a_project(factory: &dyn EnsureScenarioController) {
     let (daemon, _backend, _clock, _temp) = standing_ensure_fixture(factory).await;
-    create_identity_convoy(&daemon, "convoy-one", "reviewer", None).await;
-    create_identity_convoy(&daemon, "convoy-two", "reviewer", Some("beta")).await;
+    let one = create_identity_convoy(&daemon, "convoy-one", "reviewer", None).await;
+    let two = create_identity_convoy(&daemon, "convoy-two", "reviewer", Some("beta")).await;
 
+    for (address, record) in [("reviewer@flotilla", &one), ("reviewer@beta", &two)] {
+        daemon.explain_convoy_internal(None, address).await.expect("explained");
+        let found = flotilla_store::resolve_convoy_record(&daemon.resource_backend(), "flotilla", address).await;
+        assert_eq!(found.as_ref(), Ok(record), "{address}");
+    }
     assert_eq!(
-        daemon.explain_convoy_internal(None, "reviewer").await.expect_err("bare role must be ambiguous"),
-        // A projectless convoy is held under its namespace's project on the engine.
-        "convoy role `reviewer` is ambiguous; use one of: reviewer@beta, reviewer@flotilla"
+        daemon.explain_convoy_internal(None, "reviewer").await.map(|explanation| explanation.convoy),
+        Err("no convoy matches `reviewer`".to_string())
     );
 }
 

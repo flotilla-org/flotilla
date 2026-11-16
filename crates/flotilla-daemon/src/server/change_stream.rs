@@ -787,6 +787,7 @@ mod tests {
                         generated: vec![],
                         fields: vec![],
                         field_aliases: vec![],
+                        subject: None,
                         aliases: vec![],
                     }],
                 })

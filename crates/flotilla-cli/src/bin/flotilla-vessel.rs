@@ -1,4 +1,5 @@
-//! The pushed flotilla CLI. Its dependency graph has neither the daemon nor TUI.
+//! The pushed flotilla CLI. Its dependency graph has neither the daemon nor TUI; `table` hands off
+//! to the flotilla-table sibling published beside it (#4261).
 use color_eyre::{eyre::eyre, Result};
 use flotilla_cli::{
     cli::args::{Cli, SubCommand},
@@ -36,6 +37,11 @@ async fn run() -> Result<()> {
         Some(SubCommand::Resource { command }) => frontend::resource::run_resource_command(&cli, command, format).await,
         Some(SubCommand::Manifest { command }) => frontend::manifest::run_manifest_command(&cli, command, format).await,
         Some(SubCommand::Ensure { command }) => frontend::manifest::run_ensure_command(&cli, command, format).await,
+        Some(SubCommand::Table(args)) => {
+            // Never spawns a daemon: the sibling reads the vessel's host socket, as every command here does.
+            let status = frontend::table::run_table(&cli, args, flotilla_daemon_api::build_info::build_id())?;
+            std::process::exit(status)
+        }
         Some(SubCommand::Status) => frontend::logs::run_status(&cli, format).await,
         Some(SubCommand::Watch) => frontend::logs::run_watch(&cli, format).await,
         Some(SubCommand::Wait(args)) => {
@@ -54,6 +60,6 @@ async fn run() -> Result<()> {
             frontend::hooks::run_completions(args.shell);
             Ok(())
         }
-        _ => Err(eyre!("this vessel CLI provides domain commands, artifacts and hooks; use the host CLI for operator surfaces")),
+        _ => Err(eyre!("this vessel CLI provides domain commands, tables, artifacts and hooks; use the host CLI for operator surfaces")),
     }
 }

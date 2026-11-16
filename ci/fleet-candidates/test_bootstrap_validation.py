@@ -63,6 +63,39 @@ class BootstrapValidationTests(unittest.TestCase):
         self.write_typescript_host()
         validation.validate_produced_payload(self.root)
 
+    # Siblings (#4249) are read from `flotilla`'s allowlist, shipped exactly at production, accepted
+    # on every platform at consumption, and never confused with the Linux vessel CLI.
+    def test_siblings_follow_the_allowlist_at_production_and_any_sibling_is_accepted_later(self):
+        source = Path(__file__).parents[2] / "crates/flotilla-client/src/sibling.rs"
+        self.assertIn("table", validation.sibling_allowlist(source))
+        for text, error in (("", "names no sibling"), ('    Sibling::Table => "Table",\n', "invalid"),
+                            ('    Sibling::Table => "table",\n    Sibling::Other => "table",\n', "duplicate")):
+            with self.subTest(error=error):
+                (self.root / "sibling.rs").write_text(text)
+                with self.assertRaisesRegex(validation.ValidationError, error):
+                    validation.sibling_allowlist(self.root / "sibling.rs")
+        for platform in validation.PLATFORMS:
+            for path in ("bin/flotilla-table", "bin/flotilla-mcp", "bin/flotilla-tui"):
+                self.assertTrue(validation.allowed_payload(path, platform))
+                self.assertNotIn(path, validation.REQUIRED_PAYLOAD)
+            for path in ("bin/flotilla-", "bin/flotilla-Table", "bin/flotilla-../x", "lib/flotilla-table"):
+                self.assertFalse(validation.allowed_payload(path, platform), path)
+        self.assertEqual(validation.sibling_paths(["bin/flotilla", "bin/flotilla-vessel", "bin/flotilla-table"]), ["bin/flotilla-table"])
+
+        host = self.root / "bin" / "drydock-host"
+        host.parent.mkdir()
+        host.write_bytes(b"host")
+        host.chmod(0o755)
+        self.write_typescript_host()
+        with self.assertRaisesRegex(validation.ValidationError, "missing executable bin/flotilla-table"):
+            validation.validate_produced_payload(self.root, ["table"])
+        sibling = self.root / "bin" / "flotilla-table"
+        sibling.write_bytes(b"table")
+        sibling.chmod(0o755)
+        validation.validate_produced_payload(self.root, ["table"])
+        with self.assertRaisesRegex(validation.ValidationError, "differ from the allowlist"):
+            validation.validate_produced_payload(self.root)
+
     def write_typescript_host(self, root=None):
         root = root or self.root
         wrapper = root / validation.TYPESCRIPT_HOST_WRAPPER
@@ -170,6 +203,25 @@ class BootstrapValidationTests(unittest.TestCase):
         self.assertFalse(stale.exists())
         self.assertTrue((destination / validation.TYPESCRIPT_HOST_WRAPPER).stat().st_mode & 0o100)
 
+    # The stable root carries exactly the selected generation's siblings: a roll adds them, and a
+    # rollback to a generation without one removes it rather than leaving another build's copy.
+    def test_darwin_refresh_carries_exactly_the_selected_generations_siblings(self):
+        older, newer, destination = self.root / "older", self.root / "newer", self.root / "destination"
+        for source in (older, newer):
+            (source / "bin").mkdir(parents=True)
+            for name in ("flotilla", "flotillad", "cleat"):
+                (source / "bin" / name).write_text(f"{source.name} {name}")
+        (newer / "bin" / "flotilla-table").write_text("newer table")
+        (newer / "bin" / "flotilla-table").chmod(0o755)
+        validation.refresh_darwin_payload(newer, destination)
+        self.assertEqual((destination / "bin" / "flotilla-table").read_text(), "newer table")
+        self.assertTrue((destination / "bin" / "flotilla-table").stat().st_mode & 0o100)
+        (destination / "bin" / "unrelated").write_text("kept")
+        validation.refresh_darwin_payload(older, destination)
+        self.assertFalse((destination / "bin" / "flotilla-table").exists())
+        self.assertEqual((destination / "bin" / "flotilla").read_text(), "older flotilla")
+        self.assertEqual((destination / "bin" / "unrelated").read_text(), "kept")
+
     # cleat's database and license are release data. Earlier generations may
     # omit them so health rollback remains valid.
     def test_terminfo_payload_accepts_release_data_without_requiring_old_generations(self):
@@ -189,6 +241,16 @@ class BootstrapValidationTests(unittest.TestCase):
         manifest.write_text(json.dumps({"signing": {"identity": "team"}, "platforms": {"linux": {"size": 7}}}))
         for args, expected in ((["value", "--", manifest, "signing.identity"], "team\n"),
                                (["platform-value", "--", manifest, "linux", "size"], "7\n")):
+            result = run(*args)
+            self.assertEqual(result.returncode, 0, result.stderr)
+            self.assertEqual(result.stdout, expected)
+        release = self.root / "release"
+        (release / "bin").mkdir(parents=True)
+        for name in ("flotilla", "flotilla-vessel", "flotilla-table", "flotilla-mcp"):
+            (release / "bin" / name).write_text(name)
+        source = Path(__file__).parents[2] / "crates/flotilla-client/src/sibling.rs"
+        for args, expected in ((["sibling-commands", "--", release], "mcp\ntable\n"),
+                               (["siblings", "--", source], "".join(f"{command}\n" for command in validation.sibling_allowlist(source)))):
             result = run(*args)
             self.assertEqual(result.returncode, 0, result.stderr)
             self.assertEqual(result.stdout, expected)

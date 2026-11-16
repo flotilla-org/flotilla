@@ -86,6 +86,7 @@ impl Layout {
             fields: Vec::new(),
             field_aliases: Vec::new(),
             aliases: Vec::new(),
+            subject: None,
         };
         let mut id = ColumnDef::new("id", ColumnType::Ref, false);
         id.reference = Some("resource_identity".into());
@@ -215,6 +216,16 @@ impl Layout {
         self.last_column().address = true;
     }
 
+    /// Declares the current table's rows to be subjects of `kind`, whose canonical address is in
+    /// the column `field` (#4199). The column must be declared, and hold addresses.
+    pub fn subject(&mut self, kind: flotilla_address::Kind, field: &str) {
+        let table = self.frames.last().expect("layout has a current table").table;
+        let table = &mut self.set.tables[table];
+        let column = table.key.iter().chain(&table.columns).find(|column| column.name == field);
+        assert!(column.is_some_and(|column| column.address), "a subject field `{field}` is a declared address column");
+        table.subject = Some(crate::Subject { kind, field: field.to_owned() });
+    }
+
     /// Declares the current table's own key: columns declared inside `f` become key columns.
     pub fn key(&mut self, f: impl FnOnce(&mut Layout)) {
         let frame = self.frame();
@@ -313,6 +324,7 @@ impl Layout {
             fields: Vec::new(),
             field_aliases,
             aliases: Vec::new(),
+            subject: None,
         };
         self.set.tables.push(table);
         self.frames.push(Frame::new(self.set.tables.len() - 1));

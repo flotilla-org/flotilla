@@ -239,7 +239,7 @@ pub(super) async fn run_stage4a_flow_reaches_running_and_completes_convoy(
                 Command::builder()
                     .action(CommandAction::ConvoyDelete {
                         namespace: Some(NAMESPACE.to_string()),
-                        name: "convoy-a".to_string(),
+                        name: format!("convoy-a@{NAMESPACE}"),
                         force: true,
                     })
                     .build(),
@@ -312,7 +312,7 @@ pub(super) async fn run_stage4a_flow_reaches_running_and_completes_convoy(
         .execute(
             Command::builder()
                 .action(CommandAction::ConvoyWorkForceComplete {
-                    convoy: "convoy-a".to_string(),
+                    convoy: format!("convoy-a@{NAMESPACE}"),
                     work: "implement".to_string(),
                     message: Some(match completion_action {
                         CompletionAction::Delete => "https://github.com/flotilla-org/flotilla/pull/884".to_string(),

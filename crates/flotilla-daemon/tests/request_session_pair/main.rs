@@ -1516,6 +1516,7 @@ async fn assert_abandon_attribution(principal_ref: PrincipalRef) {
     .await
     .expect("spawn attributed client topology");
     let role = "attributed-abandon";
+    let address = format!("{role}@flotilla");
     let launch = admit_convoy(&leader, engine_convoy("attributed-abandon-g1", convoy_spec("empty", role), implementing())).await;
     let mut events = leader.subscribe();
 
@@ -1527,7 +1528,7 @@ async fn assert_abandon_attribution(principal_ref: PrincipalRef) {
             context_repo: None,
             action: CommandAction::ConvoyAbandon {
                 namespace: Some("flotilla".to_string()),
-                name: role.to_string(),
+                name: address.clone(),
                 reason: "no longer needed".to_string(),
             },
         })
@@ -1535,7 +1536,7 @@ async fn assert_abandon_attribution(principal_ref: PrincipalRef) {
         .expect("dispatch abandon");
     assert_eq!(
         await_command_result(&mut events, command_id).await,
-        CommandValue::ConvoyAbandoned { name: role.to_string(), archives: Vec::new() }
+        CommandValue::ConvoyAbandoned { name: address.clone(), archives: Vec::new() }
     );
 
     let status =
@@ -1587,6 +1588,7 @@ async fn in_memory_mutation_preserves_socket_caller_in_status_and_explain() {
     .expect("spawn caller-attributed topology");
     let convoys = leader.resource_backend().using::<Convoy>("flotilla");
     let role = "attributed-status";
+    let address = format!("{role}@flotilla");
     let launch = admit_convoy(
         &leader,
         engine_convoy(
@@ -1604,7 +1606,7 @@ async fn in_memory_mutation_preserves_socket_caller_in_status_and_explain() {
                 .action(CommandAction::ConvoyResume {
                     reopen: false,
                     namespace: Some("flotilla".into()),
-                    name: role.into(),
+                    name: address.clone(),
                     prompt: String::new(),
                     vessel: None,
                     role: None,
@@ -1619,7 +1621,7 @@ async fn in_memory_mutation_preserves_socket_caller_in_status_and_explain() {
         .client
         .execute(
             Command::builder()
-                .action(CommandAction::ConvoyAbandon { namespace: Some("flotilla".into()), name: role.into(), reason: "done".into() })
+                .action(CommandAction::ConvoyAbandon { namespace: Some("flotilla".into()), name: address.clone(), reason: "done".into() })
                 .build(),
         )
         .await
@@ -1632,7 +1634,9 @@ async fn in_memory_mutation_preserves_socket_caller_in_status_and_explain() {
     let value = topology
         .client
         .execute_query(
-            Command::builder().action(CommandAction::QueryExplainConvoy { namespace: Some("flotilla".into()), name: role.into() }).build(),
+            Command::builder()
+                .action(CommandAction::QueryExplainConvoy { namespace: Some("flotilla".into()), name: address.clone() })
+                .build(),
             uuid::Uuid::nil(),
         )
         .await

@@ -4,7 +4,7 @@
 //! `invocation`, `idempotent` and `result = "kind"`; each
 //! named field is a parameter, typed by its Rust type through `Param`, and refined by
 //! `#[param(text)]`, `#[param(options("a", "b"))]`, `#[param(subject = "kind")]` and
-//! `#[param(default = "...")]`. A kind names its `flotilla_address::Kind` variant in snake case,
+//! `#[param(default = "...")]`. A kind names its `flotilla_verbs::Kind` variant in snake case,
 //! so a kind that is none does not compile.
 use proc_macro2::TokenStream;
 use quote::quote;
@@ -36,9 +36,9 @@ fn verb_attrs(input: &DeriveInput) -> syn::Result<VerbAttrs> {
         } else if meta.path.is_ident("effect") {
             let value = meta.value()?.parse::<LitStr>()?;
             effect = Some(match value.value().as_str() {
-                "read" => quote!(::flotilla_schema::VerbEffect::Read),
-                "write" => quote!(::flotilla_schema::VerbEffect::Write),
-                "destructive" => quote!(::flotilla_schema::VerbEffect::Destructive),
+                "read" => quote!(::flotilla_verbs::VerbEffect::Read),
+                "write" => quote!(::flotilla_verbs::VerbEffect::Write),
+                "destructive" => quote!(::flotilla_verbs::VerbEffect::Destructive),
                 _ => return Err(syn::Error::new_spanned(value, "effect is read, write or destructive")),
             });
         } else if meta.path.is_ident("invocation") {
@@ -85,20 +85,20 @@ fn param(field: &syn::Field) -> syn::Result<TokenStream> {
     if [text, !options.is_empty(), subject.is_some()].into_iter().filter(|set| *set).count() > 1 {
         return Err(syn::Error::new_spanned(field, "a parameter is text, an enum or a subject, not several"));
     }
-    let declared = quote!(<#ty as ::flotilla_schema::Param>::TYPE);
+    let declared = quote!(<#ty as ::flotilla_verbs::Param>::TYPE);
     let ty_tokens = if text {
         quote!({
-            const _: () = assert!(matches!(#declared, ::flotilla_schema::ParamType::Str), "#[param(text)] is for String fields");
-            ::flotilla_schema::ParamType::Text
+            const _: () = assert!(matches!(#declared, ::flotilla_verbs::ParamType::Str), "#[param(text)] is for String fields");
+            ::flotilla_verbs::ParamType::Text
         })
     } else if !options.is_empty() {
         quote!({
-            const _: () = assert!(matches!(#declared, ::flotilla_schema::ParamType::Str), "#[param(options(...))] is for String fields");
-            ::flotilla_schema::ParamType::Enum
+            const _: () = assert!(matches!(#declared, ::flotilla_verbs::ParamType::Str), "#[param(options(...))] is for String fields");
+            ::flotilla_verbs::ParamType::Enum
         })
     } else if let Some(kind) = &subject {
         let kind = kind_path(kind);
-        quote!(::flotilla_schema::ParamType::Subject(#kind))
+        quote!(::flotilla_verbs::ParamType::Subject(#kind))
     } else {
         declared
     };
@@ -108,13 +108,13 @@ fn param(field: &syn::Field) -> syn::Result<TokenStream> {
             let required = !matches!(ty, syn::Type::Path(path) if path.path.segments.last().is_some_and(|last| last.ident == "Option"));
             quote!(#required)
         }
-        None => quote!(<#ty as ::flotilla_schema::Param>::REQUIRED),
+        None => quote!(<#ty as ::flotilla_verbs::Param>::REQUIRED),
     };
     let default = match &default {
         Some(default) => quote!(::core::option::Option::Some(#default)),
         None => quote!(::core::option::Option::None),
     };
-    Ok(quote!(::flotilla_schema::ParamDeclaration {
+    Ok(quote!(::flotilla_verbs::ParamDeclaration {
         name: #name,
         ty: #ty_tokens,
         required: #required,
@@ -145,9 +145,9 @@ pub(crate) fn expand(input: &DeriveInput) -> syn::Result<TokenStream> {
         None => quote!(::core::option::Option::None),
     };
     Ok(quote! {
-        impl #implementation ::flotilla_schema::Verb for #ident #ty #clause {
-            fn declaration() -> ::flotilla_schema::VerbDeclaration {
-                ::flotilla_schema::VerbDeclaration {
+        impl #implementation ::flotilla_verbs::Verb for #ident #ty #clause {
+            fn declaration() -> ::flotilla_verbs::VerbDeclaration {
+                ::flotilla_verbs::VerbDeclaration {
                     name: #name,
                     subject: #subject,
                     effect: #effect,
@@ -161,7 +161,7 @@ pub(crate) fn expand(input: &DeriveInput) -> syn::Result<TokenStream> {
     })
 }
 
-/// `::flotilla_address::Kind::<Variant>` for a kind written in snake case.
+/// `::flotilla_verbs::Kind::<Variant>` for a kind written in snake case.
 fn kind_path(kind: &LitStr) -> TokenStream {
     let variant: String = kind
         .value()
@@ -172,5 +172,5 @@ fn kind_path(kind: &LitStr) -> TokenStream {
         })
         .collect();
     let variant = Ident::new(&variant, kind.span());
-    quote!(::flotilla_address::Kind::#variant)
+    quote!(::flotilla_verbs::Kind::#variant)
 }

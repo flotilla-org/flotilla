@@ -216,6 +216,35 @@ pub async fn resolve_command_repositories(daemon: &dyn DaemonHandle, command: &m
     Ok(())
 }
 
+/// Completes the convoy reference a convoy command carries from the caller's context (#4272):
+/// the current checkout's project, or the vessel's own convoy. The daemon looks the completed
+/// reference up exactly.
+pub async fn complete_command_convoy(daemon: std::sync::Arc<dyn DaemonHandle>, command: &mut Command) -> Result<(), String> {
+    let (namespace, name) = match &mut command.action {
+        CommandAction::QueryExplainConvoy { namespace, name }
+        | CommandAction::ConvoyDelete { namespace, name, .. }
+        | CommandAction::ConvoyLink { namespace, name, .. }
+        | CommandAction::ConvoyUnlink { namespace, name, .. }
+        | CommandAction::ConvoyAbandon { namespace, name, .. }
+        | CommandAction::ConvoyRebind { namespace, name, .. }
+        | CommandAction::ConvoyResume { namespace, name, .. }
+        | CommandAction::ConvoyWithdrawPendingBrief { namespace, name }
+        | CommandAction::CrewSupervise { namespace, convoy: name, .. } => (namespace.clone(), name),
+        CommandAction::ConvoyWorkForceComplete { convoy, .. } | CommandAction::ConvoyPromiseVerdict { convoy, .. } => (None, convoy),
+        _ => return Ok(()),
+    };
+    let env = |name: &str| std::env::var(name).ok();
+    let namespace = namespace.or_else(|| env("FLOTILLA_NAMESPACE")).unwrap_or_else(|| "flotilla".into());
+    let known = flotilla_client::address_context::known_convoys(daemon.clone(), &namespace).await;
+    let mut sources = flotilla_client::address_context::ContextSources::from_env(env);
+    // A vessel's own convoy is the deeper context; the checkout is asked only without one.
+    if let (None, Ok(path)) = (&sources.convoy, std::env::current_dir()) {
+        sources.checkout_project = flotilla_client::address_context::checkout_project(&*daemon, path).await;
+    }
+    *name = flotilla_client::address_context::complete_convoy(name, &sources, &known)?;
+    Ok(())
+}
+
 fn provisioning_target_for_environment(host: &HostName, environment_id: &EnvironmentId) -> flotilla_protocol::ProvisioningTarget {
     if environment_id.is_host() {
         flotilla_protocol::ProvisioningTarget::Host { host: host.clone() }

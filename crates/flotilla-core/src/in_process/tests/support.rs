@@ -366,24 +366,6 @@ impl CommandRunner for BatchedObservationRunner {
     }
 }
 
-/// Old Convoy `record` in a plain store, generation 1 of standing `role` in `project`: what a
-/// store without the engine's Convoy path holds.
-pub(in crate::in_process) async fn create_identity_record(backend: &ResourceBackend, record: &str, role: &str, project: Option<&str>) {
-    let labels = BTreeMap::from([
-        (PROJECT_LABEL.to_string(), project.unwrap_or_default().to_string()),
-        (ROLE_LABEL.to_string(), role.to_string()),
-        (GENERATION_LABEL.to_string(), "1".to_string()),
-    ]);
-    let mut spec = ConvoySpec::builder().workflow_ref("review".to_string()).role(role.to_string()).generation(1).build();
-    spec.project_ref = project.map(str::to_string);
-    backend
-        .clone()
-        .using::<ResourceConvoy>("flotilla")
-        .create(&InputMeta::builder().name(record.to_string()).labels(labels).build(), &spec)
-        .await
-        .expect("convoy");
-}
-
 /// Admits a launch of `record`, generation 1 of standing `role` in `project`, on `daemon`'s
 /// engine, its work crewed by an agent for `role`. Returns the launch's name.
 pub(in crate::in_process) async fn create_identity_convoy(

@@ -25,6 +25,7 @@
 //! [`Address::from_str`]: std::str::FromStr
 
 mod address;
+mod completion;
 mod condition;
 mod encoding;
 mod forge;
@@ -38,6 +39,7 @@ mod tests;
 use std::fmt;
 
 pub use address::{Address, Segment};
+pub use completion::{complete, CompletionError};
 pub use condition::{Condition, FieldPath, Operator, Template, Variable};
 pub use encoding::{decode_canonical, encode};
 pub use forge::{BuiltinForges, Forge, ForgeKind, ForgeLookup, GITHUB_FORGE_ID, GITHUB_HOSTS};

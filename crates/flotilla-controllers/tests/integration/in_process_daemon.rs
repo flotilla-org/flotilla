@@ -2806,7 +2806,10 @@ async fn allocation_shares_equal_need_roles_and_explains_grouping() {
     let result = daemon
         .execute_query(
             Command::builder()
-                .action(CommandAction::QueryExplainConvoy { namespace: Some("flotilla".to_string()), name: "shared-needs".to_string() })
+                .action(CommandAction::QueryExplainConvoy {
+                    namespace: Some("flotilla".to_string()),
+                    name: "shared-needs@flotilla".to_string(),
+                })
                 .build(),
             uuid::Uuid::new_v4(),
         )
@@ -3143,7 +3146,7 @@ async fn codex_admission_refuses_old_host_and_explains_version_gap() {
     let result = daemon
         .execute_query(
             Command::builder()
-                .action(CommandAction::QueryExplainConvoy { namespace: Some("flotilla".into()), name: "codex-version".into() })
+                .action(CommandAction::QueryExplainConvoy { namespace: Some("flotilla".into()), name: "codex-version@flotilla".into() })
                 .build(),
             uuid::Uuid::new_v4(),
         )
@@ -3269,7 +3272,10 @@ async fn requested_model_ignores_legacy_account_evidence_and_uses_only_selected_
     let result = daemon
         .execute_query(
             Command::builder()
-                .action(CommandAction::QueryExplainConvoy { namespace: Some("flotilla".to_string()), name: "model-driven".to_string() })
+                .action(CommandAction::QueryExplainConvoy {
+                    namespace: Some("flotilla".to_string()),
+                    name: "model-driven@flotilla".to_string(),
+                })
                 .build(),
             uuid::Uuid::new_v4(),
         )
@@ -3356,7 +3362,7 @@ async fn invalid_issue_need_admits_with_warning_in_result_and_explain() {
     let result = daemon
         .execute_query(
             Command::builder()
-                .action(CommandAction::QueryExplainConvoy { namespace: Some("flotilla".into()), name: "triage-label".into() })
+                .action(CommandAction::QueryExplainConvoy { namespace: Some("flotilla".into()), name: "triage-label@flotilla".into() })
                 .build(),
             uuid::Uuid::new_v4(),
         )
@@ -9839,7 +9845,7 @@ mod account_bindings {
         let result = daemon
             .execute_query(
                 Command::builder()
-                    .action(CommandAction::QueryExplainConvoy { namespace: Some("flotilla".to_string()), name: name.to_string() })
+                    .action(CommandAction::QueryExplainConvoy { namespace: Some("flotilla".to_string()), name: format!("{name}@flotilla") })
                     .build(),
                 uuid::Uuid::new_v4(),
             )

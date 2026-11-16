@@ -116,7 +116,7 @@ async fn sqlite_adopted_checkout_flow_reaches_running_and_preserves_checkout_on_
         .execute(
             Command::builder()
                 .action(CommandAction::ConvoyWorkForceComplete {
-                    convoy: "convoy-adopted".to_string(),
+                    convoy: format!("convoy-adopted@{NAMESPACE}"),
                     work: "implement".to_string(),
                     message: Some("done".to_string()),
                 })

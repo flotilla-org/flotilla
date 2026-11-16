@@ -1,6 +1,6 @@
 //! Showcase of interesting glyphs available in terminal UIs.
 //!
-//! Run with: cargo run --example glyph_showcase
+//! Run with: cargo run -p flotilla-tui --example glyph_showcase
 
 use std::io;
 

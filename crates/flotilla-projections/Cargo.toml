@@ -26,6 +26,7 @@ flotilla-charter = { path = "../flotilla-charter" }
 flotilla-protocol = { path = "../flotilla-protocol" }
 flotilla-resources = { path = "../flotilla-resources" }
 async-trait = { workspace = true }
+flotilla-verbs = { path = "../flotilla-verbs" }
 bon = { workspace = true }
 tokio = { workspace = true }
 tracing = { workspace = true }

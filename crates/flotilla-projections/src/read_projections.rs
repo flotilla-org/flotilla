@@ -42,8 +42,8 @@ use flotilla_resources::{
     FulfilmentKind, FulfilmentRealisation, Host as ResourceHost, HostStatus as ResourceHostStatus, IssueSourceResolution,
     IssueSourceUnavailable, Project, ReadResourceObject, Repository, RepositoryKey, ResourceObject, ResourceProvenance, SettlementMode,
     TerminalAttentionState, TerminalSession as ResourceTerminalSession, TerminalSessionPhase as ResourceTerminalSessionPhase,
-    TerminalSessionSource, Vessel, WorkPhase as ResourceWorkPhase, WorkflowTemplate, CONVOY_LABEL, HEARTBEAT_READY_TTL_SECS, PROJECT_LABEL,
-    ROLE_LABEL, VESSEL_LABEL,
+    TerminalSessionSource, Vessel, WorkPhase as ResourceWorkPhase, WorkflowTemplate, CONVOY_LABEL, HEARTBEAT_READY_TTL_SECS, ROLE_LABEL,
+    VESSEL_LABEL,
 };
 use flotilla_store::{ProjectHierarchyStoreExt, ResourceBackend, StoreQuery};
 use tracing::warn;
@@ -59,9 +59,7 @@ use crate::{
 };
 use flotilla_resources::checkout_records::latest_launches;
 use flotilla_resources::LANDING_EVIDENCE_TTL;
-use flotilla_resources::{
-    explain_unmet_expectation, resolve_convoy_candidate_indices, ConvoyAddressIdentity, LeafFiringRecord, LeafSubscriptionRow, LeafWatcher,
-};
+use flotilla_resources::{explain_unmet_expectation, LeafFiringRecord, LeafSubscriptionRow, LeafWatcher};
 use flotilla_store as project_ops;
 
 /// Read projections can inspect subscription evidence without changing subscriptions or delivery.
@@ -1285,16 +1283,9 @@ impl ReadProjections<'_> {
         namespace: &str,
         name: &str,
     ) -> Result<(ConvoyExplanation, ResourceObject<ResourceConvoy>), String> {
-        let mut candidates = vec![StoreQuery::names([name.to_string()], true)];
-        if let Ok((role, project)) = flotilla_resources::parse_role_address(name) {
-            let mut labels = BTreeMap::from([(ROLE_LABEL.into(), role.into())]);
-            if let Some(project) = project {
-                labels.insert(PROJECT_LABEL.into(), project.into());
-            }
-            candidates.push(StoreQuery::labels(&labels, true, true));
-        }
-        let selected_query =
-            StoreQuery { any_of: (!candidates.is_empty()).then_some(candidates), include_replicas: true, ..Default::default() };
+        // The one convoy lookup (#4272): the address's role in its project, or its record.
+        let convoy_name = flotilla_store::ConvoyName::parse(name);
+        let selected_query = convoy_name.query();
         let mut linked = Vec::new();
         for target in ["spec.subjects.*.subject", "status.subjects.*.subject"] {
             for source in ["spec.subjects.*.subject", "status.subjects.*.subject"] {
@@ -1307,7 +1298,7 @@ impl ReadProjections<'_> {
         let mut generations = flotilla_store::live_convoys_query();
         generations.field_matches_query = StoreQuery::related(&ensured_from, &ensured_from, selected_query.clone()).field_matches_query;
         // Select candidate identities, their roles' live generations and linked landed evidence in
-        // one indexed operation; the address resolver still owns exact-name and ambiguity rules.
+        // one indexed operation; `ConvoyName::select` owns the role, record and ambiguity rules.
         let convoy_sources = self
             .backend
             .query_declared::<ResourceConvoy>(
@@ -1328,22 +1319,7 @@ impl ReadProjections<'_> {
             )
             .await
             .map_err(|error| error.to_string())?;
-        let identities = convoy_sources
-            .items
-            .iter()
-            .map(|source| ConvoyAddressIdentity {
-                record_name: &source.object.metadata.name,
-                role: source.object.metadata.labels.get(ROLE_LABEL).map(String::as_str),
-                project: source.object.metadata.labels.get(PROJECT_LABEL).map(String::as_str),
-                terminal: source.object.status.as_ref().is_some_and(|status| status.phase.is_terminal()),
-            })
-            .collect::<Vec<_>>();
-        let selected = resolve_convoy_candidate_indices(&identities, name)?;
-        let convoy_source = selected
-            .into_iter()
-            .map(|index| &convoy_sources.items[index])
-            .max_by_key(|source| matches!(source.provenance, ResourceProvenance::Local))
-            .ok_or_else(|| format!("no convoy matches `{name}`"))?;
+        let convoy_source = convoy_name.select(&convoy_sources.items)?.ok_or_else(|| format!("no convoy matches `{convoy_name}`"))?;
         // With the engine holding the convoy, the promises explained are the engine's (#3587 layer 8).
         let convoy = flotilla_resources::convoy::engine::viewed_read(self.convoy_engine, convoy_source)?;
         let now = self.clock.now();

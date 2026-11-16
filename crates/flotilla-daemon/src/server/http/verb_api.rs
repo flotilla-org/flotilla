@@ -22,7 +22,7 @@ pub(super) async fn invoke(
     UserCommandCaller { caller, namespace }: UserCommandCaller,
     Wire(request): Wire<Invocation, BODY_LIMIT>,
 ) -> Response {
-    match verbs.invoke(&caller.to_string(), &namespace, &name, request).await {
+    match verbs.invoke(&caller, &namespace, &name, request).await {
         Ok(invoked) => encoding.render(StatusCode::OK, invoked),
         Err(Refusal::UnknownVerb(name)) => encoding.error_code(StatusCode::NOT_FOUND, "not_found", format!("no verb `{name}`")),
         Err(Refusal::Invalid(message)) => encoding.error_code(StatusCode::BAD_REQUEST, "invalid_request", message),

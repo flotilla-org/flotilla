@@ -88,11 +88,45 @@ pub fn should_reexec_for_incompatible_daemon(error: &str, already_reexecuted_bui
     !remote_daemon_selected && is_incompatible_daemon_error(error) && already_reexecuted_build != Some(crate::build_id())
 }
 
+/// Why a re-exec for `incompatibility` failed with `reexec_error`, naming both.
+pub fn incompatible_daemon_reexec_failure(incompatibility: &str, reexec_error: &dyn std::fmt::Display) -> String {
+    format!("{incompatibility}; re-exec could not reach a matching build: {reexec_error}")
+}
+
+/// Runs this binary again with its arguments, to pick up a newly installed build. On Unix this
+/// execs it and returns only an error; elsewhere it spawns the replacement and exits.
+pub fn reexec_current_process() -> std::io::Result<()> {
+    let executable = std::env::current_exe()?;
+    let mut command = std::process::Command::new(executable);
+    command.args(std::env::args_os().skip(1));
+    #[cfg(unix)]
+    {
+        use std::os::unix::process::CommandExt;
+        Err(command.exec())
+    }
+    #[cfg(not(unix))]
+    {
+        command.spawn()?;
+        std::process::exit(0);
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use std::time::Duration;
 
     use super::*;
+
+    #[test]
+    fn failed_incompatible_daemon_reexec_names_both_builds_and_protocols() {
+        let mismatch = "daemon protocol version mismatch: client built cli-old speaks proto 19; daemon built daemon-new speaks proto 20";
+
+        let message = incompatible_daemon_reexec_failure(mismatch, &std::io::Error::from(std::io::ErrorKind::NotFound));
+
+        assert!(message.contains("client built cli-old speaks proto 19"), "{message}");
+        assert!(message.contains("daemon built daemon-new speaks proto 20"), "{message}");
+        assert!(message.contains("re-exec could not reach a matching build"), "{message}");
+    }
 
     #[test]
     fn reconnect_backoff_doubles_and_caps_with_jitter() {

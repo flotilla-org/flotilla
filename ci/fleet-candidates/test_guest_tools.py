@@ -93,9 +93,15 @@ class GuestToolsTests(unittest.TestCase):
         files = fixture()
         catalog = json.loads(files[validation.GUEST_CATALOG])
         self.assertEqual(catalog['layers'], validation.load_guest_layers(DECLARATIONS))
-        self.assertEqual(validation.LEGACY_GUEST_LAYERS, validation.load_guest_layers(DECLARATIONS))
+        # The legacy composition is the declaration as it stood before the table sibling joined (#4261).
+        declared = validation.load_guest_layers(DECLARATIONS)
+        declared[0]['members'] = [member for member in declared[0]['members'] if member['role'] != 'table']
+        self.assertEqual(validation.LEGACY_GUEST_LAYERS, declared)
         sources = catalog['sources']
         del catalog['layers']
+        del files[f'{validation.GUEST_TREE}/bin/flotilla-table']
+        platform = catalog['platforms'][validation.GUEST_TARGET]
+        platform['files'] = [item for item in platform['files'] if item['path'] != 'bin/flotilla-table']
         files[validation.GUEST_CATALOG] = json.dumps(catalog).encode()
         self.assertEqual(validation.validate_guest_tools(files, sources, '42', required=True), catalog)
         with self.assertRaisesRegex(ValueError, 'differs from the source declaration'):

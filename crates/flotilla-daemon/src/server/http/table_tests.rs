@@ -179,6 +179,7 @@ async fn table_carriers_share_paging_filter_count_and_resync_contract() {
             if let Message::Rows { rows, cursor, partial, .. } = message {
                 assert!(*partial);
                 assert_eq!(rows[0]["metadata.name"], "b");
+                // The projected `spec` and the key: an access delivery is no verb subject.
                 assert_eq!(rows[0].len(), 2);
                 cursor.clone()
             } else {
@@ -690,7 +691,10 @@ async fn served_tables_type_addresses_and_carry_enum_names() {
                 "{table}.{name} whereOperators: {field}"
             );
             if field["type"] == "address" {
-                assert_eq!(column.map(|column| &column.ty), Some(&ColumnType::Interned(ADDRESS_DOMAIN)), "{table}.{name}");
+                // A stored address is interned; a resource row's subject address is derived (#4199).
+                if stored.is_some() {
+                    assert_eq!(column.map(|column| &column.ty), Some(&ColumnType::Interned(ADDRESS_DOMAIN)), "{table}.{name}");
+                }
                 addresses.push(format!("{table}.{name}"));
             }
             match column.map(|column| (&column.ty, &column.categories)) {
@@ -1104,6 +1108,81 @@ async fn messages_filter_under_a_convoy_address() {
     let resumed = messages(&router, &format!("/tables/message/rows?where={under}&cursor={former}"), false).await;
     assert!(matches!(resumed[0], Message::Resync { .. }), "{resumed:?}");
     assert_eq!(inbox_of(&resumed).len(), 2, "a fresh first page follows the resync");
+}
+
+// #4199: `/tables/convoys` names its subject: each row is a convoy, whose canonical address is
+// the derived `address` field, under its project when it has one. The field is an address column,
+// always projected, and filterable with `under`; each row's address resolves to that convoy.
+#[tokio::test]
+async fn convoy_rows_name_their_subject_by_address() {
+    use crate::server::{
+        tables::{Catalog, SubjectTables},
+        verbs::{catalog::Subjects, subjects::StoredSubjects},
+    };
+    let directory = tempfile::tempdir().unwrap();
+    let decided = Arc::new(
+        flotilla_schema_sqlite::stream::Service::open(
+            &directory.path().join("decided.sqlite"),
+            "home",
+            flotilla_provisioning::stored::decided_registry().unwrap(),
+        )
+        .unwrap(),
+    );
+    let store = EngineStore { service: Arc::clone(&decided), _directory: directory };
+    let backend = ResourceBackend::new(InMemoryBackend::default());
+    backend.compose_as_engine_home();
+    let engine = flotilla_provisioning_testkit::EngineFixture::over_service(&decided);
+    let convoys = flotilla_engine_convoys_testkit::EngineConvoysHome::over(
+        &decided,
+        "test",
+        &backend,
+        Arc::new(flotilla_resources::SystemClock),
+        engine.reads(),
+    );
+    let mut launched = Vec::new();
+    for (name, project) in [("convoy-1", Some("flotilla")), ("convoy-2", Some("flotilla2")), ("convoy-3", None)] {
+        let spec = ConvoySpec::builder().workflow_ref("workflow".into()).maybe_project_ref(project.map(str::to_owned)).build();
+        let convoy = flotilla_engine_convoys_testkit::convoy("test", name, spec, flotilla_engine_convoys_testkit::single_agent("coder"));
+        launched.push(convoys.launch(convoy).await);
+    }
+    let address = |project: &str, record: &str| {
+        flotilla_schema::Address::project(project)
+            .and_then(|project| project.child(flotilla_address::Kind::Convoy, record))
+            .unwrap()
+            .to_string()
+    };
+    let router = router(backend.clone(), &store);
+    let schema = json(&router, "/tables/convoys").await;
+    assert_eq!(schema["subject"], json!({"kind": "convoy", "field": "address"}));
+    let field = schema["fields"].as_array().unwrap().iter().find(|field| field["name"] == "address").unwrap().clone();
+    assert_eq!((&field["type"], &field["constraints"]["required"]), (&json!("address"), &json!(true)));
+    assert_eq!(field["whereOperators"], json!(["==", "!=", "in", "under", "has"]));
+
+    let rows = |messages: Vec<Message>| -> Vec<flotilla_protocol::table::Row> {
+        messages.into_iter().flat_map(|message| if let Message::Rows { rows, .. } = message { rows } else { vec![] }).collect()
+    };
+    let all = rows(messages(&router, "/tables/convoys/rows?namespace=test&columns=status.phase", false).await);
+    let addresses: Vec<_> = all.iter().map(|row| (row["metadata.name"].clone(), row["address"].clone())).collect();
+    assert_eq!(
+        addresses,
+        [
+            (json!(launched[0]), json!(address("flotilla", &launched[0]))),
+            (json!(launched[1]), json!(address("flotilla2", &launched[1]))),
+            // The engine holds a convoy admitted without a project under its namespace's project.
+            (json!(launched[2]), json!(address("test", &launched[2]))),
+        ]
+    );
+    let subjects = StoredSubjects::new(Catalog::stores(backend, Some(decided), SubjectTables::registered(), "test".into()));
+    for row in &all {
+        let address: flotilla_schema::Address = row["address"].as_str().unwrap().parse().unwrap();
+        let resolved = subjects.row("test", &address).await.unwrap().expect("the row's address names a convoy");
+        assert_eq!(resolved["metadata.name"], row["metadata.name"], "{address}");
+        assert_eq!(resolved["address"], row["address"]);
+    }
+
+    let under = condition(r#"address.under("project:flotilla")"#);
+    let selected = rows(messages(&router, &format!("/tables/convoys/rows?namespace=test&where={under}"), false).await);
+    assert_eq!(selected.iter().map(|row| row["metadata.name"].clone()).collect::<Vec<_>>(), [json!(launched[0])]);
 }
 
 #[test]

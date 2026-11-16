@@ -74,6 +74,17 @@ PRODUCED_PAYLOAD = {"bin/drydock-host"}
 # tolerated at consumption for health rollback, like `bin/drydock-host`; the
 # wrapper is a script, so it is not a Darwin signing target.
 TYPESCRIPT_HOST_WRAPPER = "bin/drydock-host-typescript"
+# Sibling binaries (#4249): `bin/flotilla-<command>` beside `bin/flotilla`, which hands
+# `flotilla <command>` to it. The allowlist is `crates/flotilla-client/src/sibling.rs`; the
+# producer reads it (`siblings`) and ships exactly those siblings (`produced-payload --sibling`).
+# Every other door accepts any sibling path, so a later sibling needs no validator crossing, and,
+# like `bin/drydock-host`, a generation built before a sibling shipped still validates for
+# rollback. Each is native and executable, signed on Darwin, and copied to the stable root there.
+SIBLING_PATTERN = re.compile(r"^bin/flotilla-[a-z][a-z0-9]*(?:-[a-z0-9]+)*$")
+# Linux guest tools that share the prefix but are no siblings of the host `flotilla`.
+NOT_SIBLINGS = {"bin/flotilla-vessel"}
+# The `Sibling::<Name> => "<command>",` arms of `Sibling::command`, one per line.
+SIBLING_ARM = re.compile(r'^\s*Sibling::\w+ => "(.*)",$')
 TYPESCRIPT_HOST_TREE = "share/flotilla/drydock-host-typescript"
 TYPESCRIPT_HOST_ENTRIES = {f"{TYPESCRIPT_HOST_TREE}/dist/main.js", f"{TYPESCRIPT_HOST_TREE}/package.json"}
 SHA_PATTERN = re.compile(r"^[0-9a-f]{40}$")
@@ -463,6 +474,8 @@ def allowed_payload(path, platform=None):
         return platform.startswith("linux-")
     if path in REQUIRED_PAYLOAD or path in CANARY_PAYLOAD or path in PRODUCED_PAYLOAD or path == TYPESCRIPT_HOST_WRAPPER:
         return True
+    if is_sibling(path):
+        return True
     pure = PurePosixPath(path)
     if path.startswith(TYPESCRIPT_HOST_TREE + "/"):
         return all(part not in ("", ".", "..") for part in path.split("/"))
@@ -621,12 +634,42 @@ def validate_skill_source_paths(document, catalog_output=None):
 
 
 
-def validate_produced_payload(bundle):
-    """Refuse a freshly assembled bundle missing a payload every new generation ships."""
-    for rel in sorted(PRODUCED_PAYLOAD):
+def is_sibling(path):
+    """Whether generation-relative `path` is a sibling binary of `bin/flotilla`."""
+    return path not in NOT_SIBLINGS and SIBLING_PATTERN.fullmatch(path) is not None
+
+
+def sibling_paths(paths):
+    return sorted(str(path) for path in paths if is_sibling(str(path)))
+
+
+def sibling_allowlist(source):
+    """The commands `flotilla` hands to siblings, read from the text of `sibling.rs`."""
+    commands = []
+    for line in Path(source).read_text().splitlines():
+        arm = SIBLING_ARM.fullmatch(line)
+        if arm is None:
+            continue
+        command = arm.group(1)
+        if not is_sibling(f"bin/flotilla-{command}") or command in commands:
+            raise ValidationError(f"sibling allowlist {source} names an invalid or duplicate command: {command!r}")
+        commands.append(command)
+    if not commands:
+        raise ValidationError(f"sibling allowlist {source} names no sibling")
+    return commands
+
+
+def validate_produced_payload(bundle, siblings=()):
+    """Refuse a freshly assembled bundle missing a payload every new generation ships, or whose
+    siblings are not exactly the `siblings` (commands) it was built with."""
+    expected = {f"bin/flotilla-{command}" for command in siblings}
+    for rel in sorted(PRODUCED_PAYLOAD | expected):
         path = Path(bundle) / rel
         if not path.is_file() or not os.access(path, os.X_OK):
             raise ValidationError(f"bundle is missing executable {rel}")
+    shipped = set(sibling_paths(path.relative_to(bundle) for path in (Path(bundle) / "bin").iterdir()))
+    if shipped != expected:
+        raise ValidationError(f"bundle siblings {sorted(shipped)} differ from the allowlist {sorted(expected)}")
     validate_typescript_host(bundle)
 
 
@@ -955,6 +998,7 @@ def validate_release(root, outer, platform):
     if codex_home.exists():
         validate_codex_home_template(codex_home)
     binaries = {"bin/flotilla", "bin/flotillad", "bin/cleat"} | (expected & ({"bin/flotilla-vessel", "bin/drydock-agent"} | PRODUCED_PAYLOAD))
+    binaries |= set(sibling_paths(expected))
     validate_typescript_host_paths(expected)
     if TYPESCRIPT_HOST_WRAPPER in expected:
         binaries = binaries | {TYPESCRIPT_HOST_WRAPPER}
@@ -1317,6 +1361,10 @@ def refresh_darwin_payload(source, destination):
     files = [Path("bin") / name for name in ("flotilla", "flotillad", "cleat")]
     # Absent from generations built before it shipped (rollback targets).
     files += [Path(p) for p in sorted(PRODUCED_PAYLOAD) if (source / p).exists()]
+    # `flotilla` finds its siblings beside itself here, so the stable root carries exactly the
+    # selected generation's: one it lacks is pruned below, never left at another build.
+    siblings = [Path(p) for p in sibling_paths(path.relative_to(source) for path in (source / "bin").iterdir())]
+    files += siblings
     files += [path.relative_to(source) for path in (source / "lib").rglob("*") if path.is_file()]
     expected = set(files)
     typescript = Path(TYPESCRIPT_HOST_TREE)
@@ -1336,6 +1384,9 @@ def refresh_darwin_payload(source, destination):
     for stale in (destination / "lib").rglob("*"):
         if (stale.is_file() or stale.is_symlink()) and stale.relative_to(destination) not in expected:
             stale.unlink()
+    for stale in sibling_paths(path.relative_to(destination) for path in (destination / "bin").iterdir()) if (destination / "bin").exists() else ():
+        if Path(stale) not in siblings:
+            (destination / stale).unlink()
     for relative in files:
         target = destination / relative
         target.parent.mkdir(parents=True, exist_ok=True)
@@ -1463,6 +1514,11 @@ def main():
     codex_home.add_argument("root")
     produced = sub.add_parser("produced-payload")
     produced.add_argument("root")
+    produced.add_argument("--sibling", action="append", default=[], help="a sibling command the bundle was built with")
+    helper = sub.add_parser("siblings")
+    helper.add_argument("source", help="crates/flotilla-client/src/sibling.rs")
+    helper = sub.add_parser("sibling-commands")
+    helper.add_argument("release")
     helper = sub.add_parser("package-page")
     helper.add_argument("response")
     helper.add_argument("package_name")
@@ -1598,7 +1654,12 @@ def main():
         elif args.command == "skill-sources":
             validate_skill_source_paths(json.loads(Path(args.manifest).read_text()), args.catalog_output)
         elif args.command == "produced-payload":
-            validate_produced_payload(args.root)
+            validate_produced_payload(args.root, args.sibling)
+        elif args.command == "siblings":
+            print(*sibling_allowlist(args.source), sep="\n")
+        elif args.command == "sibling-commands":
+            for path in sibling_paths(path.relative_to(args.release) for path in (Path(args.release) / "bin").iterdir()):
+                print(path.removeprefix("bin/flotilla-"))
         elif args.command == "codex-home":
             validate_codex_home_template(args.root)
         elif args.command == "generation":

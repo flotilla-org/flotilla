@@ -17,7 +17,13 @@ const GITHUB_RECORD_SERVICE: &str = "github.com";
 /// - artifact slot: `artifact-<sha256 of convoy, role, kind and subject>`;
 /// - usage account: `usage-<sha256 prefix of provider and account>`;
 /// - project, convoy and host: their name;
-/// - checkout: its name, which reads its latest launch (`<name>#<n>`).
+/// - checkout: its name, which reads its latest launch (`<name>#<n>`);
+/// - agent session: its id, the name of its AgentSession record.
+///
+/// A standing convoy's address names its role while its record is `convoy-<uuid>` or
+/// `ensure-<hash>`, so a convoy address needs the role-and-project lookup
+/// (`flotilla_store::ConvoyName`) as well; both go once the engine names a convoy by its
+/// address (#3108).
 ///
 /// These are the names records already carry, so this is a read and write
 /// boundary, not a stored-shape change. A convoy's Project does not take part
@@ -50,7 +56,7 @@ pub fn record_name(address: &Address) -> Option<String> {
             let digest = format!("{:x}", hash.finalize());
             Some(format!("usage-{}", &digest[..54]))
         }
-        Kind::Project | Kind::Convoy | Kind::Host | Kind::Checkout => Some(address.name().to_string()),
+        Kind::Project | Kind::Convoy | Kind::Host | Kind::Checkout | Kind::Session => Some(address.name().to_string()),
         Kind::Fleet
         | Kind::Provider
         | Kind::Vessel

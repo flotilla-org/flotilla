@@ -1,9 +1,8 @@
-//! The verb catalog: each native verb's declaration joined with its presentation entry and
-//! checked once, at load (#4182 rulings 2 revised and 10). A verb whose declaration fails the
+//! The verb catalog: each registered verb's declaration and presentation, checked once, at load
+//! (#4182 rulings 2 revised and 10). The declaring crates register them (#4267 ruling 1). A verb whose declaration fails the
 //! check is listed with the reason in `broken`, never dropped, and the route refuses to run it.
 //! Checks of the presentation entry itself come with the entries baked from YAML (#4198).
 use std::{
-    any::Any,
     collections::{BTreeMap, BTreeSet},
     sync::Arc,
 };
@@ -11,98 +10,11 @@ use std::{
 use async_trait::async_trait;
 use flotilla_address::{Address, Kind};
 use flotilla_protocol::table::Row;
-use flotilla_schema::{ColumnType, Layout, ParamDeclaration, ParamType, Table, TableRole, TableSet, Verb, VerbDeclaration, VerbEffect};
-use serde::de::DeserializeOwned;
+use flotilla_schema::{ColumnType, Layout, Table, TableRole, TableSet};
+use flotilla_verbs::{Handler, ParamDeclaration, ParamType, Picks, Presentation, Registered, VerbDeclaration, VerbEffect, VerbRegistry};
 use serde_json::{json, Map, Value};
 
 use super::when::Condition;
-
-/// How a verb takes the rows it is offered (#4182 ruling 4).
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
-pub(crate) enum Picks {
-    /// The cursor row only.
-    #[default]
-    One,
-    /// Any number of rows; the verb runs once per subject.
-    Each,
-    /// Any number of rows; the verb runs once with them all.
-    Set,
-}
-
-impl Picks {
-    pub(crate) fn as_str(self) -> &'static str {
-        match self {
-            Picks::One => "one",
-            Picks::Each => "each",
-            Picks::Set => "set",
-        }
-    }
-}
-
-/// Presentation and applicability for one native verb (#4182 ruling 10). Built-in entries are
-/// code until #4198 bakes them from `verbs/*.yaml`.
-#[derive(Debug, Clone, Default)]
-pub(crate) struct Presentation {
-    pub verb: &'static str,
-    pub label: Option<&'static str>,
-    pub help: Option<&'static str>,
-    pub key: Option<&'static str>,
-    pub default: bool,
-    pub picks: Picks,
-    pub when: Vec<&'static str>,
-    pub confirm: Option<&'static str>,
-}
-
-/// One subject a verb runs on: its address and its current row.
-#[derive(Debug, Clone)]
-pub(crate) struct Subject {
-    pub address: Address,
-    pub row: Row,
-}
-
-/// A native verb, called by the route once per subject (`one`, `each`) or once with every
-/// subject (`set`). Its parameters arrive deserialized into the type that declares it.
-#[async_trait]
-pub(crate) trait NativeVerb: Send + Sync + 'static {
-    /// The parameter struct whose `#[derive(Verb)]` is the verb's declaration.
-    type Params: Verb + DeserializeOwned + Send + Sync + 'static;
-
-    /// Runs the verb. `invocation` is the caller's id, for a verb that takes it into its effect.
-    async fn run(&self, subjects: &[Subject], params: &Self::Params, invocation: &str) -> Result<Option<Value>, String>;
-}
-
-/// A verb's deserialized parameters, their type erased so one catalog holds every verb.
-pub(crate) type Params = Box<dyn Any + Send + Sync>;
-
-/// A native verb with its parameter type erased, as the catalog holds it.
-#[async_trait]
-pub(crate) trait Handler: Send + Sync {
-    fn declaration(&self) -> VerbDeclaration;
-
-    /// The request's parameters as the verb's own type; `Err` is why they do not deserialize.
-    fn params(&self, params: Map<String, Value>) -> Result<Params, String>;
-
-    /// Runs the verb on parameters [`Handler::params`] made.
-    async fn run(&self, subjects: &[Subject], params: &Params, invocation: &str) -> Result<Option<Value>, String>;
-}
-
-#[async_trait]
-impl<V: NativeVerb> Handler for V {
-    fn declaration(&self) -> VerbDeclaration {
-        V::Params::declaration()
-    }
-
-    fn params(&self, params: Map<String, Value>) -> Result<Params, String> {
-        serde_json::from_value::<V::Params>(Value::Object(params))
-            .map(|params| Box::new(params) as Params)
-            .map_err(|error| error.to_string())
-    }
-
-    async fn run(&self, subjects: &[Subject], params: &Params, invocation: &str) -> Result<Option<Value>, String> {
-        let params = params.downcast_ref::<V::Params>().ok_or("the parameters are another verb's")?;
-        NativeVerb::run(self, subjects, params, invocation).await
-    }
-}
 
 /// Where subjects' rows come from: the table holding a kind's rows, for the load check, and a
 /// subject's current row, for the route's re-check.
@@ -144,7 +56,7 @@ impl Entry {
     }
 }
 
-/// `convoy.start_convoy` → `Start convoy`.
+/// `<kind>.<verb_name>` → `Verb name`.
 fn generated_label(name: &str) -> String {
     let verb = name.split_once('.').map_or(name, |(_, verb)| verb).replace('_', " ");
     let mut characters = verb.chars();
@@ -157,16 +69,11 @@ pub(crate) struct Catalog {
 }
 
 impl Catalog {
-    /// Joins `natives` with `presentations` and checks each verb's meaning against `subjects`'
-    /// tables. A presentation naming no native verb is a programming error in the built-in set,
-    /// caught by its test; it is dropped here with a warning.
-    pub(crate) fn new(natives: Vec<Arc<dyn Handler>>, presentations: Vec<Presentation>, subjects: &dyn Subjects) -> Self {
-        let mut presentations: BTreeMap<_, _> = presentations.into_iter().map(|presentation| (presentation.verb, presentation)).collect();
+    /// Lists every registered verb and checks its meaning against `subjects`' tables.
+    pub(crate) fn new(registry: VerbRegistry, subjects: &dyn Subjects) -> Self {
         let mut entries = BTreeMap::new();
-        for handler in natives {
+        for Registered { handler, presentation } in registry.into_verbs() {
             let declaration = handler.declaration();
-            let presentation =
-                presentations.remove(declaration.name).unwrap_or(Presentation { verb: declaration.name, ..Presentation::default() });
             let mut problems = Vec::new();
             let when = presentation
                 .when
@@ -196,9 +103,6 @@ impl Catalog {
             let broken = (!problems.is_empty()).then(|| problems.join("; "));
             entries.insert(entry.declaration.name, Entry { broken, ..entry });
         }
-        for name in presentations.keys() {
-            tracing::warn!(verb = %name, "verb presentation names no native verb");
-        }
         Self { entries }
     }
 
@@ -224,11 +128,7 @@ impl Catalog {
         layout.column("default", ColumnType::Bool, true);
         layout.categories("effect", VerbEffect::ALL.iter().map(|effect| (effect.as_str().into(), effect.as_str().into())).collect(), true);
         layout.column("idempotent", ColumnType::Bool, true);
-        layout.categories(
-            "picks",
-            [Picks::One, Picks::Each, Picks::Set].iter().map(|picks| (picks.as_str().into(), picks.as_str().into())).collect(),
-            true,
-        );
+        layout.categories("picks", Picks::ALL.iter().map(|picks| (picks.as_str().into(), picks.as_str().into())).collect(), true);
         layout.column("when", ColumnType::Cbor, true);
         layout.property("type", array());
         layout.column("confirm", ColumnType::Text, false);

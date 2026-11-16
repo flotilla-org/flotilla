@@ -5,10 +5,14 @@ mod filter;
 mod position;
 mod query;
 use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine};
+use flotilla_address::Address;
 use flotilla_protocol::table::{Message, Row};
 use flotilla_resources::WatchStart;
 use flotilla_schema::{ColumnType, Filterable, Layout, Table, TableSet};
-use flotilla_store::{query_resource_kind, watch_resource_kind_from, ResourceBackend, REGISTERED_RESOURCE_KINDS};
+use flotilla_store::{
+    query_resource_kind, subject_record_name, watch_resource_kind_from, ResourceBackend, StoreQuery, REGISTERED_RESOURCE_KINDS,
+};
+use flotilla_verbs::SubjectTable;
 use futures::{stream::BoxStream, StreamExt};
 pub(crate) use position::Positions;
 pub(crate) use query::QueryFeed;
@@ -26,6 +30,43 @@ pub(crate) const MAX_LIMIT: usize = 10_000;
 /// The longest a watch goes without a message.
 const PROGRESS: Duration = Duration::from_secs(15);
 const KEY: &str = "metadata.name";
+/// The derived field holding a subject row's address (#4199).
+pub(crate) const ADDRESS: &str = "address";
+
+/// The subject tables the kinds' owning crates register (#4355): which table serves each subject
+/// kind, and how its rows find their address. The daemon names no kind.
+#[derive(Clone, Default)]
+pub(crate) struct SubjectTables(Arc<[SubjectTable]>);
+
+impl SubjectTables {
+    pub(crate) fn new(tables: &[SubjectTable]) -> Self {
+        Self(tables.into())
+    }
+
+    /// The composition root's subject tables.
+    #[cfg(test)]
+    pub(crate) fn registered() -> Self {
+        Self::new(crate::runtime::verb_registry(None).expect("each subject table is registered once").subjects())
+    }
+
+    /// The subject served by the table `name`.
+    pub(crate) fn of_table(&self, name: &str) -> Option<SubjectTable> {
+        self.0.iter().find(|subject| subject.table == name).copied()
+    }
+
+    pub(crate) fn iter(&self) -> impl Iterator<Item = &SubjectTable> {
+        self.0.iter()
+    }
+}
+
+/// `row` with its subject's address in the derived field, from what the row is read from.
+fn addressed(mut row: Row, subject: Option<&SubjectTable>, source: &Value) -> Row {
+    if let Some(subject) = subject {
+        let address = (subject.address)(source).map_or(Value::Null, |address| Value::String(address.as_str().to_owned()));
+        row.insert(ADDRESS.into(), address);
+    }
+    row
+}
 #[derive(Debug, Clone)]
 pub(crate) struct Failure {
     pub code: String,
@@ -67,7 +108,8 @@ pub(crate) fn batches(rows: Vec<Row>, sequence: u64, partial: bool, cursor: Opti
     Ok(messages)
 }
 
-pub(crate) fn descriptor(kind: &str) -> Table {
+/// A resource kind's table, with the derived address column when its rows are `subject`'s.
+pub(crate) fn descriptor(kind: &str, subject: Option<&SubjectTable>) -> Table {
     let condition_items = json!({
         "type":"object",
         "properties":{
@@ -79,6 +121,11 @@ pub(crate) fn descriptor(kind: &str) -> Table {
     let label_values = json!({"type":"string","sortable":false});
     let mut layout = Layout::description(kind);
     layout.key(|layout| layout.column(KEY, ColumnType::Text, true));
+    if let Some(subject) = subject {
+        layout.column(ADDRESS, ColumnType::Text, true);
+        layout.address();
+        layout.subject(subject.kind, ADDRESS);
+    }
     for (name, ty, required) in [
         ("metadata.namespace", ColumnType::Text, true),
         ("metadata.resourceVersion", ColumnType::Text, true),
@@ -108,6 +155,10 @@ pub(crate) fn descriptor(kind: &str) -> Table {
     {
         let column = table.key.iter_mut().chain(&mut table.columns).find(|column| column.name == field).expect("declared column");
         column.properties.insert("sortable".into(), json!(field != "metadata.resourceVersion"));
+    }
+    if let Some(column) = table.columns.iter_mut().find(|column| column.name == ADDRESS) {
+        column.properties.insert("sortable".into(), json!(true));
+        column.properties.insert("title".into(), json!("Address"));
     }
     for column in table.key.iter_mut().chain(&mut table.columns) {
         column.properties.entry("sortable".into()).or_insert(json!(false));
@@ -205,9 +256,9 @@ impl Query {
         if columns.iter().any(|name| !fields.contains(name.as_str())) {
             return Err(bad("unknown_column", "unknown projected column"));
         }
-        for key in &table.key {
-            if !columns.contains(&key.name) {
-                columns.push(key.name.clone());
+        for key in table.key.iter().map(|key| &key.name).chain(table.subject.as_ref().map(|subject| &subject.field)) {
+            if !columns.contains(key) {
+                columns.push(key.clone());
             }
         }
         for column in table.key.iter().chain(&table.columns).filter(|column| column.reference.is_some()) {
@@ -370,8 +421,8 @@ fn compare(a: &Value, b: &Value) -> Ordering {
         _ => rank(a).cmp(&rank(b)).then_with(|| if rank(a) >= 4 { a.to_string().cmp(&b.to_string()) } else { Ordering::Equal }),
     }
 }
-fn row(value: &Value, table: &Table) -> Row {
-    table
+fn row(value: &Value, table: &Table, subject: Option<&SubjectTable>) -> Row {
+    let row: Row = table
         .key
         .iter()
         .chain(&table.columns)
@@ -379,7 +430,8 @@ fn row(value: &Value, table: &Table) -> Row {
             let pointer = format!("/{}", column.name.replace('.', "/"));
             (column.name.clone(), value.pointer(&pointer).cloned().unwrap_or(Value::Null))
         })
-        .collect()
+        .collect();
+    addressed(row, subject, value)
 }
 /// A complete source snapshot. The carrier never sees backend ids or watch tokens.
 #[derive(Clone)]
@@ -407,12 +459,55 @@ impl DerivedSet {
 pub(crate) struct Catalog {
     pub backend: ResourceBackend,
     pub service: Option<Arc<flotilla_schema_sqlite::stream::Service>>,
+    pub subjects: SubjectTables,
     pub derived: Vec<Arc<DerivedSet>>,
     pub queries: Option<Arc<QueryFeed>>,
     /// The daemon run, the incarnation of tables whose sequences restart with it.
     pub incarnation: String,
     /// The resource tables' positions in the decided store's log.
     pub positions: Arc<Positions>,
+}
+
+impl Catalog {
+    /// The stored tables alone: no derived table or named query serves a subject.
+    pub(crate) fn stores(
+        backend: ResourceBackend,
+        service: Option<Arc<flotilla_schema_sqlite::stream::Service>>,
+        subjects: SubjectTables,
+        incarnation: String,
+    ) -> Self {
+        Self { backend, service, subjects, derived: Vec::new(), queries: None, incarnation, positions: Arc::default() }
+    }
+
+    /// The row of the subject at `address`, read from `table`, the table its kind's owner
+    /// registered (#4355): from the engine's store at this daemon's home for an engine kind, by
+    /// its record name (`flotilla_address::record_name`), or from the resource store in
+    /// `namespace` for a kind not yet moved (`flotilla_store::subject_record_name`, whose lookup
+    /// decides which addresses name a record). A record name ignores the address's parents, so an
+    /// engine row is the subject's only when the address it carries is `address`.
+    pub(crate) async fn subject_row(&self, table: &Table, namespace: &str, address: &Address) -> Result<Option<Row>, String> {
+        let Some(subject) = self.subjects.iter().find(|subject| subject.kind == address.kind()) else {
+            return Err(format!("no table serves `{}` subjects", address.kind()));
+        };
+        match TableSource::open(subject.table.to_owned(), self).map_err(|failure| failure.to_string())? {
+            TableSource::Resource { backend, name, subject, .. } => {
+                let Some(record) = subject_record_name(&backend, namespace, address).await? else { return Ok(None) };
+                let query = StoreQuery::names([record], false);
+                let document = query_resource_kind(&backend, namespace, &name, &query).await.map_err(|error| error.to_string())?;
+                Ok(resource_rows(&document, table, subject.as_ref())?.into_iter().next())
+            }
+            source @ TableSource::Decided { .. } => {
+                let Some(record) = flotilla_address::record_name(address) else { return Ok(None) };
+                // An engine subject is this daemon's own record: read at the store's home, which
+                // the `default` namespace names, whatever resource namespace the caller acts in.
+                let params = [("namespace".into(), "default".to_owned()), ("where".into(), format!("resource.name == {}", json!(record)))];
+                let query = Query::parse(&params, table).map_err(|failure| failure.to_string())?;
+                let rows = source.read(table, &query).await.map_err(|failure| failure.to_string())?.rows;
+                Ok(rows.into_iter().find(|row| row.get(ADDRESS).and_then(Value::as_str) == Some(address.as_str())))
+            }
+            _ => Err(format!("`{}` is not a stored table", subject.table)),
+        }
+    }
 }
 
 /// A watch's resume point: the `incarnation` and `sequence` of the last message a client applied.
@@ -433,10 +528,12 @@ pub(crate) enum TableSource {
         service: Arc<flotilla_schema_sqlite::stream::Service>,
         positions: Arc<Positions>,
         run: String,
+        subject: Option<SubjectTable>,
     },
     Decided {
         service: Arc<flotilla_schema_sqlite::stream::Service>,
         name: String,
+        subject: Option<SubjectTable>,
     },
     Derived {
         derived: Arc<DerivedSet>,
@@ -477,6 +574,7 @@ impl TableSource {
         Ok(json!({"kinds":kinds}))
     }
     pub(crate) fn open(name: String, catalog: &Catalog) -> Result<Self, Failure> {
+        let subject = catalog.subjects.of_table(&name);
         if let Some(kind) = resource_tables(catalog).find(|kind| kind.plural == name) {
             let service = catalog.service.clone().expect("a served resource table's store");
             return Ok(Self::Resource {
@@ -486,6 +584,7 @@ impl TableSource {
                 service,
                 positions: Arc::clone(&catalog.positions),
                 run: catalog.incarnation.clone(),
+                subject,
             });
         }
         if let Some(derived) = catalog.derived.iter().find(|derived| derived.table(&name).is_some()) {
@@ -494,7 +593,7 @@ impl TableSource {
         if let Some(source) = query::Source::open(&name, catalog.queries.as_ref()) {
             return Ok(Self::Query(source));
         }
-        catalog.service.clone().map(|service| Self::Decided { service, name }).ok_or_else(|| bad("not_found", "unknown table"))
+        catalog.service.clone().map(|service| Self::Decided { service, name, subject }).ok_or_else(|| bad("not_found", "unknown table"))
     }
     /// Reads the named query `query` (JSON text of a query id) instead of the table's default.
     pub(crate) fn with_query(self, query: Option<&str>) -> Result<Self, Failure> {
@@ -521,21 +620,44 @@ impl TableSource {
     }
     pub(crate) async fn describe(&self) -> Result<Description, Failure> {
         match self {
-            Self::Resource { name, .. } => {
-                let table = descriptor(name);
+            Self::Resource { .. } => self.describe_stored(),
+            Self::Decided { .. } => {
+                let source = self.clone();
+                tokio::task::spawn_blocking(move || source.describe_stored()).await.map_err(|error| Failure::from(error.to_string()))?
+            }
+            Self::Derived { derived, name, .. } => {
+                let mut table = derived.set.tables[derived.table(name).expect("opened table")].clone();
+                mark_scalar_columns(&mut table);
+                Ok(Description { schema: derived.set.frictionless(&table), markdown: flotilla_schema::render_view([&derived.set]), table })
+            }
+            Self::Query(source) => {
+                let set = source.set();
+                let mut table = set.tables.iter().find(|table| table.name == source.name()).expect("opened table").clone();
+                mark_scalar_columns(&mut table);
+                Ok(Description { schema: set.frictionless(&table), markdown: flotilla_schema::render_view([set]), table })
+            }
+        }
+    }
+    /// The description of a resource or engine table, reading the engine store's kinds in place:
+    /// for a blocking caller, or one describing tables once at startup.
+    pub(crate) fn describe_stored(&self) -> Result<Description, Failure> {
+        match self {
+            Self::Resource { name, subject, .. } => {
+                let table = descriptor(name, subject.as_ref());
                 Ok(Description { schema: table.frictionless(), markdown: flotilla_schema::render_table_view(&table), table })
             }
-            Self::Decided { service, name } => {
+            Self::Decided { service, name, subject } => {
                 let lookup = name.clone();
-                let mut set = decided::blocking(service, move |store| {
-                    Ok(store
-                        .kinds()
-                        .iter()
-                        .find(|set| set.tables.iter().any(|table| table.name == lookup) || set.log_projection().name == lookup)
-                        .cloned())
-                })
-                .await?
-                .ok_or_else(|| bad("not_found", "unknown table"))?;
+                let mut set = service
+                    .with_store(move |store| {
+                        Ok(store
+                            .kinds()
+                            .iter()
+                            .find(|set| set.tables.iter().any(|table| table.name == lookup) || set.log_projection().name == lookup)
+                            .cloned())
+                    })
+                    .map_err(|error| Failure::from(error.to_string()))?
+                    .ok_or_else(|| bad("not_found", "unknown table"))?;
                 set.tables.push(set.log_projection());
                 let markdown = flotilla_schema::render_view([&set]);
                 let mut table = set.tables.iter().find(|table| table.name == *name).expect("described table").clone();
@@ -552,24 +674,21 @@ impl TableSource {
                 }
                 // The rows wire names enum values; codes stay in storage (ADR 0047: wire only).
                 table = table.with_natural_references().readable();
+                if let Some(subject) = subject {
+                    let mut address = flotilla_schema::ColumnDef::new(ADDRESS, ColumnType::Text, false);
+                    address.address = true;
+                    address.properties.insert("title".into(), json!("Address"));
+                    table.columns.push(address);
+                    table.subject = Some(flotilla_schema::Subject { kind: subject.kind, field: ADDRESS.into() });
+                }
                 mark_scalar_columns(&mut table);
                 Ok(Description { schema: set.frictionless(&table), table, markdown })
             }
-            Self::Derived { derived, name, .. } => {
-                let mut table = derived.set.tables[derived.table(name).expect("opened table")].clone();
-                mark_scalar_columns(&mut table);
-                Ok(Description { schema: derived.set.frictionless(&table), markdown: flotilla_schema::render_view([&derived.set]), table })
-            }
-            Self::Query(source) => {
-                let set = source.set();
-                let mut table = set.tables.iter().find(|table| table.name == source.name()).expect("opened table").clone();
-                mark_scalar_columns(&mut table);
-                Ok(Description { schema: set.frictionless(&table), markdown: flotilla_schema::render_view([set]), table })
-            }
+            Self::Derived { .. } | Self::Query(_) => Err(bad("not_found", "not a stored table")),
         }
     }
     pub(crate) async fn diagram(&self, observed: bool, namespace: String, record: Option<String>) -> Result<String, Failure> {
-        let Self::Decided { service, name } = self else { return Err(bad("no_machine", "resource kind has no declared machine")) };
+        let Self::Decided { service, name, .. } = self else { return Err(bad("no_machine", "resource kind has no declared machine")) };
         let name = name.clone();
         let kind = decided::blocking(service, move |store| {
             Ok(store
@@ -614,7 +733,7 @@ impl TableSource {
     }
     async fn read(&self, table: &Table, query: &Query) -> Result<Snapshot, Failure> {
         match self {
-            Self::Resource { backend, kind, name, service, positions, run } => {
+            Self::Resource { backend, kind, name, service, positions, run, subject } => {
                 let codes = backend.engine_codes(kind).ok_or_else(|| bad("unavailable", format!("{kind} is not served here")))?;
                 // The position before the rows: each port's read applies the log at least up to it,
                 // and sees at least the changes it has counted outside the log.
@@ -631,13 +750,35 @@ impl TableSource {
                 let filter = filter::pushdown(query.filter.as_ref(), &query.fields, queryable);
                 let document = query_resource_kind(backend, &query.namespace, name, &filter).await.map_err(source_failure)?;
                 Ok(Snapshot {
-                    rows: resource_rows(&document, table)?.into_iter().filter(|row| query.keeps(row)).collect(),
+                    rows: resource_rows(&document, table, subject.as_ref())?.into_iter().filter(|row| query.keeps(row)).collect(),
                     sequence: position.sequence + unlogged.unwrap_or(0),
                     incarnation,
                 })
             }
-            Self::Decided { service, name } => {
+            Self::Decided { service, name, subject: None } => {
                 let (sequence, _, rows) = decided::read(service, name, query).await?;
+                Ok(Snapshot { rows, sequence, incarnation: "durable".into() })
+            }
+            Self::Decided { service, name, subject: Some(subject) } => {
+                // The store holds no address column: a filter reading the derived address is
+                // evaluated here, over the addressed rows.
+                let mut stored = table.clone();
+                stored.columns.retain(|column| column.name != ADDRESS);
+                let mut pushed = query.clone();
+                pushed.filter = query
+                    .filter
+                    .clone()
+                    .filter(|filter| rigging_condition::Checked::new((**filter).clone(), filter::fields(&stored).schema()).is_ok());
+                let local = pushed.filter.is_none() && query.filter.is_some();
+                let (sequence, _, rows) = decided::read(service, name, &pushed).await?;
+                let rows = rows
+                    .into_iter()
+                    .map(|row| {
+                        let source = Value::Object(row.clone().into_iter().collect());
+                        addressed(row, Some(subject), &source)
+                    })
+                    .filter(|row| !local || query.keeps(row))
+                    .collect();
                 Ok(Snapshot { rows, sequence, incarnation: "durable".into() })
             }
             Self::Derived { derived, name, incarnation } => {
@@ -1006,7 +1147,7 @@ mod properties {
     use std::sync::atomic::Ordering as AtomicOrdering;
     #[test]
     fn timestamp_keysets_compare_instants_across_precision_and_offsets() {
-        let table = descriptor("convoys");
+        let table = descriptor("convoys", None);
         for descending in [false, true] {
             let field = if descending { "-metadata.deletionTimestamp" } else { "metadata.deletionTimestamp" };
             let query = Query::parse(&[("sort".into(), field.into())], &table).unwrap();
@@ -1033,7 +1174,7 @@ mod properties {
         assert_eq!(source_failure(flotilla_resources::ResourceError::other("disk unavailable")).code, "table_source");
         assert_eq!(source_failure(flotilla_resources::ResourceError::invalid("unsupported predicate")).code, "invalid_request");
         for document in [json!({}), json!({"items":null}), json!({"items":[{}]}), json!({"items":[{"metadata":{"name":3}}]})] {
-            assert!(resource_rows(&document, &descriptor("convoys")).is_err());
+            assert!(resource_rows(&document, &descriptor("convoys", None), None).is_err());
         }
     }
 
@@ -1100,7 +1241,7 @@ mod properties {
         let index = tc.draw(gs::integers::<usize>().min_value(0).max_value(11));
         let phase = tc.draw(gs::integers::<usize>().min_value(0).max_value(3));
         let params = vec![("sort".into(), format!("{}status.phase", if descending { "-" } else { "" })), ("columns".into(), "spec".into())];
-        let query = Query::parse(&params, &descriptor("convoys")).unwrap_or_else(|_| panic!("valid query"));
+        let query = Query::parse(&params, &descriptor("convoys", None)).unwrap_or_else(|_| panic!("valid query"));
         let row = Row::from([
             (KEY.into(), json!(format!("row-{index}"))),
             (
@@ -1146,7 +1287,7 @@ mod properties {
     #[hegel::test]
     fn numeric_sort_orders_rows_and_cursors_page_every_row_once(tc: hegel::TestCase) {
         use hegel::generators as gs;
-        let mut table = descriptor("convoys");
+        let mut table = descriptor("convoys", None);
         let column = table.columns.iter_mut().find(|column| column.name == "status.phase").expect("phase column");
         column.ty = ColumnType::Number;
         column.nullable = true;
@@ -1194,14 +1335,14 @@ mod properties {
         assert_eq!(seen, expected);
     }
 }
-pub(crate) fn resource_rows(document: &Value, table: &Table) -> Result<Vec<Row>, String> {
+pub(crate) fn resource_rows(document: &Value, table: &Table, subject: Option<&SubjectTable>) -> Result<Vec<Row>, String> {
     document["items"]
         .as_array()
         .ok_or("missing resource items")?
         .iter()
         .map(|value| {
             value.pointer("/metadata/name").and_then(Value::as_str).ok_or("missing resource name")?;
-            Ok(row(value, table))
+            Ok(row(value, table, subject))
         })
         .collect()
 }
@@ -1246,8 +1387,9 @@ mod source_contract_tests {
                 service: decided.clone(),
                 positions: Arc::default(),
                 run: "run".into(),
+                subject: None,
             },
-            TableSource::Decided { service: service.clone(), name: "feed_sample".into() },
+            TableSource::Decided { service: service.clone(), name: "feed_sample".into(), subject: None },
         ] {
             let description = source.describe().await.unwrap();
             let query = Query::parse(&[("watch".into(), "true".into())], &description.table).unwrap();
@@ -1301,7 +1443,7 @@ mod source_contract_tests {
                 write.commit()
             })
             .unwrap();
-        let source = TableSource::Decided { service, name: "frozen_sample".into() };
+        let source = TableSource::Decided { service, name: "frozen_sample".into(), subject: None };
         let description = source.describe().await.unwrap();
         let query = Query::parse(&[], &description.table).unwrap();
         let snapshot = source.read(&description.table, &query).await.unwrap();
@@ -1310,7 +1452,7 @@ mod source_contract_tests {
     }
     #[test]
     fn live_diff_observes_projected_values_only() {
-        let table = descriptor("convoys");
+        let table = descriptor("convoys", None);
         let query = Query::parse(&[("columns".into(), "spec".into())], &table).unwrap();
         let row = Row::from([(KEY.into(), json!("one")), ("spec".into(), json!({})), ("metadata.labels".into(), json!({"group":"a"}))]);
         let before = Snapshot { rows: vec![row.clone()], sequence: 1, incarnation: "same".into() };

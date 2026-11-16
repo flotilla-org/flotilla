@@ -1,4 +1,4 @@
-//! Dashboard startup, landing selection and re-exec handoff.
+//! Dashboard startup, landing selection and re-exec handoff, moved from `flotilla` (#4263).
 
 use std::{
     path::{Path, PathBuf},
@@ -6,7 +6,10 @@ use std::{
 };
 
 use color_eyre::Result;
-use flotilla_cli::cli::args::Cli;
+use flotilla_cli::{
+    cli::args::Cli,
+    frontend::connection::{connect_cli_socket, host_daemon_socket_required},
+};
 use flotilla_config::ConfigStore;
 use flotilla_daemon_api::daemon::DaemonHandle;
 use flotilla_paths::path_context::{DaemonHostPath, ExecutionEnvironmentPath};
@@ -15,8 +18,6 @@ use flotilla_provider_runtime::ProcessCommandRunner;
 use flotilla_tui::{app, event_log, theme};
 use flotilla_vcs::providers::{git::GitVcs, VcsInspection};
 use tracing::info;
-
-use super::{connect_cli_socket, host_daemon_socket_required};
 
 fn select_startup_repo_roots(cli_roots: &[PathBuf], cwd_repo_root: Option<PathBuf>) -> Vec<PathBuf> {
     if cli_roots.is_empty() {
@@ -82,8 +83,7 @@ pub(crate) async fn run_tui(cli: Cli, scoped_view: Option<flotilla_protocol::Vie
     let startup_repo_roots = startup_repo_roots(&cli.repo_root).await;
     let cli_theme = cli.theme.clone();
     let socket_path = paths.socket_path;
-    let require_host_daemon =
-        host_daemon_socket_required(std::env::var_os(flotilla_environment::environment::CONTAINED_DAEMON_REQUIRED_ENV).as_deref());
+    let require_host_daemon = host_daemon_socket_required(std::env::var_os("FLOTILLA_CONTAINED_HOST_DAEMON").as_deref());
 
     // Connect to the daemon concurrently with terminal initialization.
     let daemon_log_path =

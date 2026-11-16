@@ -30,7 +30,11 @@ use serde_json::Value as Json;
 /// `flotilla-table`'s arguments. `flotilla table` passes the global flags it resolved (`--socket`,
 /// `--config-dir`, `--daemon`, `--json`) ahead of the user's own.
 #[derive(clap::Parser, Debug)]
-#[command(name = "flotilla-table", version, about = "Show a described table through binnacle: printed when piped, inline in a terminal")]
+// The version names the build id, as `flotilla --version` does, so a release can check its siblings.
+#[command(
+    name = "flotilla-table",
+    version = concat!(env!("CARGO_PKG_VERSION"), " (wire=", env!("FLOTILLA_BUILD_ID"), ")"),
+    about = "Show a described table through binnacle: printed when piped, inline in a terminal")]
 pub struct Args {
     /// Described table name, e.g. convoys; omit to list the tables
     pub name: Option<String>,

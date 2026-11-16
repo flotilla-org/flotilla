@@ -214,10 +214,26 @@ mkdir -p "$codex_home_bundle"
 cp -R "$flotilla_root/share/flotilla/codex-home/." "$codex_home_bundle/"
 python3 "$(dirname "$0")/generation_validation.py" codex-home "$codex_home_bundle"
 
+# The siblings `flotilla` hands commands to (#4249): its allowlist, read from the source, less any
+# whose crate has not landed yet (no `flotilla-<command>` binary in the workspace).
+siblings=()
+while IFS= read -r sibling; do
+  if (cd "$flotilla_root" && cargo metadata --locked --no-deps --format-version 1) \
+    | python3 -c 'import json, sys; sys.exit(sys.argv[1] not in {t["name"] for p in json.load(sys.stdin)["packages"] for t in p["targets"] if "bin" in t["kind"]})' "flotilla-$sibling"; then
+    siblings+=("$sibling")
+  else
+    printf 'skipping sibling flotilla-%s: no such binary in this flotilla revision yet\n' "$sibling" >&2
+  fi
+done < <(python3 "$(dirname "${BASH_SOURCE[0]}")/generation_validation.py" siblings "$flotilla_root/crates/flotilla-client/src/sibling.rs")
+
 (
   cd "$flotilla_root"
   export FLOTILLA_BUILD_ID="${flotilla_sha:0:12}"
   cargo build --locked --release --bin flotilla --bin flotillad
+  # Built with the same build id, which `flotilla` hands each one and it checks.
+  for sibling in ${siblings[@]+"${siblings[@]}"}; do
+    cargo build --locked --release -p "flotilla-$sibling" --bin "flotilla-$sibling"
+  done
   # flotillad embeds the drydock daemon, which finds provider hosts beside itself.
   # drydock-host is only a dev-dependency here, which cargo cannot build as a package.
   drydock_rev="$(sed -n 's/^drydock-host = .*rev = "\([0-9a-f]\{40\}\)".*/\1/p' Cargo.toml)"
@@ -255,6 +271,9 @@ if [[ "$platform" == linux-* ]]; then
   install -m 0755 "$flotilla_root/target/release/flotilla-vessel" "$bundle/bin/flotilla-vessel"
   install -m 0755 "$flotilla_root/target/release/drydock-agent" "$bundle/bin/drydock-agent"
 fi
+for sibling in ${siblings[@]+"${siblings[@]}"}; do
+  install -m 0755 "$flotilla_root/target/release/flotilla-$sibling" "$bundle/bin/flotilla-$sibling"
+done
 install -m 0755 "$cleat_root/target/release/cleat" "$bundle/bin/cleat"
 package_cleat_terminfo "$cleat_root" "$bundle"
 
@@ -298,11 +317,20 @@ cp "$flotilla_root/scripts/fleet-canary-agent.sh" "$bundle/fleet-canary-agent.sh
 cp "$flotilla_root/ci/fleet-candidates/generation_validation.py" "$bundle/generation_validation.py"
 chmod 0755 "$bundle/install.sh" "$bundle/generation_validation.py"
 
-python3 "$(dirname "$0")/generation_validation.py" produced-payload "$bundle"
+sibling_arguments=()
+for sibling in ${siblings[@]+"${siblings[@]}"}; do
+  sibling_arguments+=(--sibling "$sibling")
+done
+python3 "$(dirname "$0")/generation_validation.py" produced-payload "$bundle" ${sibling_arguments[@]+"${sibling_arguments[@]}"}
 
 wire_generation="${flotilla_sha:0:12}"
 "$bundle/bin/flotilla" --version | grep -F "wire=$wire_generation"
 "$bundle/bin/flotillad" --version | grep -F "wire=$wire_generation"
+# Each sibling reports the generation's build, and `flotilla` finds and runs it from its directory.
+for sibling in ${siblings[@]+"${siblings[@]}"}; do
+  "$bundle/bin/flotilla-$sibling" --version | grep -F "wire=$wire_generation"
+  "$bundle/bin/flotilla" "$sibling" --version | grep -F "wire=$wire_generation"
+done
 protocol_version="$(read_protocol_version "$bundle/bin/flotilla")"
 test "$(read_protocol_version "$bundle/bin/flotillad")" = "$protocol_version"
 "$bundle/bin/cleat" launch --help | grep -q -- --tag

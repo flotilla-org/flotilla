@@ -4,14 +4,53 @@ Run `scripts/fleet-install latest` (or a generation ID) using the configured
 fleet reader credential. `scripts/fleet-install rollback` restores the previous
 verified generation. `status` reports the selection and wire generations.
 
+## Sibling binaries
+
+`flotilla` hands some commands to sibling binaries named `flotilla-<command>`
+(#4249). It runs them only from its own directory, with symlinks resolved, and
+only those on the allowlist compiled into it
+(`crates/flotilla-client/src/sibling.rs`). Each generation ships every
+allowlisted sibling whose crate has landed:
+
+| Sibling | `flotilla` command | Status |
+| --- | --- | --- |
+| `flotilla-table` | `flotilla table` | shipped |
+| `flotilla-mcp` | `flotilla mcp` | joins the allowlist with #4201 |
+| `flotilla-tui` | `flotilla` with no subcommand, `flotilla view` (and the hidden `flotilla tui` the checks below run) | shipped |
+
+The candidate build reads the allowlist from that file, builds the siblings with
+the generation's build id, and refuses a bundle whose siblings differ from it.
+They are verified like `flotilla`, and signed with it on macOS. On Linux they
+sit in the generation directory, where the `current` symlink resolves; on macOS
+they are copied beside `flotilla` into `tcc/bin/` (below). A rollback restores
+the previous generation's siblings with it, and drops one it did not ship.
+
+After activation and after `rollback`, fleet-install runs
+`flotilla <command> --version` through the managed launcher for each sibling the
+selected generation ships. The sibling must be found beside `flotilla` and pass
+its build-id check (`FLOTILLA_PARENT_BUILD`), and report the generation's build.
+A failure names the sibling and leaves the generation active; reinstall it.
+
+Vessels and the crew image get `flotilla-table` beside their CLI through the
+`table` member of the guest tool composition (`stdlib/guest-layers`), and never
+`flotilla-tui`.
+
+The first generation carrying a sibling is a payload-boundary crossing: an
+installed validator older than it refuses `bin/flotilla-table` as an unexpected
+path. Stage the reviewed bootstrap/validator pair first (see "Bootstrap helpers
+and synchronization"). That validator accepts any `bin/flotilla-<command>`, so
+later siblings need no further crossing.
+
 ## Stable Darwin executables
 
 On macOS, fleet-install copies the selected generation's signed `flotillad`,
-`flotilla`, and `cleat` into `~/.local/opt/flotilla-fleet/tcc/bin/`. These are
-regular files, not symlinks. The executable-relative libraries are copied into
-`tcc/lib/`. Launchd and the managed CLI launchers execute these fixed paths;
-activation, reinstall, recovery and rollback all refresh the copies from the
-selected verified release. Linux retains its generation symlinks.
+`flotilla`, `cleat` and sibling binaries into
+`~/.local/opt/flotilla-fleet/tcc/bin/`. These are regular files, not symlinks.
+The executable-relative libraries are copied into `tcc/lib/`. Launchd and the
+managed CLI launchers execute these fixed paths; activation, reinstall, recovery
+and rollback all refresh the copies from the selected verified release, and
+remove a sibling copy the selected release does not ship. Linux retains its
+generation symlinks.
 
 Keep `FLEET_INSTALL_ROOT` unchanged between installs: changing it changes the
 privacy identity. Signing remains the existing comte signing contract (team

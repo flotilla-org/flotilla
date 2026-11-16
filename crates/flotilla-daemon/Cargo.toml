@@ -23,6 +23,7 @@ flotilla-engine-messages = { path = "../flotilla-engine-messages" }
 flotilla-inbox = { path = "../flotilla-inbox" }
 flotilla-state-machines = { path = "../flotilla-state-machines" }
 flotilla-schema = { path = "../flotilla-schema" }
+flotilla-verbs = { path = "../flotilla-verbs" }
 rigging-condition = { workspace = true }
 flotilla-address = { path = "../flotilla-address" }
 flotilla-messaging = { path = "../flotilla-messaging" }
@@ -59,7 +60,7 @@ flotilla-charter = { path = "../flotilla-charter" }
 flotilla-credentials = { path = "../flotilla-credentials" }
 flotilla-capability-contract = { path = "../flotilla-capability-contract" }
 flotilla-protocol = { path = "../flotilla-protocol" }
-flotilla-relay-protocol = { path = "../flotilla-relay-protocol" }
+rigging-relay-protocol = { workspace = true }
 flotilla-resources = { path = "../flotilla-resources" }
 flotilla-transport = { path = "../flotilla-transport" }
 tender = { path = "../tender" }

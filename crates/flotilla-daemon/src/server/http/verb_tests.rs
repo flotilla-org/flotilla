@@ -22,10 +22,11 @@ use flotilla_protocol::{
     CallerProcess, CommandCaller, PrincipalRef,
 };
 use flotilla_resources::{ConvoySpec, PROJECT_LABEL, ROLE_LABEL};
-use flotilla_schema::{Table, Verb};
+use flotilla_schema::Table;
 use flotilla_store::ResourceBackend;
 use flotilla_store_memory::InMemoryBackend;
 use flotilla_tracing::{SdkTracerProvider, TracerProvider as _};
+use flotilla_verbs::{Call, NativeVerb, Picks, Presentation, Verb, VerbRegistry};
 use serde::Deserialize;
 use serde_json::{json, Value};
 use tower::ServiceExt;
@@ -36,9 +37,9 @@ use crate::server::{
     caller::PeerCredential,
     tables,
     verbs::{
-        catalog::{Catalog, NativeVerb, Picks, Presentation, Subject, Subjects},
-        invoke::{allow_all, FIELD_LIMIT, INVOCATION_LIMIT, SUBJECT_LIMIT},
-        Verbs,
+        self,
+        catalog::Subjects,
+        invoke::{FIELD_LIMIT, INVOCATION_LIMIT, SUBJECT_LIMIT},
     },
 };
 use crate::testkits::engine::admit_convoy;
@@ -48,7 +49,8 @@ mod span_exporter;
 use span_exporter::InMemorySpanExporter;
 
 /// A write verb that counts its runs and answers with its parameter. Its effect marks each
-/// subject once per invocation id, so a repeat runs again and changes nothing.
+/// subject once per invocation id, so a repeat runs again and changes nothing. It is declared and
+/// registered as a crate outside the daemon declares one, through `flotilla_verbs` alone.
 #[derive(Verb, Deserialize)]
 #[verb(name = "convoy.touch", subject = "convoy", effect = "write", invocation)]
 struct Touch {
@@ -59,18 +61,21 @@ struct Touch {
 struct Counted {
     runs: Arc<AtomicUsize>,
     touched: Arc<Mutex<BTreeSet<(String, String)>>>,
+    /// The caller of each run, as the handler saw it.
+    callers: Arc<Mutex<Vec<CommandCaller>>>,
 }
 
 #[async_trait]
 impl NativeVerb for Counted {
     type Params = Touch;
 
-    async fn run(&self, subjects: &[Subject], params: &Touch, invocation: &str) -> Result<Option<Value>, String> {
+    async fn run(&self, call: Call<'_>, params: &Touch) -> Result<Option<Value>, String> {
         let _span = tracing::info_span!("convoy.touch.effect").entered();
         self.runs.fetch_add(1, Ordering::SeqCst);
+        self.callers.lock().unwrap().push(call.caller.clone());
         let mut touched = self.touched.lock().unwrap();
-        touched.extend(subjects.iter().map(|subject| (subject.address.to_string(), invocation.to_owned())));
-        Ok(Some(json!({"subjects": subjects.len(), "note": params.note})))
+        touched.extend(call.subjects.iter().map(|subject| (subject.address.to_string(), call.invocation.to_owned())));
+        Ok(Some(json!({"subjects": call.subjects.len(), "note": params.note})))
     }
 }
 
@@ -85,7 +90,7 @@ struct Looked;
 impl NativeVerb for Looked {
     type Params = Look;
 
-    async fn run(&self, _subjects: &[Subject], _params: &Look, _invocation: &str) -> Result<Option<Value>, String> {
+    async fn run(&self, _call: Call<'_>, _params: &Look) -> Result<Option<Value>, String> {
         Ok(None)
     }
 }
@@ -96,7 +101,7 @@ struct Rows(BTreeMap<String, Row>);
 #[async_trait]
 impl Subjects for Rows {
     fn table(&self, kind: Kind) -> Option<Table> {
-        (kind == Kind::Convoy).then(|| tables::descriptor("convoys"))
+        (kind == Kind::Convoy).then(|| tables::descriptor("convoys", tables::SubjectTables::registered().of_table("convoys").as_ref()))
     }
 
     async fn row(&self, _namespace: &str, address: &Address) -> Result<Option<Row>, String> {
@@ -113,6 +118,7 @@ struct Fixture {
     daemon: Arc<InProcessDaemon>,
     runs: Arc<AtomicUsize>,
     touched: Arc<Mutex<BTreeSet<(String, String)>>>,
+    callers: Arc<Mutex<Vec<CommandCaller>>>,
     _dir: tempfile::TempDir,
 }
 
@@ -121,22 +127,17 @@ async fn fixture() -> Fixture {
     let (dir, daemon) = super::super::tests::empty_daemon().await;
     let runs = Arc::new(AtomicUsize::new(0));
     let touched = Arc::new(Mutex::new(BTreeSet::new()));
+    let callers = Arc::new(Mutex::new(Vec::new()));
     let rows = [(RUNNING, "Running"), (OTHER, "Running"), (LANDED, "Landed")]
         .map(|(address, phase)| (address.to_owned(), Row::from([("status.phase".into(), json!(phase))])));
     let subjects = Arc::new(Rows(rows.into()));
-    let presentation = Presentation {
-        verb: "convoy.touch",
-        label: Some("Touch convoy"),
-        picks: Picks::Each,
-        when: vec![".status.phase != Landed"],
-        ..Presentation::default()
-    };
-    let catalog = Catalog::new(
-        vec![Arc::new(Counted { runs: Arc::clone(&runs), touched: Arc::clone(&touched) }), Arc::new(Looked)],
-        vec![presentation],
-        subjects.as_ref(),
-    );
-    let verbs = Verbs { catalog, subjects, policy: allow_all };
+    let presentation =
+        Presentation { label: Some("Touch convoy"), picks: Picks::Each, when: vec![".status.phase != Landed"], ..Presentation::default() };
+    let mut registry = VerbRegistry::new();
+    let counted = Counted { runs: Arc::clone(&runs), touched: Arc::clone(&touched), callers: Arc::clone(&callers) };
+    registry.register(counted, presentation).unwrap();
+    registry.register(Looked, Presentation::default()).unwrap();
+    let verbs = verbs::serve(registry, subjects);
     let router = HttpRouter::builder()
         .backend(ResourceBackend::new(InMemoryBackend::default()))
         .daemon(Arc::clone(&daemon))
@@ -144,7 +145,7 @@ async fn fixture() -> Fixture {
         .verbs(Arc::new(verbs))
         .build()
         .into_router();
-    Fixture { router, daemon, runs, touched, _dir: dir }
+    Fixture { router, daemon, runs, touched, callers, _dir: dir }
 }
 
 async fn send(router: &Router, caller: CallerAuth, method: &str, path: &str, body: Option<Value>) -> (StatusCode, Vec<u8>) {
@@ -386,7 +387,7 @@ async fn the_invocation_span_records_the_intent_and_the_outcomes() {
     let _subscriber = tracing::subscriber::set_default(
         tracing_subscriber::registry().with(flotilla_tracing::layer().with_tracer(provider.tracer("verbs"))),
     );
-    let Fixture { router, daemon, .. } = fixture().await;
+    let Fixture { router, daemon, callers, .. } = fixture().await;
     let missing = "project:flotilla/convoy:missing";
     let request = json!({"invocation": "rec", "subjects": [RUNNING, missing], "params": {"note": "why"}});
     let (crew, evidence) = crew_on_the_main_socket();
@@ -413,8 +414,12 @@ async fn the_invocation_span_records_the_intent_and_the_outcomes() {
             .unwrap_or_else(|| panic!("no span for {id}: {spans:?}"))
     };
     let span = invocation("rec");
-    // A crew on the main socket is recorded as the crew, not as its process's uid.
+    // A crew on the main socket is recorded as the crew, not as its process's uid, and the verb's
+    // handler is handed that same resolved caller (#4267 ruling 4).
     assert_eq!(attribute(span, "verb.caller").as_deref(), Some("crew:flotilla/convoy-1/work/coder#crew-1"));
+    let seen = callers.lock().unwrap()[0].clone();
+    assert_eq!(seen.crew.as_ref().map(|crew| crew.crew_id.as_str()), Some("crew-1"));
+    assert_eq!(Some(seen.to_string()), attribute(span, "verb.caller"));
     assert_eq!(attribute(span, "verb.name").as_deref(), Some("convoy.touch"));
     assert_eq!(attribute(span, "verb.subjects").map(|text| serde_json::from_str::<Value>(&text).unwrap()), Some(json!([RUNNING, missing])));
     assert_eq!(attribute(span, "verb.params").map(|text| serde_json::from_str::<Value>(&text).unwrap()), Some(json!({"note": "why"})));
@@ -472,9 +477,9 @@ async fn requests_that_do_not_fit_the_verb_are_refused_whole() {
     assert_eq!(runs.load(Ordering::SeqCst), 0);
 }
 
-// Behaviour (#4197 operator check, #4234): the built-in catalog lists `convoy.explain`, unbroken,
-// and it runs through the route over the daemon's own convoy, named by its record name or by
-// its role under its project, as the CLI's `convoy explain` names it. The role under another
+// Behaviour (#4197 operator check, #4234, #4267): the catalog lists `convoy.explain`, which
+// flotilla-projections registers, unbroken, and it runs through the route over the daemon's own
+// convoy, named by its record name or by its role under its project. The role under another
 // project names nothing.
 #[tokio::test]
 async fn convoy_explain_finds_a_convoy_by_its_record_name_or_role() {
@@ -500,5 +505,158 @@ async fn convoy_explain_finds_a_convoy_by_its_record_name_or_role() {
         assert_eq!(outcome["status"], "done", "{body}");
         assert!(outcome["result"].is_object(), "{body}");
     }
-    assert_eq!(body["outcomes"][2], json!({"subject": subjects[2], "status": "failed", "error": "no convoy matches `fix-3774@other`"}));
+    assert_eq!(
+        body["outcomes"][2],
+        json!({"subject": subjects[2], "status": "failed", "error": format!("no convoy at `{}`", subjects[2])})
+    );
+}
+
+/// A read verb answering with the record its subject's row is.
+#[derive(Verb, Deserialize)]
+#[verb(name = "convoy.record", subject = "convoy", effect = "read")]
+struct Record {}
+
+struct Records;
+
+#[async_trait]
+impl NativeVerb for Records {
+    type Params = Record;
+
+    async fn run(&self, call: Call<'_>, _params: &Record) -> Result<Option<Value>, String> {
+        Ok(call.subjects.first().map(|subject| subject.row["metadata.name"].clone()))
+    }
+}
+
+// Behaviour (#4199, #4272): a convoy row's own address acts on that row's convoy. A record named
+// like a role (`lander`, holding `coder`) is not displaced by the live holder of `lander`, nor an
+// ended holder of a role by its live one: each row read from `/tables/convoys` is invoked on by
+// its `address`, and the verb sees that row's record.
+#[tokio::test]
+async fn a_convoy_rows_address_acts_on_that_rows_convoy() {
+    let (_dir, daemon) = super::super::tests::empty_daemon().await;
+    let namespace = daemon.provisioning_namespace().await;
+    let backend = daemon.resource_backend();
+    let engine = Arc::clone(daemon.convoy_engine_path().get().expect("the engine Convoy path"));
+    for (record, role, landed) in [("lander", "coder", false), ("convoy-1", "lander", true), ("convoy-2", "lander", false)] {
+        let labels = BTreeMap::from([(ROLE_LABEL.to_owned(), role.to_owned()), (PROJECT_LABEL.to_owned(), "flotilla".to_owned())]);
+        let spec = ConvoySpec::builder().workflow_ref("workflow".into()).project_ref("flotilla".into()).role(role.into()).build();
+        let mut convoy =
+            flotilla_engine_convoys_testkit::convoy(&namespace, record, spec, flotilla_engine_convoys_testkit::single_agent("coder"));
+        convoy.metadata.labels = labels;
+        let launch = admit_convoy(&daemon, convoy).await;
+        if landed {
+            // An operator keeps its work and it is delivered: an ended holder of `lander`.
+            let convoy = backend.using::<flotilla_resources::Convoy>(&namespace).get(&launch).await.expect("convoy");
+            let scope = flotilla_resources::convoy::engine::VerdictScope { vessel: "work".to_string(), role: None };
+            engine.keep_by_verdict(&convoy, &scope, "operator", "landed").await.expect("keep the work");
+            engine.deliver(&convoy, "claim").await.expect("deliver");
+        }
+    }
+    let mut registry = VerbRegistry::new();
+    flotilla_store::register_subjects(&mut registry).unwrap();
+    registry.register(Records, Presentation::default()).unwrap();
+    let router = HttpRouter::builder()
+        .backend(backend)
+        .daemon(Arc::clone(&daemon))
+        .logins(Arc::new(LoginStore::new(Arc::new(flotilla_resources::SystemClock))))
+        .registry(registry)
+        .build()
+        .into_router();
+    let rows = rows(&router, &format!("/tables/convoys/rows?namespace={namespace}")).await;
+    assert_eq!(rows.len(), 3);
+    for row in rows {
+        let request = json!({"invocation": "r", "subjects": [row["address"]]});
+        let (status, body) = invoke(&router, CallerAuth::Bearer, "convoy.record", request).await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        assert_eq!((&body["outcomes"][0]["status"], &body["outcomes"][0]["result"]), (&json!("done"), &row["metadata.name"]), "{body}");
+    }
+}
+
+/// A read verb on an agent session, answering with its session's record name.
+#[derive(Verb, Deserialize)]
+#[verb(name = "session.name", subject = "session", effect = "read")]
+struct SessionName {}
+
+struct SessionNames;
+
+#[async_trait]
+impl NativeVerb for SessionNames {
+    type Params = SessionName;
+
+    async fn run(&self, call: Call<'_>, _params: &SessionName) -> Result<Option<Value>, String> {
+        Ok(call.subjects.first().map(|subject| subject.row["resource.name"].clone()))
+    }
+}
+
+const CODER: &str = "project:flotilla/convoy:fix/role:coder";
+
+/// The session subject table as an owning crate would register it: `agent_session` rows, each
+/// the session of `CODER` its record names.
+fn sessions_of_coder() -> flotilla_verbs::SubjectTable {
+    flotilla_verbs::SubjectTable {
+        kind: Kind::Session,
+        table: "agent_session",
+        address: |row| CODER.parse::<Address>().ok()?.child(Kind::Session, row["resource.name"].as_str()?).ok(),
+    }
+}
+
+// Behaviour (#4355): a kind held only by the engine is a verb subject through its registration
+// alone. Its engine table, read through `/tables`, names the subject and gives each row its
+// `session` address, which `where` reads; the verb invoked on a row's address sees that row's
+// record. An address naming the record under another role is no row's, and finds no session.
+#[tokio::test]
+async fn an_engine_kinds_row_address_acts_on_that_rows_record() {
+    use flotilla_state_machines::{
+        machines::agent_session::{AgentSession, MemoryAgentSessionWorld},
+        Home,
+    };
+    let (dir, daemon) = super::super::tests::empty_daemon().await;
+    let service = Arc::new(
+        flotilla_schema_sqlite::stream::Service::open(&dir.path().join("engine.db"), "home", crate::runtime::decided_registry().unwrap())
+            .unwrap(),
+    );
+    let mut sessions =
+        Home::<AgentSession, flotilla_engine_store::StoreLog>::with_log("home", flotilla_engine_store::StoreLog::new(service.store()))
+            .unwrap();
+    for (name, at) in [("s-1", 1), ("s-2", 2), ("s-3", 3)] {
+        sessions.create(name, (), &MemoryAgentSessionWorld::default(), flotilla_schema::Timestamp(at)).unwrap();
+    }
+    let mut registry = VerbRegistry::new();
+    registry.register_subject(sessions_of_coder()).unwrap();
+    registry.register(SessionNames, Presentation::default()).unwrap();
+    let router = HttpRouter::builder()
+        .backend(ResourceBackend::new(InMemoryBackend::default()))
+        .daemon(Arc::clone(&daemon))
+        .table_store(service)
+        .logins(Arc::new(LoginStore::new(Arc::new(flotilla_resources::SystemClock))))
+        .registry(registry)
+        .build()
+        .into_router();
+    let verbs = rows(&router, "/tables/verbs/rows").await;
+    assert_eq!((&verbs[0]["name"], &verbs[0]["broken"]), (&json!("session.name"), &Value::Null));
+    let (status, schema) = send(&router, CallerAuth::Bearer, "GET", "/tables/agent_session", None).await;
+    assert_eq!(status, StatusCode::OK);
+    let schema: Value = serde_json::from_slice(&schema).unwrap();
+    assert_eq!(schema["subject"], json!({"kind": "session", "field": "address"}));
+    let field = schema["fields"].as_array().unwrap().iter().find(|field| field["name"] == "address").unwrap().clone();
+    assert_eq!(field["type"], "address");
+
+    let all = rows(&router, "/tables/agent_session/rows?columns=resource.name").await;
+    let addresses: Vec<_> = all.iter().map(|row| (row["resource.name"].clone(), row["address"].clone())).collect();
+    let expected: Vec<_> = ["s-1", "s-2", "s-3"].map(|name| (json!(name), json!(format!("{CODER}/session:{name}")))).into();
+    assert_eq!(addresses, expected);
+    // The filter on the derived address is evaluated over every stored row, not a page of them:
+    // under `limit=1` the last session is still found.
+    let selected = rows(&router, &format!("/tables/agent_session/rows?limit=1&where=address%20%3D%3D%20%22{CODER}/session:s-3%22")).await;
+    assert_eq!(selected.iter().map(|row| row["resource.name"].clone()).collect::<Vec<_>>(), [json!("s-3")]);
+    for row in &all {
+        let request = json!({"invocation": "s", "subjects": [row["address"]]});
+        let (status, body) = invoke(&router, CallerAuth::Bearer, "session.name", request).await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        assert_eq!((&body["outcomes"][0]["status"], &body["outcomes"][0]["result"]), (&json!("done"), &row["resource.name"]), "{body}");
+    }
+    let elsewhere = "project:flotilla/convoy:fix/role:reviewer/session:s-1";
+    let (status, body) = invoke(&router, CallerAuth::Bearer, "session.name", json!({"invocation": "e", "subjects": [elsewhere]})).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(body["outcomes"][0], json!({"subject": elsewhere, "status": "failed", "error": format!("no session at `{elsewhere}`")}));
 }

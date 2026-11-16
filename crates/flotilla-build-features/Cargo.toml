@@ -10,6 +10,10 @@ publish = false
 [build-dependencies]
 proc-macro2 = "1"
 quote = "1"
+# #4263: flotilla-tui's crokey proc macro takes crossterm on the host, and through parking_lot these.
+libc = { workspace = true }
+log = { version = "0.4", default-features = false, features = ["std"] }
+smallvec = { version = "1", default-features = false, features = ["const_generics", "const_new"] }
 syn = { version = "2", features = ["extra-traits", "fold", "full", "visit", "visit-mut"] }
 # syn 3 is a second major beside syn 2: async-trait and other host proc-macros take it, and
 # binnacle's layout schema derives (schemars_derive, serde_derive_internals, ref-cast-impl) select

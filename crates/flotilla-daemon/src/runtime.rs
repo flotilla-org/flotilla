@@ -926,6 +926,20 @@ pub(crate) fn decided_registry() -> Result<flotilla_schema::KindRegistry, flotil
     flotilla_core::in_process::decided::registry()
 }
 
+/// The native verbs, each registered by the crate performing its effect (#4267 ruling 1), and
+/// the subject tables, each registered by the crate owning its kind (#4355); the daemon declares
+/// neither. Without the daemon (resource-handler tests) no verb is registered.
+pub(crate) fn verb_registry(
+    daemon: Option<std::sync::Arc<flotilla_core::in_process::InProcessDaemon>>,
+) -> Result<flotilla_verbs::VerbRegistry, flotilla_verbs::Duplicate> {
+    let mut registry = flotilla_verbs::VerbRegistry::new();
+    flotilla_store::register_subjects(&mut registry)?;
+    if let Some(daemon) = daemon {
+        flotilla_projections::register_verbs(&mut registry, daemon)?;
+    }
+    Ok(registry)
+}
+
 /// The machine diagram of each kind in [`decided_registry`], by kind name.
 pub(crate) fn decided_diagrams() -> Result<std::collections::BTreeMap<String, String>, flotilla_schema::RegistryError> {
     flotilla_core::in_process::decided::diagrams()
