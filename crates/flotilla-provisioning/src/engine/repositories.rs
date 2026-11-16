@@ -255,6 +255,10 @@ impl EngineRecords for EngineRepositories {
         &[KIND]
     }
 
+    fn codes(&self, _kind: &str) -> Vec<KindCode> {
+        vec![CODE]
+    }
+
     fn home(&self) -> String {
         self.home.clone()
     }

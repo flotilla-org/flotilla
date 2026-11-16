@@ -186,6 +186,10 @@ impl VesselRecords for Counted {
         self.reads.vessels().expect("vessels").home()
     }
 
+    fn codes(&self) -> Vec<flotilla_schema::KindCode> {
+        self.reads.vessels().expect("vessels").codes()
+    }
+
     fn get(&self, name: &str, home: Option<&str>) -> Result<Option<VesselRecord>, String> {
         self.reads.vessels()?.get(name, home)
     }

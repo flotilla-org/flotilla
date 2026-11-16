@@ -140,6 +140,18 @@ impl ResourceBackend {
         })
     }
 
+    /// The stored kinds whose log entries can change `kind`'s records as its port reads them;
+    /// `None` unless the engine serves `kind`.
+    pub fn engine_codes(&self, kind: &str) -> Option<Vec<flotilla_resources::engine_records::KindCode>> {
+        self.engine_records(kind).map(|port| port.codes(kind))
+    }
+
+    /// How many times `kind`'s engine records changed outside the log since this home started;
+    /// `None` unless the engine serves `kind` with some of its state held only in memory.
+    pub fn engine_unlogged_changes(&self, kind: &str) -> Option<u64> {
+        self.engine_records(kind).and_then(|port| port.unlogged_changes(kind))
+    }
+
     /// The shared listing of `kind`'s engine records, started for the first watcher; `None` unless
     /// the engine serves `kind`.
     pub(crate) async fn engine_feed(
@@ -1051,6 +1063,9 @@ mod tests {
     impl EngineRecords for Port {
         fn kinds(&self) -> &'static [&'static str] {
             self.kinds
+        }
+        fn codes(&self, _kind: &str) -> Vec<flotilla_resources::engine_records::KindCode> {
+            Vec::new()
         }
         fn reads(&self, kind: &str) -> bool {
             kind != "ImageBuild"

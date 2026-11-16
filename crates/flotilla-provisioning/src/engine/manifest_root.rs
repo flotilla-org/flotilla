@@ -85,6 +85,8 @@ pub struct EngineManifestRoots {
     commits: CommitsSeen,
     /// The last pass's judgement of each document of each root homed here, by engine name.
     judged: Mutex<BTreeMap<String, BTreeMap<DocumentKey, DocumentState>>>,
+    /// How many times a judgement changed since this home started; each change ticks watchers.
+    judged_changes: tokio::sync::watch::Sender<u64>,
     clock: Arc<dyn flotilla_resources::Clock>,
 }
 
@@ -103,6 +105,7 @@ impl EngineManifestRoots {
             roots: Mutex::new(roots),
             resident: Mutex::new(resident),
             judged: Mutex::new(BTreeMap::new()),
+            judged_changes: tokio::sync::watch::Sender::new(0),
             clock,
         };
         let homes = opened.service.homes();
@@ -477,7 +480,10 @@ impl ManifestRoots for EngineManifestRoots {
         // The judgement follows the records just written; the settlements below are each their own
         // write, and a pass that fails among them is repeated whole by the next, which the claimed
         // check and `Unchanged` absorb.
-        locked(&self.judged).insert(engine.clone(), pass.documents.clone());
+        let before = locked(&self.judged).insert(engine.clone(), pass.documents.clone());
+        if before.as_ref() != Some(&pass.documents) {
+            self.judged_changes.send_modify(|tick| *tick += 1);
+        }
         // Settle each resolution the pass claimed and finished.
         let resolutions = locked(&self.roots).get(&engine).map(|root| root.spec().resolutions.clone()).unwrap_or_default();
         for (key, document) in &pass.documents {
@@ -608,6 +614,15 @@ impl flotilla_resources::engine_records::EngineRecords for EngineManifestRoots {
         &[ROOT_KIND]
     }
 
+    fn codes(&self, _kind: &str) -> Vec<KindCode> {
+        vec![ROOT]
+    }
+
+    /// This home's judgements of its roots' documents.
+    fn unlogged_changes(&self, _kind: &str) -> Option<u64> {
+        Some(*self.judged_changes.borrow())
+    }
+
     fn home(&self) -> String {
         self.home.clone()
     }
@@ -662,7 +677,7 @@ impl flotilla_resources::engine_records::EngineRecords for EngineManifestRoots {
 
     async fn changes(&self) -> Result<futures::stream::BoxStream<'static, ()>, String> {
         let watch = super::watch::EngineWatch::start(Arc::clone(&self.service), [ROOT]).map_err(|error| error.to_string())?;
-        let stream = futures::stream::unfold(watch, |mut watch| async move {
+        let logged = futures::stream::unfold(watch, |mut watch| async move {
             match watch.next(|_, _| Ok(())).await {
                 Ok(()) => Some(((), watch)),
                 Err(error) => {
@@ -671,7 +686,14 @@ impl flotilla_resources::engine_records::EngineRecords for EngineManifestRoots {
                 }
             }
         });
-        Ok(Box::pin(stream))
+        let mut judged = self.judged_changes.subscribe();
+        judged.mark_unchanged();
+        // The port is gone once its sender is; the log alone ticks from then on.
+        let judged = futures::stream::unfold(judged, |mut judged| async move {
+            judged.changed().await.ok()?;
+            Some(((), judged))
+        });
+        Ok(Box::pin(futures::stream::select(logged, judged)))
     }
 }
 

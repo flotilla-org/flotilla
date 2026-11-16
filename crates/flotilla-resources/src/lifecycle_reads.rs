@@ -99,6 +99,34 @@ pub trait LifecycleReads: Send + Sync {
     }
 }
 
+/// One of the record sets [`LifecycleReads`] serves, for a view naming those it reads.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RecordSet {
+    Convoys,
+    Vessels,
+    Terminals,
+    Environments,
+    Checkouts,
+    Clones,
+}
+
+/// The stored kinds of `sets` as `reads` serves them; a set it does not serve adds none.
+pub fn record_codes(reads: &dyn LifecycleReads, sets: &[RecordSet]) -> Vec<flotilla_schema::KindCode> {
+    let mut codes = Vec::new();
+    for set in sets {
+        let served = match set {
+            RecordSet::Convoys => reads.convoys().map(|records| records.codes()),
+            RecordSet::Vessels => reads.vessels().map(|records| records.codes()),
+            RecordSet::Terminals => reads.terminals().map(|records| records.codes()),
+            RecordSet::Environments => reads.environments().map(|records| records.codes()),
+            RecordSet::Checkouts => reads.checkouts().map(|records| records.codes()),
+            RecordSet::Clones => reads.clones().map(|records| records.codes()),
+        };
+        codes.extend(served.unwrap_or_default());
+    }
+    codes
+}
+
 /// Readings of an engine that holds nothing.
 pub struct NoLifecycleReads;
 

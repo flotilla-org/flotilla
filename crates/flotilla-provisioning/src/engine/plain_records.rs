@@ -218,6 +218,10 @@ impl<K: PlainKind> EngineRecords for PlainRecords<K> {
         &[K::KIND]
     }
 
+    fn codes(&self, _kind: &str) -> Vec<flotilla_schema::KindCode> {
+        vec![K::CODE]
+    }
+
     fn home(&self) -> String {
         self.home.clone()
     }

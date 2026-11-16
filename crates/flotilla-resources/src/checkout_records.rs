@@ -287,6 +287,8 @@ pub enum CheckoutChange {
 /// read is keyed or indexed. [`CheckoutRecords::request`] and the integration writes are the only
 /// writes, and only for this home: the Checkout controller writes every lifecycle edge after them.
 pub trait CheckoutRecords: Send + Sync {
+    /// The stored kinds these checkouts are read from: a log entry of any other kind changes none.
+    fn codes(&self) -> Vec<flotilla_schema::KindCode>;
     /// `name` held at `home`, or at this home when `None`. A launch name (`<checkout>#<n>`) reads
     /// that launch; a checkout's name reads its latest launch.
     fn get(&self, name: &str, home: Option<&str>) -> Result<Option<CheckoutRecord>, String>;

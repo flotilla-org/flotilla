@@ -176,6 +176,10 @@ impl ConvoyRecords for Convoys {
     fn home(&self) -> &str {
         HERE
     }
+
+    fn codes(&self) -> Vec<flotilla_resources::engine_records::KindCode> {
+        Vec::new()
+    }
     fn get(&self, name: &str, home: Option<&str>) -> Result<Option<ConvoyRecord>, String> {
         self.read.fetch_add(1, Ordering::SeqCst);
         self.reading.notify_one();
@@ -213,6 +217,10 @@ impl TerminalRecords for Terminals {
     fn home(&self) -> &str {
         HERE
     }
+
+    fn codes(&self) -> Vec<flotilla_resources::engine_records::KindCode> {
+        Vec::new()
+    }
     fn get(&self, name: &str, _home: Option<&str>) -> Result<Option<TerminalRecord>, String> {
         Ok(self.records.iter().find(|record| record.name == name).cloned())
     }
@@ -249,6 +257,10 @@ struct Vessels {
 impl VesselRecords for Vessels {
     fn home(&self) -> &str {
         HERE
+    }
+
+    fn codes(&self) -> Vec<flotilla_resources::engine_records::KindCode> {
+        Vec::new()
     }
     fn get(&self, name: &str, home: Option<&str>) -> Result<Option<VesselRecord>, String> {
         let home = home.unwrap_or(HERE);

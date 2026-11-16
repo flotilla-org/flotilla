@@ -25,6 +25,10 @@ impl EngineRecords for Uncomposed {
         &[]
     }
 
+    fn codes(&self, _kind: &str) -> Vec<flotilla_resources::engine_records::KindCode> {
+        Vec::new()
+    }
+
     fn home(&self) -> String {
         String::new()
     }

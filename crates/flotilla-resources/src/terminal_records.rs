@@ -354,6 +354,8 @@ pub enum TerminalRenewal {
 /// are the only writes, and only at this home: the TerminalSession controller writes every edge
 /// after them, including the release once the holder has ended.
 pub trait TerminalRecords: Send + Sync {
+    /// The stored kinds these sessions are read from: a log entry of any other kind changes none.
+    fn codes(&self) -> Vec<flotilla_schema::KindCode>;
     /// This home.
     fn home(&self) -> &str;
     /// `name` held at `home`, or at this home when `None`. A launch name (`<session>#<n>`) reads
@@ -456,15 +458,28 @@ impl TerminalObservation {
 pub struct TerminalObservations {
     held: Mutex<HashMap<String, TerminalObservation>>,
     changes: tokio::sync::broadcast::Sender<String>,
+    /// How many times an observation changed since this home started, counted after each change.
+    changed: std::sync::atomic::AtomicU64,
 }
 
 impl Default for TerminalObservations {
     fn default() -> Self {
-        Self { held: Mutex::new(HashMap::new()), changes: tokio::sync::broadcast::channel(256).0 }
+        Self { held: Mutex::new(HashMap::new()), changes: tokio::sync::broadcast::channel(256).0, changed: Default::default() }
     }
 }
 
 impl TerminalObservations {
+    /// How many times an observation has changed since this home started. Counted after each
+    /// change is in place, so a reader that reads this before the observations sees those changes.
+    pub fn changed(&self) -> u64 {
+        self.changed.load(std::sync::atomic::Ordering::SeqCst)
+    }
+
+    fn noted(&self, name: &str) {
+        self.changed.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        let _ = self.changes.send(name.to_owned());
+    }
+
     /// What is observed of launch `name`, if anything.
     pub fn get(&self, name: &str) -> Option<TerminalObservation> {
         self.lock().get(name).cloned()
@@ -481,7 +496,7 @@ impl TerminalObservations {
             *observation != before
         };
         if changed {
-            let _ = self.changes.send(name.to_owned());
+            self.noted(name);
         }
         changed
     }
@@ -497,7 +512,7 @@ impl TerminalObservations {
             *observation != before
         };
         if changed {
-            let _ = self.changes.send(name.to_owned());
+            self.noted(name);
         }
         changed
     }
@@ -505,7 +520,7 @@ impl TerminalObservations {
     /// Forgets launch `name`, which has ended.
     pub fn forget(&self, name: &str) {
         if self.lock().remove(name).is_some() {
-            let _ = self.changes.send(name.to_owned());
+            self.noted(name);
         }
     }
 

@@ -454,6 +454,10 @@ impl EngineRecords for EngineDefinitions {
         &DEFINITION_KINDS
     }
 
+    fn codes(&self, kind: &str) -> Vec<KindCode> {
+        codes().into_iter().filter(|(_, name)| *name == kind).map(|(code, _)| code).chain([ROOT]).collect()
+    }
+
     fn home(&self) -> String {
         self.home.clone()
     }

@@ -108,6 +108,10 @@ impl ConvoyRecords for EngineConvoyRecords {
         &self.home
     }
 
+    fn codes(&self) -> Vec<KindCode> {
+        followed_kinds().to_vec()
+    }
+
     fn get(&self, name: &str, home: Option<&str>) -> Result<Option<ConvoyRecord>, String> {
         let home = home.unwrap_or(&self.home).to_owned();
         self.read(&format!("{name} at {home}"), |read| {

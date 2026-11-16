@@ -526,6 +526,10 @@ impl EngineRecords for EngineObservations {
         &[CHANGE_REQUEST, ISSUE]
     }
 
+    fn codes(&self, kind: &str) -> Vec<KindCode> {
+        vec![if kind == CHANGE_REQUEST { CHANGE_REQUEST_CODE } else { ISSUE_CODE }]
+    }
+
     fn home(&self) -> String {
         self.home.clone()
     }

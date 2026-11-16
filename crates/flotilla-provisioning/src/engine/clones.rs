@@ -164,6 +164,10 @@ impl EngineClones {
 }
 
 impl CloneRecords for EngineClones {
+    fn codes(&self) -> Vec<flotilla_schema::KindCode> {
+        vec![<Resource<Clone> as Kind>::CODE, CloneFacts::CODE]
+    }
+
     fn changes(&self) -> tokio::sync::broadcast::Receiver<CloneChange> {
         self.changes.subscribe()
     }

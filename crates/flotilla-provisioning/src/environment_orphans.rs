@@ -185,6 +185,10 @@ mod tests {
     }
 
     impl EnvironmentRecords for Authority {
+        fn codes(&self) -> Vec<flotilla_schema::KindCode> {
+            Vec::new()
+        }
+
         fn get(&self, _: &str, _: Option<&str>) -> Result<Option<EnvironmentRecord>, String> {
             unreachable!("the sweep reads live environments only")
         }

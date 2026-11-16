@@ -220,6 +220,17 @@ impl EngineRecords for LifecycleViews {
         &[CLONE, ENVIRONMENT, CHECKOUT, IMAGE_BUILD]
     }
 
+    fn codes(&self, kind: &str) -> Vec<flotilla_resources::engine_records::KindCode> {
+        use flotilla_resources::lifecycle_reads::{record_codes, RecordSet};
+        let set = match kind {
+            CLONE => RecordSet::Clones,
+            ENVIRONMENT => RecordSet::Environments,
+            CHECKOUT => RecordSet::Checkouts,
+            _ => return Vec::new(),
+        };
+        record_codes(self.reads.as_ref(), &[set])
+    }
+
     fn reads(&self, kind: &str) -> bool {
         kind != IMAGE_BUILD
     }

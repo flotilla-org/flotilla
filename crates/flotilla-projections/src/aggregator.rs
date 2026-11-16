@@ -7112,6 +7112,10 @@ mod tests {
     /// The checkouts held for any convoy: each scripted checkout with a reading, as its first
     /// launch at its home. A scripted read error fails the whole read.
     impl flotilla_resources::checkout_records::CheckoutRecords for ScriptedReadings {
+        fn codes(&self) -> Vec<flotilla_resources::engine_records::KindCode> {
+            Vec::new()
+        }
+
         fn get(&self, _: &str, _: Option<&str>) -> Result<Option<flotilla_resources::checkout_records::CheckoutRecord>, String> {
             Err("readiness reads checkouts by holder".into())
         }
@@ -7171,6 +7175,10 @@ mod tests {
 
     /// Clones read by key from the same script as [`crate::ports::ProvisioningKind::Clone`].
     impl flotilla_resources::clone_records::CloneRecords for ScriptedReadings {
+        fn codes(&self) -> Vec<flotilla_resources::engine_records::KindCode> {
+            Vec::new()
+        }
+
         fn get(&self, name: &str, home: Option<&str>) -> Result<Option<flotilla_resources::clone_records::CloneRecord>, String> {
             use crate::ports::LifecycleReads as _;
             let reading = self.try_reading(crate::ports::ProvisioningKind::Clone, name, home)?;

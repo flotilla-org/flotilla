@@ -437,6 +437,16 @@ impl EngineRecords for TerminalViews {
         &[KIND]
     }
 
+    fn codes(&self, _kind: &str) -> Vec<flotilla_resources::engine_records::KindCode> {
+        use flotilla_resources::lifecycle_reads::{record_codes, RecordSet};
+        record_codes(self.reads.as_ref(), &[RecordSet::Terminals, RecordSet::Environments, RecordSet::Vessels])
+    }
+
+    /// This home's observations of its launches.
+    fn unlogged_changes(&self, _kind: &str) -> Option<u64> {
+        Some(self.reads.terminals().map_or(0, |terminals| terminals.observations().changed()))
+    }
+
     fn home(&self) -> String {
         self.terminals().map(|terminals| terminals.home().to_owned()).unwrap_or_default()
     }

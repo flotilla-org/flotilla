@@ -420,6 +420,15 @@ impl EngineRecords for EngineProjects {
         &[KIND]
     }
 
+    fn codes(&self, _kind: &str) -> Vec<KindCode> {
+        vec![PROJECT, OPS, ROOT]
+    }
+
+    /// This home's dispatch judgements.
+    fn unlogged_changes(&self, _kind: &str) -> Option<u64> {
+        Some(*self.judged_changes.borrow())
+    }
+
     fn home(&self) -> String {
         self.home.clone()
     }

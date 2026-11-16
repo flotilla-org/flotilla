@@ -446,6 +446,16 @@ impl EngineRecords for ConvoyViews {
         &[KIND]
     }
 
+    fn codes(&self, _kind: &str) -> Vec<flotilla_resources::engine_records::KindCode> {
+        use flotilla_resources::lifecycle_reads::{record_codes, RecordSet};
+        record_codes(self.reads.as_ref(), &[RecordSet::Convoys, RecordSet::Vessels, RecordSet::Terminals])
+    }
+
+    /// This home's notes on its launches.
+    fn unlogged_changes(&self, _kind: &str) -> Option<u64> {
+        Some(self.reads.convoys().map_or(0, |convoys| convoys.memory().changed()))
+    }
+
     fn home(&self) -> String {
         self.convoys().map(|convoys| convoys.home().to_owned()).unwrap_or_default()
     }

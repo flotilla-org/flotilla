@@ -19,6 +19,7 @@ use futures::{stream::BoxStream, StreamExt};
 use flotilla_protocol::{LifecycleReading, NodeId};
 use flotilla_resources::{
     checkout_records::{latest_launches, CheckoutChange, CheckoutHolder, CheckoutRecord},
+    convoy_records::ConvoyChange,
     engine_records::{EngineObject, EngineRecords},
     environment_records::{EnvironmentChange, EnvironmentRecord},
     lifecycle_reads::{ChangeCursor, LifecycleReads},
@@ -104,6 +105,9 @@ struct Cursors {
     environments: Box<dyn ChangeCursor<EnvironmentChange>>,
     terminals: Box<dyn ChangeCursor<TerminalChange>>,
     checkouts: Box<dyn ChangeCursor<CheckoutChange>>,
+    /// The convoys' launches, where their log is held: a pass then sees a convoy written before it,
+    /// which their watch tells only later. Their notes, held in memory, still come by the watch.
+    convoys: Option<Box<dyn ChangeCursor<ConvoyChange>>>,
 }
 
 impl Cursors {
@@ -114,7 +118,8 @@ impl Cursors {
         else {
             return Ok(None);
         };
-        Ok(Some(Self { vessels, environments, terminals, checkouts }))
+        let convoys = reads.convoys().ok().and_then(|convoys| convoys.cursor());
+        Ok(Some(Self { vessels, environments, terminals, checkouts, convoys }))
     }
 
     /// Marks in `dirt` what changed since the last pass; a change that could not be read marks
@@ -148,6 +153,15 @@ impl Cursors {
             }
             CheckoutChange::Rescanned => true,
         });
+        if let Some(convoys) = &mut self.convoys {
+            dirt.all |= read(convoys, |change| match change {
+                ConvoyChange::Changed { name, .. } => {
+                    dirt.convoys.insert(name);
+                    false
+                }
+                ConvoyChange::Rescanned => true,
+            });
+        }
     }
 }
 
@@ -523,6 +537,18 @@ fn engine_object(source: ReadResourceObject<Vessel>, home: String) -> Result<Eng
 impl EngineRecords for VesselViews {
     fn kinds(&self) -> &'static [&'static str] {
         &[KIND]
+    }
+
+    /// The launches' kinds and those of everything their views join, the convoys among them.
+    fn codes(&self, _kind: &str) -> Vec<flotilla_resources::engine_records::KindCode> {
+        use flotilla_resources::lifecycle_reads::{record_codes, RecordSet};
+        let sets = [RecordSet::Vessels, RecordSet::Environments, RecordSet::Terminals, RecordSet::Checkouts, RecordSet::Convoys];
+        record_codes(self.reads.as_ref(), &sets)
+    }
+
+    /// The notes of the convoys the views join.
+    fn unlogged_changes(&self, _kind: &str) -> Option<u64> {
+        Some(self.reads.convoys().map_or(0, |convoys| convoys.memory().changed()))
     }
 
     fn home(&self) -> String {

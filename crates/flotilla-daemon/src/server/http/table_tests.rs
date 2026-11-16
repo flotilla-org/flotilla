@@ -17,28 +17,46 @@ use std::{
 };
 use tower::ServiceExt;
 
-fn router(backend: ResourceBackend) -> Router {
+/// The router over `backend`, whose resource tables are positioned in `store`'s log.
+fn router(backend: ResourceBackend, store: &EngineStore) -> Router {
     HttpRouter::builder()
         .backend(backend)
+        .table_store(Arc::clone(&store.service))
         .logins(Arc::new(LoginStore::new(Arc::new(flotilla_resources::SystemClock))))
         .build()
         .into_router()
 }
+/// The decided store an engine backend serves from, living as long as its directory.
+pub(super) struct EngineStore {
+    pub(super) service: Arc<flotilla_schema_sqlite::stream::Service>,
+    _directory: tempfile::TempDir,
+}
 /// A daemon's resource backend as production composes it, the engine's home, serving AccessDelivery
 /// from a decided store in `test`. The carrier tests use AccessDelivery because it takes creates,
 /// updates and deletes through the backend, and reads back a label, its convoy; a Convoy is
-/// admitted, never written, so only its own case seeds one, by launch. The store lives as long as
-/// the directory.
-pub(super) fn engine_backend() -> (ResourceBackend, tempfile::TempDir) {
+/// admitted, never written, so only its own case seeds one, by launch.
+pub(super) fn engine_backend() -> (ResourceBackend, EngineStore) {
     engine_backend_in("test")
 }
 /// [`engine_backend`] serving in `namespace`, with the definition and Project kinds a fleet's
 /// designation is written to.
-pub(super) fn engine_backend_in(namespace: &str) -> (ResourceBackend, tempfile::TempDir) {
+pub(super) fn engine_backend_in(namespace: &str) -> (ResourceBackend, EngineStore) {
+    engine_backend_over(namespace, tempfile::tempdir().unwrap())
+}
+impl EngineStore {
+    /// The daemon restarted over this store: its ports reopened in `namespace` from what the
+    /// store holds. Every reader of the old ports is dropped first.
+    pub(super) fn restart(self, namespace: &str) -> (ResourceBackend, EngineStore) {
+        let Self { service, _directory: directory } = self;
+        drop(service);
+        engine_backend_over(namespace, directory)
+    }
+}
+/// [`engine_backend_in`] over the decided store in `directory`, created or reopened.
+fn engine_backend_over(namespace: &str, directory: tempfile::TempDir) -> (ResourceBackend, EngineStore) {
     use flotilla_provisioning::engine::{
         access_deliveries::EngineAccessDeliveries, definitions::EngineDefinitions, projects::EngineProjects,
     };
-    let directory = tempfile::tempdir().unwrap();
     let service = Arc::new(
         flotilla_schema_sqlite::stream::Service::open(
             &directory.path().join("decided.sqlite"),
@@ -53,8 +71,8 @@ pub(super) fn engine_backend_in(namespace: &str) -> (ResourceBackend, tempfile::
     backend.serve_engine_in(namespace);
     backend.install_engine_records(Arc::new(EngineAccessDeliveries::open(Arc::clone(&service), Arc::clone(&clock)).unwrap()));
     backend.install_engine_records(Arc::new(EngineDefinitions::open(Arc::clone(&service), Arc::clone(&clock)).unwrap()));
-    backend.install_engine_records(Arc::new(EngineProjects::open(service, clock).unwrap()));
-    (backend, directory)
+    backend.install_engine_records(Arc::new(EngineProjects::open(Arc::clone(&service), clock).unwrap()));
+    (backend, EngineStore { service, _directory: directory })
 }
 /// A delivery whose convoy label reads `convoy`.
 pub(super) fn delivery(convoy: &str) -> AccessDeliverySpec {
@@ -79,18 +97,6 @@ async fn relabel(backend: &ResourceBackend, name: &str, label: &str) {
 /// A `where` on the label [`seed`] gives.
 fn labelled(label: &str) -> String {
     condition(&format!(r#"metadata.labels["{CONVOY_LABEL}"] == "{label}""#))
-}
-/// `messages` with each description's incarnation removed. An engine-served table's incarnation
-/// names its opening, not the store, so two reads of one table differ there: the resume bug, by
-/// which no cursor resumes on the engine path. Compare whole messages again once the incarnation
-/// is the store's identity.
-fn without_incarnation(mut messages: Vec<Message>) -> Vec<Message> {
-    for message in &mut messages {
-        if let Message::Table { incarnation, .. } = message {
-            incarnation.clear();
-        }
-    }
-    messages
 }
 async fn call(router: &Router, path: &str, cbor: bool) -> axum::response::Response {
     let mut request = Request::builder()
@@ -147,11 +153,11 @@ async fn messages(router: &Router, path: &str, cbor: bool) -> Vec<Message> {
 // pages and resync have identical decoded meaning in JSON Lines and CBOR sequences.
 #[tokio::test]
 async fn table_carriers_share_paging_filter_count_and_resync_contract() {
-    let (backend, _store) = engine_backend();
+    let (backend, store) = engine_backend();
     for (name, label) in [("a", "yes"), ("z", "no"), ("b", "yes")] {
         seed(&backend, name, label).await;
     }
-    let router = router(backend);
+    let router = router(backend, &store);
     let listed = call(&router, "/tables", false).await;
     let listed: serde_json::Value = serde_json::from_slice(&to_bytes(listed.into_body(), 1024 * 1024).await.unwrap()).unwrap();
     assert!(listed["kinds"].as_array().unwrap().iter().any(|kind| kind["root"] == "accessdeliveries"));
@@ -165,7 +171,7 @@ async fn table_carriers_share_paging_filter_count_and_resync_contract() {
     let path = path.as_str();
     let json = messages(&router, path, false).await;
     let cbor = messages(&router, path, true).await;
-    assert_eq!(without_incarnation(json.clone()), without_incarnation(cbor));
+    assert_eq!(json, cbor);
     assert!(json.iter().any(|message| matches!(message, Message::Count { count: 2, estimate: false, .. })));
     let cursor = json
         .iter()
@@ -211,11 +217,11 @@ async fn table_carriers_share_paging_filter_count_and_resync_contract() {
 // null cell is absent: `!=` does not keep it (the condition is unknown), and `!has` selects it.
 #[tokio::test]
 async fn in_memory_filters_page_fully_and_read_null_cells_as_absent() {
-    let (backend, _store) = engine_backend();
+    let (backend, store) = engine_backend();
     for name in ["a", "b", "c", "d", "e"] {
         seed(&backend, name, "yes").await;
     }
-    let router = router(backend);
+    let router = router(backend, &store);
     let names = |messages: &[Message]| -> Vec<serde_json::Value> {
         messages
             .iter()
@@ -255,9 +261,9 @@ async fn in_memory_filters_page_fully_and_read_null_cells_as_absent() {
 // Table reads inherit the exact user-caller gate of the resource routes.
 #[tokio::test]
 async fn tables_do_not_bypass_resource_caller_access() {
-    let (backend, _store) = engine_backend();
+    let (backend, store) = engine_backend();
     seed(&backend, "private", "yes").await;
-    let router = router(backend);
+    let router = router(backend, &store);
     for path in [
         "/tables",
         "/tables/accessdeliveries",
@@ -279,9 +285,9 @@ async fn tables_do_not_bypass_resource_caller_access() {
 #[tokio::test]
 async fn table_watch_delivers_live_changes_on_both_carriers() {
     for cbor in [false, true] {
-        let (backend, _store) = engine_backend();
+        let (backend, store) = engine_backend();
         seed(&backend, "before", "yes").await;
-        let router = router(backend.clone());
+        let router = router(backend.clone(), &store);
         let response = call(&router, "/tables/accessdeliveries/rows?namespace=test&watch&count=exact", cbor).await;
         assert_eq!(response.status(), StatusCode::OK);
         let mut stream = response.into_body().into_data_stream();
@@ -313,6 +319,7 @@ async fn convoys_table_watch_delivers_a_launch_on_both_carriers() {
             )
             .unwrap(),
         );
+        let store = EngineStore { service: Arc::clone(&decided), _directory: directory };
         let backend = ResourceBackend::new(InMemoryBackend::default());
         backend.compose_as_engine_home();
         let engine = flotilla_provisioning_testkit::EngineFixture::over_service(&decided);
@@ -333,7 +340,7 @@ async fn convoys_table_watch_delivers_a_launch_on_both_carriers() {
             ))
         };
         launch("before").await;
-        let router = router(backend.clone());
+        let router = router(backend.clone(), &store);
         let response = call(&router, "/tables/convoys/rows?namespace=test&watch&count=exact", cbor).await;
         assert_eq!(response.status(), StatusCode::OK);
         let mut stream = response.into_body().into_data_stream();
@@ -346,6 +353,55 @@ async fn convoys_table_watch_delivers_a_launch_on_both_carriers() {
         let bytes = stream.next().await.unwrap().unwrap();
         assert!(matches!(decode(&bytes, cbor)[0], Message::Count { count: 2, .. }));
     }
+}
+
+// A convoy's notes are its home's, held in memory and in no log: a change of them after synced
+// still reaches a watcher of the convoys table, and moves its sequence past the synced one.
+#[tokio::test]
+async fn a_notes_change_reaches_a_convoys_table_watch_and_moves_its_sequence() {
+    let directory = tempfile::tempdir().unwrap();
+    let decided = Arc::new(
+        flotilla_schema_sqlite::stream::Service::open(
+            &directory.path().join("decided.sqlite"),
+            "home",
+            flotilla_provisioning::stored::decided_registry().unwrap(),
+        )
+        .unwrap(),
+    );
+    let store = EngineStore { service: Arc::clone(&decided), _directory: directory };
+    let backend = ResourceBackend::new(InMemoryBackend::default());
+    backend.compose_as_engine_home();
+    let engine = flotilla_provisioning_testkit::EngineFixture::over_service(&decided);
+    let convoys = flotilla_engine_convoys_testkit::EngineConvoysHome::over(
+        &decided,
+        "test",
+        &backend,
+        Arc::new(flotilla_resources::SystemClock),
+        engine.reads(),
+    );
+    let spec = ConvoySpec::builder().workflow_ref("workflow".into()).build();
+    let launched = convoys
+        .launch(flotilla_engine_convoys_testkit::convoy("test", "noted", spec, flotilla_engine_convoys_testkit::single_agent("coder")))
+        .await;
+    let router = router(backend.clone(), &store);
+    let response = call(&router, "/tables/convoys/rows?namespace=test&watch", false).await;
+    assert_eq!(response.status(), StatusCode::OK);
+    let mut stream = response.into_body().into_data_stream();
+    let mut synced = None;
+    while synced.is_none() {
+        if let Message::Synced { sequence } = decode(&stream.next().await.unwrap().unwrap(), false)[0] {
+            synced = Some(sequence);
+        }
+    }
+    let (_, changed) = convoys.reads().convoys().unwrap().memory().update(&launched, |notes| {
+        notes.branch_subject_scan_error = Some("the forge is unreachable".into());
+    });
+    assert!(changed);
+    let bytes = tokio::time::timeout(std::time::Duration::from_secs(2), stream.next()).await.unwrap().unwrap().unwrap();
+    let Message::Upsert { key, row, sequence } = &decode(&bytes, false)[0] else { panic!("an upsert: {bytes:?}") };
+    assert_eq!(key, &vec![json!(launched)]);
+    assert!(serde_json::to_string(row).unwrap().contains("the forge is unreachable"), "{row:?}");
+    assert!(Some(*sequence) > synced, "{sequence} after {synced:?}");
 }
 
 // ADR 0067 ordering: null sorts first ascending, and supplementary characters compare
@@ -686,25 +742,27 @@ async fn served_tables_type_addresses_and_carry_enum_names() {
 // A quiet watch proves liveness without requiring any resource mutation.
 #[tokio::test(start_paused = true)]
 async fn quiet_table_watch_sends_progress() {
-    let (backend, _store) = engine_backend();
-    let router = router(backend);
+    let (backend, store) = engine_backend();
+    let router = router(backend, &store);
     let response = call(&router, "/tables/accessdeliveries/rows?namespace=test&watch", false).await;
     let mut stream = response.into_body().into_data_stream();
+    let mut synced = None;
     for _ in 0..3 {
-        stream.next().await.unwrap().unwrap();
+        if let Message::Synced { sequence } = decode(&stream.next().await.unwrap().unwrap(), false)[0] {
+            synced = Some(sequence);
+        }
     }
     let heartbeat = stream.next().await.unwrap().unwrap();
-    // An engine-served table's first read is its sequence 1. Under the resume fix the sequence
-    // becomes the store's watermark and this changes again.
-    assert!(matches!(decode(&heartbeat, false)[0], Message::Progress { sequence: 1 }));
+    // The table's position in the store's log, unmoved by a quiet store.
+    assert!(matches!(decode(&heartbeat, false)[0], Message::Progress { sequence } if Some(sequence) == synced));
 }
 
 // Unknown columns, incompatible types, unsupported pushdown, invalid paging and
 // unacceptable carriers are distinct public refusals, independent of stored rows.
 #[tokio::test]
 async fn table_request_errors_and_content_negotiation_are_explicit() {
-    let (backend, _store) = engine_backend();
-    let router = router(backend);
+    let (backend, store) = engine_backend();
+    let router = router(backend, &store);
     for (query, code) in [
         (format!("where={}", condition(r#"unknown == "x""#)), "unknown_column"),
         (format!("where={}", condition(r#"spec == "x""#)), "unsupported_filter"),
@@ -756,9 +814,9 @@ async fn table_request_errors_and_content_negotiation_are_explicit() {
 #[tokio::test(start_paused = true)]
 async fn table_watch_interleaving_preserves_filter_membership() {
     for cbor in [false, true] {
-        let (backend, _store) = engine_backend();
+        let (backend, store) = engine_backend();
         seed(&backend, "before", "yes").await;
-        let router = router(backend.clone());
+        let router = router(backend.clone(), &store);
         let response =
             call(&router, &format!("/tables/accessdeliveries/rows?namespace=test&watch&count=exact&where={}", labelled("yes")), cbor).await;
         let mut stream = response.into_body().into_data_stream();
@@ -781,11 +839,11 @@ async fn table_watch_interleaving_preserves_filter_membership() {
 // lexicographic sorting as though it were version ordering (review finding 1).
 #[tokio::test]
 async fn resource_version_sort_is_explicitly_unsupported() {
-    let (backend, _store) = engine_backend();
+    let (backend, store) = engine_backend();
     for number in 0..12 {
         seed(&backend, &format!("row-{number}"), "yes").await;
     }
-    let router = router(backend);
+    let router = router(backend, &store);
     let response = call(&router, "/tables/accessdeliveries/rows?namespace=test&sort=metadata.resourceVersion", false).await;
     assert_eq!(response.status(), StatusCode::BAD_REQUEST);
     let body = error_body(response).await;
@@ -803,10 +861,10 @@ async fn resource_version_sort_is_explicitly_unsupported() {
 #[tokio::test]
 async fn table_watch_tracks_rows_outside_its_initial_page() {
     for cbor in [false, true] {
-        let (backend, _store) = engine_backend();
+        let (backend, store) = engine_backend();
         seed(&backend, "a", "yes").await;
         seed(&backend, "z", "yes").await;
-        let router = router(backend.clone());
+        let router = router(backend.clone(), &store);
         let response = call(&router, "/tables/accessdeliveries/rows?namespace=test&limit=1&watch", cbor).await;
         let mut stream = response.into_body().into_data_stream();
         stream.next().await.unwrap().unwrap();

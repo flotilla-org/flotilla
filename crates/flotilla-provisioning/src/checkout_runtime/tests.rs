@@ -285,6 +285,10 @@ impl LiveEnvironments {
 }
 
 impl EnvironmentRecords for LiveEnvironments {
+    fn codes(&self) -> Vec<flotilla_schema::KindCode> {
+        Vec::new()
+    }
+
     fn get(&self, _: &str, _: Option<&str>) -> Result<Option<EnvironmentRecord>, String> {
         unreachable!("the sweep reads live environments only")
     }
@@ -376,6 +380,10 @@ impl Launches {
 impl flotilla_resources::convoy_records::ConvoyRecords for Launches {
     fn home(&self) -> &str {
         "home"
+    }
+
+    fn codes(&self) -> Vec<flotilla_schema::KindCode> {
+        Vec::new()
     }
     fn get(&self, _: &str, _: Option<&str>) -> Result<Option<flotilla_resources::convoy_records::ConvoyRecord>, String> {
         unreachable!("the sweep lists every launch")

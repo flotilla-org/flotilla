@@ -2080,6 +2080,9 @@ impl flotilla_resources::engine_records::EngineRecords for HeldListingPort {
     fn kinds(&self) -> &'static [&'static str] {
         &["TestPrimary"]
     }
+    fn codes(&self, _kind: &str) -> Vec<flotilla_resources::engine_records::KindCode> {
+        Vec::new()
+    }
     fn home(&self) -> String {
         "kiwi".into()
     }

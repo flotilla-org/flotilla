@@ -294,6 +294,10 @@ impl EngineTerminals {
 }
 
 impl TerminalRecords for EngineTerminals {
+    fn codes(&self) -> Vec<flotilla_schema::KindCode> {
+        vec![<Resource<TerminalSession> as Kind>::CODE, TerminalLaunchFacts::CODE]
+    }
+
     fn cursor(&self) -> Option<Box<dyn flotilla_resources::lifecycle_reads::ChangeCursor<TerminalChange>>> {
         let cursor = super::log_cursor::LogCursor::start(
             self.reads.clone(),

@@ -500,6 +500,16 @@ impl EngineRecords for EngineHosts {
         &[KIND]
     }
 
+    fn codes(&self, _kind: &str) -> Vec<KindCode> {
+        vec![HOST, OBSERVATION]
+    }
+
+    /// None counted: what moves outside the log is when each home was last heard, from this
+    /// home's clock and the change streams' watermarks, which tick no change.
+    fn unlogged_changes(&self, _kind: &str) -> Option<u64> {
+        Some(0)
+    }
+
     fn home(&self) -> String {
         self.home.clone()
     }

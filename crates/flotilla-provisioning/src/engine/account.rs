@@ -866,6 +866,10 @@ impl EngineRecords for EngineAccounts {
         &[BINDING_KIND, PROVISION_KIND]
     }
 
+    fn codes(&self, _kind: &str) -> Vec<KindCode> {
+        vec![BINDING, PROVISION]
+    }
+
     fn home(&self) -> String {
         self.home.clone()
     }

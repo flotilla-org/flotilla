@@ -154,6 +154,10 @@ impl VesselRecords for CountedVessels {
         self.port().home()
     }
 
+    fn codes(&self) -> Vec<flotilla_resources::engine_records::KindCode> {
+        self.port().codes()
+    }
+
     fn get(&self, name: &str, home: Option<&str>) -> Result<Option<VesselRecord>, String> {
         Meter::count(&self.meter.vessels);
         self.port().get(name, home)
@@ -212,6 +216,10 @@ impl ConvoyRecords for CountedConvoys {
         self.records.home()
     }
 
+    fn codes(&self) -> Vec<flotilla_resources::engine_records::KindCode> {
+        self.records.codes()
+    }
+
     fn get(&self, name: &str, home: Option<&str>) -> Result<Option<ConvoyRecord>, String> {
         Meter::count(&self.meter.convoys);
         self.records.get(name, home)
@@ -258,6 +266,10 @@ impl CountedEnvironments {
 }
 
 impl EnvironmentRecords for CountedEnvironments {
+    fn codes(&self) -> Vec<flotilla_resources::engine_records::KindCode> {
+        self.port().codes()
+    }
+
     fn get(&self, name: &str, home: Option<&str>) -> Result<Option<EnvironmentRecord>, String> {
         Meter::count(&self.meter.environments);
         self.port().get(name, home)
@@ -312,6 +324,10 @@ impl CountedTerminals {
 impl TerminalRecords for CountedTerminals {
     fn home(&self) -> &str {
         self.port().home()
+    }
+
+    fn codes(&self) -> Vec<flotilla_resources::engine_records::KindCode> {
+        self.port().codes()
     }
 
     fn get(&self, name: &str, home: Option<&str>) -> Result<Option<TerminalRecord>, String> {

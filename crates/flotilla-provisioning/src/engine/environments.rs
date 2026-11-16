@@ -260,6 +260,10 @@ impl EngineEnvironments {
 }
 
 impl EnvironmentRecords for EngineEnvironments {
+    fn codes(&self) -> Vec<flotilla_schema::KindCode> {
+        vec![<Resource<Environment> as Kind>::CODE, EnvironmentLaunchFacts::CODE]
+    }
+
     fn cursor(&self) -> Option<Box<dyn flotilla_resources::lifecycle_reads::ChangeCursor<EnvironmentChange>>> {
         let cursor = super::log_cursor::LogCursor::start(
             self.reads.clone(),

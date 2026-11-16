@@ -77,6 +77,8 @@ pub enum EnvironmentChange {
 /// read is keyed or indexed; [`EnvironmentRecords::request`] is the only write, and only for this
 /// home: the Environment controller writes every edge after it.
 pub trait EnvironmentRecords: Send + Sync {
+    /// The stored kinds these environments are read from: a log entry of any other kind changes none.
+    fn codes(&self) -> Vec<flotilla_schema::KindCode>;
     /// `name` held at `home`, or at this home when `None`.
     fn get(&self, name: &str, home: Option<&str>) -> Result<Option<EnvironmentRecord>, String>;
     /// `name` at whichever home holds it. Environment names are fleet-unique by construction

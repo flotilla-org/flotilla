@@ -14,3 +14,4 @@ mod review_bundle_aggregator;
 mod test_module_registration;
 // vessel_finalization deleted: a vessel is now a read view of its launch, with no finalizer to run (#3108).
 mod vessel_reconciler;
+mod vessel_views;

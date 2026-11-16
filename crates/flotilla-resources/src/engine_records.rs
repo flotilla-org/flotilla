@@ -8,6 +8,7 @@
 
 use std::collections::BTreeMap;
 
+pub use flotilla_schema::KindCode;
 use futures::stream::BoxStream;
 
 /// One record as the old store's objects carry it: its spec and status as JSON.
@@ -33,6 +34,16 @@ pub struct EngineObject {
 pub trait EngineRecords: Send + Sync + std::fmt::Debug {
     /// The resource kinds this port serves.
     fn kinds(&self) -> &'static [&'static str];
+    /// The stored kinds whose log entries can change `kind`'s records as this port reads them:
+    /// its own and every kind it joins or follows. A table's position counts only these.
+    fn codes(&self, kind: &str) -> Vec<KindCode>;
+    /// How many times `kind`'s records, as this port reads them, changed outside the log since
+    /// this home started: this home's state held in memory, lost on restart. Counted after each
+    /// change is in place, and each such change ticks [`EngineRecords::changes`]. `None` where
+    /// every change is in the log.
+    fn unlogged_changes(&self, _kind: &str) -> Option<u64> {
+        None
+    }
     /// Whether `kind`'s records are read through this port; a kind it serves only to refuse
     /// holds none as resources, so lists in no namespace.
     fn reads(&self, _kind: &str) -> bool {

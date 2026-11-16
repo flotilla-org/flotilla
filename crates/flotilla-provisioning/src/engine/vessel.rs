@@ -366,6 +366,10 @@ impl EngineVessels {
 }
 
 impl VesselRecords for EngineVessels {
+    fn codes(&self) -> Vec<flotilla_schema::KindCode> {
+        vec![<Resource<Vessel> as Kind>::CODE]
+    }
+
     fn cursor(&self) -> Option<Box<dyn flotilla_resources::lifecycle_reads::ChangeCursor<VesselChange>>> {
         let cursor = super::log_cursor::LogCursor::start(
             self.reads.clone(),

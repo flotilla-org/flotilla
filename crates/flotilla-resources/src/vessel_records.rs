@@ -178,6 +178,8 @@ pub enum VesselChange {
 /// is keyed or indexed. [`VesselRecords::request`] and [`VesselRecords::step`] are the only
 /// writes, and only at this home: a vessel's home is its single writer.
 pub trait VesselRecords: Send + Sync {
+    /// The stored kinds these launches are read from: a log entry of any other kind changes none.
+    fn codes(&self) -> Vec<flotilla_schema::KindCode>;
     /// This home.
     fn home(&self) -> &str;
     /// Launch `name` held at `home`, or at this home when `None`.

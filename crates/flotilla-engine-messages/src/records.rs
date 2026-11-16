@@ -68,6 +68,10 @@ impl EngineRecords for MessageRecords {
         &[MESSAGE_KIND]
     }
 
+    fn codes(&self, _kind: &str) -> Vec<flotilla_schema::KindCode> {
+        vec![Resource::<Message>::CODE]
+    }
+
     fn home(&self) -> String {
         self.primitives.home().to_owned()
     }

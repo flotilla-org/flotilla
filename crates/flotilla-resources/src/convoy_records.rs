@@ -579,6 +579,8 @@ pub enum ConvoyChange {
 
 /// The convoys' records at this home and the replicas of other homes', with this home's notes.
 pub trait ConvoyRecords: Send + Sync {
+    /// The stored kinds these launches are read from: a log entry of any other kind changes none.
+    fn codes(&self) -> Vec<flotilla_schema::KindCode>;
     /// This home.
     fn home(&self) -> &str;
     /// Launch `name` held at `home`, or at this home when `None`.
@@ -687,6 +689,8 @@ impl OpenLaunches {
 pub struct ConvoyMemory {
     notes: Mutex<BTreeMap<String, ConvoyNotes>>,
     changes: tokio::sync::broadcast::Sender<String>,
+    /// How many times the notes changed since this home started, counted after each change.
+    changed: AtomicU64,
     /// How many launches, at any home, the convoy views last listed as unreadable.
     unreadable: AtomicU64,
     /// The evidence records each launch's last pass read: a change of one wakes only the
@@ -699,6 +703,7 @@ impl Default for ConvoyMemory {
         Self {
             notes: Mutex::default(),
             changes: tokio::sync::broadcast::channel(256).0,
+            changed: AtomicU64::new(0),
             unreadable: AtomicU64::new(0),
             evidence: Mutex::default(),
         }
@@ -753,6 +758,18 @@ impl ConvoyMemory {
         self.changes.subscribe()
     }
 
+    /// How many times the notes have changed since this home started. Counted after each change
+    /// is in place, so a reader that reads this before the notes sees at least those changes.
+    pub fn changed(&self) -> u64 {
+        self.changed.load(Ordering::SeqCst)
+    }
+
+    fn noted(&self, name: &str) {
+        self.changed.fetch_add(1, Ordering::SeqCst);
+        // No follower is no reason to fail: one may subscribe later.
+        drop(self.changes.send(name.to_owned()));
+    }
+
     /// The notes on launch `name`; empty when none are held.
     pub fn get(&self, name: &str) -> ConvoyNotes {
         self.notes.lock().unwrap_or_else(PoisonError::into_inner).get(name).cloned().unwrap_or_default()
@@ -774,8 +791,7 @@ impl ConvoyMemory {
         }
         drop(held);
         if changed {
-            // No follower is no reason to fail: one may subscribe later.
-            drop(self.changes.send(name.to_owned()));
+            self.noted(name);
         }
         (output, changed)
     }
@@ -856,7 +872,7 @@ impl ConvoyMemory {
     /// Drops the notes on launch `name`, once it has ended and its home no longer judges it.
     pub fn forget(&self, name: &str) {
         if self.notes.lock().unwrap_or_else(PoisonError::into_inner).remove(name).is_some() {
-            drop(self.changes.send(name.to_owned()));
+            self.noted(name);
         }
     }
 }

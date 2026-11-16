@@ -83,6 +83,8 @@ pub enum CloneRenewal {
 /// is keyed or indexed. [`CloneRecords::request`] and [`CloneRecords::renew`] are the only
 /// writes, and only for this home: the Clone controller writes every edge after them.
 pub trait CloneRecords: Send + Sync {
+    /// The stored kinds these clones are read from: a log entry of any other kind changes none.
+    fn codes(&self) -> Vec<flotilla_schema::KindCode>;
     /// `name` held at `home`, or at this home when `None`. A launch name (`<clone>#<n>`) reads
     /// that launch; a clone's name reads its latest launch.
     fn get(&self, name: &str, home: Option<&str>) -> Result<Option<CloneRecord>, String>;

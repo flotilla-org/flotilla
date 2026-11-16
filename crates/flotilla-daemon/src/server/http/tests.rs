@@ -25,7 +25,7 @@ use tower::ServiceExt;
 
 use super::{
     login::{LOGIN_CODE_LIFETIME, SESSION_LIFETIME, SESSION_LIMIT},
-    table_tests::{delivery, engine_backend_in},
+    table_tests::{delivery, engine_backend_in, EngineStore},
     tcp::{TOKEN_DIRECTORY, TOKEN_FILE},
     CallerAuth, HttpRouter, ListenAddress, ListenerOrigin, LoginStore, TcpListener,
 };
@@ -54,7 +54,7 @@ struct Incarnation {
     origin: ListenerOrigin,
     router: Router,
     /// The decided store an engine-served backend reads, when this incarnation opened one.
-    _store: Option<tempfile::TempDir>,
+    _store: Option<EngineStore>,
 }
 
 impl Incarnation {
@@ -424,6 +424,9 @@ static EVERY_KIND: std::sync::LazyLock<Vec<&'static str>> =
 impl flotilla_resources::engine_records::EngineRecords for EveryKindEmpty {
     fn kinds(&self) -> &'static [&'static str] {
         EVERY_KIND.as_slice()
+    }
+    fn codes(&self, _kind: &str) -> Vec<flotilla_resources::engine_records::KindCode> {
+        Vec::new()
     }
     fn home(&self) -> String {
         "home-a".into()

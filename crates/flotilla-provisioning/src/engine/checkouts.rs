@@ -382,6 +382,10 @@ impl EngineCheckouts {
 }
 
 impl CheckoutRecords for EngineCheckouts {
+    fn codes(&self) -> Vec<flotilla_schema::KindCode> {
+        vec![<Resource<Checkout> as Kind>::CODE, CheckoutFacts::CODE, CheckoutIntegration::CODE]
+    }
+
     fn cursor(&self) -> Option<Box<dyn flotilla_resources::lifecycle_reads::ChangeCursor<CheckoutChange>>> {
         let cursor = super::log_cursor::LogCursor::start(
             self.reads.clone(),

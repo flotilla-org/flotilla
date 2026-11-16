@@ -2,6 +2,7 @@
 //! have one implementation shared by every carrier and both storage adapters.
 mod decided;
 mod filter;
+mod position;
 mod query;
 use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine};
 use flotilla_protocol::table::{Message, Row};
@@ -9,6 +10,7 @@ use flotilla_resources::WatchStart;
 use flotilla_schema::{ColumnType, Filterable, Layout, Table, TableSet};
 use flotilla_store::{query_resource_kind, watch_resource_kind_from, ResourceBackend, REGISTERED_RESOURCE_KINDS};
 use futures::{stream::BoxStream, StreamExt};
+pub(crate) use position::Positions;
 pub(crate) use query::QueryFeed;
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
@@ -16,10 +18,7 @@ use sha2::{Digest, Sha256};
 use std::{
     cmp::Ordering,
     collections::{BTreeMap, BTreeSet, VecDeque},
-    sync::{
-        atomic::{AtomicU64, Ordering as AtomicOrdering},
-        Arc,
-    },
+    sync::Arc,
     time::Duration,
 };
 const LIMIT: usize = 200;
@@ -412,6 +411,8 @@ pub(crate) struct Catalog {
     pub queries: Option<Arc<QueryFeed>>,
     /// The daemon run, the incarnation of tables whose sequences restart with it.
     pub incarnation: String,
+    /// The resource tables' positions in the decided store's log.
+    pub positions: Arc<Positions>,
 }
 
 /// A watch's resume point: the `incarnation` and `sequence` of the last message a client applied.
@@ -423,13 +424,15 @@ pub(crate) struct Resume {
 
 #[derive(Clone)]
 pub(crate) enum TableSource {
-    /// A resource kind's table. `subscription` (the daemon run and this opening) and `reads`
-    /// stand in for the position an engine-served kind's listing does not carry.
+    /// A resource kind's table, positioned in the decided store's log (`service`), plus the
+    /// changes its port counts outside the log; those last only this daemon run (`run`).
     Resource {
         backend: ResourceBackend,
+        kind: &'static str,
         name: String,
-        subscription: String,
-        reads: Arc<AtomicU64>,
+        service: Arc<flotilla_schema_sqlite::stream::Service>,
+        positions: Arc<Positions>,
+        run: String,
     },
     Decided {
         service: Arc<flotilla_schema_sqlite::stream::Service>,
@@ -448,14 +451,19 @@ pub(crate) struct Description {
     pub markdown: String,
 }
 /// The registered kinds read as tables: every one but `ImageBuild`, which the engine holds as
-/// demands and launches with no resource view, so its table could only refuse.
-fn resource_tables() -> impl Iterator<Item = &'static flotilla_store::RegisteredResourceKind> {
-    REGISTERED_RESOURCE_KINDS.iter().filter(|kind| kind.kind != "ImageBuild")
+/// demands and launches with no resource view, so its table could only refuse. A kind's table is
+/// served only where the engine serves the kind from the decided store its position is read from.
+fn resource_tables(catalog: &Catalog) -> impl Iterator<Item = &'static flotilla_store::RegisteredResourceKind> + '_ {
+    REGISTERED_RESOURCE_KINDS
+        .iter()
+        .filter(|kind| kind.kind != "ImageBuild")
+        .filter(|kind| catalog.service.is_some() && catalog.backend.engine_codes(kind.kind).is_some())
 }
 
 impl TableSource {
     pub(crate) async fn list(catalog: &Catalog) -> Result<Value, Failure> {
-        let mut kinds: Vec<_> = resource_tables().map(|kind| json!({"kind":kind.kind,"root":kind.plural,"tables":[kind.plural]})).collect();
+        let mut kinds: Vec<_> =
+            resource_tables(catalog).map(|kind| json!({"kind":kind.kind,"root":kind.plural,"tables":[kind.plural]})).collect();
         kinds.extend(catalog.derived.iter().map(|derived| {
             let names: Vec<_> = derived.set.tables.iter().map(|table| table.name.clone()).collect();
             json!({"kind":derived.set.kind,"root":names[0],"tables":names})
@@ -469,10 +477,16 @@ impl TableSource {
         Ok(json!({"kinds":kinds}))
     }
     pub(crate) fn open(name: String, catalog: &Catalog) -> Result<Self, Failure> {
-        if resource_tables().any(|kind| kind.plural == name) {
-            static OPENED: AtomicU64 = AtomicU64::new(0);
-            let subscription = format!("{}~{}", catalog.incarnation, OPENED.fetch_add(1, AtomicOrdering::Relaxed));
-            return Ok(Self::Resource { backend: catalog.backend.clone(), name, subscription, reads: Arc::default() });
+        if let Some(kind) = resource_tables(catalog).find(|kind| kind.plural == name) {
+            let service = catalog.service.clone().expect("a served resource table's store");
+            return Ok(Self::Resource {
+                backend: catalog.backend.clone(),
+                kind: kind.kind,
+                name,
+                service,
+                positions: Arc::clone(&catalog.positions),
+                run: catalog.incarnation.clone(),
+            });
         }
         if let Some(derived) = catalog.derived.iter().find(|derived| derived.table(&name).is_some()) {
             return Ok(Self::Derived { derived: Arc::clone(derived), name, incarnation: catalog.incarnation.clone() });
@@ -600,18 +614,26 @@ impl TableSource {
     }
     async fn read(&self, table: &Table, query: &Query) -> Result<Snapshot, Failure> {
         match self {
-            Self::Resource { backend, name, subscription, reads } => {
+            Self::Resource { backend, kind, name, service, positions, run } => {
+                let codes = backend.engine_codes(kind).ok_or_else(|| bad("unavailable", format!("{kind} is not served here")))?;
+                // The position before the rows: each port's read applies the log at least up to it,
+                // and sees at least the changes it has counted outside the log.
+                let unlogged = backend.engine_unlogged_changes(kind);
+                let position = positions.read(service, kind, codes).await?;
+                // A table with state in memory starts again with each daemon run; one read wholly
+                // from the log resumes across them.
+                let incarnation = match unlogged {
+                    Some(_) => format!("{run}~{}", position.resets),
+                    None => format!("durable~{}", position.resets),
+                };
                 let declared = flotilla_store::declared_resource_kinds().into_iter().find(|entry| entry.paths.plural == *name);
                 let queryable = declared.map_or(&[][..], |entry| entry.queryable_fields);
                 let filter = filter::pushdown(query.filter.as_ref(), &query.fields, queryable);
                 let document = query_resource_kind(backend, &query.namespace, name, &filter).await.map_err(source_failure)?;
-                // The engine's listing carries no position, so a resume cannot be honoured: the
-                // sequence counts this subscription's reads, and the incarnation names the
-                // subscription, so another one's cursor gets a fresh snapshot.
                 Ok(Snapshot {
                     rows: resource_rows(&document, table)?.into_iter().filter(|row| query.keeps(row)).collect(),
-                    sequence: reads.fetch_add(1, AtomicOrdering::Relaxed) + 1,
-                    incarnation: subscription.clone(),
+                    sequence: position.sequence + unlogged.unwrap_or(0),
+                    incarnation,
                 })
             }
             Self::Decided { service, name } => {
@@ -981,6 +1003,7 @@ pub(crate) fn test_ordering() {
 #[cfg(test)]
 mod properties {
     use super::*;
+    use std::sync::atomic::Ordering as AtomicOrdering;
     #[test]
     fn timestamp_keysets_compare_instants_across_precision_and_offsets() {
         let table = descriptor("convoys");
@@ -1216,7 +1239,14 @@ mod source_contract_tests {
             engine.reads(),
         );
         for source in [
-            TableSource::Resource { backend: backend.clone(), name: "convoys".into(), subscription: "test".into(), reads: Arc::default() },
+            TableSource::Resource {
+                backend: backend.clone(),
+                kind: "Convoy",
+                name: "convoys".into(),
+                service: decided.clone(),
+                positions: Arc::default(),
+                run: "run".into(),
+            },
             TableSource::Decided { service: service.clone(), name: "feed_sample".into() },
         ] {
             let description = source.describe().await.unwrap();
