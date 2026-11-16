@@ -5,6 +5,7 @@
 mod common;
 mod convoy_engine_path;
 mod environment_vessels;
+mod message_reads;
 mod placement_tiebreak_capacity_wait;
 mod read_costs;
 mod review_bundle;

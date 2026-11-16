@@ -9,9 +9,10 @@ use chrono::{DateTime, Utc};
 
 use flotilla_engine_messages::{view::record_name, MessagePrimitives};
 use flotilla_engine_messages_testkit::Served;
+use flotilla_provisioning_testkit::EngineFixture;
 use flotilla_resources::{
     attentions::{Attention, Attentions, Fact, Sender, Subject},
-    Convoy, ConvoyEnsure, FleetDesignation, FleetDesignationSpec, InputMeta, Project, ProjectSpec, SystemClock, TerminalSession, Vessel,
+    Convoy, ConvoyEnsure, FleetDesignation, FleetDesignationSpec, InputMeta, Project, ProjectSpec, SystemClock, TerminalSession,
     CONVOY_LABEL, FLEET_DESIGNATION_NAME, ROLE_LABEL,
 };
 use flotilla_schema_sqlite::stream::Service;
@@ -56,11 +57,6 @@ async fn records() -> ResourceBackend {
         .create(&meta("standing-gui"), &spec::<ConvoyEnsure>(json!({"project_ref": NAMESPACE, "role": "gui", "repositories": []})))
         .await
         .expect("ensure");
-    backend
-        .using::<Vessel>(NAMESPACE)
-        .create(&meta("demo-work"), &spec::<Vessel>(json!({"convoy_ref": "demo", "vessel_name": "work", "fulfilment_kind_ref": "p"})))
-        .await
-        .expect("vessel");
     let mut session = meta("session-1");
     session.labels = BTreeMap::from([(CONVOY_LABEL.to_owned(), "demo".to_owned()), (ROLE_LABEL.to_owned(), "coder".to_owned())]);
     backend
@@ -78,18 +74,26 @@ async fn records() -> ResourceBackend {
 
 /// One implementation under the contract, and how a person acknowledges an attention there.
 enum Implementation {
-    Engine { primitives: Served<Arc<MessagePrimitives>>, _dir: tempfile::TempDir },
+    Engine { primitives: Served<Arc<MessagePrimitives>>, _engine: EngineFixture, _dir: tempfile::TempDir },
 }
 
 impl Implementation {
     async fn engine() -> Self {
         let dir = tempfile::tempdir().expect("tempdir");
         let service = Arc::new(
-            Service::open(&dir.path().join("decided.sqlite"), "home-a", flotilla_engine_store::registry().expect("registry"))
-                .expect("store"),
+            Service::open(
+                &dir.path().join("decided.sqlite"),
+                "home-a",
+                flotilla_provisioning::stored::decided_registry().expect("registry"),
+            )
+            .expect("store"),
         );
+        // The convoy's work is launched here, where a credential refresh reads its vessel.
+        let engine = EngineFixture::over_service(&service);
+        engine.vessels.request("demo", "work", "home-a");
         let (_, primitives) = engine_at_store("home-a", service, records().await);
-        Implementation::Engine { primitives, _dir: dir }
+        primitives.install_lifecycle_reads(engine.reads()).expect("lifecycle reads");
+        Implementation::Engine { primitives, _engine: engine, _dir: dir }
     }
 
     fn attentions(&self) -> &dyn Attentions {

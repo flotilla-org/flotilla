@@ -14,6 +14,7 @@ pub mod attention;
 pub mod attentions;
 pub mod awaiting;
 pub mod convert;
+pub mod keyed_reads;
 pub mod ports;
 pub mod records;
 pub mod roles;
@@ -397,9 +398,8 @@ pub struct MessagePrimitives {
     bindings: Arc<dyn ports::RoleBindings>,
     conditions: Arc<dyn ports::ConditionReads>,
     home_reads: std::sync::OnceLock<Arc<dyn ports::HomeReads>>,
-    /// The engine's vessels and terminal sessions, through which a convoy role's session is
-    /// read; without them it is read by its labels.
-    lifecycle: std::sync::OnceLock<Arc<dyn flotilla_resources::lifecycle_reads::LifecycleReads>>,
+    /// The records messages name, each read by its key; the ports read through them too.
+    keyed: Arc<keyed_reads::KeyedReads>,
     /// Signalled after an attention here is raised, cleared or acknowledged, and after another
     /// home's Messages are applied.
     attention_changes: tokio::sync::broadcast::Sender<()>,
@@ -464,6 +464,7 @@ impl MessagePrimitives {
         }));
         let changes =
             flotilla_engine_store::watch::SharedChanges::new(Arc::clone(&service), [<Resource<Message> as StoredKind>::CODE], "messages");
+        let keyed = Arc::new(keyed_reads::KeyedReads::new(home, Arc::clone(&service), backend.downgrade()));
         Ok(Self {
             home: home.to_owned(),
             changes,
@@ -478,10 +479,10 @@ impl MessagePrimitives {
             receipts,
             charter_pass: Arc::default(),
             charter_admission: Arc::default(),
-            bindings: Arc::new(ports::OldRoleRouting { backend: backend.downgrade() }),
-            conditions: Arc::new(ports::OldStoreConditions { backend: backend.downgrade() }),
+            bindings: Arc::new(ports::RoleRouting { keyed: Arc::clone(&keyed) }),
+            conditions: Arc::new(ports::RecordConditions { keyed: Arc::clone(&keyed) }),
             home_reads: std::sync::OnceLock::new(),
-            lifecycle: std::sync::OnceLock::new(),
+            keyed,
             attention_changes,
             acknowledgements: tokio::sync::broadcast::channel(16).0,
             backend: backend.downgrade(),
@@ -556,9 +557,14 @@ impl MessagePrimitives {
         self.home_reads.set(reads).map_err(|_| "home reads are already installed".to_owned())
     }
 
-    /// Installs the engine's vessel and terminal session reads; the composition root owns them.
+    /// Installs the engine's convoy, vessel and terminal session reads; the composition root owns them.
     pub fn install_lifecycle_reads(&self, reads: Arc<dyn flotilla_resources::lifecycle_reads::LifecycleReads>) -> Result<(), String> {
-        self.lifecycle.set(reads).map_err(|_| "lifecycle reads are already installed".to_owned())
+        self.keyed.install_lifecycle(reads)
+    }
+
+    /// The keyed reads of the records messages name.
+    pub fn keyed_reads(&self) -> &Arc<keyed_reads::KeyedReads> {
+        &self.keyed
     }
 
     /// Runs `spell` on the old-store records it names, each read by its key: a lookup
@@ -624,67 +630,59 @@ impl MessagePrimitives {
     /// sessions of that vessel; the sessions of a role whose convoy names no vessel for it are
     /// read by their labels, as is every role's where the engine's reads are not installed.
     async fn read_asked(&self, records: &mut OldStoreRecords, mut asked: Wanted) -> Result<(), ResourceError> {
-        let backend = self.backend().map_err(ResourceError::other)?;
+        let keyed = &self.keyed;
         let namespace = records.namespace.clone();
         // A seat is read through its convoy, so the convoy is read first.
         asked.convoys.extend(asked.seats.iter().map(|(convoy, _)| convoy.clone()).filter(|convoy| !records.read.convoys.contains(convoy)));
         if asked.forges {
-            records.forges =
-                backend.definitions::<flotilla_resources::Forge>(&namespace).list().await?.into_iter().map(|forge| forge.spec).collect();
+            records.forges = keyed.forges(&namespace).await?;
         }
         for name in &asked.convoys {
-            let copies = match backend.including_replicas::<Convoy>(&namespace).get_all(name).await {
-                Ok(copies) => copies.items,
-                Err(ResourceError::NotFound { .. }) => Vec::new(),
-                Err(error) => return Err(error),
-            };
-            if copies.iter().any(|copy| !copy.object.status.as_ref().is_some_and(|status| status.phase.is_terminal())) {
-                records.live_convoys.insert(name.clone());
-            }
-            // This home's copy, else the first listed.
-            let held =
-                copies.iter().position(|copy| matches!(copy.provenance, ResourceProvenance::Local)).or((!copies.is_empty()).then_some(0));
-            if let Some(copy) = held.map(|index| copies[index].clone()) {
-                let home = match &copy.provenance {
-                    ResourceProvenance::Local => self.home.clone(),
-                    ResourceProvenance::Replica { origin_root, .. } => origin_root.to_string(),
-                };
-                records.convoy_homes.insert(name.clone(), home);
-                records.convoys.insert(name.clone(), copy.object);
+            if let Some(held) = keyed.convoy(&namespace, name).await? {
+                if held.live {
+                    records.live_convoys.insert(name.clone());
+                }
+                records.convoy_homes.insert(name.clone(), held.home);
+                records.convoys.insert(name.clone(), held.object);
             }
         }
         for name in &asked.terminals {
-            if let Some(terminal) = found(backend.including_replicas::<TerminalSession>(&namespace).get(name).await)? {
-                records.terminals.insert(name.clone(), terminal.object);
+            if let Some(terminal) = keyed.record::<TerminalSession>(&namespace, name).await? {
+                records.terminals.insert(name.clone(), terminal);
             }
         }
         for name in &asked.artifacts {
-            if let Some(artifact) = found(backend.including_replicas::<Artifact>(&namespace).get(name).await)? {
-                records.artifacts.insert(name.clone(), artifact.object);
+            if let Some(artifact) = keyed.record::<Artifact>(&namespace, name).await? {
+                records.artifacts.insert(name.clone(), artifact);
             }
         }
         for name in &asked.repositories {
-            if let Some(repository) = found(backend.including_replicas::<Repository>(&namespace).get(name).await)? {
-                records.repositories.insert(name.clone(), repository.object);
+            if let Some(repository) = keyed.record::<Repository>(&namespace, name).await? {
+                records.repositories.insert(name.clone(), repository);
             }
         }
         if asked.every_repository {
+            let backend = self.backend().map_err(ResourceError::other)?;
             for repository in backend.including_replicas::<Repository>(&namespace).list().await?.items {
                 records.repositories.insert(repository.object.metadata.name.clone(), repository.object);
             }
         }
         for name in &asked.projects {
-            if let Some(project) = found(backend.definitions::<Project>(&namespace).get(name).await)? {
+            if let Some(project) = keyed.declared::<Project>(&namespace, name).await? {
                 records.projects.insert(name.clone(), project);
             }
         }
         let mut labelled = asked.labelled.clone();
         for (convoy, role) in &asked.seats {
-            match self.seat_sessions(records, convoy, role) {
+            let seat = match (records.convoys.get(convoy), records.convoy_homes.get(convoy)) {
+                (Some(held), Some(home)) => keyed.seat_sessions(held, home, role).await,
+                _ => None,
+            };
+            match seat {
                 Some(sessions) => {
                     for session in sessions {
-                        if let Some(terminal) = found(backend.including_replicas::<TerminalSession>(&namespace).get(&session).await)? {
-                            records.terminals.insert(session, terminal.object);
+                        if let Some(terminal) = keyed.record::<TerminalSession>(&namespace, &session).await? {
+                            records.terminals.insert(session, terminal);
                         }
                     }
                 }
@@ -694,52 +692,13 @@ impl MessagePrimitives {
             }
         }
         for (convoy, role) in &labelled {
-            let labels = BTreeMap::from([
-                (flotilla_resources::CONVOY_LABEL.to_owned(), convoy.clone()),
-                (flotilla_resources::ROLE_LABEL.to_owned(), role.clone()),
-            ]);
-            for terminal in backend.including_replicas::<TerminalSession>(&namespace).list_matching_labels(&labels).await?.items {
-                records.terminals.insert(terminal.object.metadata.name.clone(), terminal.object);
+            for terminal in keyed.labelled_sessions(&namespace, convoy, role).await? {
+                records.terminals.insert(terminal.metadata.name.clone(), terminal);
             }
         }
         asked.labelled.extend(labelled);
         records.read.absorb(asked);
         Ok(())
-    }
-
-    /// The sessions of the vessel launched for the work holding `role` in `convoy`, newest
-    /// launch at each home this store holds, since the vessel is homed where it was placed:
-    /// through the convoy's snapshot and the engine's indexed vessel and terminal reads, one
-    /// index read per home. `None` when those reads are not installed or the convoy's snapshot
-    /// names no work for the role, and the sessions are read by their labels.
-    fn seat_sessions(&self, records: &OldStoreRecords, convoy: &str, role: &str) -> Option<Vec<String>> {
-        let lifecycle = self.lifecycle.get()?;
-        let (vessels, terminals) = (lifecycle.vessels().ok()?, lifecycle.terminals().ok()?);
-        let work = records.convoys.get(convoy).and_then(|held| snapshot_vessel(held, role))?;
-        let convoy_home = records.convoy_homes.get(convoy)?;
-        let launch_of = flotilla_resources::vessel_resource_name(flotilla_resources::convoy::launch_of(convoy), &work);
-        let mut homes = BTreeSet::from([self.home.clone(), convoy_home.clone()]);
-        homes.extend(self.service.homes());
-        let mut sessions = Vec::new();
-        for home in &homes {
-            let vessel = match vessels.newest(convoy, convoy_home, &launch_of, Some(home)) {
-                Ok(vessel) => vessel,
-                Err(error) => {
-                    tracing::debug!(%convoy, %role, %error, "a convoy role's vessel could not be read");
-                    return None;
-                }
-            };
-            let Some(vessel) = vessel else { continue };
-            match terminals.of_vessel(&vessel.name) {
-                Ok(launches) => sessions
-                    .extend(launches.into_iter().filter(|launch| launch.role == role).map(|launch| launch.session_name().to_owned())),
-                Err(error) => {
-                    tracing::debug!(%convoy, %role, %error, "a convoy role's sessions could not be read");
-                    return None;
-                }
-            }
-        }
-        Some(sessions)
     }
 
     /// The consumer identity of a crew session's record at this home.
@@ -2222,16 +2181,6 @@ impl Wanted {
     }
 }
 
-/// `read` with a missing record as `None`.
-fn found<T>(read: Result<T, ResourceError>) -> Result<Option<T>, ResourceError> {
-    match read {
-        Ok(read) => Ok(Some(read)),
-        Err(ResourceError::NotFound { .. }) => Ok(None),
-        Err(error) => Err(error),
-    }
-}
-
-/// The work holding `role` in `convoy`'s workflow snapshot.
 /// Where a message created at `created` stands, read as in `seat`'s inbox.
 fn standing(seat: String, resource: &Resource<Message>, created: CreatedAt) -> Option<flotilla_messaging::SeatMessage> {
     let Some(name) = record_name(resource.name()) else {
@@ -2263,17 +2212,6 @@ fn named_inboxes<'a>(conversion: &Conversion<'_>, named: &'a [(String, String)])
             }
         })
         .collect()
-}
-
-fn snapshot_vessel(convoy: &ResourceObject<Convoy>, role: &str) -> Option<String> {
-    let status = convoy.status.as_ref()?;
-    status
-        .workflow_snapshot
-        .as_ref()?
-        .vessels
-        .iter()
-        .find(|vessel| vessel.crew.iter().any(|crew| crew.role == role))
-        .map(|vessel| vessel.name.clone())
 }
 
 /// The old-store facts the new path reads, through one named port (#3317
@@ -2400,24 +2338,6 @@ impl OldStoreRecords {
             read: Wanted::default(),
             asked: Mutex::default(),
         }
-    }
-
-    /// Every record of each kind the port reads, for the role-routing and condition ports.
-    pub async fn load(backend: &ResourceBackend, namespace: &str) -> Result<Self, ResourceError> {
-        let forges =
-            backend.definitions::<flotilla_resources::Forge>(namespace).list().await?.into_iter().map(|forge| forge.spec).collect();
-        fn objects<R: flotilla_resources::Resource>(items: Vec<ReadResourceObject<R>>) -> Vec<ResourceObject<R>> {
-            items.into_iter().map(|item| item.object).collect()
-        }
-        Ok(Self::from_records(
-            namespace,
-            forges,
-            objects(backend.including_replicas::<Convoy>(namespace).list().await?.items),
-            objects(backend.including_replicas::<TerminalSession>(namespace).list().await?.items),
-            objects(backend.including_replicas::<Artifact>(namespace).list().await?.items),
-            objects(backend.including_replicas::<Repository>(namespace).list().await?.items),
-            backend.definitions::<Project>(namespace).list().await?,
-        ))
     }
 
     /// Every project declared in this namespace, by name.
@@ -2563,7 +2483,7 @@ impl ViewLookups for OldStoreRecords {
     /// From the convoy's snapshot; where it names no vessel for the role (the convoy is not held
     /// here, or its snapshot lacks the role), from the labels of a session holding the role.
     fn vessel(&self, convoy: &str, role: &str) -> Option<String> {
-        if let Some(vessel) = self.convoy(convoy).and_then(|held| snapshot_vessel(held, role)) {
+        if let Some(vessel) = self.convoy(convoy).and_then(|held| keyed_reads::snapshot_work(held, role)) {
             return Some(vessel);
         }
         let labelled = self.terminals.values().find_map(|terminal| {

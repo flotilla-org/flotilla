@@ -9,7 +9,7 @@ use flotilla_address::{Address, Kind};
 use flotilla_inbox::InboxBackend;
 use flotilla_resources::{
     attentions::{self, Attentions, Fact, OpenAttention, Sender, Subject},
-    Convoy, ConvoyEnsure, Project, ResourceError, ResourceObject, Vessel,
+    Convoy, ConvoyEnsure, Project, ResourceError, ResourceObject,
 };
 use flotilla_schema::Timestamp;
 use flotilla_state_machines::{
@@ -22,9 +22,9 @@ use flotilla_state_machines::{
 
 use super::{
     attention::{Attention, Cause, Read},
-    convert::Conversion,
+    convert::{Conversion, NoRecords, ReferenceAddresses},
     roles::FleetRoles,
-    MessagePrimitives, OldStoreRecords,
+    MessagePrimitives,
 };
 
 /// One attention message in this replica, with its home, what it is and the reason it gives.
@@ -120,19 +120,27 @@ impl MessagePrimitives {
             Err(ResourceError::NotFound { .. }) => return Ok(None),
             Err(error) => return Err(error.to_string()),
         };
-        let projects = match convoy.spec.project_ref.as_deref() {
-            Some(project) => match self.backend()?.definitions::<Project>(namespace).get(project).await {
-                Ok(project) => vec![project],
-                Err(ResourceError::NotFound { .. }) => Vec::new(),
-                Err(error) => return Err(error.to_string()),
-            },
-            None => Vec::new(),
-        };
         let principal = format!("principal:{}", convoy.spec.dispatching_principal_ref.name);
-        let project = convoy.spec.project_ref.clone();
-        let records = OldStoreRecords::from_records(namespace, Vec::new(), vec![convoy], Vec::new(), Vec::new(), Vec::new(), projects);
-        let conversion = Conversion { roles, forges: &records.forges, records: &records };
-        conversion.person(&principal, project.as_deref()).map(Some)
+        self.person_inbox(namespace, roles, &principal, convoy.spec.project_ref.as_deref()).await.map(Some)
+    }
+}
+
+/// A project's declaration, read for the roles its charter says a person holds there.
+struct Declared(Option<ResourceObject<Project>>);
+
+impl ReferenceAddresses for Declared {
+    fn address(&self, reference: &flotilla_resources::MessageReference) -> Result<Address, String> {
+        NoRecords.address(reference)
+    }
+
+    fn principal_roles(&self, project: &str, principal: &str) -> Vec<String> {
+        let declared = self.0.as_ref().filter(|declared| declared.metadata.name == project);
+        declared
+            .into_iter()
+            .flat_map(|declared| &declared.spec.role_definitions)
+            .filter(|(_, definition)| definition.principal.as_deref() == Some(principal))
+            .map(|(role, _)| role.clone())
+            .collect()
     }
 }
 
@@ -173,41 +181,37 @@ impl MessagePrimitives {
         Ok(held.into_iter().filter(|held| held.sender == sender && &held.subject == subject).collect())
     }
 
-    /// `principal`'s role in `project`, on the project's declaration read into `records`.
-    async fn person_inbox(
-        &self,
-        records: &mut OldStoreRecords,
-        roles: &FleetRoles,
-        principal: &str,
-        project: Option<&str>,
-    ) -> Result<Address, String> {
-        self.spell(records, |records| Conversion { roles, forges: &[], records }.person(principal, project))
-            .await
-            .map_err(|error| error.to_string())?
+    /// `principal`'s role in `project`, on the project's declaration read by its name.
+    async fn person_inbox(&self, namespace: &str, roles: &FleetRoles, principal: &str, project: Option<&str>) -> Result<Address, String> {
+        let declared = match project {
+            Some(project) => self.keyed_reads().declared::<Project>(namespace, project).await.map_err(|error| error.to_string())?,
+            None => None,
+        };
+        Conversion { roles, forges: &[], records: &Declared(declared) }.person(principal, project)
     }
 
     /// The engine's cause and person inbox for a fact, read from the records it names.
     async fn cause(&self, namespace: &str, roles: &FleetRoles, fact: &Fact) -> Result<(Cause, Address), String> {
-        let mut records = OldStoreRecords::empty(namespace);
         let Some(name) = fact.convoy() else {
             let Fact::Refused { ensure, project, role } = fact else { unreachable!("only a refused admission names no convoy") };
             // No generation was admitted: the principal admission would have stamped hears it,
             // in the role's project, as the other standing attentions are addressed.
             let principal = format!("principal:{}", flotilla_protocol::PrincipalRef::implicit_for_namespace(namespace).name);
-            let inbox = self.person_inbox(&mut records, roles, &principal, Some(project)).await?;
+            let inbox = self.person_inbox(namespace, roles, &principal, Some(project)).await?;
             return Ok((Cause::Refused { role: self.standing_role(namespace, ensure, project, role).await? }, inbox));
         };
         let convoy = self
-            .spell(&mut records, |records| records.convoy(name).cloned())
+            .keyed_reads()
+            .convoy(namespace, name)
             .await
             .map_err(|error| error.to_string())?
             .ok_or_else(|| format!("convoy `{name}` is not in this home's records"))?;
         let held = Read {
-            address: super::convoy_address(name, convoy.spec.project_ref.as_deref())?,
-            revision: convoy.metadata.resource_version.clone(),
+            address: super::convoy_address(name, convoy.object.spec.project_ref.as_deref())?,
+            revision: convoy.object.metadata.resource_version.clone(),
         };
-        let principal = format!("principal:{}", convoy.spec.dispatching_principal_ref.name);
-        let inbox = self.person_inbox(&mut records, roles, &principal, convoy.spec.project_ref.as_deref()).await?;
+        let principal = format!("principal:{}", convoy.object.spec.dispatching_principal_ref.name);
+        let inbox = self.person_inbox(namespace, roles, &principal, convoy.object.spec.project_ref.as_deref()).await?;
         let cause = match fact {
             Fact::Hold { .. } => Cause::Hold { convoy: held },
             Fact::ReclaimRefused { .. } => Cause::ReclaimRefused { convoy: held },
@@ -216,18 +220,14 @@ impl MessagePrimitives {
             }
             Fact::Refused { .. } => unreachable!("a refused admission names no convoy"),
             Fact::CredentialRefresh { vessel, .. } => {
-                let record = self
-                    .backend()?
-                    .including_replicas::<Vessel>(namespace)
-                    .list()
-                    .await
-                    .map_err(|error| error.to_string())?
-                    .items
-                    .into_iter()
-                    .find(|record| record.object.spec.convoy_ref == name && record.object.spec.vessel_name == *vessel)
+                // A vessel's view is versioned by its launch, so its newest launch is its revision.
+                let launch = self
+                    .keyed_reads()
+                    .vessel(name, &convoy.home, vessel)
+                    .await?
                     .ok_or_else(|| format!("convoy `{name}` has no vessel `{vessel}`"))?;
                 let address = child(&held.address, Kind::Vessel, vessel)?;
-                Cause::CredentialRefresh { vessel: Read { address, revision: record.object.metadata.resource_version } }
+                Cause::CredentialRefresh { vessel: Read { address, revision: launch.name } }
             }
             Fact::DeliveryHeld { role, .. } => {
                 Cause::DeliveryHeld { role: Read { address: child(&held.address, Kind::Role, role)?, revision: held.revision } }

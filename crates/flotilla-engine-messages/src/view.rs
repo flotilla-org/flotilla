@@ -128,6 +128,16 @@ pub fn old_address(address: &Address, roles: &FleetRoles, lookups: &dyn ViewLook
 
 /// A condition as the Leaf it was converted from.
 pub fn old_leaf(condition: &Condition, lookups: &dyn ViewLookups) -> Result<Leaf, String> {
+    condition_leaf(condition, |convoy, role| {
+        let vessel = lookups.vessel(convoy, role).ok_or_else(|| format!("no vessel holds `{role}` in convoy `{convoy}`"))?;
+        Ok((convoy.to_owned(), vessel))
+    })
+}
+
+/// A condition as the Leaf its value is read through. A role in a convoy is read from its work's
+/// crew: `work` names the convoy's record and the work holding the role, given the convoy's
+/// segment and the role.
+pub fn condition_leaf(condition: &Condition, work: impl FnOnce(&str, &str) -> Result<(String, String), String>) -> Result<Leaf, String> {
     let operator = match condition.operator {
         flotilla_address::Operator::Equal => LeafOperator::Equal,
         flotilla_address::Operator::NotEqual => LeafOperator::NotEqual,
@@ -142,12 +152,9 @@ pub fn old_leaf(condition: &Condition, lookups: &dyn ViewLookups) -> Result<Leaf
         Kind::ChangeRequest | Kind::Issue => (leaf_for(address)?, path),
         Kind::Convoy => (LeafAddress::Convoy { name: address.name().to_owned() }, path),
         Kind::Role if address.get(Kind::Convoy).is_some() => {
-            let convoy = address.get(Kind::Convoy).expect("checked");
-            let vessel = lookups
-                .vessel(convoy, address.name())
-                .ok_or_else(|| format!("no vessel holds `{}` in convoy `{convoy}`", address.name()))?;
+            let (convoy, work) = work(address.get(Kind::Convoy).expect("checked"), address.name())?;
             let rest = path.strip_prefix('.').unwrap_or(&path);
-            (LeafAddress::Work { convoy: convoy.to_owned(), work: vessel }, format!(".crew.{}.{rest}", address.name()))
+            (LeafAddress::Work { convoy, work }, format!(".crew.{}.{rest}", address.name()))
         }
         Kind::Account => (
             LeafAddress::Usage { provider: address.get(Kind::Usage).unwrap_or_default().to_owned(), account: address.name().to_owned() },

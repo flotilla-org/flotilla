@@ -2416,6 +2416,7 @@ dependencies = [
  "flotilla-daemon-api",
  "flotilla-discovery-api",
  "flotilla-engine-convoys-testkit",
+ "flotilla-engine-messages",
  "flotilla-engine-messages-testkit",
  "flotilla-environment",
  "flotilla-forge-github",
