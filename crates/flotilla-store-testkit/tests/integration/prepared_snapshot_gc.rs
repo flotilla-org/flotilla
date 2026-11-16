@@ -5,8 +5,8 @@ use chrono::Utc;
 use flotilla_protocol::NodeId;
 use flotilla_resources::{
     Convoy, ConvoySpec, FulfilmentKind, FulfilmentKindSpec, FulfilmentRealisation, InputMeta, ResourceError, WorkflowTemplate,
-    WorkflowTemplateSpec, PLACEMENT_SNAPSHOT_ANNOTATION, PLACEMENT_SNAPSHOT_KIND, PREPARED_SNAPSHOT_LABEL, WORKFLOW_SNAPSHOT_ANNOTATION,
-    WORKFLOW_SNAPSHOT_KIND,
+    WorkflowTemplateSpec, CONVOY_LABEL, PLACEMENT_SNAPSHOT_ANNOTATION, PLACEMENT_SNAPSHOT_KIND, PREPARED_SNAPSHOT_LABEL,
+    WORKFLOW_SNAPSHOT_ANNOTATION, WORKFLOW_SNAPSHOT_KIND,
 };
 use flotilla_store::{PreparedSnapshotGarbageCollector, ResourceBackend};
 
@@ -112,6 +112,40 @@ async fn replicated_convoy_keeps_an_authored_snapshot_alive() {
     let collected = collector.collect(Some("remote-convoy")).await.expect("collect after remote release");
     assert_eq!(collected.workflows_deleted, 1);
     assert_eq!(collected.placements_deleted, 1);
+}
+
+// Admission writes a convoy's placement snapshot before it admits the convoy: another
+// convoy's teardown, or a sweep, meanwhile must leave it to its own convoy.
+#[tokio::test]
+async fn a_placement_snapshot_written_before_its_convoy_is_released_only_by_that_convoy() {
+    let backend = ResourceBackend::new(InMemoryBackend::default());
+    let workflow_name = "workflow-snapshot-012345abcdef";
+    let shared_placement = "placement-snapshot-012345abcdef";
+    let admitting_placement = "placement-snapshot-fedcba543210";
+    backend
+        .clone()
+        .using::<WorkflowTemplate>("flotilla")
+        .create(&prepared_meta(workflow_name, WORKFLOW_SNAPSHOT_KIND), &WorkflowTemplateSpec::builder().vessels(Vec::new()).build())
+        .await
+        .expect("create prepared workflow");
+    backend
+        .clone()
+        .using::<FulfilmentKind>("flotilla")
+        .create(&prepared_meta(shared_placement, PLACEMENT_SNAPSHOT_KIND), &placement())
+        .await
+        .expect("create ending convoy's placement");
+    let mut owned = prepared_meta(admitting_placement, PLACEMENT_SNAPSHOT_KIND);
+    owned.labels.insert(CONVOY_LABEL.to_string(), "admitting".to_string());
+    backend.clone().using::<FulfilmentKind>("flotilla").create(&owned, &placement()).await.expect("create admitting convoy's placement");
+    create_convoy(&backend, "ending", workflow_name, shared_placement).await.expect("create ending convoy");
+
+    let collector = PreparedSnapshotGarbageCollector::new(backend.clone(), "flotilla");
+    assert_eq!(collector.collect(Some("ending")).await.expect("ending convoy's teardown").placements_deleted, 1);
+    assert_eq!(collector.collect(None).await.expect("sweep").placements_deleted, 0);
+    backend.clone().using::<FulfilmentKind>("flotilla").get(admitting_placement).await.expect("the admitting convoy keeps its placement");
+
+    assert_eq!(collector.collect(Some("admitting")).await.expect("admitting convoy's release").placements_deleted, 1);
+    assert!(matches!(backend.using::<FulfilmentKind>("flotilla").get(admitting_placement).await, Err(ResourceError::NotFound { .. })));
 }
 
 #[tokio::test]

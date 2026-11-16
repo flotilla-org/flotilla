@@ -256,6 +256,48 @@ async fn convoy_create_command_creates_convoy_resource() {
     );
 }
 
+// Admission freezes the placement before it admits the launch; a launch refused after that
+// releases what was frozen for it, since no convoy's teardown will.
+#[tokio::test]
+async fn a_refused_launch_releases_its_placement_snapshot() {
+    let (daemon, backend, _config, _runtime, _tmp) = start_daemon().await;
+
+    let mut rx = daemon.subscribe();
+    let id = daemon
+        .execute(
+            Command::builder()
+                .action(CommandAction::ConvoyCreate {
+                    name: "no-topic".into(),
+                    workflow_ref: "scratch".into(),
+                    inputs: Vec::new(),
+                    repository_url: None,
+                    r#ref: None,
+                    project_ref: None,
+                    placement_policy: None,
+                    adopted_checkout: None,
+                })
+                .build(),
+        )
+        .await
+        .expect("execute");
+    assert_eq!(
+        await_command_result(&mut rx, id).await,
+        CommandValue::Error { message: "workflow `scratch` input `topic` has no value".into() }
+    );
+
+    let snapshots: Vec<String> = backend
+        .using::<FulfilmentKind>("flotilla")
+        .list()
+        .await
+        .expect("fulfilment kinds should list")
+        .items
+        .into_iter()
+        .map(|kind| kind.metadata.name)
+        .filter(|name| name.starts_with("placement-snapshot-"))
+        .collect();
+    assert_eq!(snapshots, Vec::<String>::new());
+}
+
 #[tokio::test]
 async fn workflow_template_apply_creates_then_updates() {
     let (daemon, backend, _config, _runtime, _tmp) = start_daemon().await;

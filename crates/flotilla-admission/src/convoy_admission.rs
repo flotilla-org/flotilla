@@ -890,24 +890,37 @@ impl ConvoyAdmission {
         if self.write_admission_briefs_from_inventory(namespace, name, spec, workflow, evidence, adopted_checkout).await? {
             annotations.insert(BRIEF_ARTIFACTS_ANNOTATION.to_string(), "true".to_string());
         }
-        if let Some(placement) = placement {
-            let placement_name = self.write_placement_snapshot(namespace, name, placement).await?;
-            annotations.insert(flotilla_resources::PLACEMENT_SNAPSHOT_ANNOTATION.to_string(), placement_name);
+        let result = async {
+            if let Some(placement) = placement {
+                let placement_name = self.write_placement_snapshot(namespace, name, placement).await?;
+                annotations.insert(flotilla_resources::PLACEMENT_SNAPSHOT_ANNOTATION.to_string(), placement_name);
+            }
+            if let Some(vessel_placements) = vessel_placements {
+                annotations.extend(self.prepare_vessel_placement_annotations(namespace, name, vessel_placements).await?);
+            }
+            if let Some(adopted) = adopted_checkout {
+                annotations.insert(
+                    flotilla_resources::ADOPTED_CHECKOUT_ANNOTATION.to_string(),
+                    serde_json::to_string(adopted).map_err(|error| error.to_string())?,
+                );
+            }
+            let created = crate::image_build::demand_planned_builds(Arc::clone(&self.lifecycle_reads), image_builds).await?;
+            let seed = ConvoyStatus { placement_decision, naming, ensure_admission: ensure.cloned(), ..ConvoyStatus::default() };
+            let result = self.admit_launch(namespace, name, spec, workflow, seed, annotations).await;
+            if result.is_err() {
+                crate::image_build::withdraw_demanded_builds(Arc::clone(&self.lifecycle_reads), &created).await;
+            }
+            result
         }
-        if let Some(vessel_placements) = vessel_placements {
-            annotations.extend(self.prepare_vessel_placement_annotations(namespace, name, vessel_placements).await?);
-        }
-        if let Some(adopted) = adopted_checkout {
-            annotations.insert(
-                flotilla_resources::ADOPTED_CHECKOUT_ANNOTATION.to_string(),
-                serde_json::to_string(adopted).map_err(|error| error.to_string())?,
-            );
-        }
-        let created = crate::image_build::demand_planned_builds(Arc::clone(&self.lifecycle_reads), image_builds).await?;
-        let seed = ConvoyStatus { placement_decision, naming, ensure_admission: ensure.cloned(), ..ConvoyStatus::default() };
-        let result = self.admit_launch(namespace, name, spec, workflow, seed, annotations).await;
-        if result.is_err() {
-            crate::image_build::withdraw_demanded_builds(Arc::clone(&self.lifecycle_reads), &created).await;
+        .await;
+        // The placement snapshots written for a launch never admitted are its to release: no
+        // convoy's teardown will.
+        if let Err(error) = &result {
+            if let Err(release) =
+                flotilla_store::PreparedSnapshotGarbageCollector::new(self.backend.clone(), namespace).collect(Some(name)).await
+            {
+                warn!(convoy = %name, %error, %release, "could not release a refused launch's placement snapshots");
+            }
         }
         result
     }
