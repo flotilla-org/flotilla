@@ -5150,7 +5150,7 @@ mod tests {
         use flotilla_resources::{Message, MessageRelation, MessageSpec};
         use flotilla_store_testkit::ReadCountsBackendExt;
         let mut outcomes = Vec::new();
-        for (reuse, n) in [(false, 0), (false, 200), (true, 0), (true, 200)] {
+        for (reuse, n) in [(false, 2), (false, 200), (true, 2), (true, 200)] {
             let mut fixture = handler_contract_fixture().await;
             let observed = fixture.backend.clone().with_read_counts();
             fixture.owner.backend = observed.clone();
@@ -5214,40 +5214,45 @@ mod tests {
                 .build();
             let spec = ConvoySpec::builder().workflow_ref("scratch".into()).project_ref("project".into()).build();
             let before = observed.read_snapshot();
-            if reuse {
-                let snapshot = fixture.owner.load_brief_definitions("flotilla", &spec, &workflow).await.unwrap();
-                let query = fixture.owner.brief_query("flotilla", "target", &spec, &workflow, &snapshot).await.unwrap().unwrap();
-                let inventory = observed.query_declared::<ResourceConvoy>("flotilla", &query).await.unwrap().items;
-                // Incomplete prepared evidence must refuse, never fall back to native reads.
-                let missing = ResourceBackend::new(flotilla_store::ViewSnapshot::default());
-                let error = fixture
-                    .owner
-                    .write_admission_briefs_from_inventory(
-                        "flotilla",
-                        "target",
-                        &spec,
-                        &workflow,
-                        BriefEvidence { definitions: &missing, convoys: &inventory },
-                        None,
-                    )
-                    .await
-                    .expect_err("missing prepared evidence");
-                assert!(error.contains("kind Repository missing from view snapshot"), "{error}");
-                assert!(fixture
-                    .owner
-                    .write_admission_briefs_from_inventory(
-                        "flotilla",
-                        "target",
-                        &spec,
-                        &workflow,
-                        BriefEvidence { definitions: &snapshot, convoys: &inventory },
-                        None,
-                    )
-                    .await
-                    .expect("render reused briefs"));
-            } else {
-                assert!(fixture.owner.write_admission_briefs("flotilla", "target", &spec, &workflow).await.expect("render briefs"));
-            }
+            let ((), port) = flotilla_store::load_metrics::measure(async {
+                if reuse {
+                    let snapshot = fixture.owner.load_brief_definitions("flotilla", &spec, &workflow).await.unwrap();
+                    let query = fixture.owner.brief_query("flotilla", "target", &spec, &workflow, &snapshot).await.unwrap().unwrap();
+                    let inventory = observed.query_declared::<ResourceConvoy>("flotilla", &query).await.unwrap().items;
+                    // Incomplete prepared evidence must refuse, never fall back to native reads.
+                    let missing = ResourceBackend::new(flotilla_store::ViewSnapshot::default());
+                    let error = fixture
+                        .owner
+                        .write_admission_briefs_from_inventory(
+                            "flotilla",
+                            "target",
+                            &spec,
+                            &workflow,
+                            BriefEvidence { definitions: &missing, convoys: &inventory },
+                            None,
+                        )
+                        .await
+                        .expect_err("missing prepared evidence");
+                    assert!(error.contains("kind Repository missing from view snapshot"), "{error}");
+                    assert!(fixture
+                        .owner
+                        .write_admission_briefs_from_inventory(
+                            "flotilla",
+                            "target",
+                            &spec,
+                            &workflow,
+                            BriefEvidence { definitions: &snapshot, convoys: &inventory },
+                            None,
+                        )
+                        .await
+                        .expect("render reused briefs"));
+                } else {
+                    assert!(fixture.owner.write_admission_briefs("flotilla", "target", &spec, &workflow).await.expect("render briefs"));
+                }
+            })
+            .await;
+            // The brief reads the convoys it may show: none of the project's other launches.
+            assert_eq!(port.get("Convoy").map_or(0, |counts| counts.converted), 0, "{n} launches held");
             assert_eq!(writer.0.read().await.len(), 2);
             let delta = observed.read_snapshot().since(&before);
             let (reads, decoded) = (delta.calls_by_kind(), delta.objects_by_kind());

@@ -1,5 +1,6 @@
 //! Declared equality queries shared by storage adapters and resource HTTP.
 use crate::{MessageQuery, ReadResourceList, Resource, ResourceBackend, ResourceError, ResourceKind, ResourceObject, TypedResolver};
+use flotilla_resources::engine_records::IndexCover;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use std::collections::{BTreeMap, BTreeSet, HashMap};
@@ -208,31 +209,31 @@ impl StoreQuery {
             crate::ReadOperation::List
         }
     }
-    /// Index keys, as [`QueryIndex`] names them, of which every row the query selects holds at
-    /// least one: an equality on a label or field, one field's values, a missing or present
-    /// field, or each alternative's keys. `None` when the query selects by nothing else, and
-    /// only a read of every row answers it.
-    pub(crate) fn covering_keys(&self) -> Option<BTreeSet<(String, String)>> {
-        if let Some((key, value)) = self.labels.iter().next() {
-            return Some(BTreeSet::from([(format!("label:{key}"), value.clone())]));
+    /// The rows the query may select, by index keys as [`QueryIndex`] names them: each equality
+    /// on a label or field, each field's values, each missing or present field and its
+    /// alternatives, all of which a row must meet. `None` when the query selects by nothing else,
+    /// and only a read of every row answers it.
+    pub(crate) fn index_cover(&self) -> Option<IndexCover> {
+        let key = |key: String, value: String| IndexCover::AnyKey(BTreeSet::from([(key, value)]));
+        let mut parts: Vec<IndexCover> = self.labels.iter().map(|(label, value)| key(format!("label:{label}"), value.clone())).collect();
+        parts.extend(self.fields.iter().map(|(path, value)| key(format!("field:{path}"), value.clone())));
+        parts.extend(
+            self.field_values
+                .iter()
+                .map(|(path, values)| IndexCover::AnyKey(values.iter().map(|value| (format!("field:{path}"), value.clone())).collect())),
+        );
+        parts.extend(self.missing_fields.iter().map(|path| key(format!("missing:{path}"), String::new())));
+        parts.extend(self.present.iter().map(|path| key(format!("present:{path}"), String::new())));
+        // Alternatives cover only when each of them does.
+        if let Some(alternatives) = self.any_of.as_ref().and_then(|alternatives| alternatives.iter().map(StoreQuery::index_cover).collect())
+        {
+            parts.push(IndexCover::Any(alternatives));
         }
-        if let Some((path, value)) = self.fields.iter().next() {
-            return Some(BTreeSet::from([(format!("field:{path}"), value.clone())]));
+        match parts.len() {
+            0 => None,
+            1 => parts.pop(),
+            _ => Some(IndexCover::All(parts)),
         }
-        if let Some((path, values)) = self.field_values.iter().next() {
-            return Some(values.iter().map(|value| (format!("field:{path}"), value.clone())).collect());
-        }
-        if let Some(path) = self.missing_fields.iter().next() {
-            return Some(BTreeSet::from([(format!("missing:{path}"), String::new())]));
-        }
-        if let Some(path) = self.present.first() {
-            return Some(BTreeSet::from([(format!("present:{path}"), String::new())]));
-        }
-        let alternatives = self.any_of.as_ref()?;
-        alternatives.iter().map(StoreQuery::covering_keys).try_fold(BTreeSet::new(), |mut keys, covered| {
-            keys.extend(covered?);
-            Some(keys)
-        })
     }
     fn validate_at(&self, kind: ResourceKind, depth: usize) -> Result<(), ResourceError> {
         if self.all_sources_for_matches

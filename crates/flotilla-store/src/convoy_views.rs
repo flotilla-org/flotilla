@@ -28,7 +28,7 @@ use flotilla_protocol::{LifecycleReading, NodeId};
 use flotilla_resources::{
     convoy::view::VesselReading,
     convoy_records::{ConvoyChange, ConvoyJoins, ConvoyNotes, ConvoyRecord, ConvoyRecords, WorkFacts},
-    engine_records::{KindRecords, LogPosition, Record, Since, UnloggedJournal},
+    engine_records::{IndexCover, KindRecords, LogPosition, Record, Since, UnloggedJournal},
     lifecycle_reads::{ChangeCursor, LifecycleReads},
     terminal_records::{newest_launches, TerminalChange},
     vessel_records::{interrupted_message, VesselChange},
@@ -110,9 +110,9 @@ impl ViewIndex {
         }
     }
 
-    /// The launches holding any of `keys`.
-    fn holding_any(&self, keys: &BTreeSet<(String, String)>) -> BTreeSet<(String, String)> {
-        keys.iter().filter_map(|key| self.entries.get(key)).flatten().cloned().collect()
+    /// The launches `cover` selects.
+    fn covered(&self, cover: &IndexCover) -> BTreeSet<(String, String)> {
+        cover.select(&self.entries)
     }
 }
 
@@ -579,11 +579,11 @@ impl KindRecords<Convoy> for ConvoyViews {
     }
 
     /// The views holding any of `keys`, from the views' index: only those are converted.
-    async fn holding_any(&self, keys: &BTreeSet<(String, String)>) -> Option<Result<Vec<Record<Convoy>>, String>> {
-        let keys = keys.clone();
+    async fn covered(&self, cover: &IndexCover) -> Option<Result<Vec<Record<Convoy>>, String>> {
+        let cover = cover.clone();
         let held = self.with_held(move |held| {
             held.index
-                .holding_any(&keys)
+                .covered(&cover)
                 .into_iter()
                 .filter_map(|launch| Some((launch.0.clone(), held.views.get(&launch)?.clone())))
                 .collect::<Vec<_>>()

@@ -235,6 +235,41 @@ impl std::fmt::Debug for CommitMark {
     }
 }
 
+/// The records a query may select, by index keys, each a `(key, value)` as the store's query
+/// index names a label or declared field: a superset of the query's rows that an index answers.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum IndexCover {
+    /// The records holding any of these keys.
+    AnyKey(std::collections::BTreeSet<(String, String)>),
+    /// The records every part selects; never empty.
+    All(Vec<IndexCover>),
+    /// The records any part selects.
+    Any(Vec<IndexCover>),
+}
+
+impl IndexCover {
+    /// The records selected, each held under its keys in `held`.
+    pub fn select<Id: Ord + Clone>(
+        &self,
+        held: &BTreeMap<(String, String), std::collections::BTreeSet<Id>>,
+    ) -> std::collections::BTreeSet<Id> {
+        match self {
+            Self::AnyKey(keys) => keys.iter().filter_map(|key| held.get(key)).flatten().cloned().collect(),
+            Self::All(parts) => {
+                let mut parts = parts.iter();
+                let Some(first) = parts.next() else { return std::collections::BTreeSet::new() };
+                parts.fold(first.select(held), |selected, part| {
+                    if selected.is_empty() {
+                        return selected;
+                    }
+                    selected.intersection(&part.select(held)).cloned().collect()
+                })
+            }
+            Self::Any(parts) => parts.iter().flat_map(|part| part.select(held)).collect(),
+        }
+    }
+}
+
 /// An engine port serving resource kind `R`. A name several homes hold reads as this home's
 /// record, else the lexically first home's; writes are this home's alone.
 #[async_trait::async_trait]
@@ -291,10 +326,10 @@ pub trait KindRecords<R: crate::Resource>: Send + Sync + std::fmt::Debug {
     async fn open_to(&self, _receiver: &str) -> Option<Result<Vec<Record<R>>, String>> {
         None
     }
-    /// Every home's record holding any of `keys`, each a `(key, value)` as the store's query index
-    /// names a label or declared field, through the port's own index; `None` when the port keeps
-    /// none, and readers filter [`KindRecords::sources`]. A reader still applies its whole query.
-    async fn holding_any(&self, _keys: &std::collections::BTreeSet<(String, String)>) -> Option<Result<Vec<Record<R>>, String>> {
+    /// Every home's record `cover` selects, through the port's own index; `None` when the port
+    /// keeps none, and readers filter [`KindRecords::sources`]. A reader still applies its whole
+    /// query.
+    async fn covered(&self, _cover: &IndexCover) -> Option<Result<Vec<Record<R>>, String>> {
         None
     }
     /// Writes this home's record `name` from its metadata and spec: created, or replaced, keeping
