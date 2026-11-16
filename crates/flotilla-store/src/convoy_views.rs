@@ -22,7 +22,7 @@ use std::{
 };
 
 use chrono::DateTime;
-use futures::{stream::BoxStream, StreamExt};
+use futures::{stream::BoxStream, FutureExt, StreamExt};
 
 use flotilla_protocol::{LifecycleReading, NodeId};
 use flotilla_resources::{
@@ -304,14 +304,30 @@ impl ConvoyViews {
 
     /// Recomposes the views each wake's changes touch, and ticks the watchers.
     async fn follow(self, mut wakes: BoxStream<'static, ()>) {
-        while wakes.next().await.is_some() {
+        let mut ended = false;
+        while !ended && wakes.next().await.is_some() {
             let mut state = self.held.state.lock().await;
             let Some(held) = state.as_mut() else { return };
-            if let Err(error) = self.pass(held).await {
-                // The views are read again in full; a failed read leaves them as they were.
-                tracing::warn!(%error, "convoy views: a change did not read; reading them all again");
-                if let Err(error) = self.refill(held).await {
-                    tracing::warn!(%error, "convoy views: reading them all again failed");
+            loop {
+                if let Err(error) = self.pass(held).await {
+                    // The views are read again in full; a failed read leaves them as they were.
+                    tracing::warn!(%error, "convoy views: a change did not read; reading them all again");
+                    if let Err(error) = self.refill(held).await {
+                        tracing::warn!(%error, "convoy views: reading them all again failed");
+                    }
+                }
+                // The changes made during the pass are read before a waiting read takes the
+                // views, so it composes none of them; one pass reads every wake waiting.
+                let mut woken = false;
+                while let Some(wake) = wakes.next().now_or_never() {
+                    ended |= wake.is_none();
+                    woken |= wake.is_some();
+                    if ended {
+                        break;
+                    }
+                }
+                if !woken {
+                    break;
                 }
             }
             drop(state);
@@ -522,6 +538,16 @@ fn view_record(held: HeldView, home: String) -> Record<Convoy> {
 
 impl crate::EnginePort for ConvoyViews {
     fn install(self: Arc<Self>, backend: &crate::ResourceBackend) {
+        // The views are composed when they open, as startup work: no read pays the first
+        // composition. Without a runtime the first read composes them.
+        if tokio::runtime::Handle::try_current().is_ok() {
+            let views = Arc::clone(&self);
+            tokio::spawn(async move {
+                if let Err(error) = views.with_held(|_| ()).await {
+                    tracing::warn!(%error, "convoy views: composing them at open failed; the first read composes them");
+                }
+            });
+        }
         backend.install_engine_kind::<Convoy>(self);
     }
 }
@@ -578,13 +604,19 @@ impl KindRecords<Convoy> for ConvoyViews {
         self.engine_copies(name).await
     }
 
-    /// The views holding any of `keys`, from the views' index: only those are converted.
-    async fn covered(&self, cover: &IndexCover) -> Option<Result<Vec<Record<Convoy>>, String>> {
+    /// The views `cover` selects, from the views' index, this home's alone when `local`: only
+    /// those are converted.
+    async fn covered(&self, cover: &IndexCover, local: bool) -> Option<Result<Vec<Record<Convoy>>, String>> {
         let cover = cover.clone();
+        let here = match self.convoys() {
+            Ok(convoys) => convoys.home().to_owned(),
+            Err(error) => return Some(Err(error)),
+        };
         let held = self.with_held(move |held| {
             held.index
                 .covered(&cover)
                 .into_iter()
+                .filter(|(home, _)| !local || *home == here)
                 .filter_map(|launch| Some((launch.0.clone(), held.views.get(&launch)?.clone())))
                 .collect::<Vec<_>>()
         });

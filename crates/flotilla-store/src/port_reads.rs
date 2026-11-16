@@ -72,11 +72,12 @@ pub(crate) async fn open_to<R: Resource>(records: &dyn KindRecords<R>, receiver:
     Some(counted(ReadShape::Index, open))
 }
 
-/// Every home's record `cover` selects, where the port keeps them indexed.
+/// The records `cover` selects, this home's alone when `local`, where the port keeps them indexed.
 pub(crate) async fn covered<R: Resource>(
     records: &dyn KindRecords<R>,
     cover: &flotilla_resources::engine_records::IndexCover,
+    local: bool,
 ) -> Option<Result<Vec<Record<R>>, String>> {
-    let held = records.covered(cover).await?;
+    let held = records.covered(cover, local).await?;
     Some(counted(ReadShape::Index, held))
 }

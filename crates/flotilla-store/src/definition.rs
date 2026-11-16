@@ -117,7 +117,8 @@ impl<T: Resource> DefinitionResolver<T> {
             }
         }
         if let Some(cover) = query.index_cover() {
-            if let Some(held) = port_reads::covered(&*records, &cover).await {
+            // A query of this home's rows reads none of another home's.
+            if let Some(held) = port_reads::covered(&*records, &cover, !query.include_replicas).await {
                 return Some(held.map_err(ResourceError::other).and_then(|held| self.reads(&records.home(), held, None)));
             }
         }

@@ -719,11 +719,7 @@ async fn ensured_queries(others: usize) -> Vec<(usize, u64)> {
 async fn a_selecting_query_converts_only_the_launches_it_selects() {
     let small = ensured_queries(10).await;
     let large = ensured_queries(400).await;
-    assert_eq!(
-        small,
-        [(1, 2), (2, 2), (2, 3)],
-        "live here, live everywhere: the role's two live launches; generations here: all three of its launches"
-    );
+    assert_eq!(small, [(1, 1), (2, 2), (2, 2)], "live here, live everywhere, generations here: each converts only the launches it returns");
     assert_eq!(large, small, "the cost does not grow with the launches held");
 }
 

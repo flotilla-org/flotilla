@@ -256,14 +256,13 @@ impl IndexCover {
         match self {
             Self::AnyKey(keys) => keys.iter().filter_map(|key| held.get(key)).flatten().cloned().collect(),
             Self::All(parts) => {
-                let mut parts = parts.iter();
-                let Some(first) = parts.next() else { return std::collections::BTreeSet::new() };
-                parts.fold(first.select(held), |selected, part| {
-                    if selected.is_empty() {
-                        return selected;
-                    }
-                    selected.intersection(&part.select(held)).cloned().collect()
-                })
+                // The smallest selection drives the intersection.
+                let mut selections: Vec<_> = parts.iter().map(|part| part.select(held)).collect();
+                selections.sort_by_key(std::collections::BTreeSet::len);
+                let mut selections = selections.into_iter();
+                let Some(smallest) = selections.next() else { return std::collections::BTreeSet::new() };
+                let rest: Vec<_> = selections.collect();
+                smallest.into_iter().filter(|id| rest.iter().all(|selection| selection.contains(id))).collect()
             }
             Self::Any(parts) => parts.iter().flat_map(|part| part.select(held)).collect(),
         }
@@ -326,10 +325,10 @@ pub trait KindRecords<R: crate::Resource>: Send + Sync + std::fmt::Debug {
     async fn open_to(&self, _receiver: &str) -> Option<Result<Vec<Record<R>>, String>> {
         None
     }
-    /// Every home's record `cover` selects, through the port's own index; `None` when the port
-    /// keeps none, and readers filter [`KindRecords::sources`]. A reader still applies its whole
-    /// query.
-    async fn covered(&self, _cover: &IndexCover) -> Option<Result<Vec<Record<R>>, String>> {
+    /// The records `cover` selects, through the port's own index: this home's alone when `local`,
+    /// else every home's; `None` when the port keeps no index, and readers filter
+    /// [`KindRecords::sources`]. A reader still applies its whole query.
+    async fn covered(&self, _cover: &IndexCover, _local: bool) -> Option<Result<Vec<Record<R>>, String>> {
         None
     }
     /// Writes this home's record `name` from its metadata and spec: created, or replaced, keeping
