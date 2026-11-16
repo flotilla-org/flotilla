@@ -1900,6 +1900,9 @@ mod tests {
             // The environment's reading, overridden; its record is the engine's.
             struct BackingReading(&'static str, Arc<dyn flotilla_projections::ports::LifecycleReads>);
             impl flotilla_projections::ports::LifecycleReads for BackingReading {
+                fn home(&self) -> Result<&str, String> {
+                    self.1.home()
+                }
                 fn try_reading(&self, kind: ProvisioningKind, _: &str, _: Option<&str>) -> Result<Option<LifecycleReading>, String> {
                     Ok((kind == ProvisioningKind::Environment).then(|| LifecycleReading::Ready { identity: self.0.into() }))
                 }

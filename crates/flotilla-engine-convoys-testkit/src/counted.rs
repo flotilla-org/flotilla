@@ -96,6 +96,10 @@ impl WithConvoys {
 }
 
 impl LifecycleReads for WithConvoys {
+    fn home(&self) -> Result<&str, String> {
+        self.reads.home()
+    }
+
     fn try_reading(&self, kind: ProvisioningKind, name: &str, origin: Option<&str>) -> Result<Option<LifecycleReading>, String> {
         self.reads.try_reading(kind, name, origin)
     }

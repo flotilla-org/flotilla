@@ -223,6 +223,10 @@ impl LifecycleReadPort {
 }
 
 impl flotilla_resources::lifecycle_reads::LifecycleReads for LifecycleReadPort {
+    fn home(&self) -> Result<&str, String> {
+        Ok(&self.home)
+    }
+
     fn environments(&self) -> Result<&dyn flotilla_resources::environment_records::EnvironmentRecords, String> {
         self.environments.as_deref().ok_or_else(|| "this read port serves no environments".to_owned())
     }

@@ -165,6 +165,10 @@ struct Counted {
 }
 
 impl LifecycleReads for Counted {
+    fn home(&self) -> Result<&str, String> {
+        LifecycleReads::home(&*self.reads)
+    }
+
     fn try_reading(&self, kind: ProvisioningKind, name: &str, origin: Option<&str>) -> Result<Option<LifecycleReading>, String> {
         self.reads.try_reading(kind, name, origin)
     }

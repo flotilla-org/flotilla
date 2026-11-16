@@ -396,6 +396,9 @@ struct Reads {
 }
 
 impl LifecycleReads for Reads {
+    fn home(&self) -> Result<&str, String> {
+        Ok(HERE)
+    }
     fn try_reading(&self, _kind: ProvisioningKind, _name: &str, _origin: Option<&str>) -> Result<Option<LifecycleReading>, String> {
         Ok(None)
     }

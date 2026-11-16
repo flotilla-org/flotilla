@@ -45,6 +45,10 @@ pub enum ProvisioningKind {
 /// impl LifecycleReads for Incomplete {}
 /// ```
 pub trait LifecycleReads: Send + Sync {
+    /// This home: the home whose records these readings resolve first. Unavailable where they
+    /// read no engine.
+    fn home(&self) -> Result<&str, String>;
+
     /// A read failure is distinct from an unheld resource and must not select legacy status.
     fn try_reading(
         &self,
@@ -149,6 +153,10 @@ pub fn record_codes(reads: &dyn LifecycleReads, sets: &[RecordSet]) -> Vec<floti
 pub struct NoLifecycleReads;
 
 impl LifecycleReads for NoLifecycleReads {
+    fn home(&self) -> Result<&str, String> {
+        Err("readings of no engine have no home".into())
+    }
+
     fn try_reading(&self, _: ProvisioningKind, _: &str, _: Option<&str>) -> Result<Option<flotilla_protocol::LifecycleReading>, String> {
         Ok(None)
     }
@@ -174,6 +182,10 @@ impl LateLifecycleReads {
 }
 
 impl LifecycleReads for LateLifecycleReads {
+    fn home(&self) -> Result<&str, String> {
+        self.installed.get().ok_or_else(|| "provisioning lifecycle reads are not installed".to_owned())?.home()
+    }
+
     fn environments(&self) -> Result<&dyn crate::environment_records::EnvironmentRecords, String> {
         self.installed.get().ok_or_else(|| "provisioning lifecycle reads are not installed".to_owned())?.environments()
     }

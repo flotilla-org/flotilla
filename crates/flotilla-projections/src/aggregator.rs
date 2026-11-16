@@ -7009,6 +7009,9 @@ mod tests {
     }
 
     impl crate::ports::LifecycleReads for ScriptedReadings {
+        fn home(&self) -> Result<&str, String> {
+            Err("scripted readings read no engine".into())
+        }
         fn reading(
             &self,
             kind: crate::ports::ProvisioningKind,

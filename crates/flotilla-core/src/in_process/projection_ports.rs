@@ -215,6 +215,10 @@ pub(super) struct DecidedReads {
 }
 
 impl flotilla_resources::lifecycle_reads::LifecycleReads for DecidedReads {
+    fn home(&self) -> Result<&str, String> {
+        self.reads.home()
+    }
+
     fn try_reading(
         &self,
         kind: flotilla_resources::lifecycle_reads::ProvisioningKind,

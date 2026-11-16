@@ -202,9 +202,9 @@ impl LifecycleViews {
         tokio::task::spawn_blocking(flotilla_schema::reads::carry(move || read(reads.as_ref()))).await.map_err(|error| error.to_string())?
     }
 
-    /// This home, as the engine's lifecycle ports name it.
+    /// This home, as the readings name it; none where they read no engine, which holds no records.
     fn here(&self) -> String {
-        self.reads.terminals().map(|terminals| terminals.home().to_owned()).unwrap_or_default()
+        self.reads.home().map(str::to_owned).unwrap_or_default()
     }
 }
 
