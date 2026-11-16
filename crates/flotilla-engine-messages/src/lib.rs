@@ -1308,23 +1308,35 @@ impl MessagePrimitives {
         inbox: Address,
     ) -> Result<Option<ReadResourceObject<OldMessage>>, ResourceError> {
         let roles = self.roles(namespace).await.map_err(ResourceError::invalid)?;
-        if let Some(view) = self.view_in(namespace, &roles, Ok(inbox.clone()), record).await? {
-            return Ok(Some(view));
+        let Some(found) = self.find_stored(record, &inbox).await? else { return Ok(None) };
+        let object = self.view_of(found.created, &found.resource, namespace, &roles).await?.map_err(ResourceError::invalid)?;
+        let provenance = match found.age_micros {
+            None => self.provenance(&found.home),
+            Some(age_micros) => ResourceProvenance::Replica {
+                origin_root: flotilla_protocol::NodeId::new(found.home),
+                last_synced_at: chrono::Utc::now() - chrono::Duration::microseconds(age_micros),
+            },
+        };
+        Ok(Some(ReadResourceObject { object, provenance }))
+    }
+
+    /// The message `record` in `inbox` as the engine stores it, with its home: from this replica
+    /// by its exact identity, or, on a miss, read at its home through [`ports::HomeReads`].
+    pub async fn find_stored(&self, record: &str, inbox: &Address) -> Result<Option<StoredMessage>, ResourceError> {
+        if let Some((id, home)) = self.locate_in(inbox, record).map_err(ResourceError::other)? {
+            if let Some((home, created, resource)) = self.load_at(id, home)? {
+                return Ok(Some(StoredMessage { home, created, resource, age_micros: None }));
+            }
         }
         let Some(reads) = self.home_reads.get() else { return Ok(None) };
-        let id = Address::message(&inbox, record).map_err(|error| ResourceError::invalid(error.to_string()))?;
+        let id = Address::message(inbox, record).map_err(|error| ResourceError::invalid(error.to_string()))?;
         let Some(read) = reads.find(Resource::<Message>::CODE, id.as_str()).await.map_err(ResourceError::other)? else { return Ok(None) };
         let Some(snapshot) = read.value else { return Ok(None) };
         let home = snapshot.home.clone();
         let created = snapshot.created_at.ok_or_else(|| ResourceError::other(format!("message {id} at {home} has no creation time")))?;
         let resource = snapshot.into_value::<Resource<Message>>().map_err(|error| ResourceError::decode(error.to_string()))?;
         tracing::info!(message = %id, %home, remote = read.remote, age_micros = read.age_micros, "replica miss read at the message's home");
-        let object = self.view_of(created, &resource, namespace, &roles).await?.map_err(ResourceError::invalid)?;
-        let synced = chrono::Utc::now() - chrono::Duration::microseconds(read.age_micros);
-        Ok(Some(ReadResourceObject {
-            object,
-            provenance: ResourceProvenance::Replica { origin_root: flotilla_protocol::NodeId::new(home), last_synced_at: synced },
-        }))
+        Ok(Some(StoredMessage { home, created, resource, age_micros: Some(read.age_micros) }))
     }
 
     /// The message `record` in `inbox`, where it was sent, which names it at its home: from this
@@ -2003,6 +2015,17 @@ impl MessagePrimitives {
     ) -> Result<Result<ResourceObject<OldMessage>, String>, ResourceError> {
         Ok(self.old_views(namespace, roles, &[(created, resource.clone())]).await?.pop().expect("one view per message"))
     }
+}
+
+/// A message as the engine stores it, read by [`MessagePrimitives::find_stored`].
+#[derive(Debug, Clone)]
+pub struct StoredMessage {
+    /// Its home: its receiver's, which admitted it.
+    pub home: String,
+    pub created: CreatedAt,
+    pub resource: Resource<Message>,
+    /// On a replica miss, the age of the read at its home.
+    pub age_micros: Option<i64>,
 }
 
 /// A message an admission read: its id, its home, the version read, and,

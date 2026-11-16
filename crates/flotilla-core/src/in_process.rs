@@ -5122,21 +5122,31 @@ impl InProcessDaemon {
             .map_err(|error| error.to_string())?
             .map_err(|error| format!("the replying role has no inbox: {error}"))?;
         let original = primitives
-            .read_view(namespace, original_id, inbox)
+            .find_stored(original_id, &inbox)
             .await
             .map_err(|error| error.to_string())?
             .ok_or_else(|| format!("replied-to message `{original_id}` is neither in this home's replica nor at a reachable home"))?;
-        if original.object.spec.sender != reply.receiver {
+        let spec = original.resource.spec();
+        let conversion = flotilla_engine_messages::convert::Conversion {
+            roles: &roles,
+            forges: &[],
+            records: &flotilla_engine_messages::convert::NoRecords,
+        };
+        if conversion.sender(&reply.receiver).ok().as_ref() != Some(&spec.sender) {
             return Err("reply system receiver does not match the original sender".into());
         }
-        let referenced = reply.references.iter().chain(original.object.spec.references.iter()).find_map(|reference| match reference {
+        let referenced = reply.references.iter().find_map(|reference| match reference {
             flotilla_resources::MessageReference::ControlRecord { resource, .. } if resource.kind == "Convoy" => {
                 Some(resource.name.clone())
             }
             _ => None,
         });
         let convoy = referenced
-            .or_else(|| flotilla_resources::parse_crew_role_address(&original.object.spec.receiver).map(|(_, convoy, _, _)| convoy));
+            .or_else(|| {
+                let convoy = spec.references.iter().find(|reference| reference.address.kind() == flotilla_address::Kind::Convoy);
+                convoy.map(|reference| reference.address.name().to_owned())
+            })
+            .or_else(|| spec.inbox.get(flotilla_address::Kind::Convoy).map(str::to_owned));
         if let Some(convoy) = convoy {
             if let Ok(convoy) = self.resource_backend.including_replicas::<ResourceConvoy>(namespace).get(&convoy).await {
                 return Ok(match convoy.provenance {
@@ -5145,10 +5155,7 @@ impl InProcessDaemon {
                 });
             }
         }
-        Ok(match original.provenance {
-            ResourceProvenance::Local => self.node_id.clone(),
-            ResourceProvenance::Replica { origin_root, .. } => origin_root,
-        })
+        Ok(if original.home == primitives.home() { self.node_id.clone() } else { NodeId::new(original.home) })
     }
 
     async fn message_creation_origin(&self, namespace: &str, document: &serde_json::Value) -> Result<Option<NodeId>, String> {

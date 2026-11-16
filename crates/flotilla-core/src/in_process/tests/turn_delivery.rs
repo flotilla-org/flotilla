@@ -302,3 +302,49 @@ async fn unknown_controller_sender_has_a_creatable_system_reply() {
     daemon.apply_intent_document("flotilla", reply).await.expect("create correlated system reply");
     assert!(backend.using::<Message>("flotilla").get("legacy-reply").await.is_ok());
 }
+
+/// The Message rows loaded and converted in routing a crew's reply to turn rules, with `count`
+/// other messages to the crew.
+async fn read_by_routing_a_reply(count: usize) -> (u64, u64) {
+    let (daemon, _backend, probe) = resume_staging_fixture().await;
+    probe.fail_next.store(false, std::sync::atomic::Ordering::SeqCst);
+    let request = flotilla_crew::leaf_engine::CrewTurnIntent::builder()
+        .namespace("flotilla".into())
+        .convoy(probe.convoy.clone())
+        .source("checks".into())
+        .vessel("work".into())
+        .role("coder".into())
+        .brief("checks settled".into())
+        .subject_revision("head".into())
+        .sender("system:turn-rules".into())
+        .build();
+    let admission = daemon.crew.deliver_turn(&request).await.expect("turn");
+    let primitives = super::support::install_engine_messages(&daemon);
+    let crew = flotilla_resources::crew_role_address("flotilla", &probe.convoy, "work", "coder");
+    for index in 0..count {
+        let intent = flotilla_resources::MessageSpec::builder()
+            .sender("system:turn-rules".into())
+            .receiver(crew.clone())
+            .relation(flotilla_resources::MessageRelation::System)
+            .body(format!("other {index}"))
+            .build();
+        primitives.admit("flotilla", &format!("other-{index}"), &intent).await.expect("another message");
+    }
+    let reply = serde_json::json!({
+        "apiVersion":"flotilla.work/v1", "kind":"Message", "metadata":{"name":"reply"},
+        "spec":{"sender":crew,"receiver":"system:turn-rules","relation":"peer","body":"done","in_reply_to":admission.message.name}
+    });
+    let before = primitives.rows_read();
+    let home = daemon.message_creation_origin("flotilla", &reply).await.expect("the reply has a home");
+    let after = primitives.rows_read();
+    assert_eq!(home, Some(daemon.node_id().clone()), "the convoy's home");
+    (after.loaded - before.loaded, after.converted - before.converted)
+}
+
+// Behaviour: routing a reply to a fleet role reads the original by its identity without
+// converting it, whatever else its receiver holds (#3108).
+#[tokio::test]
+async fn routing_a_reply_reads_its_original_without_converting_it() {
+    assert_eq!(read_by_routing_a_reply(5).await, (1, 0), "five other messages");
+    assert_eq!(read_by_routing_a_reply(60).await, (1, 0), "sixty other messages");
+}
