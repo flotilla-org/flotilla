@@ -30,12 +30,12 @@ use crate::{
     shared::{
         check_kind_codes, check_kind_columns, has_string_domain, log_predates_changes, schema_ddl, sync_indexes, sync_views, CHANGE_APPEND,
         CHANGE_EXISTS, CHANGE_GET, CHANGE_ITEMS, CHANGE_ITEM_APPEND, CHANGE_NAMED, CHANGE_NAMING, CHANGE_SEQS, FLOOR_GET, FLOOR_RAISE,
-        HOME_IDS_RESET, HOME_LOG_CLEAR, HOME_MARK_RESET, HOME_SEQ_RESET, IDENTITIES_PAGE, IDENTITY_CREATED, IDENTITY_DELETE,
+        FLOOR_SET, HOME_IDS_RESET, HOME_LOG_CLEAR, HOME_MARK_RESET, HOME_SEQ_RESET, IDENTITIES_PAGE, IDENTITY_CREATED, IDENTITY_DELETE,
         IDENTITY_INSERT, IDENTITY_NAMED, IDENTITY_OF, IDENTITY_RESOLVE, IDENTITY_RESTORE_CREATED, IDENTITY_SEQ, IDENTITY_SET_CREATED,
         IDENTITY_SET_SEQ, LOG_ABOUT_AFTER, LOG_ABOUT_FIRST, LOG_APPEND, LOG_BY_HOME, LOG_BY_RESOURCE, LOG_CAUSE, LOG_EXPUNGE,
-        LOG_EXPUNGED_AFTER, LOG_LAST_CHANGE, OBJECT_BYTES, OBJECT_EXISTS, OBJECT_PUT, REMOVED_MAX, SEQUENCE_LAST, SEQUENCE_NEXT,
-        SEQUENCE_RAISE, SHARED_STATEMENTS, SNAPSHOT_CAUSE_DELETE, SNAPSHOT_CAUSE_GET, SNAPSHOT_CAUSE_PUT, STRING_ID, STRING_INSERT,
-        WATERMARK_PUT,
+        LOG_EXPUNGED_AFTER, LOG_LAST_CHANGE, LOG_LAST_EDGE, OBJECT_BYTES, OBJECT_EXISTS, OBJECT_PUT, REMOVED_MAX, SEQUENCE_LAST,
+        SEQUENCE_NEXT, SEQUENCE_RAISE, SHARED_STATEMENTS, SNAPSHOT_CAUSE_DELETE, SNAPSHOT_CAUSE_GET, SNAPSHOT_CAUSE_PUT, STRING_ID,
+        STRING_INSERT, WATERMARK_PUT,
     },
     sql::{KindSql, TableSql},
 };
@@ -117,7 +117,26 @@ pub struct Snapshot {
     /// from a snapshot reads the home's creation time, not the time it was installed.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub created_at: Option<CreatedAt>,
+    /// Earlier entries of the resource its readers need and its rows do not hold, as the kind's
+    /// [`CarriedEdges`] names them (a retired convoy's end), each with its change. A restore
+    /// records each as an entry of the resource, so a replica reads it as the home does.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub entries: Vec<CarriedEntry>,
 }
+
+/// An earlier entry a [`Snapshot`] carries, with the change it belongs to.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CarriedEntry {
+    pub event: Event,
+    pub change: ChangeHeader,
+}
+
+/// For a snapshot of a resource of one kind, the edges whose newest entry the snapshot carries:
+/// what a reader of the resource needs that its rows do not hold. See [`Store::carry`].
+pub type CarriedEdges = dyn Fn(&Snapshot) -> Result<Vec<Code>, StoreError> + Send + Sync;
+
+/// Each kind's [`CarriedEdges`], shared by a store and the readers its service opens.
+pub(crate) type Carriers = std::sync::Arc<std::sync::RwLock<BTreeMap<KindCode, std::sync::Arc<CarriedEdges>>>>;
 
 impl Snapshot {
     pub fn decode<K: Kind>(&self) -> Result<K, StoreError> {
@@ -173,6 +192,8 @@ struct Runtime {
     ids: TwoGen<ResourceId, Identity>,
     /// Told of each write to their kind inside its transaction: see [`Store::observe`].
     observers: Vec<std::sync::Arc<dyn Observing>>,
+    /// The edges each kind's snapshots carry: see [`Store::carry`].
+    carriers: Carriers,
 }
 
 /// What a write did to a resource of the kind an observer watches, told inside the write's
@@ -227,6 +248,22 @@ impl Store {
     /// commits and is never ahead of or behind them for a reader holding the store's lock.
     pub fn observe<K: Kind + 'static>(&mut self, observer: std::sync::Arc<Observer<K>>) {
         self.runtime.observers.push(std::sync::Arc::new(Typed(observer)));
+    }
+
+    /// From now on each snapshot of a resource of `kind` carries the newest entry of each edge
+    /// `edges` names for it ([`Snapshot::entries`]), here and in the readers this store's service
+    /// opens to serve snapshots: what a reader needs that the rows do not hold.
+    pub fn carry(&self, kind: KindCode, edges: std::sync::Arc<CarriedEdges>) {
+        self.runtime.carriers.write().unwrap_or_else(std::sync::PoisonError::into_inner).insert(kind, edges);
+    }
+
+    pub(crate) fn carriers(&self) -> Carriers {
+        std::sync::Arc::clone(&self.runtime.carriers)
+    }
+
+    /// Takes `carriers` as this store's: a reader serving snapshots for the store that holds them.
+    pub(crate) fn share_carriers(&mut self, carriers: Carriers) {
+        self.runtime.carriers = carriers;
     }
     /// Read one described table with `filter` applied in SQLite. The filter is checked against the
     /// table's readable description ([`flotilla_schema::Table::filterable`]). Natural identities
@@ -320,6 +357,7 @@ impl Store {
             ids: TwoGen::new(options.identity_cache),
             change_page_bytes: options.change_page_bytes,
             observers: Vec::new(),
+            carriers: Carriers::default(),
         };
         Ok(Store { conn, runtime, wrote: false })
     }
@@ -492,6 +530,12 @@ impl Read<'_> {
     /// read here once this store holds it. Limits as for [`Read::changes`].
     pub fn about(&mut self, id: ResourceId, after: Option<&AboutCursor>, limit: u32) -> Result<AboutPage, StoreError> {
         self.ctx().about(id, after, limit)
+    }
+
+    /// The newest entry of resource `id` that edge `edge` made, if this store holds it: logged
+    /// here, or carried by the snapshot it was restored from ([`Snapshot::entries`]).
+    pub fn last_edge(&mut self, id: ResourceId, edge: &Code) -> Result<Option<Event>, StoreError> {
+        self.ctx().last_edge(id, edge)
     }
 
     /// The change `seq` homed at `home`, with its items in order, if this store holds it: who
@@ -826,6 +870,10 @@ impl Write<'_> {
             let home = ctx.intern(HOME_DOMAIN, home)?;
             let seq = i64::try_from(home_seq).map_err(|_| Malformed::Sequence { home_seq })?;
             ctx.conn.prepare_cached(SEQUENCE_RAISE)?.execute(params![home, seq])?;
+            // The home's sequence is held here from the cut on, never before it: a follower
+            // asking to resume below the cut is served a snapshot, not a tail through the earlier
+            // entries a snapshot carries ([`Snapshot::entries`]) or changes its causes name.
+            ctx.conn.prepare_cached(FLOOR_SET)?.execute(params![home, seq])?;
             ctx.note_rescan();
             let mark = crate::stream::Watermark { home_seq, ..current };
             ctx.conn.prepare_cached(WATERMARK_PUT)?.execute(params![home, seq, mark.applied_through.micros()])?;
@@ -905,6 +953,12 @@ impl Write<'_> {
     /// read here once this store holds it. Limits as for [`Read::changes`].
     pub fn about(&mut self, id: ResourceId, after: Option<&AboutCursor>, limit: u32) -> Result<AboutPage, StoreError> {
         self.ctx().about(id, after, limit)
+    }
+
+    /// The newest entry of resource `id` that edge `edge` made, if this store holds it: logged
+    /// here, or carried by the snapshot it was restored from ([`Snapshot::entries`]).
+    pub fn last_edge(&mut self, id: ResourceId, edge: &Code) -> Result<Option<Event>, StoreError> {
+        self.ctx().last_edge(id, edge)
     }
 
     /// The highest sequence of `home` this store has taken or applied; 0 when none.
@@ -2084,6 +2138,30 @@ impl Ctx<'_> {
             let seq = i64::try_from(cause.seq).map_err(|_| Malformed::Sequence { home_seq: cause.seq })?;
             self.conn.prepare_cached(SNAPSHOT_CAUSE_PUT)?.execute(params![id.0, home, seq])?;
         }
+        for CarriedEntry { event, change } in &snapshot.entries {
+            // An entry carried is an earlier one of this resource, at its home, in its change.
+            if event.identity() != identity || event.home_seq >= snapshot.version || change.home != event.home || change.seq != event.change
+            {
+                return Err(Malformed::ChangeMismatch { home: event.home.clone(), seq: event.home_seq }.into());
+            }
+            let seq = i64::try_from(event.home_seq).map_err(|_| Malformed::Sequence { home_seq: event.home_seq })?;
+            let home = self.intern(HOME_DOMAIN, &event.home)?;
+            // Held already, as one this store logged or an earlier restore carried.
+            if self.conn.prepare_cached(LOG_CAUSE)?.query_row(params![home, seq], |_| Ok(())).optional()?.is_some() {
+                continue;
+            }
+            self.record_change(change)?;
+            let header = Header {
+                topic: event.topic,
+                cause: event.cause,
+                change: event.change,
+                about: event.about.clone(),
+                arguments: event.arguments.clone(),
+            };
+            // Recorded, not applied: the rows already hold its effect, and the home's sequence
+            // stays where the snapshot left it.
+            self.append_log(event.kind, &event.home, Some(id), header, event.prev_seq, seq, &event.effect.encode()?)?;
+        }
         self.note_written(snapshot.kind, &snapshot.home);
         let home = self.intern(HOME_DOMAIN, &snapshot.home)?;
         self.conn.prepare_cached(SEQUENCE_RAISE)?.execute(params![home, sequence])?;
@@ -2280,6 +2358,11 @@ impl Ctx<'_> {
         let after = i64::try_from(after).unwrap_or(i64::MAX);
         let limit = page_limit(limit)?;
         self.events(LOG_BY_RESOURCE, params![id.0, after, limit]).map(|events| events.into_iter().map(|(_, _, event)| event).collect())
+    }
+
+    /// Resource `id`'s newest entry of `edge`, by `log_by_resource`.
+    fn last_edge(&mut self, id: ResourceId, edge: &Code) -> Result<Option<Event>, StoreError> {
+        Ok(self.events(LOG_LAST_EDGE, params![id.0, edge.as_str()])?.pop().map(|(_, _, event)| event))
     }
 
     /// Logged events homed at `home` after `after`, in home order, by the primary key.
@@ -2568,15 +2651,34 @@ impl Ctx<'_> {
             }
         }
         rows.sort();
-        Ok(Some(Snapshot { kind: identity.kind, name: identity.name, home: identity.home, version, rows, cause: None, created_at: None }))
+        Ok(Some(Snapshot {
+            kind: identity.kind,
+            name: identity.name,
+            home: identity.home,
+            version,
+            rows,
+            cause: None,
+            created_at: None,
+            entries: Vec::new(),
+        }))
     }
 
-    /// [`Self::snapshot`] with the resource's cause and creation time: what a snapshot sends, and
-    /// what a restore records.
+    /// [`Self::snapshot`] with the resource's cause, creation time and the entries its kind's
+    /// snapshots carry: what a snapshot sends, and what a restore records.
     fn snapshot_with_cause(&mut self, id: ResourceId) -> Result<Option<Snapshot>, StoreError> {
         let Some(mut snapshot) = self.snapshot(id)? else { return Ok(None) };
         snapshot.cause = self.last_change(id)?;
         snapshot.created_at = self.created(id)?;
+        let carried = self.runtime.carriers.read().unwrap_or_else(std::sync::PoisonError::into_inner).get(&snapshot.kind).cloned();
+        if let Some(carried) = carried {
+            for edge in carried(&snapshot)? {
+                let Some(event) = self.last_edge(id, &edge)? else { continue };
+                let change = self
+                    .change(&event.home, event.change)?
+                    .ok_or_else(|| StoreError::Corrupt { table: "change".into(), column: "seq".into() })?;
+                snapshot.entries.push(CarriedEntry { event, change });
+            }
+        }
         Ok(Some(snapshot))
     }
 

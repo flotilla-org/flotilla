@@ -804,6 +804,7 @@ mod tests {
                 },
                 cause: None,
                 created_at: None,
+                entries: Vec::new(),
             });
             let remote = value.clone();
             let peer = tokio::spawn(async move {

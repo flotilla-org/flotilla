@@ -4,7 +4,10 @@
 use std::{collections::BTreeMap, sync::Arc};
 
 use chrono::{TimeZone, Utc};
-use flotilla_engine_convoys::{convoy_records::EngineConvoyRecords, convoys::Convoys};
+use flotilla_engine_convoys::{
+    convoy_records::EngineConvoyRecords,
+    convoys::{Convoys, Retirement},
+};
 use flotilla_engine_messages::awaiting::{AwaitingReplies, OpenAwaiting, STALL};
 use flotilla_protocol::{PrincipalRef, Relationship};
 use flotilla_resources::{
@@ -14,19 +17,22 @@ use flotilla_resources::{
     workflow_template::single_agent_workflow_spec,
     SubjectDiscoverySource, WorkflowSnapshot,
 };
-use flotilla_schema::{Address, Frozen, Timestamp};
-use flotilla_schema_sqlite::stream::Service;
+use flotilla_schema::{Address, Frozen, Kind, NewChange, Timestamp};
+use flotilla_schema_sqlite::{
+    stream::{Follower, Received, Service},
+    Applied, Stamp,
+};
 use flotilla_state_machines::{
     kinds::{stock, Catalog},
     machines::{
         awaiting_reply::{Awaited, AwaitingReplySpec, ProposedDisposition, StallReason},
         convoy::{
-            Abandon, AbandonCause, AddSeat, AdmissionBytes, AdmittedPromise, Authority, ConvoyRequest, FailSeat, Link, LinkSource,
+            Abandon, AbandonCause, AddSeat, AdmissionBytes, AdmittedPromise, Authority, Convoy, ConvoyRequest, FailSeat, Link, LinkSource,
             Priority, PromiseId, PromiseSource, Reassign, Seat, SeatName, VesselClass,
         },
         message::MessageRef,
     },
-    Ref,
+    Ref, Resource,
 };
 
 const HOME: &str = "home-a";
@@ -243,6 +249,160 @@ fn an_undecodable_launch_is_listed_as_unreadable_beside_the_others() {
         let named = records.named(&readable, home).expect("read by name");
         assert_eq!((named.records.len(), named.unreadable.len()), (1, 0));
     }
+}
+
+/// A decided store at `home` holding every kind a retirement reads for holds.
+fn service_at(dir: &tempfile::TempDir, home: &str) -> Arc<Service> {
+    let registry = flotilla_provisioning::stored::decided_registry().expect("registry");
+    Arc::new(Service::open(&dir.path().join("decided.sqlite"), home, registry).expect("store"))
+}
+
+/// One round of `home`'s stream, as `from` serves it after `after`, received into `to`.
+fn round(from: &Service, home: &str, after: Option<u64>, to: &Service) -> Received {
+    let mut frames = Vec::new();
+    from.serve_home(home, after, Timestamp(9_000_000), |frame| {
+        frames.push(frame.to_vec());
+        Ok(())
+    })
+    .expect("serve");
+    let relayed = from.home() != home;
+    to.with_store(|store| {
+        let mut follower = if relayed { Follower::relayed(store) } else { Follower::new(store) };
+        follower.receive(home, |sink| frames.iter().try_for_each(|frame| sink(frame)))
+    })
+    .expect("follow")
+}
+
+/// A launch of `fix-it` admitted at `convoys`' home.
+fn admitted(convoys: &Convoys) -> String {
+    convoys.world(|world| world.projects.put(&Ref::new(project().as_str()), ()));
+    convoys.world(|world| world.authority.put(&Ref::new("granted"), true));
+    let reserved = convoys.reserve("fix-it", Timestamp(1_000_000)).expect("reserved");
+    convoys.create_reserved(&reserved, request(), Timestamp(1_000_000)).expect("admitted");
+    convoys.get("fix-it").expect("launch").name().to_owned()
+}
+
+/// Ends `launch` as failed at two seconds and retires it at three; the version of its end.
+fn failed_and_retired(convoys: &Convoys, launch: &str) -> u64 {
+    let abandon = Abandon {
+        by: SeatName::new("coder", ""),
+        cause: AbandonCause::Failed,
+        reason: "coder failed".into(),
+        authority: Ref::new("granted"),
+    };
+    let ended = convoys.apply("fix-it", abandon, Timestamp(2_000_000)).expect("abandoned").0;
+    assert_eq!(convoys.retire(launch, Timestamp(3_000_000)), Ok(Retirement::Retired));
+    ended
+}
+
+// Behaviour (#3108): a replica given a retired launch by a snapshot reads how it ended, and when,
+// as its home does, from the end entry the snapshot carries; the home's end event, sent to the
+// replica afterwards, is a duplicate there and changes nothing.
+#[test]
+fn a_replica_snapshotted_a_retired_launch_reads_its_end() {
+    let (dir_b, dir_a) = (tempfile::tempdir().expect("tempdir"), tempfile::tempdir().expect("tempdir"));
+    let home_b = service_at(&dir_b, "home-b");
+    let convoys = Convoys::open("home-b", &home_b).expect("open");
+    let launch = admitted(&convoys);
+    let ended = failed_and_retired(&convoys, &launch);
+
+    let home_a = service_at(&dir_a, HOME);
+    assert!(round(&home_b, "home-b", None, &home_a).snapshot);
+    let records = EngineConvoyRecords::new(HOME, Arc::clone(&home_a), Arc::default(), OpenAwaiting::open(&home_a).expect("open records"));
+    let record = records.get(&launch, Some("home-b")).expect("read").expect("the replica");
+    assert!(record.retired);
+    assert_eq!(record.ended, Some((ConvoyEnd::Failed { reason: "coder failed".into() }, time(2))));
+
+    let end = home_b
+        .with_store(|store| store.read()?.changes_since("home-b", ended - 1, 1))
+        .expect("the home's log")
+        .pop()
+        .filter(|event| event.home_seq == ended)
+        .expect("the end event");
+    let applied = home_a
+        .with_store(|store| {
+            let mut write = store.write()?;
+            let applied = write.apply(&end)?;
+            write.commit()?;
+            Ok(applied)
+        })
+        .expect("apply");
+    assert!(matches!(applied, Applied::Duplicate(_)), "{applied:?}");
+    let record = records.get(&launch, Some("home-b")).expect("read").expect("the replica");
+    assert_eq!(record.ended, Some((ConvoyEnd::Failed { reason: "coder failed".into() }, time(2))));
+}
+
+// Behaviour (#3108): a replica holding a retired launch by snapshot resumes from its own
+// watermark with the home's tail, as any replica does, and the launch's expunge there takes the
+// end entry its snapshot carried with the rest of it.
+#[test]
+fn a_replica_resumes_past_a_carried_end_and_an_expunge_takes_it() {
+    let (dir_b, dir_a) = (tempfile::tempdir().expect("tempdir"), tempfile::tempdir().expect("tempdir"));
+    let home_b = service_at(&dir_b, "home-b");
+    let convoys = Convoys::open("home-b", &home_b).expect("open");
+    let launch = admitted(&convoys);
+    let ended = failed_and_retired(&convoys, &launch);
+    let home_a = service_at(&dir_a, HOME);
+    assert!(round(&home_b, "home-b", None, &home_a).snapshot);
+
+    // At its home, the retired launch is deleted; the replica resumes with the delete.
+    let id = home_b
+        .with_store(|store| {
+            let mut write = store.write()?;
+            let id = write.resolve(<Resource<Convoy> as Kind>::CODE, &launch, "home-b")?.expect("held");
+            let version = write.load_snapshot(id)?.expect("its rows").version;
+            let change = write.open_change(&NewChange::new("test", Timestamp(4_000_000)))?;
+            write.delete::<Resource<Convoy>>(Stamp { id, version }, change)?;
+            write.commit()?;
+            Ok(id)
+        })
+        .expect("deleted at its home");
+    let resume = |label: &str| {
+        let cursor = home_a.watermark("home-b").expect("cursor").home_seq;
+        let resumed = round(&home_b, "home-b", Some(cursor), &home_a);
+        assert!(!resumed.snapshot, "a resume from the replica's watermark is a tail: {label}");
+        assert_eq!(resumed.applied, 1, "{label}");
+    };
+    resume("the delete");
+
+    // Then expunged, which the replica applies in turn.
+    home_b
+        .with_store(|store| {
+            let mut write = store.write()?;
+            let change = write.open_change(&NewChange::new("test", Timestamp(5_000_000)))?;
+            write.expunge::<Resource<Convoy>>(id, change)?;
+            write.commit()
+        })
+        .expect("expunged at its home");
+    resume("the expunge");
+    let held = home_a.with_store(|store| store.read()?.changes_since("home-b", 0, 1_000)).expect("the replica's log");
+    assert!(held.iter().all(|event| event.home_seq != ended), "the carried end goes with the launch: {held:?}");
+}
+
+// Behaviour (#3108): a follower whose cursor at a home is before the cut of the snapshot a relay
+// holds of it is sent a snapshot through the relay, never a tail through the end entries the relay
+// holds only as its snapshot carried them, and reads the retired launch's end as its home does.
+#[test]
+fn a_relay_holding_a_retired_launch_by_snapshot_snapshots_a_follower_behind_its_cut() {
+    let dirs = [(); 3].map(|_| tempfile::tempdir().expect("tempdir"));
+    let home_b = service_at(&dirs[0], "home-b");
+    let convoys = Convoys::open("home-b", &home_b).expect("open");
+    let launch = admitted(&convoys);
+    let home_c = service_at(&dirs[2], "home-c");
+    round(&home_b, "home-b", None, &home_c);
+    let cursor = home_c.watermark("home-b").expect("cursor").home_seq;
+    failed_and_retired(&convoys, &launch);
+
+    let relay = service_at(&dirs[1], HOME);
+    // Every daemon opens its convoys, which names what their snapshots carry, relayed ones too.
+    let _relay_convoys = Convoys::open(HOME, &relay).expect("open");
+    assert!(round(&home_b, "home-b", None, &relay).snapshot);
+    assert!(round(&relay, "home-b", Some(cursor), &home_c).snapshot, "a follower behind the relay's cut is snapshotted");
+    let records =
+        EngineConvoyRecords::new("home-c", Arc::clone(&home_c), Arc::default(), OpenAwaiting::open(&home_c).expect("open records"));
+    let record = records.get(&launch, Some("home-b")).expect("read").expect("the replica");
+    assert!(record.retired);
+    assert_eq!(record.ended, Some((ConvoyEnd::Failed { reason: "coder failed".into() }, time(2))));
 }
 
 // Behaviour: a crew that hands its work to a crew it fans out reads as handed back, under its old

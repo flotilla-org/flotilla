@@ -21,8 +21,8 @@ use flotilla_resources::{
     lifecycle_reads::{ChangeCursor, CursorSince},
     ConvoyStatus, DiscoveredSubject, SubjectDiscovery, SubjectDiscoverySource,
 };
-use flotilla_schema::{Cause, CodeEnum, Kind, KindCode, Timestamp};
-use flotilla_schema_sqlite::{stream::Service, Loaded, Read, ResourceId, StoreError};
+use flotilla_schema::{Code, CodeEnum, Event, Kind, KindCode, Timestamp};
+use flotilla_schema_sqlite::{stream::Service, Loaded, Read, ResourceId, Snapshot, StoreError};
 use flotilla_state_machines::{
     machines::{
         awaiting_reply::{AwaitingReply, AwaitingReplySpec},
@@ -289,25 +289,37 @@ fn end_of(cause: AbandonCause, reason: String) -> ConvoyEnd {
     }
 }
 
-/// How retired launch `id`, homed at `home` and retired at `version`, ended, and when: its last
-/// Deliver or Abandon entry, read back from the Retire one entry at a time. None where this store
-/// does not hold that entry.
-fn end_entry(read: &mut Read<'_>, id: ResourceId, home: &str, version: u64) -> Result<Option<(ConvoyEnd, Timestamp)>, StoreError> {
-    let ends = [ConvoyEdgeKind::Deliver.code(), ConvoyEdgeKind::Abandon.code()];
-    for at in (1..version).rev() {
-        let Some(entry) = read.changes(id, at - 1, 1)?.into_iter().next() else { return Ok(None) };
-        if !matches!(entry.cause, Cause::Edge { edge, .. } if ends.contains(&edge)) {
-            continue;
+/// The edges whose entry tells how a launch ended.
+const END_EDGES: [ConvoyEdgeKind; 2] = [ConvoyEdgeKind::Deliver, ConvoyEdgeKind::Abandon];
+
+/// The edges whose newest entry a snapshot of launch `snapshot` carries: a retired launch's end,
+/// which its record no longer holds, so a replica reads how it ended as its home does.
+pub(crate) fn carried_ends(snapshot: &Snapshot) -> Result<Vec<Code>, StoreError> {
+    Ok(match snapshot.decode::<Resource<Convoy>>()?.state() {
+        ConvoyState::Retired => END_EDGES.iter().map(|edge| edge.code()).collect(),
+        _ => Vec::new(),
+    })
+}
+
+/// How retired launch `id`, homed at `home`, ended, and when: its Deliver or Abandon entry, logged
+/// here or carried by the snapshot it was restored from. None where this store does not hold it.
+fn end_entry(read: &mut Read<'_>, id: ResourceId, home: &str) -> Result<Option<(ConvoyEnd, Timestamp)>, StoreError> {
+    let mut last: Option<Event> = None;
+    for edge in END_EDGES {
+        if let Some(entry) = read.last_edge(id, &edge.code())? {
+            if last.as_ref().is_none_or(|held| entry.home_seq > held.home_seq) {
+                last = Some(entry);
+            }
         }
-        let end = match entry.arguments::<ConvoyEdge>().transpose()? {
-            Some(ConvoyEdge::Deliver(deliver)) => ConvoyEnd::Delivered { disposition: deliver.disposition },
-            Some(ConvoyEdge::Abandon(abandon)) => end_of(abandon.cause, abandon.reason),
-            _ => return Ok(None),
-        };
-        let Some(change) = read.change(home, entry.change)? else { return Ok(None) };
-        return Ok(Some((end, change.at)));
     }
-    Ok(None)
+    let Some(entry) = last else { return Ok(None) };
+    let end = match entry.arguments::<ConvoyEdge>().transpose()? {
+        Some(ConvoyEdge::Deliver(deliver)) => ConvoyEnd::Delivered { disposition: deliver.disposition },
+        Some(ConvoyEdge::Abandon(abandon)) => end_of(abandon.cause, abandon.reason),
+        _ => return Ok(None),
+    };
+    let Some(change) = read.change(home, entry.change)? else { return Ok(None) };
+    Ok(Some((end, change.at)))
 }
 
 /// `convoy`, held at `home` at `version`, as a read by its name takes it, a retired one with how
@@ -340,7 +352,7 @@ fn entry(
         ConvoyState::Delivered { disposition, .. } => Some((ConvoyEnd::Delivered { disposition: disposition.clone() }, convoy.since())),
         ConvoyState::Abandoned { cause, reason, .. } => Some((end_of(*cause, reason.clone()), convoy.since())),
         ConvoyState::Retired if retired == Retired::Skip => return Ok(None),
-        ConvoyState::Retired => end_entry(read, id, &home, version)?,
+        ConvoyState::Retired => end_entry(read, id, &home)?,
     }
     .map(|(end, at)| (end, time(at)));
     let is_retired = matches!(convoy.state(), ConvoyState::Retired);

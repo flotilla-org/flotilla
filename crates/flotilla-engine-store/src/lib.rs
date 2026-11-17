@@ -328,6 +328,7 @@ impl Rehearsal {
             rows,
             cause: None,
             created_at: created,
+            entries: Vec::new(),
         };
         let mut write = self.store.write().map_err(|error| error.to_string())?;
         write.restore(&snapshot).map_err(|error| error.to_string())?;

@@ -15,7 +15,7 @@ use std::{
 use flotilla_address::Address;
 use flotilla_engine_store::StoreLog;
 use flotilla_resources::convoy_records::ConvoyMemory;
-use flotilla_schema::Timestamp;
+use flotilla_schema::{Kind, Timestamp};
 use flotilla_schema_sqlite::stream::Service;
 use flotilla_state_machines::{
     launch_name,
@@ -80,6 +80,7 @@ impl Convoys {
         for convoy in stored {
             convoys.restore(convoy).map_err(|error| format!("{error:?}"))?;
         }
+        service.carry(<Resource<Convoy> as Kind>::CODE, Arc::new(crate::convoy_records::carried_ends));
         Ok(Self {
             home_name: home.to_owned(),
             service: Arc::clone(service),

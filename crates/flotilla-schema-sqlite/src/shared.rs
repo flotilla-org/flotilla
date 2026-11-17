@@ -171,6 +171,7 @@ pub(crate) const SHARED_STATEMENTS: &[(&str, &str)] = &[
     ("identities_page", IDENTITIES_PAGE),
     ("removed_max", REMOVED_MAX),
     ("floor_raise", FLOOR_RAISE),
+    ("floor_set", FLOOR_SET),
     ("floor_get", FLOOR_GET),
     ("watermark_put", WATERMARK_PUT),
     ("log_append", LOG_APPEND),
@@ -189,6 +190,7 @@ pub(crate) const SHARED_STATEMENTS: &[(&str, &str)] = &[
     ("log_cause", LOG_CAUSE),
     ("log_by_resource", LOG_BY_RESOURCE),
     ("log_by_home", LOG_BY_HOME),
+    ("log_last_edge", LOG_LAST_EDGE),
     ("log_about_first", LOG_ABOUT_FIRST),
     ("log_about_after", LOG_ABOUT_AFTER),
     ("log_expunge", LOG_EXPUNGE),
@@ -257,6 +259,8 @@ macro_rules! log_select {
 }
 pub(crate) const LOG_BY_RESOURCE: &str = log_select!("WHERE l.resource = ?1 AND l.home_seq > ?2 ORDER BY l.home_seq LIMIT ?3");
 pub(crate) const LOG_BY_HOME: &str = log_select!("WHERE l.home = ?1 AND l.home_seq > ?2 ORDER BY l.home_seq LIMIT ?3");
+/// A resource's newest entry of one edge, by `log_by_resource`: what a snapshot carries of it.
+pub(crate) const LOG_LAST_EDGE: &str = log_select!("WHERE l.resource = ?1 AND l.edge = ?2 ORDER BY l.home_seq DESC LIMIT 1");
 /// The shared statements that sort their result through a temporary b-tree, by their labels in
 /// `Store::statements`. Entries about one master page in their changes' time order, the same on
 /// every replica; the time is the change's (#4024), so the sort follows the `log_about` search,
@@ -628,6 +632,10 @@ fn progress_views() -> Vec<(String, String)> {
 pub(crate) const WATERMARK_PUT: &str = "INSERT INTO stream_watermark (home, home_seq, applied_through) VALUES (?1, ?2, ?3) ON CONFLICT(home) DO UPDATE SET home_seq = excluded.home_seq, applied_through = excluded.applied_through";
 pub(crate) const FLOOR_GET: &str = "SELECT home_seq FROM stream_history WHERE home = ?1";
 pub(crate) const FLOOR_RAISE: &str = "INSERT INTO stream_history (home, home_seq) VALUES (?1, ?2) ON CONFLICT(home) DO UPDATE SET home_seq = max(home_seq, excluded.home_seq)";
+/// A replica's floor for a home at the cut of the snapshot it installed: a reset home's later
+/// cut may be lower than an earlier one.
+pub(crate) const FLOOR_SET: &str =
+    "INSERT INTO stream_history (home, home_seq) VALUES (?1, ?2) ON CONFLICT(home) DO UPDATE SET home_seq = excluded.home_seq";
 pub(crate) const REMOVED_MAX: &str = "SELECT max(home_seq) FROM log WHERE resource = ?1";
 pub(crate) const IDENTITIES_PAGE: &str = "SELECT id FROM resource_identity WHERE home = ?1 AND kind = ?2 AND id > ?3 ORDER BY id LIMIT ?4";
 pub(crate) const HOME_LOG_CLEAR: &str = "DELETE FROM log WHERE home = ?1";

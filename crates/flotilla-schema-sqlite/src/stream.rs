@@ -264,6 +264,8 @@ fn resource_chunks(snapshot: &Snapshot, send: &mut dyn FnMut(&[u8]) -> Result<()
                 rows: chunk,
                 cause: snapshot.cause.clone(),
                 created_at: snapshot.created_at,
+                // The first chunk is the one the follower assembles the rest into.
+                entries: if sent == 1 { snapshot.entries.clone() } else { Vec::new() },
             };
             let bytes = FRAMING.encode(&Frame::ResourceChunk { value, last: sent == total }).map_err(|error| {
                 if matches!(error.kind(), flotilla_cbor::ErrorKind::MessageLimit | flotilla_cbor::ErrorKind::ElementLimit) {
@@ -458,6 +460,8 @@ pub struct Service {
     applied: AppliedListeners,
     commits: Commits,
     serve_observer: OnceLock<Arc<ServeObserver>>,
+    /// The edges each kind's snapshots carry, shared with the readers that serve them.
+    carriers: crate::store::Carriers,
 }
 /// A completed serving round. Tail success does not prove snapshot servability.
 pub struct ServedRound {
@@ -578,6 +582,7 @@ impl Service {
         let watermarks = store.watermarks();
         let applied = store.applied_listeners();
         let commits = store.commits();
+        let carriers = store.carriers();
         Ok(Self {
             store: std::sync::Arc::new(StoreHandle::new(store)),
             source,
@@ -585,7 +590,19 @@ impl Service {
             applied,
             commits,
             serve_observer: OnceLock::new(),
+            carriers,
         })
+    }
+    /// From now on each snapshot of a resource of `kind` this service sends or reads carries the
+    /// newest entry of each edge `edges` names for it: see [`Store::carry`].
+    pub fn carry(&self, kind: KindCode, edges: Arc<crate::store::CarriedEdges>) {
+        self.carriers.write().unwrap_or_else(std::sync::PoisonError::into_inner).insert(kind, edges);
+    }
+    /// A reader of this service's store, carrying in its snapshots what the store's do.
+    fn reader(&self) -> Result<Store, StoreError> {
+        let mut reader = Store::open_reader(&self.source.path, &self.source.home, self.source.kinds.clone())?;
+        reader.share_carriers(Arc::clone(&self.carriers));
+        Ok(reader)
     }
     /// The highest sequence of `home` this store holds; 0 when none.
     pub fn last_sequence(&self, home: &str) -> Result<u64, StoreError> {
@@ -612,7 +629,7 @@ impl Service {
         self.with_store(|_| Ok(()))?;
         let heard = if home == self.source.home { now } else { watermark(&self.watermarks, home).applied_through };
         let round = Round { home, heard, homes: self.homes() };
-        let mut reader = Store::open_reader(&self.source.path, &self.source.home, self.source.kinds.clone())?;
+        let mut reader = self.reader()?;
         let result = serve_round(&mut reader, &round, after, sink);
         if let Some(observer) = self.serve_observer.get() {
             observer(&result);
@@ -620,7 +637,7 @@ impl Service {
         result.map(|round| round.watermark)
     }
     pub fn query(&self, kind: KindCode, name: &str, now: Timestamp) -> Result<Vec<u8>, StoreError> {
-        let mut store = Store::open_reader(&self.source.path, &self.source.home, self.source.kinds.clone())?;
+        let mut store = self.reader()?;
         let mut read = store.read()?;
         let value = read.resolve(kind, name, &self.source.home)?.map(|id| read.load_snapshot(id)).transpose()?.flatten();
         Frame::Read { home: self.source.home.clone(), value, served_at: now }.encode()
@@ -650,6 +667,7 @@ mod tests {
             rows,
             cause: None,
             created_at: None,
+            entries: Vec::new(),
         }
     }
 
