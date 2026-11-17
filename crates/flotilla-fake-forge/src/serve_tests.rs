@@ -40,6 +40,7 @@ fn config() -> Config {
         admin_token: ADMIN_TOKEN.into(),
         auto_merge_after: None,
         seed: None,
+        git_root: None,
         forges: [("lab".to_string(), ForgeSettings { token: LAB_TOKEN.into(), login: "lab-bot".into() })].into(),
     }
 }

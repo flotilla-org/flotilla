@@ -19,7 +19,8 @@ use flotilla_protocol::PlacementDecision;
 use flotilla_resources::address::{remote_change_request_subject, same_subject};
 #[cfg(test)]
 use flotilla_resources::{CapabilityNeed, ProjectSpec};
-use repository_discovery::discover_repository_change_request_with;
+use flotilla_vcs::forge_credentials::{ForgeCredentialRunner, GitHttpCredentials};
+use repository_discovery::{discover_repository_change_request_with, DaemonForgeCredentials};
 #[cfg(test)]
 mod host_registry_tests;
 mod host_summary_tests;
@@ -558,6 +559,7 @@ async fn forge_for_remote(
     Ok(matching.into_iter().next())
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn discover_vcs_for_checkout(
     environment_manager: &EnvironmentManager,
     discovery: &DiscoveryRuntime,
@@ -566,10 +568,15 @@ async fn discover_vcs_for_checkout(
     environment_id: &EnvironmentId,
     checkout_path: &Path,
     repository_url: Option<&str>,
+    forge_credentials: &Arc<dyn GitHttpCredentials>,
 ) -> Result<CheckoutProvider, String> {
-    let runner = environment_manager
+    let mut runner = environment_manager
         .environment_runner(environment_id)
         .ok_or_else(|| format!("command runner unavailable for environment {environment_id}"))?;
+    // The daemon's forge identities live in this host's files; Git elsewhere cannot read them.
+    if environment_id == local_environment_id {
+        runner = Arc::new(ForgeCredentialRunner::new(runner, Arc::clone(forge_credentials)));
+    }
     let host_bag = environment_manager
         .environment_bag(environment_id)
         .ok_or_else(|| format!("discovery environment unavailable: {environment_id}"))?;
@@ -1144,6 +1151,12 @@ impl InProcessDaemon {
             )
             .await;
         let agent_state_store = flotilla_agent::shared_file_backed_agent_state_store(config.base_path());
+        let provisioning_namespace = Arc::new(std::sync::RwLock::new(DEFAULT_PROVISIONING_NAMESPACE.to_string()));
+        let forge_credentials: Arc<dyn GitHttpCredentials> = Arc::new(DaemonForgeCredentials {
+            resource_backend: resource_backend.clone(),
+            config: Arc::clone(&config),
+            provisioning_namespace: Arc::clone(&provisioning_namespace),
+        });
         for path in repo_paths {
             let path = canonical_or_original(&path);
             if repos.values().any(|state| state.contains_path(&path)) {
@@ -1157,6 +1170,7 @@ impl InProcessDaemon {
                 &local_environment_id,
                 &path,
                 None,
+                &forge_credentials,
             )
             .await;
             let mut startup_inspection = match &initial_vcs {
@@ -1301,7 +1315,6 @@ impl InProcessDaemon {
         .await;
 
         let repos = Arc::new(RwLock::new(repos));
-        let provisioning_namespace = Arc::new(std::sync::RwLock::new(DEFAULT_PROVISIONING_NAMESPACE.to_string()));
         // One per host: every provider this daemon builds shares its forge read cache.
         let forge_reads =
             flotilla_observation::forge_observation::ForgeReads::new(resource_backend.clone(), DEFAULT_PROVISIONING_NAMESPACE.into())
@@ -1380,6 +1393,7 @@ impl InProcessDaemon {
                 .environment_manager(Arc::clone(&environment_manager))
                 .local_environment_id(local_environment_id.clone())
                 .provisioning_namespace(Arc::clone(&provisioning_namespace))
+                .forge_credentials(forge_credentials)
                 .build(),
         );
         let crew = Arc::new(

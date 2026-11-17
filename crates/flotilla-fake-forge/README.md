@@ -29,6 +29,7 @@ tls_key = "/etc/flotilla-fake-forge/server-key.pem" # private key, PEM
 admin_token_file = "/etc/flotilla-fake-forge/admin-token"
 auto_merge_after_secs = 120                         # optional; see below
 seed = "/etc/flotilla-fake-forge/seed.json"         # optional
+git_root = "/var/lib/flotilla-fake-forge/git"       # optional; see below
 
 [forges.github]
 token_file = "/etc/flotilla-fake-forge/tokens/github"
@@ -52,6 +53,13 @@ token_file = "/etc/flotilla-fake-forge/tokens/lab"
   each open, non-draft pull request that has been open at least that long.
   This lets dummy crews open pull requests and see them merge without a
   driver. Omit the field to merge only through the admin API.
+- With `git_root`, the API listener also serves Git fetches (clone, fetch,
+  `ls-remote`) of the bare repositories at `<git_root>/<forge>/<owner>/<repo>.git`
+  as `<public_url>/<forge>/<owner>/<repo>.git`. Git must sign in with Basic
+  authentication as the forge's `login`, with its token as the password;
+  otherwise it gets 401 with a Basic challenge, as a private Forgejo
+  repository answers. Pushes are refused. The service reads the repositories
+  as they are on disk; nothing creates them.
 
 ## Seed
 

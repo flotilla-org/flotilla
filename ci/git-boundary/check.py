@@ -45,6 +45,9 @@ def exempt(path, production=False):
         or Path(path).name == "build.rs"
         or path == "crates/build_identity.rs"
         or path == "crates/flotilla-provider-runtime/src/git_config_guard.rs"
+        # The rehearsal fake forge serves Git's HTTP transport as a forge's server does; it
+        # runs no Git on a checkout.
+        or path == "crates/flotilla-fake-forge/src/git.rs"
         or path.startswith("crates/flotilla-vcs/src/")
     )
 

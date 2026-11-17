@@ -11,6 +11,7 @@ license.workspace = true
 flotilla-provider-runtime = { path = "../flotilla-provider-runtime" }
 async-trait.workspace = true
 axum = { version = "0.8", default-features = false, features = ["http1", "json", "tokio"] }
+base64 = "0.22"
 bytes.workspace = true
 chrono = { version = "0.4", default-features = false, features = ["clock"] }
 # `string` aligns clap with the workspace feature set (flotilla-commands).

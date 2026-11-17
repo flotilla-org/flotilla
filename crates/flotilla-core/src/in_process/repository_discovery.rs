@@ -3,7 +3,10 @@ use super::*;
 use flotilla_discovery_api::EnvironmentBag;
 use flotilla_forge_forgejo::FORGEJO_AUTH_PROVIDER;
 use flotilla_observation::forge_observation::ForgeReads;
-use flotilla_vcs::providers::detection::remote_assertion;
+use flotilla_vcs::{
+    forge_credentials::{GitHttpCredential, GitHttpCredentials},
+    providers::detection::remote_assertion,
+};
 pub(super) async fn discover_repository_change_request_with(
     forge_reads: &ForgeReads,
     config: &ConfigStore,
@@ -92,25 +95,73 @@ pub(super) async fn repository_provider_bag(
         return Ok(bag.with(EnvironmentAssertion::ForgeOverride { binding: binding.clone() }));
     }
     if let Some(forge) = &forge {
-        if forge.kind == ForgeKind::Forgejo {
-            // Read current intent on each request: provider leases compare the
-            // resolved bag so a changed identity cannot reuse a stale credential.
-            if let Some(name) = daemon.credentials.forgejo.get(&forge.forge_id) {
-                let credential = resource_backend
-                    .definitions::<CredentialSpec>(namespace)
-                    .get(name)
-                    .await
-                    .map_err(|error| format!("daemon Forgejo credential {name}: {error}"))?;
-                match (&credential.spec.consumer, &credential.spec.source) {
-                    (CredentialConsumer::Forgejo { forge_ref, .. }, CredentialSource::File { path }) if forge_ref == &forge.forge_id => {
-                        bag = bag.with(EnvironmentAssertion::auth_file(FORGEJO_AUTH_PROVIDER, path));
-                    }
-                    _ => {
-                        return Err(format!("daemon Forgejo credential {name} must use a file source and target Forge {}", forge.forge_id))
-                    }
-                }
-            }
+        // Read current intent on each request: provider leases compare the
+        // resolved bag so a changed identity cannot reuse a stale credential.
+        if let Some(identity) = daemon_forgejo_identity(resource_backend, &daemon, namespace, forge).await? {
+            bag = bag.with(EnvironmentAssertion::auth_file(FORGEJO_AUTH_PROVIDER, &identity.token_file));
         }
     }
     Ok(bag)
+}
+
+/// The daemon's own identity on a Forgejo `forge`: the file-sourced credential `[credentials.forgejo]`
+/// maps the forge to. GitHub forges and unmapped Forgejo forges have none.
+async fn daemon_forgejo_identity(
+    resource_backend: &ResourceBackend,
+    daemon: &flotilla_config::DaemonConfig,
+    namespace: &str,
+    forge: &flotilla_resources::ForgeSpec,
+) -> Result<Option<GitHttpCredential>, String> {
+    if forge.kind != ForgeKind::Forgejo {
+        return Ok(None);
+    }
+    let Some(name) = daemon.credentials.forgejo.get(&forge.forge_id) else {
+        return Ok(None);
+    };
+    let credential = resource_backend
+        .definitions::<CredentialSpec>(namespace)
+        .get(name)
+        .await
+        .map_err(|error| format!("daemon Forgejo credential {name}: {error}"))?;
+    match (&credential.spec.consumer, &credential.spec.source) {
+        (CredentialConsumer::Forgejo { forge_ref, username }, CredentialSource::File { path }) if forge_ref == &forge.forge_id => {
+            let host = forge
+                .https_url
+                .strip_prefix("https://")
+                .and_then(|front| front.split('/').next())
+                .ok_or_else(|| format!("Forge {} https_url names no host", forge.forge_id))?;
+            Ok(Some(GitHttpCredential { host: host.to_string(), username: username.clone(), token_file: path.clone() }))
+        }
+        _ => Err(format!("daemon Forgejo credential {name} must use a file source and target Forge {}", forge.forge_id)),
+    }
+}
+
+/// The daemon's identities on the forges `[credentials.forgejo]` maps, which every Git
+/// invocation of the local environment's checkout providers carries. A mapping whose Forge is
+/// not declared yet contributes nothing; host health reports it.
+pub(super) struct DaemonForgeCredentials {
+    pub(super) resource_backend: ResourceBackend,
+    pub(super) config: Arc<ConfigStore>,
+    pub(super) provisioning_namespace: Arc<std::sync::RwLock<String>>,
+}
+
+#[async_trait::async_trait]
+impl GitHttpCredentials for DaemonForgeCredentials {
+    async fn current(&self) -> Result<Vec<GitHttpCredential>, String> {
+        let daemon = self.config.load_daemon_config()?;
+        if daemon.credentials.forgejo.is_empty() {
+            return Ok(Vec::new());
+        }
+        let namespace = self.provisioning_namespace.read().expect("provisioning namespace lock poisoned").clone();
+        let mut identities = Vec::new();
+        for forge_id in daemon.credentials.forgejo.keys() {
+            let forge = match self.resource_backend.including_replicas::<Forge>(&namespace).get(forge_id).await {
+                Ok(forge) => forge.object.spec,
+                Err(ResourceError::NotFound { .. }) => continue,
+                Err(error) => return Err(format!("Forge {forge_id}: {error}")),
+            };
+            identities.extend(daemon_forgejo_identity(&self.resource_backend, &daemon, &namespace, &forge).await?);
+        }
+        Ok(identities)
+    }
 }

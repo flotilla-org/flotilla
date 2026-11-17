@@ -26,7 +26,7 @@ use super::{discover_vcs_for_checkout, InProcessDaemon};
 use flotilla_discovery::environment_manager::ManagedEnvironmentKind;
 use flotilla_discovery::registry::ProviderRegistry;
 use flotilla_paths::path_context::ExecutionEnvironmentPath;
-use flotilla_vcs::vcs::Vcs;
+use flotilla_vcs::{forge_credentials::GitHttpCredentials, vcs::Vcs};
 
 pub(super) struct CheckoutProvider {
     pub(super) descriptor: ProviderDescriptor,
@@ -59,6 +59,8 @@ pub(super) struct CheckoutProviders {
     local_environment_id: EnvironmentId,
     provisioning_namespace: Arc<std::sync::RwLock<String>>,
     lifecycle_reads: Arc<dyn LifecycleReads>,
+    /// What local checkouts' Git invocations authenticate with.
+    forge_credentials: Arc<dyn GitHttpCredentials>,
     #[builder(default)]
     checkout_vcs: tokio::sync::Mutex<CheckoutVcsCache>,
 }
@@ -83,6 +85,7 @@ impl CheckoutProviders {
                 env_id,
                 path,
                 clone_url.as_deref(),
+                &self.forge_credentials,
             )
             .await
             .map(Arc::new);
@@ -116,6 +119,7 @@ impl CheckoutProviders {
                 env_id,
                 path,
                 repository.spec.remotes().first().map(String::as_str),
+                &self.forge_credentials,
             )
             .await
             .map(Arc::new)

@@ -124,6 +124,7 @@ mod drydock_launch;
 mod engine_turns;
 mod environment_reads;
 mod environments;
+mod forge_identity;
 mod health;
 mod heartbeat;
 mod memory_tests;
