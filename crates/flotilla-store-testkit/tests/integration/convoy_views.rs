@@ -100,6 +100,7 @@ fn launch(name: &str, home: &str) -> ConvoyRecord {
         },
         admitted_at: at(100),
         ended: None,
+        retired: false,
         seats: BTreeMap::new(),
         promises: BTreeMap::from([("work".into(), BTreeMap::from([("coder".into(), vec![promise])]))]),
         subjects: Vec::new(),

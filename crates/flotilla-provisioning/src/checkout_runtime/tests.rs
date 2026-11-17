@@ -369,6 +369,7 @@ impl Launches {
             },
             admitted_at: chrono::Utc::now(),
             ended: None,
+            retired: false,
             seats: Default::default(),
             promises: Default::default(),
             subjects: Vec::new(),

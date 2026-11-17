@@ -36,6 +36,7 @@ use flotilla_resources::{
     },
     address::{stored_change_request_address, subject_for},
     convoy::{admission::AdmissionDocument, engine::seat_address},
+    convoy_records::ConvoyEnd,
     convoy_records::ConvoyRecords,
     engine_records::KindRecords,
     standing_roles::{RunningValues, StandingRoles},
@@ -424,7 +425,12 @@ fn an_ended_convoy_retires_once_its_holds_release() {
     checkouts.step(&checkout, &Step::Released, Timestamp(6_000_000)).expect("released");
     assert_eq!(fixture.convoys.retire(&fixture.launch, Timestamp(7_000_000)), Ok(Retirement::Retired));
     assert_eq!(fixture.label(), ConvoyLabel::Retired);
-    assert_eq!(records.get(&fixture.launch, None).expect("read"), None, "a retired convoy reads as absent");
+    // Read by name, a retired convoy still says how and when it ended, from its end's log entry;
+    // a listing leaves it out.
+    let retired = records.get(&fixture.launch, None).expect("read").expect("a retired convoy reads by name");
+    let abandoned_at = Timestamp(4_000_000).to_datetime().expect("a time");
+    assert_eq!(retired.ended, Some((ConvoyEnd::Abandoned { reason: "stopped".into() }, abandoned_at)));
+    assert!(retired.retired);
     assert_eq!(records.at(HOME).expect("listing").records.len(), 0);
 }
 

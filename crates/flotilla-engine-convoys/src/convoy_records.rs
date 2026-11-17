@@ -21,12 +21,12 @@ use flotilla_resources::{
     lifecycle_reads::{ChangeCursor, CursorSince},
     ConvoyStatus, DiscoveredSubject, SubjectDiscovery, SubjectDiscoverySource,
 };
-use flotilla_schema::{Kind, KindCode, Timestamp};
-use flotilla_schema_sqlite::{stream::Service, Loaded, Read, StoreError};
+use flotilla_schema::{Cause, CodeEnum, Kind, KindCode, Timestamp};
+use flotilla_schema_sqlite::{stream::Service, Loaded, Read, ResourceId, StoreError};
 use flotilla_state_machines::{
     machines::{
         awaiting_reply::{AwaitingReply, AwaitingReplySpec},
-        convoy::{AbandonCause, Convoy, ConvoySpec, ConvoyState, LinkSource, Progress, PromiseSource},
+        convoy::{AbandonCause, Convoy, ConvoyEdge, ConvoyEdgeKind, ConvoySpec, ConvoyState, LinkSource, Progress, PromiseSource},
     },
     Resource,
 };
@@ -92,7 +92,7 @@ impl EngineConvoyRecords {
             let page = read.scan::<Resource<Convoy>>(home, after, PAGE)?;
             for id in page.ids {
                 if let Some(loaded) = read.load::<Resource<Convoy>>(id)? {
-                    match entry(read, stalls, loaded)? {
+                    match entry(read, stalls, loaded, Retired::Skip)? {
                         Some(Ok(record)) => listing.records.push(record),
                         Some(Err(unreadable)) => listing.unreadable.push(unreadable),
                         None => {}
@@ -260,29 +260,69 @@ fn written_at(
     Ok(read.change(home, event.change)?.map(|change| change.at))
 }
 
-/// `convoy`, held at `home` at `version`, as its readers take it, none once it retired; one that
-/// cannot be read is an error naming why.
+/// How an abandoned launch ended, by its cause.
+fn end_of(cause: AbandonCause, reason: String) -> ConvoyEnd {
+    match cause {
+        AbandonCause::Failed => ConvoyEnd::Failed { reason },
+        AbandonCause::Operator => ConvoyEnd::Abandoned { reason },
+    }
+}
+
+/// How retired launch `id`, homed at `home` and retired at `version`, ended, and when: its last
+/// Deliver or Abandon entry, read back from the Retire one entry at a time. None where this store
+/// does not hold that entry.
+fn end_entry(read: &mut Read<'_>, id: ResourceId, home: &str, version: u64) -> Result<Option<(ConvoyEnd, Timestamp)>, StoreError> {
+    let ends = [ConvoyEdgeKind::Deliver.code(), ConvoyEdgeKind::Abandon.code()];
+    for at in (1..version).rev() {
+        let Some(entry) = read.changes(id, at - 1, 1)?.into_iter().next() else { return Ok(None) };
+        if !matches!(entry.cause, Cause::Edge { edge, .. } if ends.contains(&edge)) {
+            continue;
+        }
+        let end = match entry.arguments::<ConvoyEdge>().transpose()? {
+            Some(ConvoyEdge::Deliver(deliver)) => ConvoyEnd::Delivered { disposition: deliver.disposition },
+            Some(ConvoyEdge::Abandon(abandon)) => end_of(abandon.cause, abandon.reason),
+            _ => return Ok(None),
+        };
+        let Some(change) = read.change(home, entry.change)? else { return Ok(None) };
+        return Ok(Some((end, change.at)));
+    }
+    Ok(None)
+}
+
+/// `convoy`, held at `home` at `version`, as a read by its name takes it, a retired one with how
+/// it ended; one that cannot be read is an error naming why.
 fn record(read: &mut Read<'_>, stalls: &OpenAwaiting, loaded: Loaded<Resource<Convoy>>) -> Result<Option<ConvoyRecord>, StoreError> {
-    entry(read, stalls, loaded)?.transpose().map_err(|unreadable| StoreError::Stream(unreadable.reason))
+    entry(read, stalls, loaded, Retired::Read)?.transpose().map_err(|unreadable| StoreError::Stream(unreadable.reason))
+}
+
+/// What a read does with a retired launch.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Retired {
+    /// Reads it, with how it ended from its end edge's log entry: a read by name.
+    Read,
+    /// Leaves it out: a listing, which reads no log entry for it.
+    Skip,
 }
 
 /// The launch `loaded` as its readers take it, or as unreadable where what it holds does not
-/// read; none once it retired, since nothing reads a retired launch. The store's own failures
-/// are errors. Each seat's stall is read from `stalls`.
+/// read. A retired one is read or left out as `retired` says. The store's own failures are errors.
+/// Each seat's stall is read from `stalls`.
 fn entry(
     read: &mut Read<'_>,
     stalls: &OpenAwaiting,
     loaded: Loaded<Resource<Convoy>>,
+    retired: Retired,
 ) -> Result<Option<Result<ConvoyRecord, UnreadableLaunch>>, StoreError> {
     let Loaded { id, home, version, value: convoy, .. } = loaded;
     let ended = match convoy.state() {
         ConvoyState::Open { .. } => None,
-        ConvoyState::Delivered { disposition, .. } => Some(ConvoyEnd::Delivered { disposition: disposition.clone() }),
-        ConvoyState::Abandoned { cause: AbandonCause::Failed, reason, .. } => Some(ConvoyEnd::Failed { reason: reason.clone() }),
-        ConvoyState::Abandoned { cause: AbandonCause::Operator, reason, .. } => Some(ConvoyEnd::Abandoned { reason: reason.clone() }),
-        ConvoyState::Retired => return Ok(None),
+        ConvoyState::Delivered { disposition, .. } => Some((ConvoyEnd::Delivered { disposition: disposition.clone() }, convoy.since())),
+        ConvoyState::Abandoned { cause, reason, .. } => Some((end_of(*cause, reason.clone()), convoy.since())),
+        ConvoyState::Retired if retired == Retired::Skip => return Ok(None),
+        ConvoyState::Retired => end_entry(read, id, &home, version)?,
     }
-    .map(|end| (end, time(convoy.since())));
+    .map(|(end, at)| (end, time(at)));
+    let is_retired = matches!(convoy.state(), ConvoyState::Retired);
     let home = home.as_str();
     let spec = convoy.spec();
     let admitted_at = read.creation_time(id)?.to_datetime();
@@ -297,6 +337,10 @@ fn entry(
         created_at: admitted_at,
         reason,
     };
+    if is_retired && ended.is_none() {
+        // A replica restored from a snapshot taken after the end does not hold its entry.
+        return Ok(Some(Err(unreadable(format!("convoy {} retired, and the log entry of its end is not held here", convoy.name())))));
+    }
     let admission = match AdmissionDocument::decode(convoy.name(), spec.admission.value().bytes()) {
         Ok(admission) => admission,
         Err(error) => return Ok(Some(Err(unreadable(format!("convoy {}'s admission: {error}", convoy.name()))))),
@@ -375,6 +419,7 @@ fn entry(
         workflow_ref: spec.workflow_ref.clone(),
         admitted_at,
         ended,
+        retired: is_retired,
         seats,
         promises: map::old_promises(&convoy, &crews),
         subjects,

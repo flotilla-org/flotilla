@@ -14,10 +14,12 @@ pub async fn refused_convoy_reclaim_leaves_runtime_children_untouched(factory: &
             .workflow_ref("quartermaster".to_string())
             .adopted_checkout_refs(BTreeMap::from([(repository, "checkout-never-provisioned".to_string())]))
             .build(),
-        ConvoyPhase::Failed,
+        ConvoyPhase::Active,
     )
     .await;
+    // Its work's vessel is requested while it runs, and holds it once it fails.
     let launch = engine(&daemon).vessels.request(convoy_name, "work", "local");
+    fail_generation(&daemon, convoy_name, "failed").await;
 
     let refusal = daemon.reap_convoy_internal("flotilla", convoy_name, false).await.expect_err("unsafe reclaim must be refused");
 
@@ -46,6 +48,8 @@ pub async fn concurrent_convoy_phase_change_prevents_operator_abandonment(factor
     let name =
         launch_convoy(&daemon, "abandon-race", ConvoySpec::builder().workflow_ref("workflow".to_string()).build(), ConvoyPhase::Active)
             .await;
+    // A running convoy's work has its vessel, which holds it once it ends.
+    engine(&daemon).vessels.request(&name, "work", "local");
 
     // On the engine the convoy's edges are serialized: a landing that wins the race ends it, and
     // the abandonment then finds nothing open to abandon.

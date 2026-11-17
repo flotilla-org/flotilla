@@ -85,6 +85,9 @@ pub struct ConvoyRecord {
     pub admitted_at: DateTime<Utc>,
     /// How and when it ended; none while it is open.
     pub ended: Option<(ConvoyEnd, DateTime<Utc>)>,
+    /// It retired: nothing holds it any more, and how it ended is read from its end edge's log
+    /// entry.
+    pub retired: bool,
     /// Its seats by work, then role.
     pub seats: BTreeMap<String, BTreeMap<String, SeatRecord>>,
     /// Its promises by work, then role.

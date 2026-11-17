@@ -85,6 +85,7 @@ fn record(coder: PromiseState) -> ConvoyRecord {
         },
         admitted_at: at(100),
         ended: None,
+        retired: false,
         seats: BTreeMap::new(),
         promises: BTreeMap::from([("work".into(), BTreeMap::from([("coder".into(), vec![promise("coder", coder)])]))]),
         subjects: Vec::new(),
