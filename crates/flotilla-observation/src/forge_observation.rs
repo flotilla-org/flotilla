@@ -754,7 +754,7 @@ mod tests {
             withdrawn |= observation && value == flotilla_resources::ConditionValue::False;
             status.conditions.push(
                 flotilla_resources::HostCondition::builder()
-                    .condition_type([flotilla_resources::PROJECTION_PARITY_CONDITION, "CapabilityRegression", "Unknown"][name])
+                    .condition_type(["Archive", "CapabilityRegression", "Unknown"][name])
                     .reason("arbitrary")
                     .message("test fault")
                     .observed_at(Utc::now())

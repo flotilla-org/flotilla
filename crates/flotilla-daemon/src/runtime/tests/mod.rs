@@ -53,7 +53,6 @@ use flotilla_environment::environment::ProvisionedEnvironment;
 use flotilla_environment::environment::ProvisionedMount;
 use flotilla_paths::path_context::DaemonHostPath;
 use flotilla_paths::path_context::ExecutionEnvironmentPath;
-use flotilla_projections::aggregator_projection::AggregatorProjectionState;
 use flotilla_protocol::ChangeRequest as ProviderChangeRequest;
 use flotilla_protocol::{
     CanonicalHostId, Command, CommandAction, CommandValue, CrewCommandContext, DaemonEvent, EnvironmentId, HostName, HostSummary, ImageId,
@@ -77,7 +76,7 @@ use flotilla_resources::{
     CredentialConsumer, CredentialLifecycle, CredentialPlacementRequirements, CredentialSource, CredentialSpec, CredentialSpecSpec,
     CrewSource, CrewSpec, EnvironmentSpec, Forge, ForgeSpec, FulfilmentFacts, FulfilmentKind, FulfilmentKindSpec, FulfilmentRealisation,
     Host, HostDirectEnvironmentSpec, HostSpec, HostStatus, HostStatusPatch, InputMeta, ModelProbeState,
-    ObservedCheckoutSpec as ResourceObservedCheckoutSpec, Project, Repository, RepositoryKey, RepositorySpec, RepositoryTrust, Resource,
+    ObservedCheckoutSpec as ResourceObservedCheckoutSpec, Repository, RepositoryKey, RepositorySpec, RepositoryTrust, Resource,
     ResourceError, Selector, TerminalAttentionState, TerminalSession, TerminalSessionPhase, TerminalSessionSource, TerminalSessionSpec,
     Vessel, VesselRequirement, WorkPhase, WorkflowTemplate, WorkflowTemplateSpec, ACTUATOR_HOST_REF_ANNOTATION, CREDENTIAL_REFS_ENV,
     CREDENTIAL_SCOPES_ENV, MANAGED_BY_LABEL,

@@ -53,7 +53,7 @@ use self::discovery::{
 };
 use self::docker::DockerControllerRuntime;
 use self::environments::reconcile_provisioned_environments;
-use self::health::{apply_host_heartbeat_with_credentials, spawn_projection_parity_task, DaemonHealthIdentity, RuntimeHealth};
+use self::health::{apply_host_heartbeat_with_credentials, DaemonHealthIdentity, RuntimeHealth};
 use self::ports::{
     ChainedForgeDefaultBranchResolver, GhForgeDefaultBranchResolver, RoutingCheckoutRuntime, RoutingCloneRuntime, RuntimeOperatorReconciler,
 };
@@ -364,13 +364,6 @@ impl DaemonRuntime {
                 options.heartbeat_interval,
             ),
             spawn_host_description_projection_task(Arc::clone(&daemon), options.namespace.clone(), options.heartbeat_interval),
-            spawn_projection_parity_task(
-                daemon.resource_backend(),
-                options.namespace.clone(),
-                aggregator_projection_state.clone(),
-                runtime_health.clone(),
-                options.heartbeat_interval,
-            ),
             spawn_sleep_inhibitor_task(
                 daemon.resource_backend(),
                 options.namespace.clone(),

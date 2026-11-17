@@ -1,4 +1,4 @@
-//! Runtime health, heartbeat conditions, and projection parity.
+//! Runtime health and heartbeat conditions.
 
 use std::{
     collections::{BTreeMap, BTreeSet},
@@ -9,25 +9,22 @@ use std::{
 
 use chrono::Utc;
 use flotilla_core::in_process::InProcessDaemon;
-use flotilla_projections::aggregator_projection::AggregatorProjectionState;
 use flotilla_projections::IssuePollingHealth;
 
 use flotilla_credentials::CredentialStore;
-use flotilla_protocol::{HostSummary, Rows};
+use flotilla_protocol::HostSummary;
 use flotilla_resources::ResourceError;
 use flotilla_resources::{
-    ConditionValue, Convoy, CredentialExpiry, Forge, FulfilmentFacts, Host, HostCondition, HostStatus, HostStatusPatch, ResourceObject,
-    SystemClock, AGENT_ADAPTERS_CAPABILITY, CREDENTIAL_EXPIRY_CAPABILITY, HELD_CREDENTIALS_CAPABILITY, LOCAL_ROWS_MISSING_REASON,
-    PROJECTION_PARITY_CONDITION,
+    ConditionValue, CredentialExpiry, Forge, FulfilmentFacts, Host, HostCondition, HostStatus, HostStatusPatch, ResourceObject,
+    AGENT_ADAPTERS_CAPABILITY, CREDENTIAL_EXPIRY_CAPABILITY, HELD_CREDENTIALS_CAPABILITY,
 };
-use flotilla_store::{Listed, ResourceBackend, TypedResolver};
+use flotilla_store::{Listed, TypedResolver};
 use serde_json::json;
-use tokio::task::JoinHandle;
-use tracing::{error, warn};
+use tracing::warn;
 
 use super::discovery::LocalProvisioningProfile;
 use super::seed::{canonicalize_kinds_for, ensure_host_matches};
-use super::tasks::{spawn_periodic_task, PeriodicTaskStart, AGGREGATOR_CONTROLLER, CONVOY_ENSURE_CONDITION_TYPE};
+use super::tasks::{AGGREGATOR_CONTROLLER, CONVOY_ENSURE_CONDITION_TYPE};
 use crate::{
     resource_limits::file_descriptor_pressure_condition, resource_manifest::manifest_root_name, supervisor::RestartBudgetExhausted,
 };
@@ -153,18 +150,6 @@ impl RuntimeHealth {
             }
             None => {
                 failures.remove(FLEET_DESIGNATION_CONDITION_TYPE);
-            }
-        }
-    }
-
-    pub(super) fn report_projection_parity(&self, condition: Option<HostCondition>) {
-        let mut failures = self.failures.lock().expect("runtime health lock poisoned");
-        match condition {
-            Some(condition) => {
-                failures.insert(PROJECTION_PARITY_CONDITION.to_string(), condition);
-            }
-            None => {
-                failures.remove(PROJECTION_PARITY_CONDITION);
             }
         }
     }
@@ -310,90 +295,6 @@ pub(super) fn test_health_identity() -> DaemonHealthIdentity {
         version: env!("CARGO_PKG_VERSION").to_string(),
         started_at: Utc::now(),
     }
-}
-
-pub(super) fn spawn_projection_parity_task(
-    backend: ResourceBackend,
-    namespace: String,
-    projection: AggregatorProjectionState,
-    runtime_health: RuntimeHealth,
-    interval: Duration,
-) -> JoinHandle<()> {
-    spawn_periodic_task("projection parity", interval, PeriodicTaskStart::AfterInterval, move || {
-        let backend = backend.clone();
-        let namespace = namespace.clone();
-        let projection = projection.clone();
-        let runtime_health = runtime_health.clone();
-        async move {
-            match projection_parity_condition(&backend, &namespace, &projection, &SystemClock).await {
-                Ok(condition) => runtime_health.report_projection_parity(condition),
-                Err(error) => warn!(%error, "failed to evaluate aggregator projection parity"),
-            }
-        }
-    })
-}
-
-// Local convoy creation and aggregator watch delivery are not atomic. Give
-// newly authored rows a small, non-renewing grace period; rows still missing
-// at the boundary retain the existing host-readiness failure (#2736).
-pub(super) const PROJECTION_PARITY_GRACE: chrono::Duration = chrono::Duration::seconds(10);
-
-pub(super) async fn projection_parity_condition(
-    backend: &ResourceBackend,
-    namespace: &str,
-    projection: &AggregatorProjectionState,
-    clock: &dyn flotilla_resources::Clock,
-) -> Result<Option<HostCondition>, String> {
-    let stored = backend.using::<Convoy>(namespace).list().await.map_err(|error| error.to_string())?;
-    let projected = match projection.local_result_set().await.rows {
-        Rows::Convoys { rows, .. } => rows.into_iter().map(|row| row.resource.name).collect::<BTreeSet<_>>(),
-        rows => return Err(format!("local convoy projection returned unexpected rows: {rows:?}")),
-    };
-    let now = clock.now();
-    let expected = stored.items.iter().map(|convoy| convoy.metadata.name.clone()).collect::<BTreeSet<_>>();
-    // `using` lists only this root's durable rows, never replicas. Creation time
-    // (rather than last update or first parity observation) bounds the grace
-    // even if controllers keep updating the row or the daemon restarts.
-    // Sort missing names for stable diagnostics, independent of backend list order.
-    let missing = stored
-        .items
-        .into_iter()
-        .filter_map(|convoy| {
-            let age = now.signed_duration_since(convoy.metadata.creation_timestamp);
-            let within_grace = age >= chrono::Duration::zero() && age < PROJECTION_PARITY_GRACE;
-            (!projected.contains(&convoy.metadata.name) && !within_grace).then_some(convoy.metadata.name)
-        })
-        .collect::<BTreeSet<_>>()
-        .into_iter()
-        .collect::<Vec<_>>();
-    if missing.is_empty() {
-        return Ok(None);
-    }
-    // Totals include every row in each snapshot; the missing list omits rows
-    // still within grace, preserving the existing diagnostic counts.
-    let message = format!(
-        "durable store has {} convoys but the local aggregator projection has {}; missing: {}",
-        expected.len(),
-        projected.len(),
-        missing.join(", ")
-    );
-    error!(
-        stored = expected.len(),
-        projected = projected.len(),
-        missing = ?missing,
-        "aggregator projection parity check failed"
-    );
-    Ok(Some(
-        HostCondition::builder()
-            .condition_type(PROJECTION_PARITY_CONDITION)
-            .value(ConditionValue::False)
-            .reason(LOCAL_ROWS_MISSING_REASON)
-            .message(message)
-            .observed_at(now)
-            // Local projection lag blocks admission, not durable forge observation.
-            .blocks_forge_observation(false)
-            .build(),
-    ))
 }
 
 pub(super) async fn apply_host_heartbeat_with_credentials(
