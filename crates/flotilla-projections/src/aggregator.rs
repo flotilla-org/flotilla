@@ -59,9 +59,11 @@ use crate::issue_materializer::{IssueMaterializationResolver, IssueMaterializer,
 
 mod convoy_inputs;
 use convoy_inputs::ConvoyInputs;
+mod held_launches;
+use held_launches::HeldLaunches;
 mod readiness;
-use flotilla_resources::checkout_records::latest_launches;
-use readiness::{apply_readiness_event, next_checkout_change, readiness_resources, HeldCheckouts};
+use flotilla_resources::checkout_records::{latest_launches, CheckoutChange, CheckoutHolder};
+use readiness::{apply_readiness_event, engine_origin, next_checkout_change, readiness_resources, HeldCheckouts};
 
 type RepositorySourceKey = (String, String, Option<flotilla_protocol::NodeId>);
 
@@ -234,6 +236,9 @@ pub struct Aggregator {
     /// has not ended (#3108).
     #[builder(skip)]
     engine_checkouts: Vec<flotilla_resources::checkout_records::CheckoutLaunch>,
+    /// Every launch the engine holds at every home it follows, indexed by holder.
+    #[builder(skip)]
+    held_launches: HeldLaunches,
     /// This home, as the engine's checkouts name it.
     #[builder(skip)]
     engine_checkout_home: Option<String>,
@@ -384,6 +389,7 @@ impl Aggregator {
             fulfilment_kinds: BTreeMap::new(),
             hosts: BTreeMap::new(),
             engine_checkouts: Vec::new(),
+            held_launches: HeldLaunches::default(),
             engine_checkout_home: None,
             bootstrapping: false,
             convoy_engine: Default::default(),
@@ -828,17 +834,17 @@ impl Aggregator {
                 }
                 event = vessel_stream.next() => {
                     match event {
-                        Some(Ok(event)) => apply_readiness_event(&mut self.readiness_vessels, event),
+                        Some(Ok(event)) => self.vessel_changed(event).await,
                         Some(Err(ResourceError::WatchExpired { .. })) => {
                             let (items, watch) = Self::recover_replica_watch(durable_vessels).await?;
                             self.readiness_vessels = readiness_resources(items);
                             vessel_stream = watch;
+                            self.refresh_origin_hosts().await;
+                            self.rebuild_local_projection().await;
                         }
                         Some(Err(error)) => return Err(error),
                         None => return Err(ResourceError::other("aggregator vessel readiness watch ended")),
                     }
-                    self.refresh_origin_hosts().await;
-                    self.rebuild_local_projection().await;
                 }
                 event = host_stream.next() => {
                     let changed = match event {
@@ -859,11 +865,8 @@ impl Aggregator {
                     }
                 }
                 change = next_checkout_change(&mut checkout_changes) => {
-                    if change {
-                        self.read_engine_checkouts();
-                        self.refresh_origin_hosts().await;
-                        self.rebuild_checkout_rows().await?;
-                        self.rebuild_local_projection().await;
+                    if let Some(change) = change {
+                        self.engine_checkout_changed(change).await?;
                     }
                 }
                 event = durable_convoy_stream.next() => match event {
@@ -1034,27 +1037,80 @@ impl Aggregator {
         Ok(watch)
     }
 
-    /// Rereads the engine's adopted checkouts at every home it follows. A failed read keeps the
+    /// Rereads every launch the engine holds at every home it follows. A failed read keeps the
     /// checkouts held, and the next change reads again.
     fn read_engine_checkouts(&mut self) {
-        let Ok(checkouts) = self.lifecycle_reads.checkouts() else { return };
-        let records = match checkouts.launches(flotilla_resources::checkout_records::Launches::Every) {
-            Ok(records) => records,
-            Err(error) => {
-                tracing::warn!(%error, "aggregator could not read the engine's checkouts");
-                return;
-            }
-        };
-        self.engine_checkout_home = Some(checkouts.home().to_owned());
+        let reads = Arc::clone(&self.lifecycle_reads);
+        if self.held_launches.read_all(reads.checkouts()) {
+            self.engine_checkout_home = reads.checkouts().ok().map(|checkouts| checkouts.home().to_owned());
+            self.derive_engine_checkouts();
+        }
+    }
+
+    /// The adopted checkouts among the launches held: each name's latest launch at its home that
+    /// has not ended.
+    fn derive_engine_checkouts(&mut self) {
         let mut by_home = BTreeMap::<String, Vec<_>>::new();
-        for record in records {
-            by_home.entry(record.home.clone()).or_default().push(record);
+        for launch in self.held_launches.launches() {
+            by_home.entry(launch.home.clone()).or_default().push(launch.clone());
         }
         self.engine_checkouts = by_home
             .into_values()
-            .flat_map(|records| flotilla_resources::checkout_records::latest_launches(records).into_values())
+            .flat_map(|records| latest_launches(records).into_values())
             .filter(|record| matches!(record.spec, CheckoutSpec::Observed(_)) && !record.ended())
             .collect();
+    }
+
+    /// After a commit of the engine's checkouts: a changed launch is read alone, and only the
+    /// convoys it was or is held for are projected again; a rescan, or a launch that did not read,
+    /// reads them all and projects every convoy.
+    async fn engine_checkout_changed(&mut self, change: CheckoutChange) -> Result<(), ResourceError> {
+        let reads = Arc::clone(&self.lifecycle_reads);
+        let holders = match change {
+            CheckoutChange::Changed { name, home } if self.held_launches.current() => {
+                match reads.checkouts().and_then(|checkouts| self.held_launches.read_one(checkouts, &name, &home)) {
+                    Ok(holders) => Some((holders, home)),
+                    Err(error) => {
+                        tracing::warn!(launch = %name, %home, %error, "aggregator could not read a changed checkout; reading them all");
+                        None
+                    }
+                }
+            }
+            CheckoutChange::Changed { .. } | CheckoutChange::Rescanned => None,
+        };
+        let Some((holders, home)) = holders else {
+            self.read_engine_checkouts();
+            self.refresh_origin_hosts().await;
+            self.rebuild_checkout_rows().await?;
+            self.rebuild_local_projection().await;
+            return Ok(());
+        };
+        self.derive_engine_checkouts();
+        let origin = flotilla_protocol::NodeId::new(home.as_str());
+        if self.engine_checkout_home.as_deref() != Some(home.as_str()) && !self.known_origins.contains(&origin) {
+            self.refresh_origin_hosts().await;
+        }
+        self.rebuild_checkout_rows().await?;
+        let keys = self.convoys_holding(&holders);
+        if !keys.is_empty() {
+            self.projection_keys.extend(keys);
+            self.schedule_local_projection().await;
+        }
+        Ok(())
+    }
+
+    /// The convoys whose engine launch is one of `holders`.
+    fn convoys_holding(&self, holders: &BTreeSet<CheckoutHolder>) -> Vec<ConvoyKey> {
+        if holders.is_empty() {
+            return Vec::new();
+        }
+        self.convoys
+            .iter()
+            .filter(|(_, convoy)| {
+                flotilla_resources::convoy::engine::checkout_holder(&convoy.object).is_some_and(|holder| holders.contains(&holder))
+            })
+            .map(|(key, _)| key.clone())
+            .collect()
     }
 
     /// The host `home` names: this host for this home, else the host its origin resolves to.
@@ -1227,6 +1283,41 @@ impl Aggregator {
         self.schedule_local_projection().await;
         if let Some((namespace, ensure)) = role {
             self.refresh_standing_role(&namespace, &ensure).await;
+        }
+    }
+
+    /// A vessel's change projects again only the convoy it serves, and the one it served before.
+    /// A vessel from a home not seen before resolves the homes again, and projects every convoy.
+    async fn vessel_changed(&mut self, event: ReadWatchEvent<Vessel>) {
+        let (key, origin) = match &event {
+            ReadWatchEvent::Added(source) | ReadWatchEvent::Modified(source) | ReadWatchEvent::Deleted(source) => (
+                repository_source_key(&source.object.metadata.namespace, &source.object.metadata.name, &source.provenance),
+                engine_origin(&source.provenance),
+            ),
+            ReadWatchEvent::DeletedByName { tombstone, provenance } => {
+                (repository_source_key(&tombstone.namespace, &tombstone.name, provenance), None)
+            }
+        };
+        let parent = |vessels: &BTreeMap<RepositorySourceKey, ReadResourceObject<Vessel>>| {
+            vessels.get(&key).map(|vessel| (vessel.object.metadata.namespace.clone(), vessel.object.spec.convoy_ref.clone()))
+        };
+        let before = parent(&self.readiness_vessels);
+        apply_readiness_event(&mut self.readiness_vessels, event);
+        let after = parent(&self.readiness_vessels);
+        self.reindex_vessel(&key, before.clone(), after.clone());
+        if origin.is_some_and(|origin| !self.known_origins.contains(&flotilla_protocol::NodeId::new(origin))) {
+            self.refresh_origin_hosts().await;
+            self.rebuild_local_projection().await;
+            return;
+        }
+        let keys: Vec<ConvoyKey> = before
+            .into_iter()
+            .chain(after)
+            .flat_map(|parent| self.convoy_keys_by_name.get(&parent).into_iter().flatten().cloned())
+            .collect();
+        if !keys.is_empty() {
+            self.projection_keys.extend(keys);
+            self.schedule_local_projection().await;
         }
     }
 
@@ -7018,6 +7109,7 @@ mod tests {
                     aggregator.attachable_sessions.insert(session_key(&source));
                     aggregator.terminal_sessions.insert(session_key(&source), source);
                 }
+                aggregator.read_engine_checkouts();
                 let row = aggregator.summarize(&reference, &convoy);
                 assert_eq!(row.phase, Some(ConvoyPhase::Active), "readiness must not rewrite lifecycle");
                 assert_eq!(row.readiness().state, expected, "operation {op}");
@@ -7116,8 +7208,9 @@ mod tests {
         }
     }
 
-    /// The checkouts held for any convoy: each scripted checkout with a reading, as its first
-    /// launch at its home. A scripted read error fails the whole read.
+    /// The checkouts held for the convoys the fixtures make (launch `convoy-a#1`): each scripted
+    /// checkout with a reading, as its first launch at its home. A scripted read error fails the
+    /// whole read.
     impl flotilla_resources::checkout_records::CheckoutRecords for ScriptedReadings {
         fn codes(&self) -> Vec<flotilla_resources::engine_records::KindCode> {
             Vec::new()
@@ -7152,7 +7245,7 @@ mod tests {
                         name: format!("{name}#1"),
                         home,
                         spec,
-                        holder: None,
+                        holder: Some(flotilla_resources::checkout_records::CheckoutHolder::Convoy("convoy-a#1".into())),
                         requested_at: chrono::DateTime::UNIX_EPOCH,
                         reading,
                         degraded: None,
@@ -7293,10 +7386,12 @@ mod tests {
 
     /// The readiness state, and each checkout and clone blocker's resource name and reason.
     fn readiness_blockers(
-        aggregator: &Aggregator,
+        aggregator: &mut Aggregator,
         reference: &ResourceRef,
         convoy: &ResourceObject<Convoy>,
     ) -> (flotilla_protocol::result_set::ReadinessState, Vec<(String, String)>) {
+        // The scripted readings changed without a commit: read them as a rescan does.
+        aggregator.read_engine_checkouts();
         let row = aggregator.summarize(reference, convoy);
         let readiness = row.readiness().clone();
         let provisioning =
@@ -7316,10 +7411,10 @@ mod tests {
 
         use crate::ports::ProvisioningKind::Checkout as Kind;
         let reads = Arc::new(ScriptedReadings::default());
-        let (aggregator, reference, convoy) = engine_readiness_fixture(true, false, reads.clone()).await;
-        let checkout = |reading| {
+        let (mut aggregator, reference, convoy) = engine_readiness_fixture(true, false, reads.clone()).await;
+        let mut checkout = |reading| {
             reads.set(Kind, "checkout-a", reading);
-            readiness_blockers(&aggregator, &reference, &convoy)
+            readiness_blockers(&mut aggregator, &reference, &convoy)
         };
         let blocker = |reason: &str| vec![("checkout-a".to_owned(), reason.to_owned())];
 
@@ -7343,6 +7438,7 @@ mod tests {
         assert!(checkout(Some(LifecycleReading::InProgress)).1.is_empty(), "another home's checkout is not the vessel's");
         // The held checkouts' read fails: the vessel is blocked on its checkouts, with the reason.
         reads.errors.lock().expect("errors").insert((Kind, "checkout-a".into()), "checkout store unavailable".into());
+        aggregator.read_engine_checkouts();
         let row = aggregator.summarize(&reference, &convoy);
         assert_eq!(row.readiness().state, ReadinessState::Blocked);
         assert!(row.readiness().explanation().contains("checkout store unavailable"), "{}", row.readiness().explanation());
@@ -7357,10 +7453,10 @@ mod tests {
 
         use crate::ports::ProvisioningKind;
         let reads = Arc::new(ScriptedReadings::default());
-        let (aggregator, reference, convoy) = engine_readiness_fixture(false, true, reads.clone()).await;
+        let (mut aggregator, reference, convoy) = engine_readiness_fixture(false, true, reads.clone()).await;
         reads.set(ProvisioningKind::Checkout, "checkout-a", Some(LifecycleReading::InProgress));
         reads.set(ProvisioningKind::Clone, "ops-clone", Some(LifecycleReading::GaveUp { cause: "repository not found".into() }));
-        let (state, blockers) = readiness_blockers(&aggregator, &reference, &convoy);
+        let (state, blockers) = readiness_blockers(&mut aggregator, &reference, &convoy);
         assert_eq!(state, ReadinessState::Failed);
         assert_eq!(
             blockers,
@@ -7368,16 +7464,87 @@ mod tests {
         );
         reads.set(ProvisioningKind::Clone, "ops-clone", Some(LifecycleReading::Ready { identity: "/work/ops".into() }));
         assert_eq!(
-            readiness_blockers(&aggregator, &reference, &convoy),
+            readiness_blockers(&mut aggregator, &reference, &convoy),
             (ReadinessState::Provisioning, vec![("checkout-a".to_owned(), "being realised".to_owned())])
         );
         reads.errors.lock().expect("errors").insert((ProvisioningKind::Clone, "ops-clone".into()), "decided store unavailable".into());
         assert_eq!(
-            readiness_blockers(&aggregator, &reference, &convoy),
+            readiness_blockers(&mut aggregator, &reference, &convoy),
             (ReadinessState::Blocked, vec![("ops-clone".into(), "decided store unavailable".into())])
         );
         let reads = reads.reads.lock().expect("reads").clone();
         assert!(reads.contains(&(ProvisioningKind::Clone, "ops-clone".into(), Some("kiwi".into()))), "{reads:?}");
+    }
+
+    // Behaviour (#3108): a vessel's change, and a change to a checkout held for one convoy, project
+    // only the convoys they touch, and read the engine as much at 16 convoys as at 2.
+    #[tokio::test]
+    async fn one_change_reads_the_engine_flat_as_convoys_grow() {
+        use flotilla_resources::{checkout_records::CheckoutChange, VesselPhase, VesselSpec, VesselStatus};
+        use flotilla_store::load_metrics::{measure, ReadCounts};
+
+        /// Every engine read made, whatever its shape, and the records they decoded.
+        fn reads(counts: &ReadCounts) -> (u64, u64) {
+            counts
+                .values()
+                .fold((0, 0), |(reads, decoded), kind| (reads + kind.keyed + kind.index + kind.whole_kind, decoded + kind.decoded))
+        }
+        let spec = |name: &str| {
+            CheckoutSpec::Observed(ObservedCheckoutSpec {
+                r#ref: "main".into(),
+                path: format!("/work/{name}"),
+                repo_ref: RepositoryKey("repo".into()),
+                host_ref: "local".into(),
+                is_main: false,
+            })
+        };
+        let mut costs = Vec::new();
+        for convoys in [2, 16] {
+            let engine = flotilla_provisioning_testkit::CheckoutFixture::at(OWN_HOME);
+            let (events, _) = broadcast::channel(1024);
+            let (mut aggregator, _convoys) = with_convoy_engine(
+                Aggregator::new(AggregatorProjectionState::new(), HostName::new("local"), events)
+                    .with_lifecycle_reads(engine.reads.clone()),
+            );
+            for index in 0..convoys {
+                let name = format!("convoy-{index}");
+                let mut convoy = convoy_with_vessel(&name).await;
+                let launch = engine.open_convoy(&name);
+                engine.put_ready(&format!("checkout-{index}"), &spec(&name), Some(&engine.holder(&name)));
+                convoy.status.as_mut().expect("status").engine_launch = Some(launch);
+                aggregator.apply_convoy_event(WatchEvent::Added(convoy)).await;
+            }
+            aggregator.read_engine_checkouts();
+            let summarized = aggregator.summarized_convoys.load(Ordering::Relaxed);
+
+            let vessel = flotilla_provisioning_testkit::object::<Vessel>(
+                "vessel-0",
+                VesselSpec {
+                    convoy_ref: "convoy-0".into(),
+                    vessel_name: "implement".into(),
+                    fulfilment_kind_ref: "local".into(),
+                    adopted_checkout_refs: BTreeMap::new(),
+                },
+                VesselStatus { phase: VesselPhase::Provisioning, ..Default::default() },
+            );
+            let ((), vessel_reads) = measure(
+                aggregator
+                    .vessel_changed(ReadWatchEvent::Added(ReadResourceObject { object: vessel, provenance: ResourceProvenance::Local })),
+            )
+            .await;
+            assert_eq!(aggregator.summarized_convoys.load(Ordering::Relaxed) - summarized, 1, "only the vessel's convoy is projected");
+            assert!(!vessel_reads.keys().any(|kind| kind.starts_with("Checkout")), "checkouts are held, not read: {vessel_reads:?}");
+
+            let launch = engine.request("checkout-more", &spec("more"), Some(&engine.holder("convoy-1")));
+            let change = CheckoutChange::Changed { name: launch, home: OWN_HOME.into() };
+            let (changed, checkout_reads) = measure(aggregator.engine_checkout_changed(change)).await;
+            changed.expect("checkout change applied");
+            assert_eq!(aggregator.summarized_convoys.load(Ordering::Relaxed) - summarized, 2, "only the holder's convoy is projected");
+            let holder = aggregator.convoys.values().find(|convoy| convoy.object.metadata.name == "convoy-1").expect("convoy-1");
+            assert_eq!(aggregator.held_checkouts(&holder.object).expect("held").len(), 2, "the new checkout is held in memory");
+            costs.push((reads(&vessel_reads), reads(&checkout_reads)));
+        }
+        assert_eq!(costs[0], costs[1], "engine reads for one change at 2 and at 16 convoys");
     }
 
     // Engine readings decide readiness despite stale lifecycle phase/message; interrupted roles remain observations.

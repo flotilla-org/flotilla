@@ -440,7 +440,7 @@ impl Woken {
 
     fn checkout(&mut self, change: Result<CheckoutChange, RecvError>) -> Result<(), ResourceError> {
         match change {
-            Ok(CheckoutChange::Changed(name)) => {
+            Ok(CheckoutChange::Changed { name, .. }) => {
                 self.checkouts.insert(name);
             }
             Ok(CheckoutChange::Rescanned) | Err(RecvError::Lagged(_)) => self.every_checkout = true,

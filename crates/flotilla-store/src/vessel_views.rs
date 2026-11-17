@@ -199,7 +199,7 @@ impl Cursors {
             TerminalChange::Rescanned => true,
         });
         dirt.all |= read(&mut self.checkouts, |change| match change {
-            CheckoutChange::Changed(name) => {
+            CheckoutChange::Changed { name, .. } => {
                 dirt.checkouts.insert(name);
                 false
             }

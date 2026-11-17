@@ -704,7 +704,7 @@ impl flotilla_store::controller::SecondaryWatch for CheckoutConvoyWake {
 /// What a followed write of the kinds tells readers.
 fn checkout_change(followed: flotilla_engine_store::follow::Followed) -> CheckoutChange {
     match followed {
-        flotilla_engine_store::follow::Followed::Changed(identity) => CheckoutChange::Changed(identity.name),
+        flotilla_engine_store::follow::Followed::Changed(identity) => CheckoutChange::Changed { name: identity.name, home: identity.home },
         flotilla_engine_store::follow::Followed::Rescan(_) => CheckoutChange::Rescanned,
     }
 }

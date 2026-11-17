@@ -462,7 +462,7 @@ impl ReconcilerWake {
                     }
                 } => {
                     let selected = match change {
-                        Ok(CheckoutChange::Changed(name)) => Some(
+                        Ok(CheckoutChange::Changed { name, .. }) => Some(
                             views.row_dependencies.lock().await.by_record.get(&checkout_dependency(launched(&name))).cloned().unwrap_or_default(),
                         ),
                         Ok(CheckoutChange::Rescanned) | Err(broadcast::error::RecvError::Lagged(_)) => None,

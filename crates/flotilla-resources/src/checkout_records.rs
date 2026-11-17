@@ -299,8 +299,8 @@ impl Integration {
 /// What changed among the checkouts, at any home.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum CheckoutChange {
-    /// The launch of this name changed: its lifecycle, its facts or its integration.
-    Changed(String),
+    /// The launch `name` at `home` changed: its lifecycle, its facts or its integration.
+    Changed { name: String, home: String },
     /// Any of them may have changed: a home's log was read afresh.
     Rescanned,
 }

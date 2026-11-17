@@ -4,7 +4,7 @@ use flotilla_protocol::{
     result_set::{Readiness, ReadinessBlocker, ReadinessState},
     LifecycleReading,
 };
-use flotilla_resources::checkout_records::{CheckoutChange, CheckoutRecord};
+use flotilla_resources::checkout_records::{CheckoutChange, CheckoutLaunch};
 use flotilla_resources::{CrewWorkPhase, CrewWorkState, VesselPhase};
 
 use super::*;
@@ -112,7 +112,7 @@ impl Aggregator {
                 }
             };
             let vessel_home = engine_origin(&vessel.provenance);
-            let at_vessel_home = |checkout: &CheckoutRecord| match &vessel_home {
+            let at_vessel_home = |checkout: &CheckoutLaunch| match &vessel_home {
                 Some(home) => checkout.home == *home,
                 None => !self.known_origins.contains(&flotilla_protocol::NodeId::new(checkout.home.clone())),
             };
@@ -229,19 +229,20 @@ pub(super) fn apply_readiness_event<T: Resource>(
 /// The engine home of a resource read from `provenance`: a replica's origin root, or `None` for
 /// this home.
 /// The checkouts the engine holds for one convoy, by checkout name, or why they could not be read.
-pub(super) type HeldCheckouts = Result<BTreeMap<String, CheckoutRecord>, String>;
+pub(super) type HeldCheckouts = Result<BTreeMap<String, CheckoutLaunch>, String>;
 
-/// Waits for the engine's next checkout commit: true when the checkouts changed (or changes were
-/// missed), false once the changes end; never returns where none are followed.
-pub(super) async fn next_checkout_change(changes: &mut Option<tokio::sync::broadcast::Receiver<CheckoutChange>>) -> bool {
+/// Waits for the engine's next checkout commit: what changed (a rescan where changes were
+/// missed), none once the changes end; never returns where none are followed.
+pub(super) async fn next_checkout_change(changes: &mut Option<tokio::sync::broadcast::Receiver<CheckoutChange>>) -> Option<CheckoutChange> {
     let Some(receiver) = changes.as_mut() else {
         return std::future::pending().await;
     };
     match receiver.recv().await {
-        Ok(_) | Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => true,
+        Ok(change) => Some(change),
+        Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => Some(CheckoutChange::Rescanned),
         Err(tokio::sync::broadcast::error::RecvError::Closed) => {
             *changes = None;
-            false
+            None
         }
     }
 }

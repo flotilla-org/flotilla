@@ -26,6 +26,22 @@ impl Aggregator {
         }
         self.convoy_inputs = index;
     }
+    /// Moves vessel `key` in the index from the convoy it served to the one it serves now, as one
+    /// vessel's change does without rebuilding the index.
+    pub(super) fn reindex_vessel(&mut self, key: &RepositorySourceKey, from: Option<Parent>, to: Option<Parent>) {
+        if !self.convoy_inputs.ready {
+            return;
+        }
+        if let Some(keys) = from.and_then(|from| self.convoy_inputs.vessels.get_mut(&from)) {
+            keys.retain(|held| held != key);
+        }
+        if let Some(to) = to {
+            let keys = self.convoy_inputs.vessels.entry(to).or_default();
+            if !keys.contains(key) {
+                keys.push(key.clone());
+            }
+        }
+    }
     pub(super) fn convoy_sessions(
         &self,
         namespace: &str,
@@ -61,9 +77,10 @@ impl Aggregator {
                 .filter_map(|key| self.readiness_vessels.get(key)),
         )
     }
-    /// The checkouts the engine holds for `convoy`, at every home, by checkout name (#3108).
+    /// The checkouts the engine holds for `convoy`, at every home, by checkout name (#3108), as
+    /// held here: projecting a convoy reads none.
     pub(super) fn held_checkouts(&self, convoy: &ResourceObject<Convoy>) -> HeldCheckouts {
         let Some(holder) = flotilla_resources::convoy::engine::checkout_holder(convoy) else { return Ok(BTreeMap::new()) };
-        Ok(latest_launches(self.lifecycle_reads.checkouts()?.held(&holder)?))
+        self.held_launches.held(&holder)
     }
 }
