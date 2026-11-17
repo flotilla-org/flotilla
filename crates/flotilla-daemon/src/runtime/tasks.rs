@@ -49,7 +49,7 @@ use super::health::{apply_host_heartbeat_with_credentials, DaemonHealthIdentity,
 use super::state::ControllerRuntimeState;
 use super::StartupRestoration;
 use crate::{
-    artifact::{retention::Retention, ArtifactService},
+    artifact::ArtifactService,
     blob_store::TieredBlobStore,
     dispatch_reconciler::{DaemonDispatchIssueSource, DispatchIssueSource, DispatchReconciler},
     resource_manifest::{materialize_bound_manifest_root, ResourceManifestReconciler},
@@ -90,62 +90,32 @@ pub(super) async fn load_checkout_archive_roots(path: &Path) -> Result<BTreeSet<
 pub(super) const BLOB_GRACE: Duration = Duration::from_secs(24 * 60 * 60);
 /// The wait before retrying a failed collection.
 const GC_RETRY: RetryBackoff = RetryBackoff { initial: Duration::from_secs(60), maximum: Duration::from_secs(60 * 60) };
-/// Consecutive failed collections retried at [`GC_RETRY`]; past it, the next change or retirement
-/// retries.
+/// Consecutive failed collections retried at [`GC_RETRY`]; past it, the next change retries.
 const GC_RETRY_LIMIT: u32 = 10;
 
-/// Which convoys have retired, and each launch as it retires here: a convoy's unpinned artifacts
-/// go with it.
-#[derive(Clone)]
-pub(super) struct Retirements {
-    /// Whether the convoy a name names has retired.
-    pub(super) retired: Arc<dyn Fn(&str) -> bool + Send + Sync>,
-    /// Each launch this home retires from now on; none where nothing retires convoys here.
-    pub(super) follow: Arc<dyn Fn() -> Option<broadcast::Receiver<String>> + Send + Sync>,
-}
-
-/// Artifact retention: reaps this home's expired artifacts and a retired convoy's, and collects
-/// the blobs no artifact references any more ([`Retention`]). It lists the artifacts once, then
-/// acts at each change to one, at each retirement here, and when the next artifact expires or a
-/// blob's grace passes: nothing is listed again and no timer runs. A failure retries at a backoff
-/// a finite number of times; past it, the next change or retirement retries.
-pub(super) async fn run_artifact_gc(
-    backend: ResourceBackend,
-    namespace: String,
-    blobs: Arc<TieredBlobStore>,
-    grace: Duration,
-    retirements: Retirements,
-) {
+/// Artifact retention: reaps this home's expired artifacts and collects the blobs no artifact
+/// references any more ([`Retention`]). A convoy's retirement reaps none of its artifacts: they go
+/// at their own expiry or by an explicit delete. It lists the artifacts once, then acts at each
+/// change to one and when the next artifact expires or a blob's grace passes: nothing is listed
+/// again and no timer runs. A failure retries at a backoff a finite number of times; past it,
+/// retention stops until the daemon restarts.
+pub(super) async fn run_artifact_gc(backend: ResourceBackend, namespace: String, blobs: Arc<TieredBlobStore>, grace: Duration) {
     let mut failures = 0_u32;
     loop {
-        let stopped = retain(&backend, &namespace, &blobs, grace, &retirements, &mut failures).await;
+        let stopped = retain(&backend, &namespace, &blobs, grace, &mut failures).await;
         failures = failures.saturating_add(1);
         warn!(error = %stopped, failures, "artifact retention stopped; reading the artifacts again");
-        if failures <= GC_RETRY_LIMIT {
-            tokio::time::sleep(GC_RETRY.delay(failures)).await;
-            continue;
+        if failures > GC_RETRY_LIMIT {
+            error!(failures, "artifact retention keeps failing; it stops until the daemon restarts");
+            return;
         }
-        if failures == GC_RETRY_LIMIT + 1 {
-            warn!(failures, "artifact retention keeps failing; the next retirement retries");
-        }
-        match (retirements.follow)() {
-            Some(mut retired) => drop(retired.recv().await),
-            None => std::future::pending::<()>().await,
-        }
+        tokio::time::sleep(GC_RETRY.delay(failures)).await;
     }
 }
 
 /// Retention over one listing and the changes after it, until the artifact watch ends: why it
 /// stopped.
-async fn retain(
-    backend: &ResourceBackend,
-    namespace: &str,
-    blobs: &Arc<TieredBlobStore>,
-    grace: Duration,
-    retirements: &Retirements,
-    failures: &mut u32,
-) -> String {
-    let mut retired_here = (retirements.follow)();
+async fn retain(backend: &ResourceBackend, namespace: &str, blobs: &Arc<TieredBlobStore>, grace: Duration, failures: &mut u32) -> String {
     let mut unwritten = blobs.follow_unwritten();
     // Watched before the listing, so no change between the two is missed.
     let mut changes = match backend.including_replicas::<Artifact>(namespace).watch().await {
@@ -157,10 +127,8 @@ async fn retain(
         Ok(retention) => retention,
         Err(error) => return format!("list artifacts: {error}"),
     };
-    let retired =
-        |retention: &Retention, convoy: &str| if (retirements.retired)(convoy) { retention.of_convoy(convoy) } else { Vec::new() };
-    // The convoys that retired while nothing followed them.
-    let mut due: BTreeSet<String> = retention.convoys().flat_map(|convoy| retired(&retention, convoy)).collect();
+    // This home's artifacts to delete: the expired ones, and those whose delete failed.
+    let mut due: BTreeSet<String> = BTreeSet::new();
     // One look at the stores at the start collects what no artifact referenced then: among it, the
     // body of a put whose artifact never landed before a restart. Later, a blob whose last
     // reference goes, or whose artifact's write failed.
@@ -197,15 +165,9 @@ async fn retain(
                 *failures = failures.saturating_add(1);
                 warn!(%error, failures = *failures, "artifact garbage collection failed");
                 if *failures == GC_RETRY_LIMIT + 1 {
-                    warn!(failures = *failures, "artifact garbage collection keeps failing; the next change or retirement retries");
+                    warn!(failures = *failures, "artifact garbage collection keeps failing; the next change retries");
                 }
                 (*failures <= GC_RETRY_LIMIT).then(|| tokio::time::Instant::now() + GC_RETRY.delay(*failures))
-            }
-        };
-        let retirement = async {
-            match retired_here.as_mut() {
-                Some(retired_here) => retired_here.recv().await,
-                None => std::future::pending().await,
             }
         };
         tokio::select! {
@@ -217,23 +179,9 @@ async fn retain(
                         Ok(event) => event,
                         Err(error) => return format!("artifact watch: {error}"),
                     };
-                    // An artifact of a convoy already retired goes as soon as it is seen.
-                    if let Some(convoy) = retention.apply(event, now) {
-                        due.extend(retired(&retention, &convoy));
-                    }
+                    retention.apply(event, now);
                 }
             }
-            launch = retirement => match launch {
-                Ok(launch) => {
-                    let convoys = [launch.as_str(), flotilla_resources::convoy::launch_of(&launch)];
-                    due.extend(convoys.into_iter().flat_map(|convoy| retired(&retention, convoy)));
-                }
-                // Fell behind: which have retired is read again.
-                Err(broadcast::error::RecvError::Lagged(_)) => {
-                    due.extend(retention.convoys().flat_map(|convoy| retired(&retention, convoy)));
-                }
-                Err(broadcast::error::RecvError::Closed) => retired_here = None,
-            },
             digest = unwritten.recv() => match digest {
                 Ok(digest) => retention.unwritten(&digest, Utc::now()),
                 // Fell behind: the stores are looked at again.

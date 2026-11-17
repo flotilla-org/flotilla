@@ -1,4 +1,4 @@
-//! Artifact retention runs on artifact changes, retirements and its next deadline (#3108).
+//! Artifact retention runs on artifact changes and its next deadline (#3108).
 
 use super::*;
 use crate::blob_store::{BlobDigest, BlobStore, TieredBlobStore};
@@ -6,9 +6,8 @@ use flotilla_agent::brief_artifact::BriefArtifactWriter;
 use flotilla_provisioning_testkit::EngineBackend;
 use flotilla_resources::{Artifact, ArtifactSpec};
 use flotilla_store::TypedResolver;
-use tokio::sync::broadcast;
 
-use crate::runtime::tasks::{Retirements, BLOB_GRACE};
+use crate::runtime::tasks::BLOB_GRACE;
 
 fn name(convoy: &str, kind: &str, subject: &str) -> String {
     flotilla_resources::address::record_name(
@@ -31,45 +30,21 @@ fn spec(convoy: &str, kind: &str, subject: &str, digest: &BlobDigest, expires_at
         .build()
 }
 
-/// Retirements the test announces: a convoy it has marked retired, told on its channel.
-fn announced() -> (Retirements, Arc<StdMutex<BTreeSet<String>>>, broadcast::Sender<String>) {
-    let retired = Arc::new(StdMutex::new(BTreeSet::new()));
-    let (announce, _) = broadcast::channel(16);
-    let retirements = Retirements {
-        retired: {
-            let retired = Arc::clone(&retired);
-            Arc::new(move |convoy: &str| retired.lock().expect("retired").contains(convoy))
-        },
-        follow: {
-            let announce = announce.clone();
-            Arc::new(move || Some(announce.subscribe()))
-        },
-    };
-    (retirements, retired, announce)
-}
-
-/// Waits until artifact `name` is deleted.
+/// Waits until artifact `name` is deleted, read by name: a watch converts each batch's names as
+/// they read when it is taken, so one written and deleted before the test takes its batch is never
+/// seen deleted there.
 async fn deleted(artifacts: &TypedResolver<Artifact>, name: &str) {
-    all_deleted(artifacts, &[name]).await;
-}
-
-/// Waits until every artifact of `names` is deleted, read by name: a watch converts each batch's
-/// names as they read when it is taken, so one written and deleted before the test takes its batch
-/// is never seen deleted there.
-async fn all_deleted(artifacts: &TypedResolver<Artifact>, names: &[&str]) {
     tokio::time::timeout(Duration::from_secs(10), async {
-        for name in names {
-            loop {
-                match artifacts.get(name).await {
-                    Ok(_) => tokio::task::yield_now().await,
-                    Err(ResourceError::NotFound { .. }) => break,
-                    Err(error) => panic!("read artifact {name}: {error}"),
-                }
+        loop {
+            match artifacts.get(name).await {
+                Ok(_) => tokio::task::yield_now().await,
+                Err(ResourceError::NotFound { .. }) => break,
+                Err(error) => panic!("read artifact {name}: {error}"),
             }
         }
     })
     .await
-    .unwrap_or_else(|_| panic!("artifacts {names:?} are deleted"));
+    .unwrap_or_else(|_| panic!("artifact {name} is deleted"));
 }
 
 // Behaviour (#3108): retention wakes when the next unpinned artifact expires, with no timer and
@@ -80,7 +55,7 @@ async fn an_artifact_is_reaped_at_its_expiry_without_a_timer() {
     let blobs = Arc::new(TieredBlobStore::new(state.path(), Vec::new()));
     let home = EngineBackend::open_in("home", NAMESPACE);
     let backend = home.backend.clone();
-    let task = tokio::spawn(run_artifact_gc(backend.clone(), NAMESPACE.into(), Arc::clone(&blobs), BLOB_GRACE, announced().0));
+    let task = tokio::spawn(run_artifact_gc(backend.clone(), NAMESPACE.into(), Arc::clone(&blobs), BLOB_GRACE));
     let artifacts = backend.using::<Artifact>(NAMESPACE);
     let digest = blobs.put(b"review notes").await.expect("put blob");
     for (subject, pinned) in [("soon", false), ("kept", true)] {
@@ -99,50 +74,6 @@ async fn an_artifact_is_reaped_at_its_expiry_without_a_timer() {
     task.abort();
 }
 
-// Behaviour (#3108 retirement): an unpinned artifact goes with its convoy when the convoy retires,
-// long before its expiry; a pinned one outlives it, and another convoy's stays.
-#[tokio::test]
-async fn a_retired_convoys_unpinned_artifacts_go_with_it() {
-    let state = tempfile::tempdir().expect("state dir");
-    let blobs = Arc::new(TieredBlobStore::new(state.path(), Vec::new()));
-    let home = EngineBackend::open_in("home", NAMESPACE);
-    let backend = home.backend.clone();
-    let (retirements, retired, announce) = announced();
-    let task = tokio::spawn(run_artifact_gc(backend.clone(), NAMESPACE.into(), Arc::clone(&blobs), BLOB_GRACE, retirements));
-    let artifacts = backend.using::<Artifact>(NAMESPACE);
-    let digest = blobs.put(b"decision ledger").await.expect("put blob");
-    let far = Utc::now() + chrono::Duration::days(3650);
-    for (convoy, subject, pinned) in [("gone", "ledger", false), ("gone", "kept", true), ("live", "ledger", false)] {
-        let spec = spec(convoy, "decision-ledger", subject, &digest, far, pinned);
-        artifacts
-            .create(&InputMeta::builder().name(name(convoy, "decision-ledger", subject)).build(), &spec)
-            .await
-            .expect("create artifact");
-    }
-    // The convoy's brief, as its crew's start writes it, and a pinned one.
-    let briefs = crate::artifact::SystemBriefArtifactWriter { backend: backend.clone(), blobs: Arc::clone(&blobs), retention_days: 3650 };
-    briefs.put_brief(NAMESPACE, "gone", "coder", "brief", b"the brief", None).await.expect("brief");
-    let pinned_brief = spec("gone", "brief", "pinned", &digest, far, true);
-    artifacts.create(&InputMeta::builder().name(name("gone", "brief", "pinned")).build(), &pinned_brief).await.expect("pinned brief");
-    // Retention has seen them once it has reaped a probe written after them.
-    let probe = spec("live", "probe", "probe", &digest, Utc::now() - chrono::Duration::seconds(1), false);
-    artifacts.create(&InputMeta::builder().name(name("live", "probe", "probe")).build(), &probe).await.expect("probe");
-    deleted(&artifacts, &name("live", "probe", "probe")).await;
-
-    retired.lock().expect("retired").insert("gone".into());
-    announce.send("gone".into()).expect("retention follows retirements");
-    all_deleted(&artifacts, &[&name("gone", "decision-ledger", "ledger"), &name("gone", "brief", "brief")]).await;
-    assert!(artifacts.get(&name("gone", "brief", "pinned")).await.is_ok(), "a pinned brief outlives its convoy");
-    assert!(artifacts.get(&name("gone", "decision-ledger", "kept")).await.is_ok(), "a pinned artifact outlives its convoy");
-    assert!(artifacts.get(&name("live", "decision-ledger", "ledger")).await.is_ok(), "another convoy's artifact stays");
-
-    // One written after its convoy retired goes as soon as retention sees it.
-    let late = spec("gone", "decision-ledger", "late", &digest, far, false);
-    artifacts.create(&InputMeta::builder().name(name("gone", "decision-ledger", "late")).build(), &late).await.expect("late artifact");
-    deleted(&artifacts, &name("gone", "decision-ledger", "late")).await;
-    task.abort();
-}
-
 // Behaviour (#3108): a blob put for an artifact whose write then fails is collected once its
 // grace has passed, while the daemon runs: its writer tells retention, and no restart is needed.
 // A blob an artifact references stays.
@@ -152,14 +83,16 @@ async fn a_blob_whose_artifact_write_failed_is_collected_without_a_restart() {
     let blobs = Arc::new(TieredBlobStore::new(state.path(), Vec::new()));
     let home = EngineBackend::open_in("home", NAMESPACE);
     let backend = home.backend.clone();
-    let task = tokio::spawn(run_artifact_gc(backend.clone(), NAMESPACE.into(), Arc::clone(&blobs), Duration::ZERO, announced().0));
     let artifacts = backend.using::<Artifact>(NAMESPACE);
-    // The brief's slot holds an artifact of another address, so the brief's write is refused.
+    // The brief's slot holds an artifact of another address, so the brief's write is refused. It
+    // is written before retention starts: with no grace, retention's first look at the stores
+    // collects a blob put before it whose artifact its listing does not yet hold.
     let held = blobs.put(b"held body").await.expect("put blob");
     let far = Utc::now() + chrono::Duration::days(3650);
     let squatter = spec("demo", "brief", "another", &held, far, true);
     artifacts.create(&InputMeta::builder().name(name("demo", "brief", "brief")).build(), &squatter).await.expect("squatter");
-    // Retention has started, and seen the squatter, once it has reaped a probe written after it.
+    let task = tokio::spawn(run_artifact_gc(backend.clone(), NAMESPACE.into(), Arc::clone(&blobs), Duration::ZERO));
+    // Retention has started once it has reaped a probe.
     let probe = spec("demo", "probe", "probe", &held, Utc::now() - chrono::Duration::seconds(1), false);
     artifacts.create(&InputMeta::builder().name(name("demo", "probe", "probe")).build(), &probe).await.expect("probe");
     deleted(&artifacts, &name("demo", "probe", "probe")).await;
@@ -194,7 +127,7 @@ async fn retention_reads_each_artifact_change_once() {
     let artifacts = backend.using::<Artifact>(NAMESPACE);
     let task = tokio::spawn(flotilla_schema::reads::attributed(
         flotilla_schema::reads::caller(RETENTION),
-        run_artifact_gc(backend.clone(), NAMESPACE.into(), Arc::clone(&blobs), BLOB_GRACE, announced().0),
+        run_artifact_gc(backend.clone(), NAMESPACE.into(), Arc::clone(&blobs), BLOB_GRACE),
     ));
     let digest = blobs.put(b"decision ledger").await.expect("put blob");
     let far = Utc::now() + chrono::Duration::days(3650);

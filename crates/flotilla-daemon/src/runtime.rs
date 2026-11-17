@@ -65,7 +65,7 @@ use self::tasks::{
     spawn_environment_orphan_sweep_task, spawn_heartbeat_task_with_credentials, spawn_host_description_projection_task,
     spawn_local_fulfilment_probe_task, spawn_manifest_reconciler_task, spawn_named_controller, spawn_periodic_task,
     spawn_provisioned_environment_reconciliation_task, spawn_sleep_inhibitor_task, spawn_ssh_fulfilment_probe_task,
-    spawn_startup_restoration, spawn_vessel_requests, CheckoutArchiveRoot, CheckoutArchiveSweep, PeriodicTaskStart, Retirements,
+    spawn_startup_restoration, spawn_vessel_requests, CheckoutArchiveRoot, CheckoutArchiveSweep, PeriodicTaskStart,
     MANIFEST_RECONCILE_INTERVAL,
 };
 use self::terminal::TerminalControllerRuntime;
@@ -333,18 +333,7 @@ impl DaemonRuntime {
             tokio::spawn(attributed(caller("blob store sync"), Arc::clone(&blob_store).run_sync())),
             tokio::spawn(attributed(
                 caller("artifact gc"),
-                run_artifact_gc(daemon.resource_backend(), options.namespace.clone(), Arc::clone(&blob_store), tasks::BLOB_GRACE, {
-                    let (retired, follow) = (Arc::clone(&daemon), Arc::clone(&daemon));
-                    Retirements {
-                        retired: Arc::new(move |convoy: &str| {
-                            retired
-                                .engine_convoys()
-                                .and_then(|convoys| convoys.launch(convoy))
-                                .is_some_and(|launch| launch.label() == flotilla_state_machines::machines::convoy::ConvoyLabel::Retired)
-                        }),
-                        follow: Arc::new(move || follow.engine_convoys().map(|convoys| convoys.retirements())),
-                    }
-                }),
+                run_artifact_gc(daemon.resource_backend(), options.namespace.clone(), Arc::clone(&blob_store), tasks::BLOB_GRACE),
             )),
             tokio::spawn(attributed(
                 caller("checkout archive gc"),

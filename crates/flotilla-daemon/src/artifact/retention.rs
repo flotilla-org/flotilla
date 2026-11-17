@@ -1,12 +1,12 @@
 //! What artifact retention reads, kept from one listing and each change after (#3108).
 //!
-//! One listing of every home's artifacts builds it: this home's unpinned artifacts by expiry and by
-//! convoy, and how many artifacts reference each blob. Each artifact change then updates only that
-//! artifact's entry. Retention deletes this home's artifacts from the head of the expiry queue, and
-//! a retired convoy's from its convoy's entry; a blob whose last reference goes is collected once
-//! its grace has passed. Nothing is listed again to find them.
+//! One listing of every home's artifacts builds it: this home's unpinned artifacts by expiry, and
+//! how many artifacts reference each blob. Each artifact change then updates only that artifact's
+//! entry. Retention deletes this home's artifacts from the head of the expiry queue; a convoy's
+//! retirement deletes none of them. A blob whose last reference goes is collected once its grace
+//! has passed. Nothing is listed again to find them.
 
-use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
+use std::collections::{BTreeSet, HashMap, HashSet};
 
 use chrono::{DateTime, Utc};
 use flotilla_resources::{Artifact, ReadResourceObject, ReadWatchEvent, ResourceProvenance};
@@ -18,7 +18,6 @@ type Key = (String, Option<String>);
 
 /// What retention reads of one artifact.
 struct Entry {
-    convoy: String,
     /// The blob it references.
     digest: BlobDigest,
     /// When it expires, for this home's unpinned artifacts: retention deletes only those.
@@ -31,8 +30,6 @@ pub(crate) struct Retention {
     artifacts: HashMap<Key, Entry>,
     /// This home's unpinned artifacts, by when they expire.
     expiry: BTreeSet<(DateTime<Utc>, String)>,
-    /// This home's unpinned artifacts, by convoy.
-    by_convoy: BTreeMap<String, BTreeSet<String>>,
     /// How many artifacts reference each blob.
     references: HashMap<BlobDigest, usize>,
     /// The blobs no artifact references any more, by when they may be collected.
@@ -47,60 +44,43 @@ impl Retention {
             grace: chrono::Duration::from_std(grace).unwrap_or(chrono::Duration::MAX),
             artifacts: HashMap::new(),
             expiry: BTreeSet::new(),
-            by_convoy: BTreeMap::new(),
             references: HashMap::new(),
             unreferenced: BTreeSet::new(),
             collectable: HashMap::new(),
         }
     }
 
-    /// Takes in one change at `now`. Returns the convoy of an unpinned artifact of this home's it
-    /// now holds, whose retirement deletes it.
-    pub(crate) fn apply(&mut self, event: ReadWatchEvent<Artifact>, now: DateTime<Utc>) -> Option<String> {
+    /// Takes in one change at `now`.
+    pub(crate) fn apply(&mut self, event: ReadWatchEvent<Artifact>, now: DateTime<Utc>) {
         match event {
             ReadWatchEvent::Added(item) | ReadWatchEvent::Modified(item) => self.insert(item, now),
-            ReadWatchEvent::Deleted(item) => {
-                self.remove(&key(&item.object.metadata.name, &item.provenance), now);
-                None
-            }
-            ReadWatchEvent::DeletedByName { tombstone, provenance } => {
-                self.remove(&key(&tombstone.name, &provenance), now);
-                None
-            }
+            ReadWatchEvent::Deleted(item) => self.remove(&key(&item.object.metadata.name, &item.provenance), now),
+            ReadWatchEvent::DeletedByName { tombstone, provenance } => self.remove(&key(&tombstone.name, &provenance), now),
         }
     }
 
-    fn insert(&mut self, item: ReadResourceObject<Artifact>, now: DateTime<Utc>) -> Option<String> {
+    fn insert(&mut self, item: ReadResourceObject<Artifact>, now: DateTime<Utc>) {
         let key = key(&item.object.metadata.name, &item.provenance);
         self.remove(&key, now);
         let spec = item.object.spec;
         // Every artifact names a blob: a put and the import both refuse one that does not.
-        let Ok(digest) = BlobDigest::parse(&spec.digest) else { return None };
+        let Ok(digest) = BlobDigest::parse(&spec.digest) else { return };
         let local = key.1.is_none() && !spec.pinned;
         *self.references.entry(digest.clone()).or_default() += 1;
         if let Some(at) = self.collectable.remove(&digest) {
             self.unreferenced.remove(&(at, digest.as_str().to_owned()));
         }
-        let entry = Entry { convoy: spec.convoy, digest, expires_at: local.then_some(spec.expires_at) };
-        let convoy = entry.expires_at.map(|expires_at| {
+        let entry = Entry { digest, expires_at: local.then_some(spec.expires_at) };
+        if let Some(expires_at) = entry.expires_at {
             self.expiry.insert((expires_at, key.0.clone()));
-            self.by_convoy.entry(entry.convoy.clone()).or_default().insert(key.0.clone());
-            entry.convoy.clone()
-        });
+        }
         self.artifacts.insert(key, entry);
-        convoy
     }
 
     fn remove(&mut self, key: &Key, now: DateTime<Utc>) {
         let Some(entry) = self.artifacts.remove(key) else { return };
         if let Some(expires_at) = entry.expires_at {
             self.expiry.remove(&(expires_at, key.0.clone()));
-            if let Some(names) = self.by_convoy.get_mut(&entry.convoy) {
-                names.remove(&key.0);
-                if names.is_empty() {
-                    self.by_convoy.remove(&entry.convoy);
-                }
-            }
         }
         let Some(count) = self.references.get_mut(&entry.digest) else { return };
         *count -= 1;
@@ -126,16 +106,6 @@ impl Retention {
     /// This home's unpinned artifacts expired at `now`.
     pub(crate) fn expired(&self, now: DateTime<Utc>) -> Vec<String> {
         self.expiry.iter().take_while(|(expires_at, _)| *expires_at <= now).map(|(_, name)| name.clone()).collect()
-    }
-
-    /// This home's unpinned artifacts of `convoy`.
-    pub(crate) fn of_convoy(&self, convoy: &str) -> Vec<String> {
-        self.by_convoy.get(convoy).into_iter().flatten().cloned().collect()
-    }
-
-    /// The convoys this home holds unpinned artifacts of.
-    pub(crate) fn convoys(&self) -> impl Iterator<Item = &str> {
-        self.by_convoy.keys().map(String::as_str)
     }
 
     /// The blobs no artifact references whose grace has passed at `now`.
