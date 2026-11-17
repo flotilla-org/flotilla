@@ -1,20 +1,33 @@
 //! When the stall judge runs (#3108): on the changes that can move a convoy's judgement, and at
 //! the next instant one turns on time. Nothing is judged on a timer, and a pass judges only the
 //! convoys that changed or are due.
+//!
+//! A crew session's own facts, its AgentSession reading and its seat's messages, are held between
+//! passes and read again only on that session's own changes or when one of its deadlines comes
+//! due. A convoy judged for any reason composes its seats' judgements from the facts held, so a
+//! wake reads only the session it is about.
 
 use std::collections::{BTreeSet, HashMap, HashSet};
 
 use chrono::{DateTime, Utc};
 use flotilla_messaging::SeatMessage;
+use flotilla_resources::agent_activity::AgentActivityView;
 
 /// How long after a failed write or withdrawal its convoy is judged again.
 pub(super) const RETRY_AFTER: chrono::Duration = chrono::Duration::seconds(30);
 
+/// An AgentSession as the judge reads it: its name, and the other home it is homed at.
+pub(super) type SessionKey = (String, Option<String>);
+
 /// What one judgement found it waits on besides the changes: the earliest instant a judgement
-/// turns on time, and the other homes whose silence left a reading unjudged.
+/// of the convoy turns on time, the instant each of its sessions' does, and the other homes whose
+/// silence left a reading unjudged.
 #[derive(Debug, Default)]
 pub(super) struct Waits {
     pub(super) due: Option<DateTime<Utc>>,
+    pub(super) sessions: HashMap<SessionKey, DateTime<Utc>>,
+    /// The sessions the judgement read.
+    pub(super) read: HashSet<SessionKey>,
     pub(super) unheard: BTreeSet<String>,
 }
 
@@ -22,16 +35,16 @@ impl Waits {
     pub(super) fn due(&mut self, at: DateTime<Utc>) {
         self.due = Some(self.due.map_or(at, |due| due.min(at)));
     }
+
+    pub(super) fn session_due(&mut self, session: &SessionKey, at: DateTime<Utc>) {
+        self.sessions.entry(session.clone()).and_modify(|due| *due = (*due).min(at)).or_insert(at);
+    }
 }
 
-/// What a convoy's seats' messages are read for: its crew seats, and the turns its status names
-/// with the seat each went to.
-pub(super) type SeatQuery = (Vec<String>, Vec<(String, String)>);
-
-/// A convoy's seats' messages as last read, with what they were read for.
+/// A seat's messages as last read, with the turns they were read for.
 #[derive(Debug)]
 struct Standings {
-    query: SeatQuery,
+    turns: Vec<String>,
     messages: Vec<SeatMessage>,
 }
 
@@ -43,14 +56,19 @@ pub(super) struct StallSchedule {
     every_changed: bool,
     /// The convoys whose inputs changed since they were last judged.
     changed: HashSet<String>,
-    /// Every convoy's seats' messages are to be read again.
-    every_unread: bool,
-    /// The convoys whose seats' messages changed since they were last read.
-    unread: HashSet<String>,
-    /// Each judged convoy's seats' messages, as last read.
+    /// Each seat's messages as last read, by the seat. A change to its inbox drops them.
     standings: HashMap<String, Standings>,
+    /// The seats each judged convoy's messages were last read for.
+    seats: HashMap<String, BTreeSet<String>>,
+    /// Each session's reading as last read; none where it has none. A change to the session, or
+    /// hearing from its home, drops it.
+    readings: HashMap<SessionKey, Option<AgentActivityView>>,
+    /// The sessions each judged convoy last read.
+    readers: HashMap<String, HashSet<SessionKey>>,
     /// When each convoy's judgement next turns on time.
     due: HashMap<String, DateTime<Utc>>,
+    /// When each session's judgement next turns on time, by the convoy that judged it.
+    session_due: HashMap<String, HashMap<SessionKey, DateTime<Utc>>>,
     /// When the namespace's own steps are tried again after a failure.
     retry: Option<DateTime<Utc>>,
     /// The convoys another home's silence left unjudged, by that home.
@@ -64,15 +82,17 @@ pub(super) struct StallSchedule {
 }
 
 impl Default for StallSchedule {
-    /// Nothing judged yet: every convoy is changed and unread.
+    /// Nothing judged yet: every convoy is changed, and nothing is held.
     fn default() -> Self {
         Self {
             every_changed: true,
             changed: HashSet::new(),
-            every_unread: true,
-            unread: HashSet::new(),
             standings: HashMap::new(),
+            seats: HashMap::new(),
+            readings: HashMap::new(),
+            readers: HashMap::new(),
             due: HashMap::new(),
+            session_due: HashMap::new(),
             retry: None,
             unheard: HashMap::new(),
             charter: true,
@@ -98,18 +118,29 @@ impl StallSchedule {
         self.charter = true;
     }
 
-    /// Messages to the seats of `names` changed, or to any seat for `None`.
-    pub(super) fn messages_changed(&mut self, names: Option<&HashSet<String>>) {
-        match names {
-            Some(names) => {
-                self.unread.extend(names.iter().cloned());
-                self.changed.extend(names.iter().cloned());
-            }
-            None => {
-                self.every_unread = true;
-                self.every_changed = true;
-            }
-        }
+    /// Messages in `inboxes` changed: the seats they hold are read again, and the convoys
+    /// `names` judged.
+    pub(super) fn inboxes_changed(&mut self, inboxes: &BTreeSet<flotilla_address::Address>, names: &HashSet<String>) {
+        // A seat with no inbox holds no message, so no change is to it.
+        self.standings.retain(|seat, _| flotilla_resources::convoy::engine::role_inbox(seat).is_ok_and(|inbox| !inboxes.contains(&inbox)));
+        self.changed.extend(names.iter().cloned());
+    }
+
+    /// Any seat's messages may have changed: every seat is read again.
+    pub(super) fn messages_rescanned(&mut self) {
+        self.standings.clear();
+        self.every_changed = true;
+    }
+
+    /// Session `session` changed: its reading is read again.
+    pub(super) fn session_changed(&mut self, session: &SessionKey) {
+        self.readings.remove(session);
+    }
+
+    /// Any session may have changed: every reading is read again, and every convoy judged.
+    pub(super) fn sessions_rescanned(&mut self) {
+        self.readings.clear();
+        self.every_changed = true;
     }
 
     /// The charter notifications' inputs changed.
@@ -117,46 +148,66 @@ impl StallSchedule {
         self.charter = true;
     }
 
-    /// Home `origin` was heard from: the convoys its silence left unjudged are judged again.
+    /// Home `origin` was heard from: its sessions' readings are read again, and the convoys its
+    /// silence left unjudged judged again.
     pub(super) fn heard(&mut self, origin: &str) {
+        self.readings.retain(|(_, home), _| home.as_deref() != Some(origin));
         if let Some(names) = self.unheard.remove(origin) {
             self.changed.extend(names);
         }
     }
 
-    /// The earliest instant a convoy or the namespace is due.
+    /// The earliest instant a convoy, one of its sessions or the namespace is due.
     pub(super) fn next_due(&self) -> Option<DateTime<Utc>> {
-        self.due.values().copied().chain(self.retry).min()
+        self.due.values().chain(self.session_due.values().flat_map(HashMap::values)).copied().chain(self.retry).min()
     }
 
     /// Takes the convoys of `held` to judge at `now`: those changed since they were last judged
-    /// and those due. Whether the namespace's own steps are due goes with them.
+    /// and those due, themselves or by one of their sessions. A session due is read again.
+    /// Whether the namespace's own steps are due goes with them.
     /// `held` maps each convoy held here to whether it has ended.
     pub(super) fn take(&mut self, held: &HashMap<&String, bool>, now: DateTime<Utc>) -> Pass {
         // A change that names no convoy passes by the ended ones already judged since they ended:
         // their seats are gone, so nothing they hold can move.
-        let every = || held.iter().filter(|(name, ended)| !**ended || !self.ended_judged.contains(**name)).map(|(name, _)| (*name).clone());
         if std::mem::take(&mut self.every_changed) {
-            let every: Vec<String> = every().collect();
+            let every: Vec<String> = held
+                .iter()
+                .filter(|(name, ended)| !**ended || !self.ended_judged.contains(**name))
+                .map(|(name, _)| (*name).clone())
+                .collect();
             self.changed.extend(every);
         }
-        if std::mem::take(&mut self.every_unread) {
-            let every: Vec<String> = every().collect();
-            self.unread.extend(every);
-        }
-        // A convoy no longer held here is judged no more.
+        // A convoy no longer held here is judged no more, and what it alone held goes.
         self.changed.retain(|name| held.contains_key(name));
-        self.unread.retain(|name| held.contains_key(name));
-        self.standings.retain(|name, _| held.contains_key(name));
         self.due.retain(|name, _| held.contains_key(name));
+        self.session_due.retain(|name, _| held.contains_key(name));
         self.seen.retain(|name| held.contains_key(name));
         self.ended_judged.retain(|name| held.get(name) == Some(&true));
+        if self.seats.len() != self.seats.iter().filter(|(name, _)| held.contains_key(name)).count() {
+            self.seats.retain(|name, _| held.contains_key(name));
+            let seats: HashSet<&String> = self.seats.values().flatten().collect();
+            self.standings.retain(|seat, _| seats.contains(seat));
+        }
+        if self.readers.len() != self.readers.iter().filter(|(name, _)| held.contains_key(name)).count() {
+            self.readers.retain(|name, _| held.contains_key(name));
+            let read: HashSet<&SessionKey> = self.readers.values().flatten().collect();
+            self.readings.retain(|session, _| read.contains(session));
+        }
         let due: Vec<String> = self.due.iter().filter(|(_, at)| **at <= now).map(|(name, _)| name.clone()).collect();
         for name in &due {
             self.due.remove(name);
         }
         let mut judged = std::mem::take(&mut self.changed);
         judged.extend(due);
+        for (name, sessions) in &mut self.session_due {
+            let due: Vec<SessionKey> = sessions.iter().filter(|(_, at)| **at <= now).map(|(session, _)| session.clone()).collect();
+            for session in due {
+                sessions.remove(&session);
+                self.readings.remove(&session);
+                judged.insert(name.clone());
+            }
+        }
+        self.session_due.retain(|_, sessions| !sessions.is_empty());
         let retry = self.retry.is_some_and(|at| at <= now);
         if retry {
             self.retry = None;
@@ -179,21 +230,47 @@ impl StallSchedule {
         self.charter |= pass.charter;
     }
 
-    /// Whether `name`'s seats' messages are to be read for `query`: they changed since they were
-    /// last read, or that read asked for other seats or turns.
-    pub(super) fn unread(&self, name: &str, query: &SeatQuery) -> bool {
-        self.unread.contains(name) || self.standings.get(name).is_none_or(|held| &held.query != query)
+    /// Whether `seat`'s messages are to be read for `turns`: they changed since they were last
+    /// read, or that read asked for other turns.
+    pub(super) fn unread(&self, seat: &str, turns: &[String]) -> bool {
+        self.standings.get(seat).is_none_or(|held| held.turns != turns)
     }
 
-    /// `name`'s seats' messages, as just read for `query`.
-    pub(super) fn read(&mut self, name: &str, query: SeatQuery, messages: Vec<SeatMessage>) {
-        self.unread.remove(name);
-        self.standings.insert(name.to_owned(), Standings { query, messages });
+    /// `seat`'s messages, as just read for `turns`.
+    pub(super) fn read(&mut self, seat: &str, turns: Vec<String>, messages: Vec<SeatMessage>) {
+        self.standings.insert(seat.to_owned(), Standings { turns, messages });
+    }
+
+    /// Convoy `name`'s messages are read for `seats`; the seats it no longer has are dropped.
+    pub(super) fn seats(&mut self, name: &str, seats: BTreeSet<String>) {
+        if let Some(gone) = self.seats.insert(name.to_owned(), seats) {
+            let seats = &self.seats[name];
+            for seat in gone.iter().filter(|seat| !seats.contains(*seat)) {
+                self.standings.remove(seat);
+            }
+        }
     }
 
     /// The messages to the seats of `judged`, as last read.
     pub(super) fn standings<'a>(&self, judged: impl Iterator<Item = &'a String>) -> Vec<SeatMessage> {
-        judged.filter_map(|name| self.standings.get(name)).flat_map(|held| held.messages.iter().cloned()).collect()
+        judged
+            .filter_map(|name| self.seats.get(name))
+            .flatten()
+            .filter_map(|seat| self.standings.get(seat))
+            .flat_map(|held| held.messages.iter().cloned())
+            .collect()
+    }
+
+    /// The sessions' readings held, for a pass to read from and add to.
+    pub(super) fn take_readings(&mut self) -> HashMap<SessionKey, Option<AgentActivityView>> {
+        std::mem::take(&mut self.readings)
+    }
+
+    /// The sessions' readings after a pass, those no judged convoy read since dropped.
+    pub(super) fn hold_readings(&mut self, mut readings: HashMap<SessionKey, Option<AgentActivityView>>) {
+        let read: HashSet<&SessionKey> = self.readers.values().flatten().collect();
+        readings.retain(|session, _| read.contains(session));
+        self.readings = readings;
     }
 
     /// What judging `name` found it waits on.
@@ -204,6 +281,12 @@ impl StallSchedule {
         if let Some(at) = waits.due {
             self.due.insert(name.to_owned(), at);
         }
+        if waits.sessions.is_empty() {
+            self.session_due.remove(name);
+        } else {
+            self.session_due.insert(name.to_owned(), waits.sessions);
+        }
+        self.readers.insert(name.to_owned(), waits.read);
     }
 
     /// What the namespace's own steps found they wait on: a retry after a failure.
@@ -249,6 +332,10 @@ mod tests {
         names.iter().map(|name| (name, false)).collect()
     }
 
+    fn session(name: &str) -> SessionKey {
+        (name.to_owned(), None)
+    }
+
     #[test]
     fn a_pass_takes_the_changed_and_the_due_and_nothing_else() {
         let now = Utc::now();
@@ -258,7 +345,7 @@ mod tests {
         // The first pass judges every convoy, once.
         assert_eq!(schedule.take(&held, now).judged, held_names);
         assert!(schedule.take(&held, now).is_empty());
-        schedule.waits("b", Waits { due: Some(now + chrono::Duration::seconds(5)), unheard: BTreeSet::new() });
+        schedule.waits("b", Waits { due: Some(now + chrono::Duration::seconds(5)), ..Waits::default() });
         schedule.changed(Some(&names(&["a", "gone"])));
         assert_eq!(schedule.next_due(), Some(now + chrono::Duration::seconds(5)));
         assert_eq!(schedule.take(&held, now).judged, names(&["a"]));
@@ -273,7 +360,7 @@ mod tests {
         let held = live(&held_names);
         let mut schedule = StallSchedule::default();
         schedule.take(&held, now);
-        schedule.waits("a", Waits { due: None, unheard: BTreeSet::from(["other".to_owned()]) });
+        schedule.waits("a", Waits { unheard: BTreeSet::from(["other".to_owned()]), ..Waits::default() });
         schedule.heard("elsewhere");
         assert!(schedule.take(&held, now).is_empty());
         schedule.heard("other");
@@ -298,5 +385,60 @@ mod tests {
         // A change that names an ended convoy still judges it.
         schedule.changed(Some(&names(&["ended"])));
         assert_eq!(schedule.take(&held, now).judged, names(&["ended"]));
+    }
+
+    // A session's deadline judges its convoy and reads that session again; the convoy's other
+    // sessions' readings stay held, and its own deadline is left as it was.
+    #[test]
+    fn a_session_due_reads_only_that_session_again() {
+        let now = Utc::now();
+        let held_names = names(&["a"]);
+        let held = live(&held_names);
+        let mut schedule = StallSchedule::default();
+        schedule.take(&held, now);
+        let mut readings = schedule.take_readings();
+        readings.insert(session("coder"), None);
+        readings.insert(session("reviewer"), None);
+        let mut waits = Waits { due: Some(now + chrono::Duration::seconds(60)), ..Waits::default() };
+        waits.read = HashSet::from([session("coder"), session("reviewer")]);
+        waits.session_due(&session("coder"), now + chrono::Duration::seconds(10));
+        waits.session_due(&session("coder"), now + chrono::Duration::seconds(5));
+        schedule.waits("a", waits);
+        schedule.hold_readings(readings);
+        assert_eq!(schedule.next_due(), Some(now + chrono::Duration::seconds(5)));
+        assert!(schedule.take(&held, now + chrono::Duration::seconds(4)).is_empty());
+        assert_eq!(schedule.take(&held, now + chrono::Duration::seconds(5)).judged, names(&["a"]));
+        let readings = schedule.take_readings();
+        assert!(!readings.contains_key(&session("coder")), "the due session was not read again");
+        assert!(readings.contains_key(&session("reviewer")), "a session not due was read again");
+        assert_eq!(schedule.next_due(), Some(now + chrono::Duration::seconds(60)));
+    }
+
+    // A reading no judged convoy read any more is not held.
+    #[test]
+    fn a_reading_no_convoy_reads_is_dropped() {
+        let now = Utc::now();
+        let held_names = names(&["a", "b"]);
+        let held = live(&held_names);
+        let mut schedule = StallSchedule::default();
+        schedule.take(&held, now);
+        let mut readings = schedule.take_readings();
+        readings.insert(session("a-old"), None);
+        readings.insert(session("b"), None);
+        schedule.waits("a", Waits { read: HashSet::from([session("a-old")]), ..Waits::default() });
+        schedule.waits("b", Waits { read: HashSet::from([session("b")]), ..Waits::default() });
+        schedule.hold_readings(readings);
+        // `a` relaunched its seat: it reads another session now.
+        schedule.waits("a", Waits { read: HashSet::from([session("a-new")]), ..Waits::default() });
+        let mut readings = schedule.take_readings();
+        readings.insert(session("a-new"), None);
+        schedule.hold_readings(readings);
+        let readings = schedule.take_readings();
+        assert_eq!(readings.keys().cloned().collect::<HashSet<_>>(), HashSet::from([session("a-new"), session("b")]));
+        schedule.hold_readings(readings);
+        // `b` is held here no more.
+        let held_names = names(&["a"]);
+        schedule.take(&live(&held_names), now);
+        assert_eq!(schedule.take_readings().keys().cloned().collect::<HashSet<_>>(), HashSet::from([session("a-new")]));
     }
 }

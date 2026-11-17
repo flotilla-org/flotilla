@@ -2,6 +2,7 @@
 //! time, never on a timer (#3108): driven through the leaf engine's own loop under paused time.
 
 use super::*;
+use crate::leaf_engine::stalls::TURN_INACTIVITY_BOUND;
 use flotilla_messaging::{AdmittedMessage, EngineMessages, InboxChange, MessageResolution, SeatMessage, SentMessage, StallOf};
 use flotilla_resources::Clock as _;
 use flotilla_store::controller::WorkQueueSender;
@@ -13,11 +14,13 @@ struct CountedMessages {
     calls: std::sync::Mutex<BTreeMap<&'static str, usize>>,
     /// The seats each settling of stalls was asked about.
     settled: std::sync::Mutex<Vec<Vec<String>>>,
+    /// The seats each read of seats' messages asked for.
+    standings: std::sync::Mutex<Vec<Vec<String>>>,
 }
 
 impl CountedMessages {
     fn over(inner: Arc<dyn EngineMessages>) -> Arc<Self> {
-        Arc::new(Self { inner, calls: Default::default(), settled: Default::default() })
+        Arc::new(Self { inner, calls: Default::default(), settled: Default::default(), standings: Default::default() })
     }
 
     fn count(&self, call: &'static str) {
@@ -81,6 +84,7 @@ impl EngineMessages for CountedMessages {
         named: &[(String, String)],
     ) -> Result<Vec<SeatMessage>, ResourceError> {
         self.count("seat_standings");
+        self.standings.lock().expect("standings").push(receivers.to_vec());
         self.inner.seat_standings(namespace, receivers, named).await
     }
     async fn sent_messages(&self, namespace: &str, named: &[(String, String)]) -> Result<Vec<SentMessage>, ResourceError> {
@@ -317,4 +321,111 @@ async fn a_lagged_feed_judges_every_live_launch_once() {
     let calls = messages.calls();
     elapse(60, &loop_task).await;
     assert_eq!(messages.calls(), calls, "the judge kept judging after the fallback");
+}
+
+// A change to one crew member's session reads only that session again, and a message to one
+// seat reads only that seat's messages: the launch's other seat is judged from what is held of it.
+#[tokio::test(start_paused = true)]
+async fn a_seat_change_reads_only_that_seat() {
+    let mut workflow = supervised_workflow();
+    let mut reviewer = workflow.vessels[0].crew[0].clone();
+    reviewer.role = "reviewer".into();
+    workflow.vessels[0].crew.push(reviewer);
+    let case = supervised_case(workflow, &[]).await;
+    case.note(|status| status.stalls.clear()).await;
+    resume_coder(&case);
+    case.home.session(&case.vessel, "reviewer", "reviewer-session", "env");
+    let (coder, reviewer) = (case.launch("resumed-coder"), case.launch("reviewer-session"));
+    let reviewer_seat = flotilla_resources::crew_role_address("wheelhouse", &case.work, "work", "reviewer");
+    let messages = CountedMessages::over(case.home.message_path().get().cloned().expect("the Message path"));
+    let (wake, clock) = paused_wake(&case.backend, &case.home, messages.path(), case.delivery.clone()).await;
+    for session in ["resumed-coder", "reviewer-session"] {
+        observe_agent(&case.home, session, TerminalAttentionState::Working, TerminalAttentionSource::Hook, clock.now());
+    }
+    let agents = Arc::clone(&case.home.agents);
+    let loop_task = run(&wake);
+    elapse(2, &loop_task).await;
+    let reads = (agents.reads(&coder), agents.reads(&reviewer));
+    assert!(reads.0 > 0 && reads.1 > 0, "the seats' sessions were never read: {reads:?}");
+    let standings = || messages.standings.lock().expect("standings").clone();
+    let read = standings();
+    assert!(read.iter().any(|seats| seats.contains(&reviewer_seat)), "the seats' messages were never read: {read:?}");
+
+    observe_agent(&case.home, "resumed-coder", TerminalAttentionState::Idle, TerminalAttentionSource::Hook, clock.now());
+    elapse(1, &loop_task).await;
+    assert!(agents.reads(&coder) > reads.0, "the changed session was not read again");
+    assert_eq!(agents.reads(&reviewer), reads.1, "the unchanged session was read again");
+    assert_eq!(standings(), read, "messages none of which changed were read again");
+
+    let reads = (agents.reads(&coder), agents.reads(&reviewer));
+    let inbox = flotilla_resources::convoy::engine::role_inbox(&reviewer_seat).expect("the reviewer's inbox");
+    let operator = flotilla_engine_messages_testkit::party("project:wheelhouse/role:operator");
+    let mut spec = flotilla_messaging::Intent::new(operator, inbox, flotilla_resources::MessageRelation::Supervisor, "Review the plan.");
+    spec.principal = Some("implicit".into());
+    case.home.messages.primitives().admit("note-to-reviewer", &spec).await.expect("message accepted");
+    elapse(1, &loop_task).await;
+    let after = standings();
+    assert_eq!(after.len(), read.len() + 1, "the seat's new message was not read: {after:?}");
+    assert_eq!(after.last().expect("a read"), &vec![reviewer_seat], "seats whose messages did not change were read");
+    assert_eq!((agents.reads(&coder), agents.reads(&reviewer)), reads, "a message read the sessions again");
+}
+
+// A working turn's tool calls, which only this daemon's memory holds, are read when its
+// inactivity bound comes due: a turn that kept calling tools is not stalled then, and is once it
+// has been silent for the bound since.
+#[tokio::test(start_paused = true)]
+async fn a_turn_bound_reads_its_session_again_when_due() {
+    let case = idle_nudge_scenario().await;
+    let messages = CountedMessages::over(case.home.message_path().get().cloned().expect("the Message path"));
+    let (wake, clock) = paused_wake(&case.backend, &case.home, messages.path(), case.delivery.clone()).await;
+    observe_agent(&case.home, "resumed-coder", TerminalAttentionState::Working, TerminalAttentionSource::Hook, clock.now());
+    let loop_task = run(&wake);
+    elapse(2, &loop_task).await;
+    let half = (TURN_INACTIVITY_BOUND.num_seconds() / 2) as u64;
+    elapse(half, &loop_task).await;
+    case.home.agents.progress.tool("resumed-coder", clock.now());
+    let inactive = || async { case.status().await.stalls.iter().any(|stall| stall.evidence.starts_with("turn inactivity bound exceeded")) };
+    elapse(half + 5, &loop_task).await;
+    assert!(!inactive().await, "a turn that called a tool was judged silent: {:?}", case.status().await.stalls);
+    elapse(half + 5, &loop_task).await;
+    assert!(inactive().await, "a turn silent for the bound was not judged so: {:?}", case.status().await.stalls);
+}
+
+// A supervisor at work on another home is judged from that home's reading while the home is
+// heard from. With nothing else changing, its reading is judged again the moment it stops being
+// current, and again when the home is heard from once more.
+#[tokio::test(start_paused = true)]
+async fn another_homes_reading_is_judged_when_it_goes_stale_and_when_its_home_is_heard() {
+    let case = project_supervision_case(&[]).await;
+    // The governor is another daemon's, its log heard here.
+    let remote_backend = ResourceBackend::new(InMemoryBackend::default());
+    let remote = EngineHome::install(&remote_backend, "flotilla", "remote");
+    super::stalls_supervision::governor_at(&remote, "governor", Some("wheelhouse-governor"), 1).await;
+    flotilla_provisioning_testkit::replicate_home(remote.service(), "remote", case.home.service());
+    let governor = remote.engine.terminals.record("governor-1-governor").name;
+    let (wake, clock) = paused_wake(&case.backend, &case.home, case.home.message_path(), case.delivery.clone()).await;
+    let agents = Arc::clone(&case.home.agents);
+    agents.observe(&governor, flotilla_protocol::AgentActivity::Working, "hook", clock.now());
+    let heard_at = clock.now();
+    agents.heard("remote", heard_at, Arc::clone(&clock) as Arc<dyn flotilla_resources::Clock>);
+    let loop_task = run(&wake);
+    elapse(2, &loop_task).await;
+    let supervisor_row = wake
+        .subscriptions
+        .rows()
+        .await
+        .into_iter()
+        .find(|row| matches!(row.maker, LeafMaker::Supervisor { .. }))
+        .expect("the stall is supervised by the remote governor")
+        .id;
+    let reported = || async { wake.subscriptions.inner.stale_attention_reported.lock().await.contains(&supervisor_row) };
+    assert!(!reported().await, "a current reading was reported stale");
+    let stale_in = flotilla_resources::agent_activity::HOME_HEARD_WITHIN.num_seconds() as u64;
+    elapse(stale_in - 4, &loop_task).await;
+    assert!(!reported().await, "the reading was reported stale before its home fell silent");
+    elapse(4, &loop_task).await;
+    assert!(reported().await, "the reading was not judged when its home fell silent");
+    agents.heard("remote", clock.now(), Arc::clone(&clock) as Arc<dyn flotilla_resources::Clock>);
+    elapse(1, &loop_task).await;
+    assert!(!reported().await, "the reading was not judged again when its home was heard from");
 }

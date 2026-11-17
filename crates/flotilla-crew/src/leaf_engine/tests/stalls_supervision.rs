@@ -104,7 +104,7 @@ async fn coder_promise(case: &Case, number: u64, state: PromiseState) {
 /// Launches generation `generation` of wheelhouse's governor role at `home`, as `name`, its
 /// `govern` vessel crewed by a governor at work; returns the launch. With `ensure`, the launch is
 /// a generation of the standing role ensured from it.
-async fn governor_at(home: &EngineHome, name: &str, ensure: Option<&str>, generation: u64) -> String {
+pub(super) async fn governor_at(home: &EngineHome, name: &str, ensure: Option<&str>, generation: u64) -> String {
     let spec = ConvoySpec::builder()
         .workflow_ref("workflow".into())
         .project_ref("wheelhouse".into())

@@ -71,3 +71,60 @@ fn a_fresh_hook_stands_over_a_disagreeing_screen_read_except_input_and_renewed_w
     assert!(sessions.observe_screen("late", Activity::Idle, at(stands)).unwrap());
     assert_eq!(current(&primitives, "late"), Some((Activity::Idle, SCREEN_CAUSE.to_owned())));
 }
+
+// Another home's AgentSession reads as current until that home has been silent too long, and says
+// when that is; hearing from the home again is a change its readers are told of.
+#[tokio::test]
+async fn another_homes_session_is_current_until_its_home_falls_silent() {
+    use flotilla_resources::agent_activity::{AgentSessionChange, AgentSessionReads, ProgressFacts, HOME_HEARD_WITHIN};
+    use futures::StreamExt;
+
+    let open = |dir: &tempfile::TempDir, home: &str| {
+        Arc::new(
+            Service::open(&dir.path().join("decided.sqlite"), home, flotilla_engine_store::registry().expect("registry")).expect("store"),
+        )
+    };
+    let (here_dir, there_dir) = (tempfile::tempdir().expect("tempdir"), tempfile::tempdir().expect("tempdir"));
+    let (here, there) = (open(&here_dir, HOME), open(&there_dir, "home-b"));
+    let backend = EngineBackend::open("home-b");
+    let writer = Served::holding(
+        MessagePrimitives::open("home-b", Arc::clone(&there), backend.backend.clone(), Arc::new(SystemClock)).expect("primitives"),
+        backend,
+    );
+    let start = at(0).to_datetime().expect("a time");
+    let clock = Arc::new(flotilla_store_testkit::VirtualClock::new(start));
+    let reads = flotilla_core::in_process::DecidedAgentSessions::new(
+        Arc::clone(&here),
+        Arc::clone(&clock) as Arc<dyn flotilla_resources::Clock>,
+        Arc::new(ProgressFacts::new(start)),
+    );
+    let mut changes = reads.changes().expect("changes");
+    // Waits until the readers are told home-b was heard from.
+    async fn until_heard(changes: &mut futures::stream::BoxStream<'static, AgentSessionChange>) {
+        loop {
+            let change = tokio::time::timeout(std::time::Duration::from_secs(10), changes.next()).await;
+            if matches!(change.expect("told in time").expect("a change"), AgentSessionChange::Heard { origin } if origin == "home-b") {
+                return;
+            }
+        }
+    }
+
+    writer.sessions().observe_screen("agent", Activity::Working, at(0)).expect("observe");
+    flotilla_provisioning_testkit::replicate_home_at(&there, "home-b", &here, start);
+    until_heard(&mut changes).await;
+    let view = reads.read("agent", Some("home-b")).expect("read").expect("held");
+    assert!(view.current);
+    assert_eq!(view.stale_at, Some(start + HOME_HEARD_WITHIN));
+
+    clock.set(start + HOME_HEARD_WITHIN);
+    let view = reads.read("agent", Some("home-b")).expect("read").expect("held");
+    assert!(!view.current, "a home silent too long is not current");
+    assert_eq!(view.stale_at, None);
+
+    let again = start + HOME_HEARD_WITHIN + chrono::Duration::seconds(1);
+    flotilla_provisioning_testkit::replicate_home_at(&there, "home-b", &here, again);
+    until_heard(&mut changes).await;
+    let view = reads.read("agent", Some("home-b")).expect("read").expect("held");
+    assert!(view.current, "a home heard from again is current");
+    assert_eq!(view.stale_at, Some(again + HOME_HEARD_WITHIN));
+}

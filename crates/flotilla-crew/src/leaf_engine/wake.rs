@@ -413,6 +413,7 @@ impl ReconcilerWake {
                     }
                 } => match change {
                     Some(flotilla_resources::agent_activity::AgentSessionChange::Changed { name, origin }) => {
+                        schedule.session_changed(&(name.clone(), origin.clone()));
                         let sessions = views.sessions.shared_list().await.map_err(|error| error.to_string())?;
                         let running = sessions.items.iter().filter(|session| {
                             flotilla_resources::terminal_records::launch_of(&session.object) == Some(name.as_str())
@@ -422,7 +423,7 @@ impl ReconcilerWake {
                         self.seats_changed(&mut schedule, &convoy_objects, Some(selected)).await;
                     }
                     Some(flotilla_resources::agent_activity::AgentSessionChange::Heard { origin }) => schedule.heard(&origin),
-                    Some(flotilla_resources::agent_activity::AgentSessionChange::Rescanned) => schedule.changed(None),
+                    Some(flotilla_resources::agent_activity::AgentSessionChange::Rescanned) => schedule.sessions_rescanned(),
                     None => agent_changes = None,
                 },
                 change = inbox_changes.next() => match change {
@@ -432,9 +433,9 @@ impl ReconcilerWake {
                             .flat_map(flotilla_resources::convoy::engine::convoy_records)
                             .filter(|name| convoy_objects.contains_key(name))
                             .collect();
-                        schedule.messages_changed(Some(&selected));
+                        schedule.inboxes_changed(&inboxes, &selected);
                     }
-                    Some(flotilla_messaging::InboxChange::Rescanned) => schedule.messages_changed(None),
+                    Some(flotilla_messaging::InboxChange::Rescanned) => schedule.messages_rescanned(),
                     None => return Err("the Message inbox changes stopped".into()),
                 },
                 changed = project_watch.changed() => {

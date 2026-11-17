@@ -9,7 +9,10 @@ use std::{
 
 use chrono::{DateTime, Utc};
 use flotilla_protocol::{AgentActivity, AgentSessionEnd, AgentSessionReading};
-use flotilla_resources::agent_activity::{AgentActivityView, AgentSessionChange, AgentSessionReads, ProgressFacts};
+use flotilla_resources::agent_activity::{
+    home_current, home_stale_at, AgentActivityView, AgentSessionChange, AgentSessionReads, ProgressFacts,
+};
+use flotilla_resources::{Clock, SystemClock};
 use futures::StreamExt;
 use tokio::sync::broadcast;
 
@@ -19,16 +22,42 @@ pub struct AgentSessionsFixture {
     /// What this home's daemon has seen of its sessions' progress.
     pub progress: Arc<ProgressFacts>,
     changes: broadcast::Sender<AgentSessionChange>,
+    /// When each other home whose silence a test plays was last heard from.
+    heard: Mutex<HashMap<String, DateTime<Utc>>>,
+    /// The clock those homes' readings are judged current by.
+    clock: Mutex<Arc<dyn Clock>>,
+    /// How many times each session was read.
+    reads: Mutex<HashMap<String, usize>>,
 }
 
 impl AgentSessionsFixture {
+    /// How many times session `name` has been read.
+    pub fn reads(&self, name: &str) -> usize {
+        self.reads.lock().expect("reads").get(name).copied().unwrap_or_default()
+    }
+
     /// No sessions, watching progress from `watched_from`.
     pub fn new(watched_from: DateTime<Utc>) -> Self {
         Self::holding(HashMap::new(), watched_from)
     }
 
     fn holding(sessions: HashMap<String, AgentSessionReading>, watched_from: DateTime<Utc>) -> Self {
-        Self { sessions: Mutex::new(sessions), progress: Arc::new(ProgressFacts::new(watched_from)), changes: broadcast::channel(64).0 }
+        Self {
+            sessions: Mutex::new(sessions),
+            progress: Arc::new(ProgressFacts::new(watched_from)),
+            changes: broadcast::channel(64).0,
+            heard: Mutex::default(),
+            clock: Mutex::new(Arc::new(SystemClock)),
+            reads: Mutex::default(),
+        }
+    }
+
+    /// Home `home` was heard from at `at`, its readings judged current by `clock` from now on:
+    /// they stop being current once it has been silent too long, until it is heard from again.
+    pub fn heard(&self, home: &str, at: DateTime<Utc>, clock: Arc<dyn Clock>) {
+        self.heard.lock().expect("heard homes").insert(home.to_owned(), at);
+        *self.clock.lock().expect("clock") = clock;
+        let _ = self.changes.send(AgentSessionChange::Heard { origin: home.to_owned() });
     }
 
     fn changed(&self, name: &str) {
@@ -78,12 +107,22 @@ impl AgentSessionsFixture {
 }
 
 impl AgentSessionReads for AgentSessionsFixture {
-    /// Every home is heard from; only this home's sessions carry progress.
+    /// Every home is heard from, but one [`Self::heard`] names, whose readings are current until
+    /// it falls silent; only this home's sessions carry progress.
     fn read(&self, name: &str, origin: Option<&str>) -> Result<Option<AgentActivityView>, String> {
+        *self.reads.lock().expect("reads").entry(name.to_owned()).or_default() += 1;
         let reading = self.sessions.lock().expect("agent sessions").get(name).cloned();
         // Progress is kept by session, as the daemon keeps it.
         let progress = origin.is_none().then(|| self.progress.get(flotilla_resources::terminal_records::launched(name)));
-        Ok(reading.map(|reading| AgentActivityView { reading, current: true, stale_at: None, progress }))
+        let heard = origin.and_then(|origin| self.heard.lock().expect("heard homes").get(origin).copied());
+        let (current, stale_at) = match heard {
+            Some(at) => {
+                let current = home_current(Some(at), self.clock.lock().expect("clock").now());
+                (current, current.then(|| home_stale_at(at)))
+            }
+            None => (true, None),
+        };
+        Ok(reading.map(|reading| AgentActivityView { reading, current, stale_at, progress }))
     }
 
     fn changes(&self) -> Result<futures::stream::BoxStream<'static, AgentSessionChange>, String> {
