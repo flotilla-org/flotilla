@@ -169,6 +169,69 @@ async fn a_handoff_passes_a_given_up_launch_for_its_relaunch() {
     crew.handoff(&context, &target, "review this").await.expect("the relaunch's live session holds the role");
 }
 
+// Behaviour: a handoff no holder will come for is refused, and its sender's seat stalls with the
+// refusal as its report (source Crew, reason Other), so the sender's supervision hears of it.
+#[tokio::test]
+async fn a_handoff_no_holder_will_come_for_stalls_its_sender() {
+    use flotilla_provisioning_testkit::TerminalsFixture;
+
+    let (crew, backend, _probe, held) = shaped_fixture(CrewWorkPhase::Working, with_review(false)).await;
+    let engine = &held.engine;
+    let reviewer = engine.vessel(&held.launch, "review", "resume-env");
+    let gave_up = engine.engine.terminals.request(&TerminalsFixture::agent(&reviewer, "reviewer", "resume-env"));
+    engine.engine.terminals.give_up(&gave_up, "provider registry unavailable for environment resume-env");
+    let context = CrewCommandContext::builder().convoy(held.launch.clone()).vessel_ref(held.vessel.clone()).role("coder".into()).build();
+    let target = format!("{}/review/reviewer", held.launch);
+    let error = crew.handoff(&context, &target, "review this").await.expect_err("no holder will come");
+    assert!(error.contains("failed provisioning and cannot be revived"), "{error}");
+
+    let status = held.convoy(&backend).await.status.expect("status");
+    assert_eq!(status.crew_work["work"]["coder"].phase, CrewWorkPhase::Stalled);
+    let stalled = status.stalled.expect("the sender's stall");
+    assert_eq!(stalled.source, flotilla_resources::StallEvidenceSource::Crew);
+    assert_eq!(stalled.reason, Some(flotilla_protocol::StallReason::Other));
+    assert!(stalled.leaves.iter().any(|leaf| leaf.field_path == ".crew.coder.phase"), "{stalled:?}");
+    assert!(stalled.evidence.contains("cannot be delivered") && stalled.evidence.contains(&error), "{}", stalled.evidence);
+}
+
+// Behaviour: a system turn no holder will come for goes to the operator: a turn-rules turn to a
+// crew whose work is done and that holds no session relaunches nothing, so it is refused, and the
+// operator is told once however often the rule fires.
+#[tokio::test]
+async fn a_system_turn_no_holder_will_come_for_tells_the_operator() {
+    let (crew, backend, _probe, held) = shaped_fixture(CrewWorkPhase::Working, with_review(true)).await;
+    held.engine.keep(&backend, &held.launch, "review", "reviewer").await;
+    assert_eq!(held.convoy(&backend).await.status.expect("status").crew_work["review"]["reviewer"].phase, CrewWorkPhase::Done);
+    let request = crate::leaf_engine::CrewTurnIntent::builder()
+        .namespace("flotilla".into())
+        .convoy(held.launch.clone())
+        .source("review".into())
+        .vessel("review".into())
+        .role("reviewer".into())
+        .brief("address review".into())
+        .subject_revision("head".into())
+        .sender(crate::leaf_engine::Party::fleet("turn-rules"))
+        .build();
+    for _ in 0..2 {
+        let error = crew.deliver_turn(&request).await.expect_err("no holder will come");
+        assert!(error.contains("relaunches nothing"), "{error}");
+    }
+    let told: Vec<_> = held
+        .messages()
+        .views()
+        .await
+        .expect("inbox")
+        .into_iter()
+        .map(|read| read.object.spec)
+        .filter(|message| message.body.contains("cannot be delivered"))
+        .collect();
+    assert_eq!(told.len(), 1, "{told:?}");
+    assert!(told[0].receiver.contains("operator"), "{}", told[0].receiver);
+    assert!(told[0].body.contains("review/reviewer"), "{}", told[0].body);
+    let status = held.convoy(&backend).await.status.expect("status");
+    assert_eq!(status.crew_work["work"]["coder"].phase, CrewWorkPhase::Working, "a system sender stalls no seat");
+}
+
 // An authenticated operator can send supervisor guidance to crew that has no stall.
 #[tokio::test]
 async fn operator_supervision_messages_working_crew() {

@@ -364,6 +364,8 @@ enum TurnReceiver {
 enum PreparedTurn {
     Admitted(CrewTurnAdmission),
     New(Box<CrewTurn>),
+    /// No holder will come for the turn, for this reason.
+    Undeliverable(String),
 }
 
 /// A turn receiver's terminal session, its launch, and the admission rung it observes.
@@ -1883,13 +1885,26 @@ impl CrewService {
             if !matches!(process.source, CrewSource::Agent { .. }) {
                 return Err(format!("crew target `{receiver}` is a tool process and cannot receive a handoff"));
             }
+            let turn = CrewTurnIntent::builder()
+                .namespace(context.namespace.clone())
+                .convoy(context.convoy.clone())
+                .source("handoff".into())
+                .vessel((target_vessel).into())
+                .role((target_role).into())
+                .brief(message.into())
+                .subject_revision(uuid::Uuid::new_v4().to_string())
+                .sender(Party::Seat { project: project.to_owned(), convoy: context.convoy.clone(), role: context.caller_role.clone() })
+                .relation(flotilla_resources::MessageRelation::Peer)
+                .references(carries)
+                .build();
             if status
                 .crew_work
                 .get(target_vessel)
                 .and_then(|crew| crew.get(target_role))
                 .is_some_and(|state| state.phase == CrewWorkPhase::Failed)
             {
-                return Err(format!("crew target `{receiver}` has failed work and cannot receive a handoff"));
+                let reason = format!("crew target `{receiver}` has failed work and cannot receive a handoff");
+                return Err(self.refuse_undeliverable(&turn, reason).await);
             }
             let holder = flotilla_messaging::resolve_message_receiver(&self.resource_backend, &context.namespace, &receiver)
                 .await
@@ -1897,28 +1912,15 @@ impl CrewService {
             if holder.as_ref().is_some_and(|holder| {
                 holder.object.status.as_ref().is_some_and(|status| status.phase == ResourceTerminalSessionPhase::Failed)
             }) {
-                return Err(format!("crew target `{receiver}` failed provisioning and cannot be revived"));
+                let reason = format!("crew target `{receiver}` failed provisioning and cannot be revived");
+                return Err(self.refuse_undeliverable(&turn, reason).await);
             }
             if !reassign.is_empty() {
                 let engine = flotilla_resources::convoy::engine::deciding(&self.convoy_engine, &convoy)
                     .ok_or_else(|| format!("convoy `{}` is not held at this home", context.convoy))?;
                 engine.reassign(&convoy, (&context.vessel, &context.caller_role), (target_vessel, target_role), reassign).await?;
             }
-            self.deliver_turn(
-                &CrewTurnIntent::builder()
-                    .namespace(context.namespace.clone())
-                    .convoy(context.convoy.clone())
-                    .source("handoff".into())
-                    .vessel((target_vessel).into())
-                    .role((target_role).into())
-                    .brief(message.into())
-                    .subject_revision(uuid::Uuid::new_v4().to_string())
-                    .sender(Party::Seat { project: project.to_owned(), convoy: context.convoy.clone(), role: context.caller_role.clone() })
-                    .relation(flotilla_resources::MessageRelation::Peer)
-                    .references(carries)
-                    .build(),
-            )
-            .await?;
+            self.deliver_turn(&turn).await?;
             return Ok(());
         }
         let target = target_role;
@@ -1941,6 +1943,18 @@ impl CrewService {
             .repository_refs
             .clone()
             .unwrap_or_else(|| convoy.spec.repositories.iter().map(|repository| repository.repo_ref.clone()).collect());
+        // The turn as a refusal reports it: the handoff's sender is told, through its seat.
+        let refused = CrewTurnIntent::builder()
+            .namespace(context.namespace.clone())
+            .convoy(context.convoy.clone())
+            .source("handoff".into())
+            .vessel(context.vessel.clone())
+            .role(target.into())
+            .brief(message.into())
+            .subject_revision(uuid::Uuid::new_v4().to_string())
+            .sender(Party::Seat { project: project.to_owned(), convoy: context.convoy.clone(), role: context.caller_role.clone() })
+            .relation(flotilla_resources::MessageRelation::Peer)
+            .build();
         if convoy
             .status
             .as_ref()
@@ -1948,7 +1962,8 @@ impl CrewService {
             .and_then(|crew| crew.get(target))
             .is_some_and(|state| state.phase == flotilla_resources::CrewWorkPhase::Failed)
         {
-            return Err(format!("crew target `{target}` has failed work and cannot receive a handoff"));
+            let reason = format!("crew target `{target}` has failed work and cannot receive a handoff");
+            return Err(self.refuse_undeliverable(&refused, reason).await);
         }
 
         let project = convoy.spec.project_ref.as_deref().unwrap_or(&context.namespace);
@@ -1988,7 +2003,8 @@ impl CrewService {
             .and_then(|session| session.status.as_ref())
             .is_some_and(|status| status.phase == ResourceTerminalSessionPhase::Failed)
         {
-            return Err(format!("crew target `{target}` failed provisioning and cannot be revived"));
+            let reason = format!("crew target `{target}` failed provisioning and cannot be revived");
+            return Err(self.refuse_undeliverable(&refused, reason).await);
         }
         let anchor = if target_session.is_none() {
             let visible_sessions = self.resource_backend.including_replicas::<ResourceTerminalSession>(&context.namespace);
@@ -2661,6 +2677,9 @@ impl CrewService {
                 .map_err(|error| error.to_string())?,
             None => None,
         };
+        if let Some(reason) = self.addressed_holder_will_not_come(request, holder.as_ref()).await? {
+            return Err(self.refuse_undeliverable(request, reason).await);
+        }
         let publisher = self.resource_intent_publisher.read().expect("resource intent publisher lock").as_ref().and_then(Weak::upgrade);
         let (message, new_turn) = if let Some(publisher) = publisher {
             let (reference, home) =
@@ -2677,6 +2696,102 @@ impl CrewService {
             (ResourceRef::new("flotilla.work/v1", "Message", &request.namespace, admitted.record), !existing)
         };
         Ok(CrewTurnAdmission { message, new_turn, rung: TurnDeliveryRung::WarmSession })
+    }
+
+    /// Refuses `request`'s turn, which no holder will come for, for `reason`, and tells whoever
+    /// can act rather than leave it to be dropped unread: a crew sender's seat stalls with it, so
+    /// its supervision hears; a system sender's turn goes to the operator. A person sending reads
+    /// the refusal, and a supervision turn's refusal moves its stall up its own ladder.
+    async fn refuse_undeliverable(&self, request: &CrewTurnIntent, reason: String) -> String {
+        if request.stall_of.is_some() || matches!(request.sender, Party::Person(_)) {
+            return reason;
+        }
+        let evidence = format!(
+            "`{}` turn to {}/{} in convoy `{}` cannot be delivered: {reason}",
+            request.source, request.vessel, request.role, request.convoy
+        );
+        if let Party::Seat { convoy, role, .. } = &request.sender {
+            match self.stall_sender_seat(&request.namespace, convoy, role, &evidence).await {
+                Ok(()) => return reason,
+                Err(error) => warn!(%convoy, %role, %error, "an undeliverable turn's sender could not stall; telling the operator"),
+            }
+        }
+        if let Err(error) = self.tell_operator_undeliverable(request, evidence).await {
+            warn!(convoy = %request.convoy, role = %request.role, %error, "an undeliverable turn could not be told to the operator");
+        }
+        reason
+    }
+
+    /// Why no holder will come for an addressed turn, if none will: its holder failed
+    /// provisioning, or the seat it names belongs to a convoy that has ended.
+    async fn addressed_holder_will_not_come(
+        &self,
+        request: &CrewTurnIntent,
+        holder: Option<&flotilla_resources::ReadResourceObject<ResourceTerminalSession>>,
+    ) -> Result<Option<String>, String> {
+        if let Some(holder) =
+            holder.filter(|holder| holder.object.status.as_ref().is_some_and(|status| status.phase == ResourceTerminalSessionPhase::Failed))
+        {
+            return Ok(Some(format!("its holder `{}` failed provisioning and cannot be revived", holder.object.metadata.name)));
+        }
+        let Some(Party::Seat { convoy, .. }) = &request.receiver else { return Ok(None) };
+        match self.resource_backend.including_replicas::<ResourceConvoy>(&request.namespace).get(convoy).await {
+            Ok(read) if read.object.status.as_ref().is_some_and(|status| status.phase.is_terminal()) => {
+                Ok(Some(terminal_convoy_refusal(convoy, "is terminal")))
+            }
+            Ok(_) | Err(ResourceError::NotFound { .. }) => Ok(None),
+            Err(error) => Err(error.to_string()),
+        }
+    }
+
+    /// Stalls the working seat of `role` in convoy `convoy`, with `evidence` as its report.
+    async fn stall_sender_seat(&self, namespace: &str, convoy: &str, role: &str, evidence: &str) -> Result<(), String> {
+        let convoys = self.resource_backend.clone().using::<ResourceConvoy>(namespace);
+        let sender = convoys.get(convoy).await.map_err(|error| error.to_string())?;
+        let status = sender.status.as_ref().filter(|status| !status.phase.is_terminal()).ok_or("its convoy has ended")?;
+        let working = status
+            .crew_work
+            .iter()
+            .filter(|(_, crew)| crew.get(role).is_some_and(|work| matches!(work.phase, CrewWorkPhase::Working | CrewWorkPhase::Stalled)))
+            .map(|(vessel, _)| vessel)
+            .collect::<Vec<_>>();
+        let [vessel] = working.as_slice() else { return Err(format!("{} working seats hold role `{role}`", working.len())) };
+        let stalled = convoy_external_patches::mark_crew_stalled(
+            convoy.to_owned(),
+            (*vessel).clone(),
+            role.to_owned(),
+            self.clock.now(),
+            flotilla_protocol::StallReason::Other,
+            None,
+            evidence.to_owned(),
+        );
+        flotilla_store::note_convoy(&self.convoy_engine, &convoys, convoy, &stalled).await.map(|_| ()).map_err(|error| error.to_string())
+    }
+
+    /// Tells the operator of `request`'s convoy's project that its turn cannot be delivered, once
+    /// per turn. A system turn to a convoy that has ended tells no one: the operator heard of its
+    /// end, and the turn's condition outlived it.
+    async fn tell_operator_undeliverable(&self, request: &CrewTurnIntent, evidence: String) -> Result<(), String> {
+        let convoy = self
+            .resource_backend
+            .including_replicas::<ResourceConvoy>(&request.namespace)
+            .get(&request.convoy)
+            .await
+            .map_err(|error| error.to_string())?;
+        if convoy.object.status.as_ref().is_some_and(|status| status.phase.is_terminal()) {
+            return Ok(());
+        }
+        let project = convoy.object.spec.project_ref.unwrap_or_else(|| request.namespace.clone());
+        let operator = self.party_inbox(&request.namespace, &Party::Person("operator".into()), &project).await?;
+        let sender = self.party_inbox(&request.namespace, &request.sender, &project).await?;
+        let turn =
+            format!("undeliverable:{}:{}:{}:{}:{}", request.convoy, request.vessel, request.role, request.source, request.subject_revision);
+        let name = flotilla_resources::message_record_name(operator.as_str(), sender.as_str(), &turn);
+        if self.holds_message(&operator, &name).await.map_err(|error| error.to_string())? {
+            return Ok(());
+        }
+        let intent = Intent::new(sender, operator, flotilla_resources::MessageRelation::System, evidence);
+        self.publish_message_intent(&request.namespace, &name, &intent).await.map(|_| ())
     }
 
     async fn ensure_vessel_backing_available(&self, namespace: &str, convoy: &str, vessel: &str) -> Result<(), String> {
@@ -2744,6 +2859,7 @@ impl CrewService {
         };
         let turn = match off_frame(|| self.prepare_crew_turn(request)).await? {
             PreparedTurn::Admitted(admission) => return Ok(admission),
+            PreparedTurn::Undeliverable(reason) => return Err(off_frame(|| self.refuse_undeliverable(request, reason)).await),
             PreparedTurn::New(turn) => turn,
         };
         off_frame(|| self.publish_crew_turn(request, *turn)).await
@@ -2793,7 +2909,7 @@ impl CrewService {
             .map_err(|error| error.to_string())?;
         let convoy = &target.object;
         if convoy.status.as_ref().is_some_and(|status| status.phase.is_terminal()) {
-            return Err(terminal_convoy_refusal(&request.convoy, "is terminal"));
+            return Ok(PreparedTurn::Undeliverable(terminal_convoy_refusal(&request.convoy, "is terminal")));
         }
         self.ensure_vessel_backing_available(&request.namespace, &request.convoy, &request.vessel).await?;
         let project = convoy.spec.project_ref.as_deref().unwrap_or(&request.namespace);
@@ -2804,6 +2920,9 @@ impl CrewService {
         let intent = turn_intent(request, sender, inbox);
         let name = turn_record_name(request, &intent);
         let (holder, rung) = off_frame(|| self.turn_receiver_session(request, &receiver)).await?;
+        if let Some(reason) = no_holder_will_come(convoy, request, holder.as_ref()) {
+            return Ok(PreparedTurn::Undeliverable(reason));
+        }
         if let Some(admission) = off_frame(|| self.earlier_turn_admission(request, &intent, &name, rung)).await? {
             return Ok(PreparedTurn::Admitted(admission));
         }
@@ -3346,6 +3465,26 @@ fn associated_change_request_name(
 
 #[cfg(test)]
 mod tests;
+
+/// Why no holder will come for a turn to `request`'s crew member of `convoy`, if none will: its
+/// work failed, its session failed provisioning, or its work is done and it holds no session, so
+/// nothing relaunches it for a turn other than a handoff, which reopens finished work.
+fn no_holder_will_come(
+    convoy: &ResourceObject<ResourceConvoy>,
+    request: &CrewTurnIntent,
+    holder: Option<&flotilla_resources::ReadResourceObject<ResourceTerminalSession>>,
+) -> Option<String> {
+    let crew = format!("{}/{}", request.vessel, request.role);
+    let work = convoy.status.as_ref().and_then(|status| status.crew_work.get(&request.vessel)?.get(&request.role)).map(|work| work.phase);
+    if work == Some(CrewWorkPhase::Failed) {
+        return Some(format!("crew `{crew}` has failed work"));
+    }
+    if holder.and_then(|holder| holder.object.status.as_ref()).is_some_and(|status| status.phase == ResourceTerminalSessionPhase::Failed) {
+        return Some(format!("crew `{crew}` failed provisioning and cannot be revived"));
+    }
+    (holder.is_none() && work == Some(CrewWorkPhase::Done) && request.source != "handoff")
+        .then(|| format!("crew `{crew}` finished its work and holds no session, and a `{}` turn relaunches nothing", request.source))
+}
 
 fn terminal_convoy_refusal(name: &str, cause: &str) -> String {
     format!(
