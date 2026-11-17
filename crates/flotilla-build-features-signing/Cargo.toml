@@ -13,6 +13,7 @@ digest = { version = "0.10", features = ["mac", "oid", "std"] }
 ed25519 = { version = "2", default-features = false, features = ["alloc", "pkcs8", "std"] }
 ed25519-dalek = { version = "2", features = ["pkcs8", "rand_core"] }
 generic-array = { version = "0.14", default-features = false, features = ["more_lengths", "zeroize"] }
+typenum = { version = "1", features = ["const-generics"] }
 getrandom = { version = "0.2", default-features = false, features = ["std"] }
 libc = { workspace = true }
 pkcs8 = { version = "0.10", default-features = false, features = ["pem", "std"] }

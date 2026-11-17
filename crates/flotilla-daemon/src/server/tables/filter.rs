@@ -30,17 +30,97 @@ pub(crate) fn describe_operators(table: &mut Table) {
     }
 }
 
-/// Every `where` parameter, conjoined and checked; `None` when there is none. Parsing is lenient
-/// (any CEL spelling of a condition in the subset); the cursor binds the canonical text.
-pub(crate) fn parse(params: &[(String, String)], table: &Table, fields: &Filterable) -> Result<Option<Checked<Condition>>, Failure> {
-    let mut terms = Vec::new();
-    for (_, text) in params.iter().filter(|(name, _)| name == "where") {
-        terms.push(Condition::parse_lenient(text).map_err(|error| bad("invalid_filter", format!("{text}: {error}")))?);
+/// A read's conditions: every `scope` and `where`, conjoined, and each apart.
+pub(crate) struct Conditions {
+    /// Every `scope` and `where`, conjoined: what the read's rows match. `None` when there is none.
+    pub filter: Option<Checked<Condition>>,
+    /// Every `scope`, conjoined: what a count's `total` counts.
+    pub scope: Option<Checked<Condition>>,
+    /// Each `where`, which a field's distinct values skip when it mentions only that field.
+    pub clauses: Vec<Clause>,
+}
+
+/// One `where` condition, and the one field it mentions, if it mentions just one.
+#[derive(Clone)]
+pub(crate) struct Clause {
+    pub condition: Checked<Condition>,
+    pub only: Option<String>,
+}
+
+/// Every `scope` and `where` parameter, checked. Parsing is lenient (any CEL spelling of a
+/// condition in the subset); the cursor binds the canonical text of their conjunction.
+pub(crate) fn parse(params: &[(String, String)], table: &Table, fields: &Filterable) -> Result<Conditions, Failure> {
+    let terms = |parameter: &str| -> Result<Vec<Condition>, Failure> {
+        params
+            .iter()
+            .filter(|(name, _)| name == parameter)
+            .map(|(_, text)| Condition::parse_lenient(text).map_err(|error| bad("invalid_filter", format!("{parameter} {text}: {error}"))))
+            .collect()
+    };
+    let (scope, clauses) = (terms("scope")?, terms("where")?);
+    let check = |terms: Vec<Condition>| -> Result<Option<Checked<Condition>>, Failure> {
+        if terms.is_empty() {
+            return Ok(None);
+        }
+        Checked::new(Condition::and(terms), fields.schema()).map(Some).map_err(|error| refusal(error, table))
+    };
+    Ok(Conditions {
+        filter: check(scope.iter().chain(&clauses).cloned().collect())?,
+        scope: check(scope)?,
+        clauses: clauses
+            .into_iter()
+            .map(|term| {
+                let only = only(&term, fields);
+                Ok(Clause { condition: check(vec![term])?.expect("one term"), only })
+            })
+            .collect::<Result<_, Failure>>()?,
+    })
+}
+
+/// The one column `condition` mentions; `None` when it mentions none, several, or a form this
+/// walk does not know.
+fn only(condition: &Condition, fields: &Filterable) -> Option<String> {
+    fn walk<'a>(condition: &'a Condition, columns: &mut Vec<&'a Path>) -> bool {
+        match condition {
+            Condition::And(terms) | Condition::Or(terms) => terms.iter().all(|term| walk(term, columns)),
+            Condition::Not(term) => walk(term, columns),
+            Condition::Has(path) => {
+                columns.push(path);
+                true
+            }
+            Condition::Compare { field, .. }
+            | Condition::In { field, .. }
+            | Condition::Member { field, .. }
+            | Condition::Under { field, .. }
+            | Condition::Field(field) => {
+                columns.push(&field.path);
+                true
+            }
+            Condition::Bool(_) => true,
+            // `Condition` is `#[non_exhaustive]`: a form rigging adds mentions what this walk
+            // cannot see, so the clause always applies.
+            _ => false,
+        }
     }
-    if terms.is_empty() {
-        return Ok(None);
+    let mut paths = Vec::new();
+    if !walk(condition, &mut paths) {
+        return None;
     }
-    Checked::new(Condition::and(terms), fields.schema()).map(Some).map_err(|error| refusal(error, table))
+    let mut columns = paths.into_iter().map(|path| fields.column(path));
+    let first = columns.next()??;
+    columns.all(|column| column == Some(first)).then(|| first.to_owned())
+}
+
+/// The field a `values` parameter names, if the table can filter it.
+pub(crate) fn distinct_field(name: &str, table: &Table, fields: &Filterable) -> Result<String, Failure> {
+    if fields.path(name).is_some() {
+        return Ok(name.to_owned());
+    }
+    if table.key.iter().chain(&table.columns).any(|column| column.name == name) {
+        Err(bad("unsupported_filter", format!("{name} cannot be filtered")))
+    } else {
+        Err(bad("unknown_column", name))
+    }
 }
 
 fn refusal(error: CheckError, table: &Table) -> Failure {

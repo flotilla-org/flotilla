@@ -123,7 +123,7 @@ fn key(id: &Id) -> String {
 #[derive(Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
 enum ClientMessage {
-    Subscribe(Subscribe),
+    Subscribe(Box<Subscribe>),
     Unsubscribe { id: Id },
     Cancel { id: Id },
     FetchMore { id: Id, query: QueryId },
@@ -138,6 +138,9 @@ struct Subscribe {
     query: Option<QueryId>,
     #[serde(rename = "where", default)]
     conditions: Vec<String>,
+    #[serde(default)]
+    scope: Vec<String>,
+    values: Option<Vec<String>>,
     sort: Option<Vec<String>>,
     columns: Option<Vec<String>>,
     namespace: Option<String>,
@@ -446,7 +449,7 @@ impl Connection {
             }
             ClientMessage::Subscribe(subscribe) => {
                 let id = subscribe.id.clone();
-                match self.subscribe(subscribe) {
+                match self.subscribe(*subscribe) {
                     Ok((query, work)) => (id, work, query, None),
                     Err(reason) => {
                         outbox.send(failure(reason, &id));
@@ -530,8 +533,9 @@ impl Connection {
         let work = Box::pin(async move {
             let description = source.describe().await?;
             let mut params: Vec<(String, String)> = vec![("watch".into(), "true".into()), ("limit".into(), MAX_LIMIT.to_string())];
+            params.extend(subscribe.scope.into_iter().map(|condition| ("scope".into(), condition)));
             params.extend(subscribe.conditions.into_iter().map(|condition| ("where".into(), condition)));
-            let lists = [("sort", subscribe.sort), ("columns", subscribe.columns)];
+            let lists = [("sort", subscribe.sort), ("columns", subscribe.columns), ("values", subscribe.values)];
             params.extend(lists.into_iter().filter_map(|(name, list)| Some((name.to_owned(), list?.join(",")))));
             params.extend(subscribe.namespace.map(|namespace| ("namespace".to_owned(), namespace)));
             params.extend(subscribe.count.map(|count| ("count".to_owned(), count)));

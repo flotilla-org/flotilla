@@ -191,7 +191,7 @@ mod tests {
     // message's full u64 range through flotilla-protocol's decoder.
     #[test]
     fn table_integer_profiles_preserve_full_u64() {
-        let message = flotilla_protocol::table::Message::Count { count: u64::MAX, estimate: false, sequence: u64::MAX };
+        let message = flotilla_protocol::table::Message::Count { count: u64::MAX, total: u64::MAX, estimate: false, sequence: u64::MAX };
         for encoding in [Encoding::Json, Encoding::Cbor] {
             let bytes = encoding.encode(&message).unwrap();
             let decoded: flotilla_protocol::table::Message = match encoding {

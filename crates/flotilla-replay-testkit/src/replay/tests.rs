@@ -34,6 +34,7 @@ fn yaml_round_trip() {
                 stderr: None,
                 exit_code: Some(0),
                 error: None,
+                ended: None,
             },
             Interaction::Extra(GithubChannel::GhApi {
                 label: None,
@@ -97,6 +98,7 @@ fn replay_session_serves_in_order() {
             stderr: None,
             exit_code: Some(0),
             error: None,
+            ended: None,
         }],
     };
 
@@ -394,6 +396,7 @@ fn channel_label_from_interaction() {
         stderr: None,
         exit_code: Some(0),
         error: None,
+        ended: None,
     };
     // DefaultLabeler uses subcommand: "git status"
     assert_eq!(cmd.channel_label(), ChannelLabel::Command("git status".into()));
@@ -407,6 +410,7 @@ fn channel_label_from_interaction() {
         stderr: None,
         exit_code: Some(0),
         error: None,
+        ended: None,
     };
     assert_eq!(cmd_no_args.channel_label(), ChannelLabel::Command("git".into()));
 
@@ -597,6 +601,7 @@ fn recorder_saves_single_round() {
         stderr: None,
         exit_code: Some(0),
         error: None,
+        ended: None,
     });
     recorder.save();
 
@@ -621,6 +626,7 @@ fn recorder_saves_multi_round_with_barriers() {
         stderr: None,
         exit_code: Some(0),
         error: None,
+        ended: None,
     });
     recorder.barrier();
     recorder.record(Interaction::Extra(GithubChannel::GhApi {
@@ -658,6 +664,7 @@ fn recorder_applies_masks() {
         stderr: None,
         exit_code: Some(0),
         error: None,
+        ended: None,
     });
     recorder.save();
 

@@ -217,6 +217,20 @@ pub fn check(bytes: &[u8], limits: &Limits) -> Result<(), Error> {
     scan::scan(bytes, limits)
 }
 
+/// How many bytes the first data item of a CBOR sequence (RFC 8742) takes,
+/// or `None` while it is still arriving; pass the result to [`from_slice`].
+/// A partial item already past `max_message` is an error, so a reader never
+/// buffers more than one message's worth of it.
+pub fn item_len(bytes: &[u8], limits: &Limits) -> Result<Option<usize>, Error> {
+    let len = scan::item_len(&bytes[..bytes.len().min(limits.max_message)], limits)?;
+    match len {
+        None if bytes.len() > limits.max_message => {
+            Err(Error::detail(ErrorKind::MessageLimit, format!("{} bytes, limit {}", bytes.len(), limits.max_message)))
+        }
+        len => Ok(len),
+    }
+}
+
 /// Check, then deserialize, any value. Use [`decode_message`] for messages.
 pub fn from_slice<T: DeserializeOwned>(bytes: &[u8], limits: &Limits) -> Result<T, Error> {
     check(bytes, limits)?;

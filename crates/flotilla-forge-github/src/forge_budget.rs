@@ -15,8 +15,8 @@ use chrono::Utc;
 use flotilla_protocol::ForgeBudgetRow;
 use flotilla_provider_runtime::ChannelLabel;
 use flotilla_provider_runtime::CommandOutput;
-use flotilla_provider_runtime::CommandProcess;
 use flotilla_provider_runtime::CommandRunner;
+use flotilla_provider_runtime::{CommandLines, CommandProcess};
 
 use crate::github::github_rate_limit;
 use crate::github::low_graphql_budget;
@@ -349,6 +349,9 @@ impl CommandRunner for BudgetedRunner {
         label: &ChannelLabel,
     ) -> Result<Box<dyn CommandProcess>, String> {
         self.inner.spawn_long_lived(cmd, args, cwd, label).await
+    }
+    async fn stream_lines(&self, cmd: &str, args: &[&str], cwd: &Path, label: &ChannelLabel) -> Result<Box<dyn CommandLines>, String> {
+        self.inner.stream_lines(cmd, args, cwd, label).await
     }
     async fn run_with_input(&self, cmd: &str, args: &[&str], cwd: &Path, label: &ChannelLabel, input: &[u8]) -> Result<String, String> {
         self.inner.run_with_input(cmd, args, cwd, label, input).await
