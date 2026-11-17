@@ -1107,6 +1107,13 @@ mod tests {
             let url = accepted["url"].as_str().unwrap();
             assert_eq!(headers[header::LOCATION], url);
             assert_eq!(accepted["id"], url.strip_prefix("/v1/commands/").unwrap());
+            // The watch's first step is recorded after the POST returns: read the progress once it is.
+            let id = Uuid::parse_str(accepted["id"].as_str().unwrap()).unwrap();
+            let mut state = h.commands.records.lock().await[&id].state.clone();
+            tokio::time::timeout(Duration::from_secs(10), state.wait_for(|state| !state.steps.is_empty()))
+                .await
+                .expect("the watch records a step")
+                .expect("the command's state is held");
             let (status, running, _) = h.call("GET", &format!("{url}?wait=0.01"), None, cbor, CallerAuth::Bearer).await;
             assert_eq!(status, StatusCode::OK);
             assert_eq!(running["state"], "running");
