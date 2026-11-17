@@ -24,7 +24,10 @@ use flotilla_protocol::{
     ProviderData,
 };
 use flotilla_resources::{
-    checkout_path::checkout_path, definition_provenance::WHOLE_REPOSITORY_PROJECT_MANAGER, discovered_checkouts::DiscoveredCheckouts,
+    checkout_path::checkout_path,
+    definition_provenance::{MANIFEST_RECONCILER_ROOT_ANNOTATION, WHOLE_REPOSITORY_PROJECT_MANAGER},
+    definitions::declares,
+    discovered_checkouts::DiscoveredCheckouts,
 };
 use flotilla_resources::{
     normalize_project_spec, Clock, ConvoyEnsure, ConvoyEnsureSpec, ConvoyRepositorySpec, DeclarationRefusedCondition, Forge, InputMeta,
@@ -167,8 +170,11 @@ async fn reconcile_whole_repository_project_definition(
     Ok(reconciled)
 }
 
+/// Whether a declaration owns `project`: its repository's `project.yaml`, or a manifest, which on
+/// the engine is its one origin once a manifest takes it over.
 pub fn is_declaration_backed_project(project: &ResourceObject<Project>) -> bool {
     project.metadata.annotations.contains_key(BOOTSTRAP_REPOSITORY_ANNOTATION)
+        || declares(&project.metadata.labels, &project.metadata.annotations)
 }
 
 fn is_whole_repository_project(spec: &ProjectSpec, repository_key: &RepositoryKey) -> bool {
@@ -379,6 +385,16 @@ impl ProjectService<'_> {
         let namespace = self.provisioning_namespace();
         let project =
             self.resource_backend.clone().definitions::<Project>(&namespace).get(name).await.map_err(|error| error.to_string())?;
+        // A manifest that took the project over is its declaration: its root's reconciler applies
+        // it, so there is nothing for its bootstrap repository to refresh.
+        if declares(&project.metadata.labels, &project.metadata.annotations) {
+            let managed = match (&project.spec.charter, project.metadata.annotations.get(MANIFEST_RECONCILER_ROOT_ANNOTATION)) {
+                (Some(_), _) => "project managed by registered charter".to_owned(),
+                (None, Some(root)) => format!("project managed by manifest root {root}"),
+                (None, None) => "project managed by a manifest".to_owned(),
+            };
+            return Ok((project.spec.repositories.len(), false, Vec::new(), vec![managed]));
+        }
         let bootstrap_key = project
             .metadata
             .annotations

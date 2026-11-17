@@ -1,3 +1,4 @@
+use std::collections::BTreeMap;
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -161,4 +162,56 @@ async fn start_attach_stage_uses_vessel_status() {
         // An admitted convoy whose work is ready to start reads Active.
         assert!(stage.starts_with("active;") && stage.contains("vessel work") && stage.contains(expected), "{stage}");
     }
+}
+
+// Attach resolves a repository's project to the one a declaration owns. A manifest that took the
+// project over leaves it no bootstrap repository, and it still wins over a project generated for
+// the whole repository beside it.
+#[tokio::test]
+async fn attach_context_is_the_project_a_manifest_declares() {
+    use flotilla_resources::definitions::{stamp, DefinitionOrigin};
+    use flotilla_resources::{
+        definition_provenance::WHOLE_REPOSITORY_PROJECT_MANAGER, InputMeta, Project, ProjectRepositorySpec, ProjectSpec, Repository,
+        RepositorySpec, MANAGED_BY_LABEL,
+    };
+
+    let (daemon, backend, _temp) = fixture().await;
+    let repository = RepositorySpec::remote("https://github.com/example/app").expect("repository");
+    let key = repository.key();
+    flotilla_store::ensure_repository(&backend.using::<Repository>("flotilla"), &key, &repository).await.expect("repository");
+    let spec = |name: &str| {
+        ProjectSpec::builder()
+            .display_name(name.to_owned())
+            .repositories(vec![ProjectRepositorySpec::builder().repo(key.clone()).build()])
+            .build()
+    };
+    let root = flotilla_resources::manifest_roots::RootDeclaration {
+        host: "local".into(),
+        path: "/ops".into(),
+        source: "ops".into(),
+        binding: None,
+        ops: false,
+    };
+    daemon.manifest_roots().declare("flotilla", "ops", root).await.expect("the manifest root");
+    let (labels, annotations) = stamp(&DefinitionOrigin::Manifest {
+        root: "ops".into(),
+        source: Some("ops".into()),
+        path: Some("projects/app.yaml".into()),
+        revision: "first".into(),
+        charter: None,
+        materialized_project: None,
+    });
+    let projects = backend.definitions::<Project>("flotilla");
+    projects
+        .create(&InputMeta::builder().name("app".into()).labels(labels).annotations(annotations).build(), &spec("app"))
+        .await
+        .expect("the manifest's project");
+    let generated = BTreeMap::from([(MANAGED_BY_LABEL.to_string(), WHOLE_REPOSITORY_PROJECT_MANAGER.to_string())]);
+    projects
+        .create(&InputMeta::builder().name("app-repo".into()).labels(generated).build(), &spec("app-repo"))
+        .await
+        .expect("the generated project");
+    let context =
+        daemon.attach_resolver().attach_project_context(Some(&flotilla_protocol::RepoSelector::Repository(key))).await.expect("context");
+    assert_eq!(context.as_deref(), Some("app"));
 }

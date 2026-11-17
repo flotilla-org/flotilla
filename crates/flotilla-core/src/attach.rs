@@ -22,9 +22,9 @@ use flotilla_protocol::{
     ResolvedAttachAction, ResolvedAttachPlan,
 };
 use flotilla_resources::{
-    terminal_session_attach_target_with_stale_status, Convoy as ResourceConvoy, ConvoyPhase as ResourceConvoyPhase, Host as ResourceHost,
-    Project, ReadResourceObject, ResourceProvenance, TerminalSession as ResourceTerminalSession, CONVOY_LABEL, ROLE_LABEL, VESSEL_LABEL,
-    VESSEL_REF_LABEL,
+    definitions::declares, terminal_session_attach_target_with_stale_status, Convoy as ResourceConvoy, ConvoyPhase as ResourceConvoyPhase,
+    Host as ResourceHost, ObjectMeta, Project, ReadResourceObject, ResourceProvenance, TerminalSession as ResourceTerminalSession,
+    CONVOY_LABEL, ROLE_LABEL, VESSEL_LABEL, VESSEL_REF_LABEL,
 };
 use flotilla_store::{ResourceBackend, StoreQuery};
 use sha2::{Digest, Sha256};
@@ -269,15 +269,21 @@ impl<'a> AttachResolver<'a> {
             .map_err(|error| error.to_string())?;
         let mut matches = projects;
         let repository_key = repository_key.to_string();
-        let mut declaration_matches = matches
-            .iter()
-            .filter(|project| project.metadata.annotations.get(BOOTSTRAP_REPOSITORY_ANNOTATION) == Some(&repository_key))
-            .map(|project| project.metadata.name.clone())
-            .collect::<Vec<_>>();
-        declaration_matches.sort();
-        declaration_matches.dedup();
-        if let [project] = declaration_matches.as_slice() {
-            return Ok(Some(project.clone()));
+        // The project this repository declares wins; then the one project a manifest declares,
+        // which holds no bootstrap repository once it has taken a project over.
+        let bootstrapped = |metadata: &ObjectMeta| metadata.annotations.get(BOOTSTRAP_REPOSITORY_ANNOTATION) == Some(&repository_key);
+        let manifested = |metadata: &ObjectMeta| declares(&metadata.labels, &metadata.annotations);
+        for declared in [&bootstrapped as &dyn Fn(&ObjectMeta) -> bool, &manifested] {
+            let mut declaration_matches = matches
+                .iter()
+                .filter(|project| declared(&project.metadata))
+                .map(|project| project.metadata.name.clone())
+                .collect::<Vec<_>>();
+            declaration_matches.sort();
+            declaration_matches.dedup();
+            if let [project] = declaration_matches.as_slice() {
+                return Ok(Some(project.clone()));
+            }
         }
         matches.sort_by(|left, right| left.metadata.name.cmp(&right.metadata.name));
         matches.dedup_by(|left, right| left.metadata.name == right.metadata.name);

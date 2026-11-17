@@ -555,6 +555,82 @@ async fn declaration_adoption_survives_whole_repository_project_reconciliation()
     assert_eq!(reconciled.spec.repositories[0].roles.len(), 3);
 }
 
+/// Writes Project `name` as manifest root `ops`'s reconciler applies it once it has taken the
+/// project over: the manifest is its one origin, so it holds no bootstrap repository.
+async fn manifest_project(daemon: &InProcessDaemon, backend: &ResourceBackend, name: &str, charter: bool) -> ProjectSpec {
+    use flotilla_resources::definitions::{stamp, DefinitionOrigin};
+    use flotilla_resources::manifest_roots::RootDeclaration;
+    let root = RootDeclaration { host: "local".into(), path: "/ops".into(), source: "ops".into(), binding: None, ops: false };
+    daemon.manifest_roots().declare("flotilla", "ops", root).await.expect("the manifest root");
+    let (labels, annotations) = stamp(&DefinitionOrigin::Manifest {
+        root: "ops".into(),
+        source: Some("ops".into()),
+        path: Some(format!("projects/{name}.json")),
+        revision: "first".into(),
+        charter: None,
+        materialized_project: None,
+    });
+    let charter = charter.then(|| flotilla_resources::CharterPointer::Inline { documents: Vec::new(), files: BTreeMap::new() });
+    let spec = ProjectSpec::builder()
+        .display_name(name.to_string())
+        .default_workflow_ref("single-agent".to_string())
+        .maybe_charter(charter)
+        .build();
+    backend
+        .definitions::<Project>("flotilla")
+        .create(&InputMeta::builder().name(name.to_string()).labels(labels).annotations(annotations).build(), &spec)
+        .await
+        .expect("the manifest's Project")
+        .spec
+}
+
+// A project a manifest declares is the manifest's: project apply refuses it as declared, though it
+// holds no bootstrap repository, and leaves it as the manifest wrote it.
+#[tokio::test]
+async fn project_apply_refuses_a_project_a_manifest_declares() {
+    let (daemon, backend, _config, _runtime, _tmp) = start_daemon().await;
+    let declared = manifest_project(&daemon, &backend, "app", false).await;
+    let mut rx = daemon.subscribe();
+    let result = execute_project_command(
+        &daemon,
+        &mut rx,
+        CommandAction::ProjectApply {
+            name: "app".to_string(),
+            spec_yaml: format!(
+                "display_name: overwritten\ndefault_workflow_ref: single-agent\nrepositories:\n  - repo: {}\n",
+                RepositorySpec::remote("https://github.com/example/app").expect("repository").key()
+            ),
+        },
+    )
+    .await;
+    assert!(
+        matches!(&result, CommandValue::Error { message } if message.contains("managed by a declaration")),
+        "unexpected command result: {result:?}"
+    );
+    assert_eq!(backend.definitions::<Project>("flotilla").get("app").await.expect("project").spec, declared);
+}
+
+// Refreshing a project a manifest took over reports it as its charter's, as before the takeover,
+// rather than asking for a declaration it no longer names.
+#[tokio::test]
+async fn project_refresh_reports_a_project_a_manifest_declares_as_its_charters() {
+    let (daemon, backend, _config, _runtime, _tmp) = start_daemon().await;
+    daemon.set_repository_inspector(Arc::new(FailingInspector)).await;
+    manifest_project(&daemon, &backend, "app", true).await;
+    let mut rx = daemon.subscribe();
+    let result = execute_project_command(&daemon, &mut rx, CommandAction::ProjectRefresh { name: "app".to_string() }).await;
+    assert_eq!(
+        result,
+        CommandValue::ProjectRefreshed {
+            name: "app".to_string(),
+            members: 0,
+            converged: false,
+            changes: Vec::new(),
+            operational_entries: vec!["project managed by registered charter".to_string()],
+        }
+    );
+}
+
 #[tokio::test]
 async fn project_refresh_accepts_every_declared_lab_forge_url_for_an_observed_checkout() {
     use flotilla_resources::{Forge, ForgeKind, ForgeSpec};
