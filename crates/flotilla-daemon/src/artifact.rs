@@ -87,7 +87,6 @@ impl BriefArtifactWriter for SystemBriefArtifactWriter {
         content: &[u8],
         charter_commit: Option<&str>,
     ) -> Result<String, String> {
-        let digest = self.blobs.put_with_media_type(content, "text/markdown").await?;
         let name = artifact_slot_record_name(convoy, role, "brief", subject)?;
         let resolver = self.backend.using::<Artifact>(namespace);
         let prior = match resolver.get(&name).await {
@@ -100,6 +99,8 @@ impl BriefArtifactWriter for SystemBriefArtifactWriter {
             .and_then(Duration::try_days)
             .and_then(|duration| Utc::now().checked_add_signed(duration))
             .ok_or_else(|| "brief retention is too large".to_string())?;
+        // Put last, so only the artifact's write can fail after it.
+        let digest = self.blobs.put_with_media_type(content, "text/markdown").await?;
         let spec = ArtifactSpec::builder()
             .convoy(convoy.to_string())
             .producer(role.to_string())
@@ -117,10 +118,14 @@ impl BriefArtifactWriter for SystemBriefArtifactWriter {
             .build();
         // The spec's convoy is the artifact's owner.
         let meta = InputMeta::builder().name(name).build();
-        match prior {
-            Some(prior) => resolver.update(&meta, &prior.metadata.resource_version, &spec).await.map_err(|error| error.to_string())?,
-            None => resolver.create(&meta, &spec).await.map_err(|error| error.to_string())?,
+        let written = match prior {
+            Some(prior) => resolver.update(&meta, &prior.metadata.resource_version, &spec).await,
+            None => resolver.create(&meta, &spec).await,
         };
+        if let Err(error) = written {
+            self.blobs.unwritten(&digest);
+            return Err(error.to_string());
+        }
         Ok(digest.as_str().to_string())
     }
 }
@@ -156,17 +161,31 @@ impl ArtifactService<'_> {
         retention_days: &BTreeMap<String, u64>,
     ) -> Result<ResourceObject<Artifact>, String> {
         let (name, spec) = self.prepare_put(caller, input, retention_days).await?;
-        let resolver = self.backend.using::<Artifact>(self.namespace);
-        let prior = match resolver.get(&name).await {
-            Ok(prior) => Some(prior),
-            Err(ResourceError::NotFound { .. }) => None,
-            Err(error) => return Err(error.to_string()),
+        let written = async {
+            let resolver = self.backend.using::<Artifact>(self.namespace);
+            let prior = match resolver.get(&name).await {
+                Ok(prior) => Some(prior),
+                Err(ResourceError::NotFound { .. }) => None,
+                Err(error) => return Err(error),
+            };
+            // The spec's convoy is the artifact's owner.
+            let meta = InputMeta::builder().name(name).build();
+            match prior {
+                Some(prior) => resolver.update(&meta, &prior.metadata.resource_version, &spec).await,
+                None => resolver.create(&meta, &spec).await,
+            }
         };
-        let meta = InputMeta::builder().name(name).build();
-        match prior {
-            Some(prior) => resolver.update(&meta, &prior.metadata.resource_version, &spec).await.map_err(|error| error.to_string()),
-            None => resolver.create(&meta, &spec).await.map_err(|error| error.to_string()),
+        self.written(&spec, written.await.map_err(|error| error.to_string()))
+    }
+
+    /// `written`, the write of an artifact with `spec`; a failed one leaves its blob unreferenced.
+    pub fn written<T>(&self, spec: &ArtifactSpec, written: Result<T, String>) -> Result<T, String> {
+        if written.is_err() {
+            if let Ok(digest) = BlobDigest::parse(&spec.digest) {
+                self.blobs.unwritten(&digest);
+            }
         }
+        written
     }
 
     pub async fn prepare_put(
@@ -196,10 +215,6 @@ impl ArtifactService<'_> {
                 }
             }
         }
-        let (digest, size) = match &input.body {
-            ArtifactBody::Bytes(bytes) => (self.blobs.put_with_media_type(bytes, &input.media_type).await?, bytes.len() as u64),
-            ArtifactBody::File(path) => self.blobs.put_file_with_media_type(path, &input.media_type).await?,
-        };
         let name = artifact_slot_record_name(&caller.convoy, &producer, &input.kind, &input.subject)?;
         let prior = match self.backend.including_replicas::<Artifact>(self.namespace).get(&name).await {
             Ok(prior) => Some(prior.object),
@@ -212,6 +227,12 @@ impl ArtifactService<'_> {
             .and_then(Duration::try_days)
             .and_then(|duration| Utc::now().checked_add_signed(duration))
             .ok_or_else(|| format!("artifact retention for `{}` is too large", input.kind))?;
+        // The body is put last: nothing here fails after it, and a caller whose write of the
+        // artifact fails tells the store (`BlobStore::unwritten`).
+        let (digest, size) = match &input.body {
+            ArtifactBody::Bytes(bytes) => (self.blobs.put_with_media_type(bytes, &input.media_type).await?, bytes.len() as u64),
+            ArtifactBody::File(path) => self.blobs.put_file_with_media_type(path, &input.media_type).await?,
+        };
         let spec = ArtifactSpec::builder()
             .convoy(caller.convoy.clone())
             .producer(producer)

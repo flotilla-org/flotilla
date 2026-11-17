@@ -201,33 +201,30 @@ impl<'a> RequestDispatcher<'a> {
                 .build();
             // Validation and storage are the complete submission; settlement needs no forge write.
             let (name, spec) = service.prepare_put(caller, input, &settings.artifact_retention_days).await?;
-            let target = self
-                .daemon
-                .resolve_existing_convoy_target(&CommandAction::QueryExplainConvoy {
-                    namespace: Some(namespace.clone()),
-                    name: caller.convoy.clone(),
-                })
-                .await?;
-            let node_id = match target {
-                Some(target) => target.node_id,
-                None if self.daemon.has_authoritative_convoy(&namespace, &caller.convoy).await? => self.daemon.node_id().clone(),
-                None => return Err(DispatcherError::from("convoy home is unavailable for artifact put")),
-            };
-            let document = |spec: &flotilla_resources::ArtifactSpec| {
-                serde_json::json!({
+            let store = async {
+                let target = self
+                    .daemon
+                    .resolve_existing_convoy_target(&CommandAction::QueryExplainConvoy {
+                        namespace: Some(namespace.clone()),
+                        name: caller.convoy.clone(),
+                    })
+                    .await?;
+                let node_id = match target {
+                    Some(target) => target.node_id,
+                    None if self.daemon.has_authoritative_convoy(&namespace, &caller.convoy).await? => self.daemon.node_id().clone(),
+                    None => return Err("convoy home is unavailable for artifact put".to_string()),
+                };
+                let document = serde_json::json!({
                     "apiVersion": "flotilla.work/v1", "kind": "Artifact",
                     "metadata": { "name": name }, "spec": spec,
-                })
+                });
+                match self.artifact_home_action(&node_id, CommandAction::ResourceApply { namespace: namespace.clone(), document }).await? {
+                    CommandValue::ResourceObject(_) => Ok(()),
+                    CommandValue::Error { message } => Err(format!("artifact storage failed: {message}")),
+                    other => Err(format!("unexpected artifact home result: {other:?}")),
+                }
             };
-            let store = async |spec: &flotilla_resources::ArtifactSpec| match self
-                .artifact_home_action(&node_id, CommandAction::ResourceApply { namespace: namespace.clone(), document: document(spec) })
-                .await?
-            {
-                CommandValue::ResourceObject(_) => Ok(()),
-                CommandValue::Error { message } => Err(format!("artifact storage failed: {message}")),
-                other => Err(format!("unexpected artifact home result: {other:?}")),
-            };
-            store(&spec).await?;
+            service.written(&spec, store.await)?;
             Ok::<_, DispatcherError>(Response::ArtifactPut {
                 address: format!("artifact/{name}"),
                 view_url: flotilla_config::artifact_view_url(&spec, &settings.blob_stores),

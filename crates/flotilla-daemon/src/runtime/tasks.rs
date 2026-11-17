@@ -87,7 +87,7 @@ pub(super) async fn load_checkout_archive_roots(path: &Path) -> Result<BTreeSet<
 }
 
 /// How long an unreferenced blob stands before it is collected.
-const BLOB_GRACE: Duration = Duration::from_secs(24 * 60 * 60);
+pub(super) const BLOB_GRACE: Duration = Duration::from_secs(24 * 60 * 60);
 /// The wait before retrying a failed collection.
 const GC_RETRY: RetryBackoff = RetryBackoff { initial: Duration::from_secs(60), maximum: Duration::from_secs(60 * 60) };
 /// Consecutive failed collections retried at [`GC_RETRY`]; past it, the next change or retirement
@@ -109,10 +109,16 @@ pub(super) struct Retirements {
 /// acts at each change to one, at each retirement here, and when the next artifact expires or a
 /// blob's grace passes: nothing is listed again and no timer runs. A failure retries at a backoff
 /// a finite number of times; past it, the next change or retirement retries.
-pub(super) async fn run_artifact_gc(backend: ResourceBackend, namespace: String, blobs: Arc<TieredBlobStore>, retirements: Retirements) {
+pub(super) async fn run_artifact_gc(
+    backend: ResourceBackend,
+    namespace: String,
+    blobs: Arc<TieredBlobStore>,
+    grace: Duration,
+    retirements: Retirements,
+) {
     let mut failures = 0_u32;
     loop {
-        let stopped = retain(&backend, &namespace, &blobs, &retirements, &mut failures).await;
+        let stopped = retain(&backend, &namespace, &blobs, grace, &retirements, &mut failures).await;
         failures = failures.saturating_add(1);
         warn!(error = %stopped, failures, "artifact retention stopped; reading the artifacts again");
         if failures <= GC_RETRY_LIMIT {
@@ -135,17 +141,19 @@ async fn retain(
     backend: &ResourceBackend,
     namespace: &str,
     blobs: &Arc<TieredBlobStore>,
+    grace: Duration,
     retirements: &Retirements,
     failures: &mut u32,
 ) -> String {
     let mut retired_here = (retirements.follow)();
+    let mut unwritten = blobs.follow_unwritten();
     // Watched before the listing, so no change between the two is missed.
     let mut changes = match backend.including_replicas::<Artifact>(namespace).watch().await {
         Ok(changes) => changes.ready_chunks(64),
         Err(error) => return format!("watch artifacts: {error}"),
     };
     let service = ArtifactService { backend, blobs: blobs.as_ref(), namespace };
-    let mut retention = match service.retention(BLOB_GRACE).await {
+    let mut retention = match service.retention(grace).await {
         Ok(retention) => retention,
         Err(error) => return format!("list artifacts: {error}"),
     };
@@ -154,7 +162,8 @@ async fn retain(
     // The convoys that retired while nothing followed them.
     let mut due: BTreeSet<String> = retention.convoys().flat_map(|convoy| retired(&retention, convoy)).collect();
     // One look at the stores at the start collects what no artifact referenced then: among it, the
-    // body of a put whose artifact never landed. Later, only a blob whose last reference goes.
+    // body of a put whose artifact never landed before a restart. Later, a blob whose last
+    // reference goes, or whose artifact's write failed.
     let mut leftovers = Some(tokio::time::Instant::now());
     loop {
         let now = Utc::now();
@@ -164,14 +173,14 @@ async fn retain(
             due.clear();
         }
         for digest in retention.collectable(now) {
-            match blobs.collect(&digest, BLOB_GRACE).await {
+            match blobs.collect(&digest, grace).await {
                 Ok(None) => retention.collected(&digest),
                 Ok(Some(left)) => retention.defer(&digest, now + chrono::Duration::from_std(left).unwrap_or(chrono::Duration::MAX)),
                 Err(error) => drop(failed.get_or_insert(error)),
             }
         }
         if leftovers.is_some_and(|at| at <= tokio::time::Instant::now()) {
-            match blobs.gc_unreferenced(&retention.referenced(), BLOB_GRACE).await {
+            match blobs.gc_unreferenced(&retention.referenced(), grace).await {
                 Ok(left) => leftovers = left.map(|left| tokio::time::Instant::now() + left),
                 Err(error) => drop(failed.get_or_insert(error)),
             }
@@ -224,6 +233,12 @@ async fn retain(
                     due.extend(retention.convoys().flat_map(|convoy| retired(&retention, convoy)));
                 }
                 Err(broadcast::error::RecvError::Closed) => retired_here = None,
+            },
+            digest = unwritten.recv() => match digest {
+                Ok(digest) => retention.unwritten(&digest, Utc::now()),
+                // Fell behind: the stores are looked at again.
+                Err(broadcast::error::RecvError::Lagged(_)) => leftovers = Some(tokio::time::Instant::now()),
+                Err(broadcast::error::RecvError::Closed) => return "the blob store closed".into(),
             },
             () = async {
                 match deadline {

@@ -18,7 +18,7 @@ use flotilla_resources::artifact::{blob_digest_of, is_blob_digest, BLOB_DIGEST_R
 use hmac::{Hmac, Mac};
 use serde::Deserialize;
 use sha2::{Digest, Sha256};
-use tokio::sync::{Mutex, Notify};
+use tokio::sync::{broadcast, Mutex, Notify};
 use url::Url;
 
 /// Failed fleet sync passes retried on a backoff before only a queued blob retries.
@@ -75,6 +75,10 @@ pub trait BlobStore: Send + Sync {
         tokio::fs::write(path, &bytes).await.map_err(|error| error.to_string())?;
         Ok(Some(bytes.len() as u64))
     }
+
+    /// `digest` was put for an artifact whose write then failed, so nothing may reference it. A
+    /// store whose blobs artifact retention collects tells it; others need do nothing.
+    fn unwritten(&self, _digest: &BlobDigest) {}
 }
 
 #[derive(Default)]
@@ -539,7 +543,12 @@ pub struct TieredBlobStore {
     wake: Notify,
     inventory: Mutex<SyncInventory>,
     sync_lock: Mutex<()>,
+    /// The blobs put for artifacts whose write then failed, told to artifact retention.
+    unwritten: broadcast::Sender<BlobDigest>,
 }
+
+/// How many unwritten blobs retention may fall behind by before it sweeps the stores instead.
+const UNWRITTEN: usize = 256;
 
 #[derive(Default)]
 struct SyncInventory {
@@ -593,7 +602,12 @@ impl TieredBlobStore {
             wake: Notify::new(),
             inventory: Mutex::new(SyncInventory::default()),
             sync_lock: Mutex::new(()),
+            unwritten: broadcast::channel(UNWRITTEN).0,
         }
+    }
+    /// The blobs put for artifacts whose write failed from now on.
+    pub fn follow_unwritten(&self) -> broadcast::Receiver<BlobDigest> {
+        self.unwritten.subscribe()
     }
     pub fn from_config(state_dir: &Path, fleet: &[BlobStoreConfig]) -> Result<Self, String> {
         let stores = fleet
@@ -1007,6 +1021,11 @@ impl BlobStore for TieredBlobStore {
             let _ = tokio::fs::remove_file(self.marker(&target.id, digest)).await;
         }
         Ok(())
+    }
+
+    fn unwritten(&self, digest: &BlobDigest) {
+        // No retention follows the store: its start sweeps the stores.
+        drop(self.unwritten.send(digest.clone()));
     }
 }
 

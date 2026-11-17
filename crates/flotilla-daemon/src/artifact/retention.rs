@@ -115,6 +115,14 @@ impl Retention {
         self.remove(&(name.to_owned(), None), now);
     }
 
+    /// `digest` was put at `now` for an artifact whose write then failed: unless an artifact
+    /// references it, it is collectable a grace later.
+    pub(crate) fn unwritten(&mut self, digest: &BlobDigest, now: DateTime<Utc>) {
+        if !self.references.contains_key(digest) {
+            self.defer(digest, now + self.grace);
+        }
+    }
+
     /// This home's unpinned artifacts expired at `now`.
     pub(crate) fn expired(&self, now: DateTime<Utc>) -> Vec<String> {
         self.expiry.iter().take_while(|(expires_at, _)| *expires_at <= now).map(|(_, name)| name.clone()).collect()
