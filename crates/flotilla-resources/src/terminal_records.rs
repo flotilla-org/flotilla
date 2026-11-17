@@ -426,6 +426,22 @@ impl TerminalObservation {
         })
     }
 
+    /// Whether this says something `before` did not. A screen re-read that confirms the held
+    /// attention moves its `as_of` and says nothing new: readers judging freshness read the held
+    /// `as_of` when they look, at their own deadline, so the confirmation wakes nobody. A hook
+    /// reading is an event of its own, and always says something.
+    fn says_more_than(&self, before: &TerminalObservation) -> bool {
+        use crate::TerminalAttentionSource;
+        match (&self.attention, &before.attention) {
+            (Some(now), Some(then))
+                if now.source == TerminalAttentionSource::Screen && now.source == then.source && now.state == then.state =>
+            {
+                TerminalObservation { attention: before.attention.clone(), ..self.clone() } != *before
+            }
+            _ => self != before,
+        }
+    }
+
     /// Records a hook's or screen's `attention` if it adds to what is held.
     pub fn observe_attention(&mut self, attention: TerminalAttention, adapter: Option<&str>) {
         if self.should_record_attention(&attention, adapter) {
@@ -485,15 +501,15 @@ impl TerminalObservations {
         self.lock().get(name).cloned()
     }
 
-    /// Changes launch `name`'s observation with `change`; a change that alters it wakes the
-    /// subscribers. Whether it changed.
+    /// Changes launch `name`'s observation with `change`; a change that says something new wakes
+    /// the subscribers. Whether it did.
     pub fn update(&self, name: &str, change: impl FnOnce(&mut TerminalObservation)) -> bool {
         let changed = {
             let mut held = self.lock();
             let observation = held.entry(name.to_owned()).or_default();
             let before = observation.clone();
             change(observation);
-            *observation != before
+            observation.says_more_than(&before)
         };
         if changed {
             self.noted(name);
@@ -502,14 +518,14 @@ impl TerminalObservations {
     }
 
     /// Changes launch `name`'s observation with `change` only while it is observed: an ended,
-    /// forgotten launch is not observed again. Whether it changed.
+    /// forgotten launch is not observed again. Whether it said something new.
     pub fn amend(&self, name: &str, change: impl FnOnce(&mut TerminalObservation)) -> bool {
         let changed = {
             let mut held = self.lock();
             let Some(observation) = held.get_mut(name) else { return false };
             let before = observation.clone();
             change(observation);
-            *observation != before
+            observation.says_more_than(&before)
         };
         if changed {
             self.noted(name);
@@ -572,6 +588,41 @@ mod tests {
         assert!(!observations.update("t#1", |observation| observation.launch_command = Some("sh".into())));
         assert_eq!(changes.try_recv().ok().as_deref(), Some("t#1"));
         assert!(changes.try_recv().is_err());
+    }
+
+    // The probe re-reads each screen every few seconds. A re-read that confirms the attention held
+    // keeps it fresh without waking anyone; a different state, or a hook, wakes the readers.
+    #[test]
+    fn a_confirming_screen_read_freshens_without_waking() {
+        use crate::{TerminalAttention, TerminalAttentionSource, TerminalAttentionState};
+        let observations = TerminalObservations::default();
+        let mut changes = observations.subscribe();
+        let read = |state, seconds| TerminalAttention {
+            state,
+            as_of: DateTime::UNIX_EPOCH + chrono::Duration::seconds(seconds),
+            source: TerminalAttentionSource::Screen,
+        };
+        let observe = |attention: TerminalAttention| {
+            observations.update("t#1", |observation| observation.observe(Some(attention), None, TerminalOccupancy::Vacant, Some("claude")))
+        };
+        assert!(observe(read(TerminalAttentionState::Idle, 0)));
+        assert_eq!(changes.try_recv().ok().as_deref(), Some("t#1"));
+        for seconds in [5, 10, 300] {
+            assert!(!observe(read(TerminalAttentionState::Idle, seconds)), "confirmation at {seconds}s woke");
+            assert!(changes.try_recv().is_err(), "confirmation at {seconds}s woke a subscriber");
+            let held = observations.get("t#1").and_then(|observation| observation.attention).expect("held attention");
+            assert_eq!(held.as_of, DateTime::UNIX_EPOCH + chrono::Duration::seconds(seconds), "the confirmation is held");
+        }
+        assert!(observe(read(TerminalAttentionState::Working, 305)));
+        assert_eq!(changes.try_recv().ok().as_deref(), Some("t#1"));
+        let hook = TerminalAttention {
+            state: TerminalAttentionState::Working,
+            as_of: DateTime::UNIX_EPOCH + chrono::Duration::seconds(310),
+            source: TerminalAttentionSource::Hook,
+        };
+        assert!(observations.update("t#1", |observation| observation.observe_attention(hook.clone(), Some("claude"))));
+        let later = TerminalAttention { as_of: hook.as_of + chrono::Duration::seconds(10), ..hook };
+        assert!(observations.update("t#1", |observation| observation.observe_attention(later, Some("claude"))), "a hook is an event");
     }
 
     // Native lifecycle hooks mark the launch that reported them; the session's next launch starts
