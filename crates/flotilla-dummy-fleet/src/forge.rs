@@ -22,12 +22,14 @@ use flotilla_protocol::{ChangeRequest, ChangeRequestStatus as ProtocolStatus};
 use flotilla_provider_runtime::{CommandRunner, ObservationError};
 use flotilla_resources::{ChangeRequestReviewObservation, ChangeRequestStatus, Observation, ObservedChangeRequestState};
 
-use crate::DummyFleet;
+use crate::{state::Event, DummyFleet};
 
 pub(crate) struct DummyChangeRequest {
     branch: String,
     title: String,
     opened_at: tokio::time::Instant,
+    /// `opened_at` on the wall clock, in milliseconds, which the state file carries.
+    opened_at_ms: i64,
     head_sha: String,
 }
 
@@ -64,27 +66,59 @@ impl DummyForge {
         &self.host
     }
 
-    /// Open (or find) the change request for `branch`, returning its web URL.
-    pub(crate) fn open(&self, repository: &str, branch: &str, title: &str) -> (u64, String) {
+    /// Open (or find) the change request for `branch`, returning its number, its web URL and
+    /// whether this opened it.
+    pub(crate) fn open(&self, fleet: &DummyFleet, repository: &str, branch: &str, title: &str) -> (u64, String, bool) {
         let mut repositories = self.repositories();
         let requests = repositories.entry(repository.to_string()).or_default();
-        let number = match requests.iter().find(|(_, request)| request.branch == branch) {
-            Some((number, _)) => *number,
+        let (number, opened) = match requests.iter().find(|(_, request)| request.branch == branch) {
+            Some((number, _)) => (*number, false),
             None => {
                 let number = requests.keys().next_back().map_or(1, |last| last + 1);
-                requests.insert(
-                    number,
-                    DummyChangeRequest {
-                        branch: branch.into(),
-                        title: title.into(),
-                        opened_at: tokio::time::Instant::now(),
-                        head_sha: format!("{:040x}", (dummy_draw(self.seed, "head", &format!("{repository}#{number}")) * 1e15) as u64),
-                    },
-                );
-                number
+                let request = DummyChangeRequest {
+                    branch: branch.into(),
+                    title: title.into(),
+                    opened_at: tokio::time::Instant::now(),
+                    opened_at_ms: Utc::now().timestamp_millis(),
+                    head_sha: format!("{:040x}", (dummy_draw(self.seed, "head", &format!("{repository}#{number}")) * 1e15) as u64),
+                };
+                fleet.record(&Self::event(repository, number, &request));
+                requests.insert(number, request);
+                (number, true)
             }
         };
-        (number, format!("{}/{repository}/pulls/{number}", self.service_url))
+        (number, format!("{}/{repository}/pulls/{number}", self.service_url), opened)
+    }
+
+    fn event(repository: &str, number: u64, request: &DummyChangeRequest) -> Event {
+        Event::ChangeRequest {
+            repository: repository.into(),
+            number,
+            branch: request.branch.clone(),
+            title: request.title.clone(),
+            opened_at: request.opened_at_ms,
+            head_sha: request.head_sha.clone(),
+        }
+    }
+
+    /// A change request a previous process opened, as old on this process's clock as on the wall clock.
+    pub(crate) fn restore(&self, repository: String, number: u64, branch: String, title: String, opened_at_ms: i64, head_sha: String) {
+        let age = Duration::from_millis(u64::try_from(Utc::now().timestamp_millis() - opened_at_ms).unwrap_or(0));
+        let now = tokio::time::Instant::now();
+        let opened_at = now.checked_sub(age).unwrap_or(now);
+        let request = DummyChangeRequest { branch, title, opened_at, opened_at_ms, head_sha };
+        self.repositories().entry(repository).or_default().insert(number, request);
+    }
+
+    /// The events that restore every change request.
+    pub(crate) fn snapshot(&self) -> Vec<Event> {
+        let repositories = self.repositories();
+        let mut names = repositories.keys().collect::<Vec<_>>();
+        names.sort();
+        names
+            .into_iter()
+            .flat_map(|repository| repositories[repository].iter().map(move |(number, request)| Self::event(repository, *number, request)))
+            .collect()
     }
 
     fn state(&self, repository: &str, request: &DummyChangeRequest, number: u64) -> ObservedChangeRequestState {
@@ -278,9 +312,10 @@ mod tests {
     #[tokio::test(start_paused = true)]
     async fn a_change_request_merges_after_its_delay() {
         let fleet = fleet(60_000, 0.0);
-        let (number, url) = fleet.forge.open("dummy/fleet", "dummy/convoy-a", "Convoy A");
-        assert_eq!(url, "https://forge.dummy.invalid/dummy/fleet/pulls/1");
-        assert_eq!(fleet.forge.open("dummy/fleet", "dummy/convoy-a", "Convoy A").0, number, "one request per branch");
+        let (number, url, opened) = fleet.forge.open(&fleet, "dummy/fleet", "dummy/convoy-a", "Convoy A");
+        assert_eq!((url.as_str(), opened), ("https://forge.dummy.invalid/dummy/fleet/pulls/1", true));
+        let again = fleet.forge.open(&fleet, "dummy/fleet", "dummy/convoy-a", "Convoy A");
+        assert_eq!((again.0, again.2), (number, false), "one request per branch");
         let tracker = tracker(&fleet);
         assert_eq!(state(&tracker, number).await, ObservedChangeRequestState::Open);
         tokio::time::advance(Duration::from_secs(61)).await;
@@ -295,7 +330,7 @@ mod tests {
     #[tokio::test]
     async fn the_close_rate_closes_instead_of_merging() {
         let fleet = fleet(0, 1.0);
-        let (number, _) = fleet.forge.open("dummy/fleet", "dummy/convoy-b", "Convoy B");
+        let (number, _, _) = fleet.forge.open(&fleet, "dummy/fleet", "dummy/convoy-b", "Convoy B");
         assert_eq!(state(&tracker(&fleet), number).await, ObservedChangeRequestState::Closed);
     }
 

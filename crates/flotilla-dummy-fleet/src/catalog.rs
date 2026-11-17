@@ -6,9 +6,10 @@ use std::path::{Path, PathBuf};
 
 use flotilla_protocol::{CommandAction, ConvoyAutoAttach, ConvoyStartIntent};
 use flotilla_resources::{
-    CapabilityNeed, CrewSource, CrewSpec, ExitDeclaration, FleetDesignation, FleetDesignationSpec, Forge, ForgeKind, ForgeSpec,
-    FulfilmentGrant, FulfilmentKind, FulfilmentKindSpec, FulfilmentRealisation, PlacementImageSource, Platform, Project,
-    ProjectRepositorySpec, ProjectSpec, Repository, RepositorySpec, Resource, Selector, WorkflowTemplate, WorkflowTemplateSpec,
+    definition_provenance::{MATERIALIZED_PROJECT_ANNOTATION, SOURCE_COMMIT_ANNOTATION, SOURCE_REPOSITORY_ANNOTATION},
+    CapabilityNeed, ConvoyEnsure, ConvoyEnsureSpec, CrewSource, CrewSpec, ExitDeclaration, FleetDesignation, FleetDesignationSpec, Forge,
+    ForgeKind, ForgeSpec, FulfilmentGrant, FulfilmentKind, FulfilmentKindSpec, FulfilmentRealisation, PlacementImageSource, Platform,
+    Project, ProjectRepositorySpec, ProjectSpec, Repository, RepositorySpec, Resource, Selector, WorkflowTemplate, WorkflowTemplateSpec,
     FLEET_DESIGNATION_NAME,
 };
 
@@ -30,6 +31,10 @@ pub const DUMMY_REPOSITORY: &str = "dummy/fleet";
 pub const DUMMY_FULFILMENT_KIND: &str = "dummy-crews";
 /// FulfilmentKind name selecting dummy cloud sandboxes.
 pub const DUMMY_CLOUD_FULFILMENT_KIND: &str = "dummy-cloud-crews";
+/// The Fleet project's standing governor: its convoy role, crew role and ConvoyEnsure name.
+pub const GOVERNOR_ROLE: &str = "governor";
+/// The standing governor's WorkflowTemplate.
+pub const GOVERNOR_WORKFLOW: &str = "dummy-governor";
 /// Image named by dummy environments; nothing pulls it.
 pub const DUMMY_IMAGE: &str = "dummy/crew:latest";
 /// Image named by dummy cloud sandboxes: a cloud backing records the digest
@@ -237,6 +242,39 @@ pub fn documents(forge_service_url: &str, host_ref: &str, long_runner_turns: u32
         documents.push(CatalogDocument::of::<WorkflowTemplate>(mix.workflow_name(), &mix.workflow(long_runner_turns))?);
     }
     Ok(documents)
+}
+
+/// The standing governor's workflow: one governor that resumes the stalled crew its supervision
+/// turns name, and declares no exit, so it runs until it is stopped.
+pub fn governor_workflow() -> WorkflowTemplateSpec {
+    WorkflowTemplateSpec::builder().roles(vec![crew(GOVERNOR_ROLE, CrewScript::Supervisor)]).build()
+}
+
+/// The Fleet project's standing governor, as an operator declares one: the workflow and the
+/// ConvoyEnsure that keeps a generation of it running on dummy environments. A convoy's default
+/// supervision reaches the project's live `governor` convoy, so every stalled dummy crew's
+/// supervision turn goes to it.
+pub fn standing_governor_documents(forge_service_url: &str) -> Result<Vec<CatalogDocument>, String> {
+    let repository = repository(&forge(forge_service_url))?;
+    let ensure = ConvoyEnsureSpec::builder()
+        .project_ref(FLEET_PROJECT.into())
+        .role(GOVERNOR_ROLE.into())
+        .workflow_ref(GOVERNOR_WORKFLOW.into())
+        .placement_policy(DUMMY_FULFILMENT_KIND.into())
+        .repositories(vec![repository.key()])
+        .build();
+    // The stamps project operations give an ensure they materialise from the project's charter;
+    // the reconciler admits only a materialised ensure's generations.
+    let source = repository.key().to_string();
+    let stamps = [
+        (MATERIALIZED_PROJECT_ANNOTATION, FLEET_PROJECT),
+        (SOURCE_REPOSITORY_ANNOTATION, source.as_str()),
+        (SOURCE_COMMIT_ANNOTATION, "dummy-catalog"),
+    ];
+    let mut ensure = CatalogDocument::of::<ConvoyEnsure>(GOVERNOR_ROLE, &ensure)?;
+    ensure.document["metadata"]["annotations"] =
+        stamps.into_iter().map(|(key, value)| (key.to_string(), serde_json::Value::from(value))).collect();
+    Ok(vec![CatalogDocument::of::<WorkflowTemplate>(GOVERNOR_WORKFLOW, &governor_workflow())?, ensure])
 }
 
 /// Write one JSON file per document under `dir`, named so they sort in apply

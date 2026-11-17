@@ -12,8 +12,8 @@ use flotilla_discovery_api::ProviderDescriptor;
 use flotilla_discovery_api::UnmetRequirement;
 
 use crate::environment::dummy::{
-    DummyEnvironmentBehaviour, DummyEnvironmentCleanup, DummyEnvironmentCounts, DummyEnvironmentProvider, DUMMY_CLOUD_ENVIRONMENT_INSTANCE,
-    DUMMY_ENVIRONMENT_INSTANCE, DUMMY_FLEET_ENV,
+    DummyEnvironmentBehaviour, DummyEnvironmentCleanup, DummyEnvironmentCounts, DummyEnvironmentProvider, DummyVendorChange,
+    DummyVendorJournal, DUMMY_CLOUD_ENVIRONMENT_INSTANCE, DUMMY_ENVIRONMENT_INSTANCE, DUMMY_FLEET_ENV,
 };
 use crate::environment::EnvironmentProvider;
 use flotilla_paths::path_context::ExecutionEnvironmentPath;
@@ -26,15 +26,32 @@ pub struct DummyEnvironmentFactory {
 }
 
 impl DummyEnvironmentFactory {
-    /// Clones share the external backing inventory across daemon restarts.
-    pub fn new(behaviour: DummyEnvironmentBehaviour, cleanup: DummyEnvironmentCleanup) -> Self {
-        Self { instance: DUMMY_ENVIRONMENT_INSTANCE, provider: Arc::new(DummyEnvironmentProvider::new(behaviour).with_cleanup(cleanup)) }
+    /// Clones share the external backing inventory across daemon restarts. `journal` hears
+    /// each change to it, for the next process's vendor.
+    pub fn new(behaviour: DummyEnvironmentBehaviour, cleanup: DummyEnvironmentCleanup, journal: DummyVendorJournal) -> Self {
+        let provider = DummyEnvironmentProvider::new(behaviour).with_cleanup(cleanup).with_journal(journal);
+        Self { instance: DUMMY_ENVIRONMENT_INSTANCE, provider: Arc::new(provider) }
     }
 
     /// The cloud-sandbox vendor, registered as [`DUMMY_CLOUD_ENVIRONMENT_INSTANCE`].
-    pub fn cloud(behaviour: DummyEnvironmentBehaviour, cleanup: DummyEnvironmentCleanup) -> Self {
-        let provider = DummyEnvironmentProvider::cloud(behaviour).with_cleanup(cleanup);
+    pub fn cloud(behaviour: DummyEnvironmentBehaviour, cleanup: DummyEnvironmentCleanup, journal: DummyVendorJournal) -> Self {
+        let provider = DummyEnvironmentProvider::cloud(behaviour).with_cleanup(cleanup).with_journal(journal);
         Self { instance: DUMMY_CLOUD_ENVIRONMENT_INSTANCE, provider: Arc::new(provider) }
+    }
+
+    /// The instance this vendor is registered as.
+    pub fn instance(&self) -> &'static str {
+        self.instance
+    }
+
+    /// See [`DummyEnvironmentProvider::restore`].
+    pub fn restore(&self, change: DummyVendorChange) {
+        self.provider.restore(change);
+    }
+
+    /// See [`DummyEnvironmentProvider::snapshot`].
+    pub fn snapshot(&self) -> Vec<DummyVendorChange> {
+        self.provider.snapshot()
     }
 
     /// Act as the vendor: see [`DummyEnvironmentProvider::vanish`].

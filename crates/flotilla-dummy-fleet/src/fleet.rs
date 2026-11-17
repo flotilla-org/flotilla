@@ -2,6 +2,7 @@
 
 use std::{
     collections::{BTreeSet, HashMap, HashSet},
+    path::{Path, PathBuf},
     sync::{
         atomic::{AtomicU64, Ordering},
         Arc, Mutex, OnceLock, Weak,
@@ -12,12 +13,26 @@ use std::{
 use async_trait::async_trait;
 use flotilla_config::dummy_fleet::DummyFleetConfig;
 use flotilla_daemon_api::daemon::DaemonHandle;
-use flotilla_environment::{environment::dummy::DummyEnvironmentCounts, factories::dummy::DummyEnvironmentFactory};
+use flotilla_environment::{
+    environment::dummy::{
+        DummyEnvironmentBehaviour, DummyEnvironmentCleanup, DummyEnvironmentCounts, DummyVendorJournal, DUMMY_CLOUD_ENVIRONMENT_INSTANCE,
+        DUMMY_ENVIRONMENT_INSTANCE,
+    },
+    factories::dummy::DummyEnvironmentFactory,
+};
 use flotilla_protocol::{commands::CommandValue, Command, CommandAction, DaemonEvent};
 use flotilla_provider_runtime::{HttpClient, ReqwestHttpClient};
+use serde::{Deserialize, Serialize};
 use tokio::sync::{broadcast::error::RecvError, oneshot};
 
-use crate::{catalog::CrewMix, forge::DummyForge, shared_forge::SharedForge, terminal::DummySessions, vcs::DummyCheckouts};
+use crate::{
+    catalog::CrewMix,
+    forge::DummyForge,
+    shared_forge::SharedForge,
+    state::{self, Event, Journal},
+    terminal::DummySessions,
+    vcs::DummyCheckouts,
+};
 
 /// How a dummy crew reaches its daemon: the same commands a real crew sends
 /// through `flotilla crew …`, without a socket or a process.
@@ -43,6 +58,8 @@ pub struct DummyFleet {
     pub(crate) sessions: DummySessions,
     pub(crate) vendor: DummyVendor,
     pub(crate) checkouts: DummyCheckouts,
+    /// The state file this fleet appends its changes to, once restored from it.
+    journal: Journal,
     port: OnceLock<Arc<dyn CrewCommandPort>>,
     counters: Counters,
     vessel_names: BTreeSet<String>,
@@ -50,10 +67,24 @@ pub struct DummyFleet {
 }
 
 impl DummyFleet {
-    /// A fleet whose shared forge, if configured, is reached over HTTPS.
+    /// A fleet whose shared forge, if configured, is reached over HTTPS. Nothing it holds
+    /// outlives it.
     pub fn new(config: DummyFleetConfig) -> Arc<Self> {
         let http = config.shared_forge.is_some().then(|| Arc::new(ReqwestHttpClient::new()) as Arc<dyn HttpClient>);
         Self::build(config, http)
+    }
+
+    /// The fleet whose state file is in `state_dir`: it holds what the fleet there held when
+    /// its process ended, and records its changes there. Its crews resume once it is attached.
+    pub fn open(config: DummyFleetConfig, state_dir: &Path) -> Result<Arc<Self>, String> {
+        let fleet = Self::new(config);
+        std::fs::create_dir_all(state_dir).map_err(|error| format!("create {}: {error}", state_dir.display()))?;
+        let path = state_dir.join(state::STATE_FILE);
+        for event in state::load(&path)? {
+            fleet.restore(event);
+        }
+        fleet.journal.open(&path, &fleet.events())?;
+        Ok(fleet)
     }
 
     /// A fleet whose shared forge, if configured, is reached through `http`.
@@ -66,17 +97,47 @@ impl DummyFleet {
         // Allocation names each vessel after a role it holds.
         let vessel_names =
             CrewMix::ALL.into_iter().flat_map(|mix| mix.workflow(config.agent.long_runner_turns).roles).map(|crew| crew.role).collect();
-        Arc::new(Self {
-            vessel_names,
-            forge: DummyForge::new(&config),
-            shared_forge,
-            sessions: DummySessions::default(),
-            vendor: DummyVendor::default(),
-            checkouts: DummyCheckouts::default(),
-            config,
-            port: OnceLock::new(),
-            counters: Counters::default(),
-            command_error_samples: Mutex::default(),
+        Arc::new_cyclic(|fleet: &Weak<Self>| {
+            let behaviour = DummyEnvironmentBehaviour {
+                seed: config.seed,
+                realise_delay: Duration::from_millis(config.environment.realise_delay_ms),
+                failure_rate: config.environment.failure_rate,
+            };
+            // A backing's destruction ends the sessions and checkouts inside it.
+            let cleanup: DummyEnvironmentCleanup = {
+                let fleet = Weak::clone(fleet);
+                Arc::new(move |id| {
+                    if let Some(fleet) = fleet.upgrade() {
+                        fleet.sessions.destroy_environment(&fleet, id);
+                        fleet.checkouts.destroy_environment(&fleet, id);
+                    }
+                })
+            };
+            let journal = |instance: &'static str| -> DummyVendorJournal {
+                let fleet = Weak::clone(fleet);
+                Arc::new(move |change| {
+                    if let Some(fleet) = fleet.upgrade() {
+                        fleet.record(&Event::Vendor { instance: instance.into(), change });
+                    }
+                })
+            };
+            let factories = [
+                DummyEnvironmentFactory::new(behaviour.clone(), Arc::clone(&cleanup), journal(DUMMY_ENVIRONMENT_INSTANCE)),
+                DummyEnvironmentFactory::cloud(behaviour, cleanup, journal(DUMMY_CLOUD_ENVIRONMENT_INSTANCE)),
+            ];
+            Self {
+                vessel_names,
+                forge: DummyForge::new(&config),
+                shared_forge,
+                sessions: DummySessions::default(),
+                vendor: DummyVendor { factories },
+                checkouts: DummyCheckouts::default(),
+                journal: Journal::default(),
+                config,
+                port: OnceLock::new(),
+                counters: Counters::default(),
+                command_error_samples: Mutex::default(),
+            }
         })
     }
 
@@ -84,10 +145,85 @@ impl DummyFleet {
         &self.config
     }
 
-    /// Connect crews to their daemon. The composition root calls this once,
-    /// after constructing the daemon whose discovery installed this fleet.
-    pub fn attach(&self, port: Arc<dyn CrewCommandPort>) -> Result<(), String> {
-        self.port.set(port).map_err(|_| "dummy fleet is already attached to a daemon".to_string())
+    /// Connect crews to their daemon, and resume those a previous process's fleet hosted. The
+    /// composition root calls this once, after constructing the daemon whose discovery
+    /// installed this fleet.
+    pub fn attach(self: &Arc<Self>, port: Arc<dyn CrewCommandPort>) -> Result<(), String> {
+        self.port.set(port).map_err(|_| "dummy fleet is already attached to a daemon".to_string())?;
+        self.sessions.resume(self);
+        Ok(())
+    }
+
+    /// End this fleet as its process's end does: its crews stop where they are, and nothing
+    /// more is recorded. The fleet [opened](Self::open) from its state file next takes over.
+    pub fn stop(&self) {
+        self.journal.close();
+        self.sessions.stop_all();
+    }
+
+    pub(crate) fn record(&self, event: &Event) {
+        self.journal.record(event);
+    }
+
+    /// Apply an event a previous process's fleet recorded.
+    fn restore(&self, event: Event) {
+        match event {
+            Event::Vendor { instance, change } => match self.vendor.factories.iter().find(|vendor| vendor.instance() == instance) {
+                Some(vendor) => vendor.restore(change),
+                None => tracing::warn!(%instance, "dummy fleet state names an unknown vendor"),
+            },
+            Event::ChangeRequest { repository, number, branch, title, opened_at, head_sha } => {
+                self.forge.restore(repository, number, branch, title, opened_at, head_sha)
+            }
+            Event::Checkout { environment, path, branch } => {
+                self.checkouts.lock().insert((environment, path), branch);
+            }
+            Event::CheckoutRemoved { environment, path } => {
+                self.checkouts.lock().remove(&(environment, path));
+            }
+            Event::CheckoutsDestroyed { environment } => self.checkouts.lock().retain(|(owner, _), _| *owner != environment),
+            Event::Launched { session, environment, command, cwd, crew } => self.sessions.restore(session, environment, command, cwd, crew),
+            Event::Killed { session } => {
+                self.sessions.lock().remove(&session);
+            }
+            Event::SessionsDestroyed { environment } => self.sessions.lock().retain(|_, session| session.environment != environment),
+            Event::Turn { session, text } => match self.sessions.get(&session) {
+                Some(session) => session.restore_turn(text),
+                None => tracing::warn!(%session, "dummy fleet state delivers a turn to an unknown session"),
+            },
+            Event::Acted { session, outcome } => {
+                if let Some(session) = self.sessions.get(&session) {
+                    session.record().outcomes.push(outcome);
+                }
+            }
+            Event::Counted { counter } => {
+                self.counters.get(counter).fetch_add(1, Ordering::Relaxed);
+            }
+            Event::Counts { counts } => {
+                for (counter, count) in counts {
+                    self.counters.get(counter).fetch_add(count, Ordering::Relaxed);
+                }
+            }
+        }
+    }
+
+    /// The fewest events that restore what this fleet holds now.
+    fn events(&self) -> Vec<Event> {
+        let counts = Counter::ALL.into_iter().map(|counter| (counter, self.counters.get(counter).load(Ordering::Relaxed))).collect();
+        let mut events = vec![Event::Counts { counts }];
+        for vendor in &self.vendor.factories {
+            events.extend(vendor.snapshot().into_iter().map(|change| Event::Vendor { instance: vendor.instance().into(), change }));
+        }
+        events.extend(self.forge.snapshot());
+        let checkouts = self
+            .checkouts
+            .lock()
+            .iter()
+            .map(|((environment, path), branch)| (environment.clone(), path.clone(), branch.clone()))
+            .collect::<BTreeSet<(String, PathBuf, String)>>();
+        events.extend(checkouts.into_iter().map(|(environment, path, branch)| Event::Checkout { environment, path, branch }));
+        events.extend(self.sessions.snapshot());
+        events
     }
 
     pub(crate) async fn execute(&self, action: CommandAction) -> Result<CommandValue, String> {
@@ -128,6 +264,7 @@ impl DummyFleet {
 
     pub(crate) fn count(&self, counter: Counter) {
         self.counters.get(counter).fetch_add(1, Ordering::Relaxed);
+        self.record(&Event::Counted { counter });
     }
 
     /// Provider-side artifacts survive resource deletion if teardown is broken.
@@ -170,7 +307,8 @@ impl DummyFleet {
     }
 }
 
-#[derive(Clone, Copy)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
 pub(crate) enum Counter {
     SessionsLaunched,
     TurnsReceived,
@@ -179,6 +317,18 @@ pub(crate) enum Counter {
     CrewsStalled,
     ChangeRequestsOpened,
     CommandErrors,
+}
+
+impl Counter {
+    const ALL: [Self; 7] = [
+        Self::SessionsLaunched,
+        Self::TurnsReceived,
+        Self::CrewsCompleted,
+        Self::CrewsFailed,
+        Self::CrewsStalled,
+        Self::ChangeRequestsOpened,
+        Self::CommandErrors,
+    ];
 }
 
 #[derive(Default)]
@@ -211,18 +361,17 @@ pub struct DummyFleetSnapshot {
     pub live_environments: u64,
 }
 
-/// The container and cloud-sandbox environment vendors. They are created on
-/// the fleet's first install and kept across daemon restarts, as a vendor's
-/// backings outlive a daemon. Acting as the vendor changes only what its
-/// provider reports.
-#[derive(Default)]
+/// The container and cloud-sandbox environment vendors. Every install of the
+/// fleet installs them, and the state file carries their backings to the next
+/// process's fleet, as a vendor's backings outlive a daemon. Acting as the
+/// vendor changes only what its provider reports.
 pub struct DummyVendor {
-    pub(crate) factories: OnceLock<[DummyEnvironmentFactory; 2]>,
+    pub(crate) factories: [DummyEnvironmentFactory; 2],
 }
 
 impl DummyVendor {
     fn each(&self) -> impl Iterator<Item = &DummyEnvironmentFactory> {
-        self.factories.get().into_iter().flatten()
+        self.factories.iter()
     }
 
     /// Delete `environment`'s backing, by Environment name or backing ID; its

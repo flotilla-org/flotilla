@@ -198,7 +198,7 @@ mod tests {
         std::fs::write(dir.path().join("daemon.toml"), "machine_id = \"metrics-host\"\n[dummy_fleet]\n").unwrap();
         let daemon_config = config.load_daemon_config().unwrap();
         let mut discovery = flotilla_discovery_testkit::fake_discovery_with_host_directories(dir.path());
-        let fleet = crate::dummy_fleet::install_dummy_fleet(&daemon_config, &mut discovery).unwrap();
+        let fleet = crate::dummy_fleet::install_dummy_fleet(&daemon_config, config.state_dir().as_path(), &mut discovery).unwrap().unwrap();
         let metrics = Arc::new(LoadMetrics::default());
         let daemon = flotilla_core::in_process::InProcessDaemon::new_with_resource_backend(
             vec![],

@@ -21,9 +21,14 @@
 //! [`DummyEnvironmentProvider::stop`] and
 //! [`DummyEnvironmentProvider::refuse_provisioning`]: the provider then reports
 //! only what the vendor did, and no stored record is touched.
+//!
+//! A vendor's backings outlive the daemon process, as Docker's containers do:
+//! the provider tells its journal each [`DummyVendorChange`], and a provider
+//! built in the next process is [restored](DummyEnvironmentProvider::restore)
+//! from them.
 
 use std::{
-    collections::{BTreeSet, HashMap},
+    collections::{BTreeMap, BTreeSet, HashMap},
     path::{Path, PathBuf},
     sync::{
         atomic::{AtomicBool, AtomicU64, AtomicU8, Ordering},
@@ -97,10 +102,42 @@ pub struct DummyEnvironmentBehaviour {
 /// In-process providers model resources that a real container destroys with it.
 pub type DummyEnvironmentCleanup = Arc<dyn Fn(&str) + Send + Sync>;
 
+/// Told each change to a vendor's backings, in order.
+pub type DummyVendorJournal = Arc<dyn Fn(DummyVendorChange) + Send + Sync>;
+
+/// A change to a dummy vendor's backings, by backing (environment ID).
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(tag = "vendor", rename_all = "snake_case")]
+pub enum DummyVendorChange {
+    /// The vendor realised a backing.
+    Provisioned { id: String, image: String, mounts: Vec<ProvisionedMount>, environment: BTreeMap<String, String> },
+    /// The daemon destroyed it.
+    Destroyed { id: String },
+    /// The vendor deleted it of its own accord.
+    Vanished { id: String },
+    /// The vendor stopped it.
+    Stopped { id: String },
+    /// A command inside it changed its files.
+    Files { id: String, change: DummyFileChange },
+    /// Counts carried over from backings no longer held, added to those the other changes make.
+    Counts { provisioned: u64, destroyed: u64, vanished: u64 },
+}
+
+/// A change to the file tree inside a dummy environment.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(tag = "op", rename_all = "snake_case")]
+pub enum DummyFileChange {
+    Wrote { path: PathBuf, content: String },
+    Made { paths: Vec<PathBuf> },
+    Removed { path: PathBuf },
+    Moved { from: PathBuf, to: PathBuf },
+}
+
 pub struct DummyEnvironmentProvider {
     behaviour: DummyEnvironmentBehaviour,
     class: DummyEnvironmentClass,
     cleanup: Option<DummyEnvironmentCleanup>,
+    journal: Option<DummyVendorJournal>,
     owner: Arc<()>,
     handles: Mutex<HashMap<EnvironmentId, Arc<DummyEnvironment>>>,
     refusing: AtomicBool,
@@ -115,6 +152,7 @@ impl DummyEnvironmentProvider {
             behaviour,
             class: DummyEnvironmentClass::Container,
             cleanup: None,
+            journal: None,
             owner: Arc::new(()),
             handles: Mutex::new(HashMap::new()),
             refusing: AtomicBool::new(false),
@@ -132,6 +170,112 @@ impl DummyEnvironmentProvider {
     pub fn with_cleanup(mut self, cleanup: DummyEnvironmentCleanup) -> Self {
         self.cleanup = Some(cleanup);
         self
+    }
+
+    /// Tell `journal` each change to the vendor's backings.
+    pub fn with_journal(mut self, journal: DummyVendorJournal) -> Self {
+        self.journal = Some(journal);
+        self
+    }
+
+    fn record(&self, change: DummyVendorChange) {
+        if let Some(journal) = &self.journal {
+            journal(change);
+        }
+    }
+
+    /// A backing as the vendor holds it, running, with an empty file tree.
+    fn backing_of(
+        &self,
+        id: EnvironmentId,
+        image: String,
+        mounts: Vec<ProvisionedMount>,
+        environment: HashMap<String, String>,
+    ) -> DummyEnvironment {
+        let journal = self.journal.clone().map(|journal| {
+            let id = id.to_string();
+            Box::new(move |change| journal(DummyVendorChange::Files { id: id.clone(), change })) as FileJournal
+        });
+        DummyEnvironment {
+            container_name: format!("flotilla-dummy-{id}"),
+            local_image_id: dummy_image_id(&image),
+            descriptor: self.descriptor(&image),
+            image: ImageId::new(image),
+            mounts,
+            environment,
+            runner: Arc::new(DummyCommandRunner { journal, ..DummyCommandRunner::default() }),
+            id,
+            destroyed: AtomicBool::new(false),
+            vendor: AtomicU8::new(RUNNING),
+            cleanup: self.cleanup.clone(),
+            journal: self.journal.clone(),
+            destroyed_count: Arc::clone(&self.destroyed_counter),
+        }
+    }
+
+    /// Apply a change a previous process's provider recorded, without recording it again or
+    /// cleaning up after it: what it destroyed was cleaned up then.
+    pub fn restore(&self, change: DummyVendorChange) {
+        let held = |id: &str| self.handles().get(&EnvironmentId::new(id)).cloned();
+        match change {
+            DummyVendorChange::Provisioned { id, image, mounts, environment } => {
+                let backing = self.backing_of(EnvironmentId::new(&id), image, mounts, environment.into_iter().collect());
+                self.handles().insert(EnvironmentId::new(id), Arc::new(backing));
+                self.provisioned.fetch_add(1, Ordering::Relaxed);
+            }
+            DummyVendorChange::Destroyed { id } => {
+                if let Some(handle) = self.handles().remove(&EnvironmentId::new(id)) {
+                    handle.destroyed.store(true, Ordering::Release);
+                    self.destroyed_counter.fetch_add(1, Ordering::Relaxed);
+                }
+            }
+            DummyVendorChange::Vanished { id } => {
+                if let Some(handle) = self.handles().remove(&EnvironmentId::new(id)) {
+                    handle.vendor.store(VANISHED, Ordering::Release);
+                    self.vanished.fetch_add(1, Ordering::Relaxed);
+                }
+            }
+            DummyVendorChange::Stopped { id } => {
+                if let Some(handle) = held(&id) {
+                    handle.vendor.store(STOPPED, Ordering::Release);
+                }
+            }
+            DummyVendorChange::Files { id, change } => {
+                if let Some(handle) = held(&id) {
+                    handle.runner.apply(&change);
+                }
+            }
+            DummyVendorChange::Counts { provisioned, destroyed, vanished } => {
+                self.provisioned.fetch_add(provisioned, Ordering::Relaxed);
+                self.destroyed_counter.fetch_add(destroyed, Ordering::Relaxed);
+                self.vanished.fetch_add(vanished, Ordering::Relaxed);
+            }
+        }
+    }
+
+    /// The fewest changes that [restore](Self::restore) what the vendor holds now and its counts.
+    pub fn snapshot(&self) -> Vec<DummyVendorChange> {
+        let held = self.handles().values().filter(|handle| handle.held()).cloned().collect::<Vec<_>>();
+        let counts = self.counts();
+        let mut changes = vec![DummyVendorChange::Counts {
+            provisioned: counts.provisioned - held.len() as u64,
+            destroyed: counts.destroyed,
+            vanished: counts.vanished,
+        }];
+        for handle in held {
+            let id = handle.id.to_string();
+            changes.push(DummyVendorChange::Provisioned {
+                id: id.clone(),
+                image: handle.image.as_str().to_owned(),
+                mounts: handle.mounts.clone(),
+                environment: handle.environment.clone().into_iter().collect(),
+            });
+            if handle.vendor.load(Ordering::Acquire) == STOPPED {
+                changes.push(DummyVendorChange::Stopped { id: id.clone() });
+            }
+            changes.extend(handle.runner.snapshot().into_iter().map(|change| DummyVendorChange::Files { id: id.clone(), change }));
+        }
+        changes
     }
 
     fn handles(&self) -> std::sync::MutexGuard<'_, HashMap<EnvironmentId, Arc<DummyEnvironment>>> {
@@ -156,6 +300,7 @@ impl DummyEnvironmentProvider {
         }
         self.vanished.fetch_add(1, Ordering::Relaxed);
         self.handles().retain(|_, current| !Arc::ptr_eq(current, &handle));
+        self.record(DummyVendorChange::Vanished { id: handle.id.to_string() });
         if let Some(cleanup) = &self.cleanup {
             cleanup(handle.id.as_str());
         }
@@ -164,8 +309,12 @@ impl DummyEnvironmentProvider {
 
     /// The vendor stops `environment`'s backing; it stays in the inventory.
     pub fn stop(&self, environment: &str) -> bool {
-        self.backing(environment)
-            .is_some_and(|handle| handle.vendor.compare_exchange(RUNNING, STOPPED, Ordering::AcqRel, Ordering::Acquire).is_ok())
+        let Some(handle) = self.backing(environment) else { return false };
+        let stopped = handle.vendor.compare_exchange(RUNNING, STOPPED, Ordering::AcqRel, Ordering::Acquire).is_ok();
+        if stopped {
+            self.record(DummyVendorChange::Stopped { id: handle.id.to_string() });
+        }
+        stopped
     }
 
     /// While set, the vendor refuses to realise any new backing.
@@ -279,23 +428,16 @@ impl EnvironmentProvider for DummyEnvironmentProvider {
         let mut environment: HashMap<String, String> = opts.tokens.into_iter().collect();
         environment.insert(DUMMY_FLEET_ENV.into(), "1".into());
         environment.insert("FLOTILLA_ENVIRONMENT_ID".into(), id.to_string());
-        let handle = Arc::new(DummyEnvironment {
-            container_name: format!("flotilla-dummy-{id}"),
-            local_image_id: dummy_image_id(&image),
-            descriptor: self.descriptor(&image),
-            image: ImageId::new(image),
-            mounts: opts.provisioned_mounts,
-            environment,
-            runner: Arc::new(DummyCommandRunner::default()),
-            id: id.clone(),
-            destroyed: AtomicBool::new(false),
-            vendor: AtomicU8::new(RUNNING),
-            cleanup: self.cleanup.clone(),
-            destroyed_count: Arc::clone(&self.destroyed_counter),
-        });
+        let handle = Arc::new(self.backing_of(id.clone(), image, opts.provisioned_mounts, environment));
         let mut handles = self.handles();
         let held = handles.entry(id).or_insert_with(|| {
             self.provisioned.fetch_add(1, Ordering::Relaxed);
+            self.record(DummyVendorChange::Provisioned {
+                id: handle.id.to_string(),
+                image: handle.image.as_str().to_owned(),
+                mounts: handle.mounts.clone(),
+                environment: handle.environment.clone().into_iter().collect(),
+            });
             handle
         });
         Ok(Arc::clone(held) as EnvironmentHandle)
@@ -358,6 +500,7 @@ struct DummyEnvironment {
     /// The vendor's view of the backing: running, stopped or vanished.
     vendor: AtomicU8,
     cleanup: Option<DummyEnvironmentCleanup>,
+    journal: Option<DummyVendorJournal>,
     destroyed_count: Arc<AtomicU64>,
     id: EnvironmentId,
     image: ImageId,
@@ -432,6 +575,9 @@ impl ProvisionedEnvironment for DummyEnvironment {
     async fn destroy(&self) -> Result<(), String> {
         if !self.destroyed.swap(true, Ordering::AcqRel) && self.vendor.load(Ordering::Acquire) != VANISHED {
             self.destroyed_count.fetch_add(1, Ordering::Relaxed);
+            if let Some(journal) = &self.journal {
+                journal(DummyVendorChange::Destroyed { id: self.id.to_string() });
+            }
             if let Some(cleanup) = &self.cleanup {
                 cleanup(self.id.as_str());
             }
@@ -459,9 +605,43 @@ fn failed(stderr: impl Into<String>) -> CommandOutput {
 pub struct DummyCommandRunner {
     files: Mutex<HashMap<PathBuf, String>>,
     directories: Mutex<BTreeSet<PathBuf>>,
+    journal: Option<FileJournal>,
 }
 
+type FileJournal = Box<dyn Fn(DummyFileChange) + Send + Sync>;
+
 impl DummyCommandRunner {
+    /// Make `change` and tell the journal.
+    fn change(&self, change: DummyFileChange) {
+        self.apply(&change);
+        if let Some(journal) = &self.journal {
+            journal(change);
+        }
+    }
+
+    fn apply(&self, change: &DummyFileChange) {
+        match change {
+            DummyFileChange::Wrote { path, content } => self.store(path, content),
+            DummyFileChange::Made { paths } => self.directories().extend(paths.iter().cloned()),
+            DummyFileChange::Removed { path } => self.remove(path),
+            DummyFileChange::Moved { from, to } => {
+                let moved = self.files().remove(from);
+                if let Some(content) = moved {
+                    self.store(to, &content);
+                }
+            }
+        }
+    }
+
+    /// The changes that make this file tree from an empty one.
+    fn snapshot(&self) -> Vec<DummyFileChange> {
+        let mut changes = vec![DummyFileChange::Made { paths: self.directories().iter().cloned().collect() }];
+        let mut files = self.files().iter().map(|(path, content)| (path.clone(), content.clone())).collect::<Vec<_>>();
+        files.sort();
+        changes.extend(files.into_iter().map(|(path, content)| DummyFileChange::Wrote { path, content }));
+        changes
+    }
+
     fn files(&self) -> std::sync::MutexGuard<'_, HashMap<PathBuf, String>> {
         self.files.lock().unwrap_or_else(std::sync::PoisonError::into_inner)
     }
@@ -494,22 +674,19 @@ impl DummyCommandRunner {
         match cmd {
             "true" | "chmod" | "chown" | "touch" | "sync" => succeeded(""),
             "mkdir" => {
-                self.directories().extend(Self::operands(args).map(PathBuf::from));
+                self.change(DummyFileChange::Made { paths: Self::operands(args).map(PathBuf::from).collect() });
                 succeeded("")
             }
             "rm" | "rmdir" => {
                 for path in Self::operands(args) {
-                    self.remove(Path::new(path));
+                    self.change(DummyFileChange::Removed { path: path.into() });
                 }
                 succeeded("")
             }
             "mv" => {
                 let operands = Self::operands(args).collect::<Vec<_>>();
                 if let [source, destination] = operands.as_slice() {
-                    let moved = self.files().remove(Path::new(source));
-                    if let Some(content) = moved {
-                        self.store(Path::new(destination), &content);
-                    }
+                    self.change(DummyFileChange::Moved { from: source.into(), to: destination.into() });
                 }
                 succeeded("")
             }
@@ -593,17 +770,17 @@ impl CommandRunner for DummyCommandRunner {
         if let Some(existing) = self.files().get(path) {
             return Ok(existing.clone());
         }
-        self.store(path, content);
+        self.change(DummyFileChange::Wrote { path: path.into(), content: content.into() });
         Ok(content.to_string())
     }
 
     async fn write_file(&self, path: &Path, content: &str) -> Result<(), String> {
-        self.store(path, content);
+        self.change(DummyFileChange::Wrote { path: path.into(), content: content.into() });
         Ok(())
     }
 
     async fn write_file_with_mode(&self, path: &Path, content: &str, _mode: u32) -> Result<(), String> {
-        self.store(path, content);
+        self.change(DummyFileChange::Wrote { path: path.into(), content: content.into() });
         Ok(())
     }
 
@@ -617,7 +794,7 @@ impl CommandRunner for DummyCommandRunner {
         let content = tokio::fs::read_to_string(source)
             .await
             .map_err(|error| format!("read {} for the dummy environment: {error}", source.display()))?;
-        self.store(destination, &content);
+        self.change(DummyFileChange::Wrote { path: destination.into(), content });
         Ok(())
     }
 }

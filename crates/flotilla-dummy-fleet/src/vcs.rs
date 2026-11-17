@@ -12,7 +12,7 @@ use std::{
     sync::{Arc, Mutex},
 };
 
-use crate::DummyFleet;
+use crate::{state::Event, DummyFleet};
 use async_trait::async_trait;
 use flotilla_discovery_api::{
     provider_config::ProviderConfigView, EnvironmentBag, Factory, ProviderCategory, ProviderDescriptor, UnmetRequirement,
@@ -44,7 +44,8 @@ const HOST_CHECKOUTS: &str = "host";
 pub(crate) struct DummyCheckouts(Mutex<HashMap<(String, PathBuf), String>>);
 
 impl DummyCheckouts {
-    pub(crate) fn destroy_environment(&self, environment: &str) {
+    pub(crate) fn destroy_environment(&self, fleet: &DummyFleet, environment: &str) {
+        fleet.record(&Event::CheckoutsDestroyed { environment: environment.into() });
         self.lock().retain(|(owner, _), _| owner != environment);
     }
 
@@ -57,7 +58,7 @@ impl DummyCheckouts {
             .collect()
     }
 
-    fn lock(&self) -> std::sync::MutexGuard<'_, HashMap<(String, PathBuf), String>> {
+    pub(crate) fn lock(&self) -> std::sync::MutexGuard<'_, HashMap<(String, PathBuf), String>> {
         self.0.lock().unwrap_or_else(std::sync::PoisonError::into_inner)
     }
 }
@@ -66,7 +67,9 @@ impl DummyVcs {
     /// A checkout is an empty directory at its target: its host or environment sees it there.
     async fn record(&self, branch: &str, target: &str) -> Result<(), String> {
         self.run(&["mkdir", "-p", target]).await?;
-        self.fleet.checkouts.lock().insert((self.environment.clone(), PathBuf::from(target)), branch.to_string());
+        let (environment, path) = (self.environment.clone(), PathBuf::from(target));
+        self.fleet.record(&Event::Checkout { environment: environment.clone(), path: path.clone(), branch: branch.into() });
+        self.fleet.checkouts.lock().insert((environment, path), branch.to_string());
         Ok(())
     }
 
@@ -157,6 +160,7 @@ impl Vcs for DummyVcs {
 
     async fn remove_materialised_checkout(&self, _branch: &str, target: &str) -> Result<CheckoutRemoval, String> {
         self.run(&["rm", "-rf", "--", target]).await?;
+        self.fleet.record(&Event::CheckoutRemoved { environment: self.environment.clone(), path: target.into() });
         self.fleet.checkouts.lock().remove(&(self.environment.clone(), PathBuf::from(target)));
         Ok(CheckoutRemoval::Removed)
     }
@@ -270,12 +274,13 @@ mod cleanup_tests {
     // Destroying one container removes all its checkouts while preserving others.
     #[test]
     fn environment_destruction_removes_only_its_checkouts() {
-        let checkouts = DummyCheckouts::default();
+        let fleet = DummyFleet::new(flotilla_config::dummy_fleet::DummyFleetConfig::default());
+        let checkouts = &fleet.checkouts;
         checkouts.lock().insert(("one".into(), "/workspace/one".into()), "dummy/convoy-a/main".into());
         checkouts.lock().insert(("two".into(), "/workspace/two".into()), "dummy/convoy-b/main".into());
         assert_eq!(checkouts.remaining_for("convoy-a", &HashSet::new()).len(), 1);
-        checkouts.destroy_environment("one");
-        checkouts.destroy_environment("one");
+        checkouts.destroy_environment(&fleet, "one");
+        checkouts.destroy_environment(&fleet, "one");
         assert!(checkouts.remaining_for("convoy-a", &HashSet::new()).is_empty());
         assert_eq!(checkouts.remaining_for("convoy-b", &HashSet::new()).len(), 1);
     }

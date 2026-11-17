@@ -198,7 +198,9 @@ async fn start_home(root: &std::path::Path, index: usize, dummy_fleet: &str, opt
     let config = Arc::new(ConfigStore::with_base(config_dir.clone()));
     let daemon_config: DaemonConfig = config.load_daemon_config().expect("daemon config");
     let mut discovery = fake_discovery_with_host_directories(&config_dir);
-    let fleet = install_dummy_fleet(&daemon_config, &mut discovery).expect("dummy fleet configured");
+    let fleet = install_dummy_fleet(&daemon_config, config.state_dir().as_path(), &mut discovery)
+        .expect("dummy fleet state")
+        .expect("dummy fleet configured");
     // The daemon's own store, opened where flotillad opens it.
     let database = config.state_dir().as_path().join("resources.sqlite");
     std::fs::create_dir_all(database.parent().expect("state dir")).expect("state dir");
@@ -234,8 +236,9 @@ async fn start_home(root: &std::path::Path, index: usize, dummy_fleet: &str, opt
 /// documents `dummy-fleet-catalog` writes, through the resource-apply command.
 async fn seed(backend: &ResourceBackend, port: &DaemonCommandPort, config: &flotilla_config::dummy_fleet::DummyFleetConfig) {
     let host = backend.clone().using::<Host>(NAMESPACE).list().await.expect("hosts").items.into_iter().next().expect("local host");
-    let documents =
+    let mut documents =
         catalog::documents(&config.forge_service_url, &host.metadata.name, config.agent.long_runner_turns).expect("dummy catalog");
+    documents.extend(catalog::standing_governor_documents(&config.forge_service_url).expect("standing governor"));
     for catalog::CatalogDocument { kind, name, document } in documents {
         let applied = port.execute(CommandAction::ResourceApply { namespace: NAMESPACE.into(), document }).await;
         assert!(matches!(applied, Ok(CommandValue::ResourceObject(_))), "apply {kind} {name}: {applied:?}");

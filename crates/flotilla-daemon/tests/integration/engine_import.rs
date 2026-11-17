@@ -115,7 +115,9 @@ impl Host {
     async fn start(&self) -> Result<DaemonRuntime, String> {
         let daemon_config: DaemonConfig = self.config.load_daemon_config().expect("daemon config");
         let mut discovery = fake_discovery(false);
-        let fleet = install_dummy_fleet(&daemon_config, &mut discovery).expect("dummy fleet");
+        let fleet = install_dummy_fleet(&daemon_config, self.config.state_dir().as_path(), &mut discovery)
+            .expect("dummy fleet state")
+            .expect("dummy fleet");
         let daemon = InProcessDaemon::new_composed(
             vec![],
             Arc::clone(&self.config),

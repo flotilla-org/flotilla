@@ -638,6 +638,45 @@ async fn supervised_coder_scenario(action: CrewSupervisionAction) {
     fleet.wait("the ruling's outcome", in_phase(&name, phase)).await;
 }
 
+// Behaviour: the load fleet's standing governor, kept by its ConvoyEnsure, receives a stalled
+// coder's supervision turn through the default project supervision, and resumes it with the
+// command the turn gives; the coder's convoy lands with no operator ruling.
+#[tokio::test(start_paused = true)]
+async fn the_standing_governor_resumes_a_stalled_coder() {
+    use flotilla_environment::environment::dummy::dummy_draw;
+
+    // The governor's own draw sets the stall rate, so it never stalls; the role is one whose
+    // coder does.
+    let rate = dummy_draw(0, "crew-stall", &format!("{0}/{0}/{0}", catalog::GOVERNOR_ROLE));
+    let role = (0..256)
+        .map(|n| format!("governed-{n}"))
+        .find(|role| dummy_draw(0, "crew-stall", &format!("{role}/coder/coder")) < rate)
+        .expect("seeded case");
+    let fleet = TestDaemon::builder().agent(&format!("stall_rate = {rate}\n")).start().await;
+    for catalog::CatalogDocument { kind, name, document } in
+        catalog::standing_governor_documents(&catalog_forge_url(&fleet).await).expect("governor documents")
+    {
+        let applied = fleet.execute(CommandAction::ResourceApply { namespace: NAMESPACE.into(), document }).await;
+        assert!(matches!(applied, CommandValue::ResourceObject(_)), "apply {kind} {name}: {applied:?}");
+    }
+    let governor = fleet
+        .wait("the standing governor's generation", |convoy: &ResourceObject<Convoy>| {
+            convoy.metadata.annotations.get(flotilla_resources::ENSURED_FROM_ANNOTATION).map(String::as_str) == Some(catalog::GOVERNOR_ROLE)
+        })
+        .await
+        .metadata
+        .name;
+    fleet.wait("the governor Active", in_phase(&governor, ConvoyPhase::Active)).await;
+    let name = create_through_admission(&fleet, &role, CrewMix::Coder.workflow_name()).await;
+    let governed = |status: &ConvoyStatus| {
+        status.stalled.as_ref().and_then(|stall| stall.supervisor.as_ref()).is_some_and(|supervisor| supervisor.convoy == governor)
+    };
+    fleet.wait("a stall the governor supervises", convoy(&name, governed)).await;
+    fleet.wait("Landed", in_phase(&name, ConvoyPhase::Landed)).await;
+    assert_eq!(fleet.counts().crews_stalled, 1, "only the coder stalled");
+    assert_eq!(fleet.counts().command_errors, 0);
+}
+
 // A daemon restart restores its active convoy while the crew process survives.
 // Its next submissions deliver the convoy without re-admission or a duplicate
 // process launch.
@@ -673,6 +712,55 @@ async fn a_long_runner_exchange_survives_a_daemon_restart() {
     fleet.wait("Landed", in_phase(&name, ConvoyPhase::Landed)).await;
     let counts = fleet.counts();
     assert_eq!(counts.command_errors, 0, "{counts:?}: {:?}", fleet.command_error_samples());
+}
+
+// A daemon restart between a coder's change request and its reviewer's answer, with the crews'
+// processes surviving, acts on each turn once: one change request, one launch of each crew, and
+// the convoy lands.
+#[tokio::test(start_paused = true)]
+#[ignore = "duplicate review turn after restart: the daemon holds typed turns in memory; fixed by the keyed cleat submission"]
+async fn a_restart_mid_review_acts_on_each_turn_once_and_lands() {
+    let fleet = TestDaemon::builder().agent("turn_delay_ms = 10000").settings("host_name = \"restart-proof\"\n").start().await;
+    let name = fleet.dispatch(CrewMix::CoderReviewer, DUMMY_FULFILMENT_KIND).await;
+    mid_review(&fleet, &name).await;
+    let fleet = fleet.restart().await;
+    acted_on_each_turn_once(&fleet, &name).await;
+}
+
+// As above, but the daemon's process ends, and the dummy fleet with it: the next process's fleet
+// restores the vendor's backing, the sessions and their crews, and the forge from its state file,
+// as a real host's Docker, cleat and forge outlive flotillad. The crews resume where they were.
+#[tokio::test(start_paused = true)]
+#[ignore = "duplicate review turn after restart: the daemon holds typed turns in memory; fixed by the keyed cleat submission"]
+async fn a_process_restart_mid_review_acts_on_each_turn_once_and_lands() {
+    let fleet = TestDaemon::builder().agent("turn_delay_ms = 10000").settings("host_name = \"restart-proof\"\n").start().await;
+    let name = fleet.dispatch(CrewMix::CoderReviewer, DUMMY_FULFILMENT_KIND).await;
+    mid_review(&fleet, &name).await;
+    let fleet = fleet.restart_process().await;
+    acted_on_each_turn_once(&fleet, &name).await;
+    assert_eq!(fleet.counts().environments_provisioned, 1, "the vendor's backing is adopted, not replaced");
+}
+
+async fn mid_review(fleet: &TestDaemon, name: &str) {
+    fleet
+        .wait("the coder's change request, before the review is answered", |found: &ResourceObject<Convoy>| {
+            let counts = fleet.counts();
+            found.metadata.name == name
+                && counts.change_requests_opened == 1
+                && counts.sessions_launched == 2
+                && counts.crews_completed == 0
+        })
+        .await;
+}
+
+async fn acted_on_each_turn_once(fleet: &TestDaemon, name: &str) {
+    fleet.wait("Landed", in_phase(name, ConvoyPhase::Landed)).await;
+    let counts = fleet.counts();
+    assert_eq!((counts.change_requests_opened, counts.sessions_launched, counts.turns_received), (1, 2, 2), "{counts:?}");
+    assert_eq!(counts.command_errors, 0, "{counts:?}: {:?}", fleet.command_error_samples());
+    let prs = promises(fleet, name, "coder", "coder").await;
+    let kept = prs.iter().filter(|p| p.kind == flotilla_resources::promises::PromiseKind::Pr).collect::<Vec<_>>();
+    assert_eq!(kept.len(), 1, "one change-request promise: {kept:?}");
 }
 
 /// Wall time moved forward by however much a test skips, so retry backoff passes at once.

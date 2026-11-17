@@ -1,6 +1,7 @@
 //! Write the dummy fleet's catalog as resource documents, one JSON file per
 //! document, for `flotilla resource apply --file` on a daemon running with
-//! `[dummy_fleet]`. Prints the files in apply order, one path per line.
+//! `[dummy_fleet]`, ending with the Fleet project's standing governor. Prints
+//! the files in apply order, one path per line.
 //!
 //! ```sh
 //! dummy-fleet-catalog --host-ref NAME --out-dir DIR \
@@ -39,7 +40,8 @@ fn run() -> Result<(), String> {
     }
     let host_ref = host_ref.filter(|name| !name.is_empty()).ok_or_else(|| format!("--host-ref is required\n{USAGE}"))?;
     let out_dir = out_dir.ok_or_else(|| format!("--out-dir is required\n{USAGE}"))?;
-    let documents = catalog::documents(&forge_service_url, &host_ref, turns)?;
+    let mut documents = catalog::documents(&forge_service_url, &host_ref, turns)?;
+    documents.extend(catalog::standing_governor_documents(&forge_service_url)?);
     for path in catalog::write_documents(&out_dir, &documents)? {
         println!("{}", path.display());
     }

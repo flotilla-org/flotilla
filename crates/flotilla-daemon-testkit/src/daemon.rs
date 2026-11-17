@@ -191,7 +191,9 @@ impl TestDaemon {
         };
         let relay = Arc::new(RestartRelay::default());
         let mut discovery = discovery(&dir, composition.forges.as_ref());
-        let fleet = install_dummy_fleet(&daemon_config, &mut discovery).expect("dummy fleet configured");
+        let fleet = install_dummy_fleet(&daemon_config, config.state_dir().as_path(), &mut discovery)
+            .expect("dummy fleet state")
+            .expect("dummy fleet configured");
         fleet.attach(Arc::clone(&relay) as Arc<dyn CrewCommandPort>).expect("attach the crews' command relay");
         let (daemon, runtime) = untouched(composition.refused(), compose(&composition, config, discovery, &relay)).await;
         let operator = Operator::connect(&daemon).await;
@@ -314,6 +316,35 @@ impl TestDaemon {
         let config = Arc::new(ConfigStore::with_base(dir.path().join("config")));
         let mut discovery = discovery(&dir, composition.forges.as_ref());
         fleet.install(&mut discovery);
+        let (daemon, runtime) = untouched(composition.refused(), compose(&composition, config, discovery, &relay)).await;
+        assert_eq!(daemon.node_id(), &node, "restart preserves the daemon's identity");
+        let operator = Operator::connect(&daemon).await;
+        Self { daemon, fleet, runtime: Some(runtime), relay, operator, composition, dispatched, dir }
+    }
+
+    /// Restart the daemon's process, as `flotillad` exiting and starting again does. The dummy
+    /// fleet runs in that process, so it ends with it: its crews stop where they are. The fleet
+    /// the new process opens restores, from its state file, what outlives a real process: the
+    /// vendors' backings, the sessions with their crews, the checkouts and the forge.
+    pub async fn restart_process(self) -> Self {
+        let Self { daemon, fleet, runtime, relay, operator, composition, dispatched, dir } = self;
+        drop(operator);
+        relay.disconnect();
+        fleet.stop();
+        let node = daemon.node_id().clone();
+        if let Some(runtime) = runtime {
+            runtime.shutdown();
+        }
+        drop(daemon);
+        drop(fleet);
+        tokio::task::yield_now().await;
+        let config = Arc::new(ConfigStore::with_base(dir.path().join("config")));
+        let daemon_config: DaemonConfig = config.load_daemon_config().expect("daemon config");
+        let mut discovery = discovery(&dir, composition.forges.as_ref());
+        let fleet = install_dummy_fleet(&daemon_config, config.state_dir().as_path(), &mut discovery)
+            .expect("dummy fleet state")
+            .expect("dummy fleet configured");
+        fleet.attach(Arc::clone(&relay) as Arc<dyn CrewCommandPort>).expect("attach the crews' command relay");
         let (daemon, runtime) = untouched(composition.refused(), compose(&composition, config, discovery, &relay)).await;
         assert_eq!(daemon.node_id(), &node, "restart preserves the daemon's identity");
         let operator = Operator::connect(&daemon).await;

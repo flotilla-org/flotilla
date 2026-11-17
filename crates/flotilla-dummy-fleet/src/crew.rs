@@ -27,7 +27,7 @@ use std::{
 
 use flotilla_environment::environment::dummy::dummy_draw;
 use flotilla_protocol::{
-    commands::{CommandValue, CrewPromiseOperation, StallProposedDisposition, StallReason},
+    commands::{CommandValue, CrewPromiseOperation, CrewSupervisionAction, StallProposedDisposition, StallReason},
     query::CrewCommandContext,
     CommandAction,
 };
@@ -36,6 +36,7 @@ use tokio::sync::mpsc;
 use crate::{
     fleet::{Counter, DummyFleet},
     shared_forge::SharedForge,
+    state::{Event, LaunchedCrew, Outcome},
     terminal::DummySession,
 };
 
@@ -50,9 +51,20 @@ const COMMAND_ATTEMPTS: usize = 3;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum CrewScript {
-    Coder { reviewer: Option<String>, repository: String },
-    Responder { reply_to: String },
-    Governor { aide: String, turns: u32 },
+    Coder {
+        reviewer: Option<String>,
+        repository: String,
+    },
+    Responder {
+        reply_to: String,
+    },
+    Governor {
+        aide: String,
+        turns: u32,
+    },
+    /// A standing governor: it resumes each stalled crew a supervision turn hands it, and runs
+    /// until its convoy is stopped.
+    Supervisor,
 }
 
 impl CrewScript {
@@ -86,6 +98,7 @@ impl CrewScript {
                     None => default_turns,
                 },
             },
+            "supervisor" => Self::Supervisor,
             other => return Err(format!("unknown dummy script `{other}`")),
         };
         match parameters.keys().next() {
@@ -100,6 +113,7 @@ impl CrewScript {
             Self::Coder { reviewer: None, repository } => format!("coder repo={repository}"),
             Self::Responder { reply_to } => format!("responder reply={reply_to}"),
             Self::Governor { aide, turns } => format!("governor aide={aide} turns={turns}"),
+            Self::Supervisor => "supervisor".into(),
         }
     }
 }
@@ -129,6 +143,19 @@ impl CrewIdentity {
         })
     }
 
+    /// The crew as the state file names it, running `script`.
+    pub(crate) fn launched(self, script: &str) -> LaunchedCrew {
+        LaunchedCrew {
+            crew_id: self.crew_id,
+            terminal_session: self.session,
+            namespace: self.namespace,
+            convoy: self.convoy,
+            vessel: self.vessel,
+            role: self.role,
+            script: script.into(),
+        }
+    }
+
     fn context(&self) -> CrewCommandContext {
         CrewCommandContext {
             crew_id: Some(self.crew_id.clone()),
@@ -144,6 +171,23 @@ impl CrewIdentity {
     }
 }
 
+impl From<&LaunchedCrew> for CrewIdentity {
+    fn from(crew: &LaunchedCrew) -> Self {
+        Self {
+            crew_id: crew.crew_id.clone(),
+            session: crew.terminal_session.clone(),
+            namespace: crew.namespace.clone(),
+            convoy: crew.convoy.clone(),
+            vessel: crew.vessel.clone(),
+            role: crew.role.clone(),
+        }
+    }
+}
+
+/// A crew runs its script over its session's turns. A crew resumed in another process runs it
+/// again from the start over the turns its session recorded, taking each command's recorded
+/// outcome rather than sending it, without pausing and without counting or reporting what it
+/// did before; once those outcomes run out it carries on from where its process ended.
 pub(crate) struct Crew {
     fleet: Arc<DummyFleet>,
     session: Arc<DummySession>,
@@ -152,6 +196,10 @@ pub(crate) struct Crew {
     /// Peer tasks that arrived while the crew waited for guidance.
     held: VecDeque<String>,
     script_finished: bool,
+    /// Outcomes a previous process recorded, not yet taken again.
+    replay: VecDeque<Outcome>,
+    /// Whether the last command's outcome was a recorded one: what followed it was counted then.
+    replayed: bool,
 }
 
 enum Ending {
@@ -165,8 +213,55 @@ impl Crew {
         session: Arc<DummySession>,
         identity: CrewIdentity,
         turns: mpsc::UnboundedReceiver<String>,
+        replay: VecDeque<Outcome>,
     ) -> Self {
-        Self { fleet, session, identity, turns, held: VecDeque::new(), script_finished: false }
+        let replayed = !replay.is_empty();
+        Self { fleet, session, identity, turns, held: VecDeque::new(), script_finished: false, replay, replayed }
+    }
+
+    fn resuming(&self) -> bool {
+        !self.replay.is_empty()
+    }
+
+    /// Send a crew command, or take its recorded outcome while resuming. Queries are read again.
+    async fn act(&mut self, action: CommandAction) -> Result<CommandValue, String> {
+        if action.is_query() {
+            return self.fleet.execute(action).await;
+        }
+        if let Some(outcome) = self.take_recorded().await {
+            return match outcome {
+                Outcome::Done { value } => Ok(*value),
+                Outcome::Refused { error } => Err(error),
+                Outcome::Opened { .. } => Err("a recorded change request stands where a command's outcome was".into()),
+            };
+        }
+        self.replayed = false;
+        let result = self.fleet.execute(action).await;
+        self.acted(match &result {
+            Ok(value) => Outcome::Done { value: Box::new(value.clone()) },
+            Err(error) => Outcome::Refused { error: error.clone() },
+        });
+        result
+    }
+
+    /// The next recorded outcome; when it is the last, the crew shows its daemon where it is.
+    async fn take_recorded(&mut self) -> Option<Outcome> {
+        let outcome = self.replay.pop_front()?;
+        if self.replay.is_empty() {
+            self.mark(self.session.working()).await;
+        }
+        Some(outcome)
+    }
+
+    fn acted(&self, outcome: Outcome) {
+        self.fleet.record(&Event::Acted { session: self.session.name.clone(), outcome: outcome.clone() });
+        self.session.record().outcomes.push(outcome);
+    }
+
+    fn count(&self, counter: Counter) {
+        if !self.replayed {
+            self.fleet.count(counter);
+        }
     }
 
     pub(crate) async fn run(mut self, script: CrewScript) {
@@ -179,10 +274,11 @@ impl Crew {
                 CrewScript::Coder { reviewer, repository } => self.code(reviewer, &repository).await,
                 CrewScript::Responder { reply_to } => self.respond(&reply_to).await,
                 CrewScript::Governor { aide, turns } => self.govern(&aide, turns).await,
+                CrewScript::Supervisor => self.supervise().await,
             },
         };
         if matches!(ending, Some(Ending::Failed)) {
-            self.fleet.count(Counter::CrewsFailed);
+            self.count(Counter::CrewsFailed);
         }
         // Completion leaves the conversation alive. A handoff can reopen Done
         // work, so consume the delivered turn and report again after acting on it.
@@ -254,7 +350,7 @@ impl Crew {
                 message: "dummy crew stalled at its configured rate".into(),
             };
             if self.attempt(action).await.is_some() {
-                self.fleet.count(Counter::CrewsStalled);
+                self.count(Counter::CrewsStalled);
             }
             self.await_guidance().await?;
         }
@@ -262,13 +358,25 @@ impl Crew {
     }
 
     async fn code(&mut self, reviewer: Option<String>, repository: &str) -> Option<Ending> {
-        let branch = format!("dummy/{}/{}", self.identity.convoy, self.identity.vessel);
-        let title = format!("Dummy work for {}", self.identity.convoy);
+        // One branch per convoy launch and role: every launch of the role's crew works on the same
+        // change request, and a standing convoy's next launch on a new one.
+        let convoy = &self.identity.convoy;
+        let branch = format!("dummy/{convoy}/{}", self.identity.role);
+        let title = format!("Dummy work for {convoy}");
         let url = match self.fleet.shared_forge.clone() {
-            Some(shared) => self.open_on_shared_forge(&shared, repository, &branch, &title).await?,
-            None => self.fleet.forge.open(repository, &branch, &title).1,
+            Some(shared) => {
+                let url = self.open_on_shared_forge(&shared, repository, &branch, &title).await?;
+                self.count(Counter::ChangeRequestsOpened);
+                url
+            }
+            None => {
+                let (_, url, opened) = self.fleet.forge.open(&self.fleet, repository, &branch, &title);
+                if opened {
+                    self.fleet.count(Counter::ChangeRequestsOpened);
+                }
+                url
+            }
         };
-        self.fleet.count(Counter::ChangeRequestsOpened);
         let submit =
             CrewPromiseOperation::Submit { promise: None, kind: PROMISE_KIND.into(), reference: url.clone(), metadata: BTreeMap::new() };
         self.persist(CommandAction::CrewPromise { context: self.identity.context(), operation: submit }).await?;
@@ -285,6 +393,26 @@ impl Crew {
             self.hand_off(reply_to, "Done.").await?;
             if turn.contains(LAST_TURN_MARKER) {
                 return self.settle_promises().await;
+            }
+        }
+    }
+
+    /// Resume every stalled crew a supervision turn names, with the command the turn gives, until
+    /// the session ends.
+    async fn supervise(&mut self) -> Option<Ending> {
+        loop {
+            let turn = self.next_turn().await?;
+            for (convoy, vessel, role) in resume_commands(&turn) {
+                self.attempt(CommandAction::CrewSupervise {
+                    namespace: Some(self.identity.namespace.clone()),
+                    convoy,
+                    vessel,
+                    role,
+                    operation: CrewSupervisionAction::Resume,
+                    message: "Carry on.".into(),
+                    actor_crew_id: Some(self.identity.crew_id.clone()),
+                })
+                .await;
             }
         }
     }
@@ -319,7 +447,7 @@ impl Crew {
             let mut backoff = Duration::from_secs(1);
             let mut last_error = String::new();
             for _ in 0..COMMAND_ATTEMPTS {
-                match self.fleet.execute(action.clone()).await {
+                match self.act(action.clone()).await {
                     Ok(value) => return Some(value),
                     Err(error) => {
                         tracing::warn!(crew = %self.identity.subject(), %error, "dummy crew command refused; retrying");
@@ -336,7 +464,7 @@ impl Crew {
                 message: format!("dummy crew command kept failing: {last_error}"),
             };
             if self.attempt(stall).await.is_some() {
-                self.fleet.count(Counter::CrewsStalled);
+                self.count(Counter::CrewsStalled);
             }
             self.await_guidance().await?;
         }
@@ -351,7 +479,21 @@ impl Crew {
             let mut backoff = Duration::from_secs(1);
             let mut last_error = String::new();
             for attempt in 1..=COMMAND_ATTEMPTS {
-                match shared.open(repository, branch, title, &body).await {
+                let opened = match self.take_recorded().await {
+                    Some(Outcome::Opened { url }) => Ok(url),
+                    Some(Outcome::Refused { error }) => Err(error),
+                    Some(Outcome::Done { .. }) => Err("a recorded command outcome stands where the change request's was".into()),
+                    None => {
+                        self.replayed = false;
+                        let opened = shared.open(repository, branch, title, &body).await;
+                        self.acted(match &opened {
+                            Ok(url) => Outcome::Opened { url: url.clone() },
+                            Err(error) => Outcome::Refused { error: error.clone() },
+                        });
+                        opened
+                    }
+                };
+                match opened {
                     Ok(url) => return Some(url),
                     Err(error) => {
                         tracing::warn!(crew = %self.identity.subject(), attempt, %error, "dummy crew could not open its change request");
@@ -371,7 +513,7 @@ impl Crew {
                 message: format!("dummy crew could not open its change request on the shared forge: {last_error}"),
             };
             if self.attempt(stall).await.is_some() {
-                self.fleet.count(Counter::CrewsStalled);
+                self.count(Counter::CrewsStalled);
             }
             self.await_guidance().await?;
         }
@@ -420,7 +562,7 @@ impl Crew {
             })
             .await?;
             // Count finished scripts before publishing evidence triggers teardown.
-            self.fleet.count(Counter::CrewsCompleted);
+            self.count(Counter::CrewsCompleted);
             self.script_finished = true;
         }
         // The envelope names its ledger by digest, as a real crew's does; the body itself is not stored.
@@ -442,8 +584,8 @@ impl Crew {
         Some(Ending::Completed)
     }
 
-    async fn attempt(&self, action: CommandAction) -> Option<CommandValue> {
-        match self.fleet.execute(action).await {
+    async fn attempt(&mut self, action: CommandAction) -> Option<CommandValue> {
+        match self.act(action).await {
             Ok(value) => Some(value),
             Err(error) => {
                 tracing::warn!(crew = %self.identity.subject(), %error, "dummy crew command failed");
@@ -467,20 +609,25 @@ impl Crew {
 
     async fn idle_for(&self, duration: Duration) {
         self.mark(false).await;
-        tokio::time::sleep(duration).await;
+        if !self.resuming() {
+            tokio::time::sleep(duration).await;
+        }
         self.mark(true).await;
     }
 
-    /// Show working or idle on the screen, and report it as a harness hook would.
+    /// Show working or idle on the screen, and report it as a harness hook would. While
+    /// resuming, the screen follows the script and only where it ends up is reported.
     async fn mark(&self, working: bool) {
         self.session.set_working(working);
-        if let Some(session) = &self.identity.session {
+        if let (Some(session), false) = (&self.identity.session, self.resuming()) {
             self.fleet.report_attention(&self.identity.namespace, session, working).await;
         }
     }
 
     async fn think(&self) {
-        tokio::time::sleep(Duration::from_millis(self.fleet.config.agent.turn_delay_ms)).await;
+        if !self.resuming() {
+            tokio::time::sleep(Duration::from_millis(self.fleet.config.agent.turn_delay_ms)).await;
+        }
     }
 }
 
@@ -490,9 +637,63 @@ fn is_peer_turn(turn: &str) -> bool {
     turn.lines().next().is_some_and(|header| header.starts_with("[from ") && header.contains(" (peer)"))
 }
 
+/// The (convoy, vessel, role) of each `flotilla crew supervise … resume` command a supervision
+/// turn offers, as a supervising agent would read them off the turn.
+fn resume_commands(turn: &str) -> Vec<(String, String, String)> {
+    turn.lines()
+        .filter_map(|line| {
+            let words = shell_words(line.trim().trim_matches('`'));
+            if !words.starts_with(&["flotilla".into(), "crew".into(), "supervise".into()]) || !words.iter().any(|word| word == "resume") {
+                return None;
+            }
+            let flag = |name: &str| words.iter().position(|word| word == name).and_then(|at| words.get(at + 1)).cloned();
+            Some((flag("--convoy")?, flag("--vessel")?, flag("--role")?))
+        })
+        .collect()
+}
+
+/// Split a command line into words, honouring single quotes (`'it'\''s'` is one word).
+fn shell_words(line: &str) -> Vec<String> {
+    let (mut words, mut word, mut quoted, mut started) = (Vec::new(), String::new(), false, false);
+    let mut chars = line.chars();
+    while let Some(c) = chars.next() {
+        match c {
+            '\'' => (quoted, started) = (!quoted, true),
+            '\\' if !quoted => {
+                word.extend(chars.next());
+                started = true;
+            }
+            c if c.is_whitespace() && !quoted => {
+                if started {
+                    words.push(std::mem::take(&mut word));
+                }
+                started = false;
+            }
+            c => {
+                word.push(c);
+                started = true;
+            }
+        }
+    }
+    if started {
+        words.push(word);
+    }
+    words
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_supervisor_reads_the_resume_command_off_a_stall_turn() {
+        let turn = "[from flotilla (supervision)]\nSupervise stalled crew coder@coder in convoy fleet/c#1 (resource ref: c-1). \
+            Reason: infra. Evidence: x. Resume it with guidance, convert it to failed, or escalate it.\n\
+            `flotilla crew supervise --convoy 'c-1' --vessel 'co'\\''der' --role 'coder' resume --message 'guidance'`\n\
+            `flotilla crew supervise --convoy 'c-1' --vessel 'co'\\''der' --role 'coder' convert-to-failed --message 'guidance'`";
+        assert_eq!(resume_commands(turn), vec![("c-1".into(), "co'der".into(), "coder".into())]);
+        assert!(resume_commands("[from coder (peer)] review this").is_empty());
+    }
 
     #[test]
     fn scripts_round_trip_through_their_brief_line() {
@@ -501,6 +702,7 @@ mod tests {
             CrewScript::Coder { reviewer: Some("reviewer".into()), repository: "acme/app".into() },
             CrewScript::Responder { reply_to: "coder".into() },
             CrewScript::Governor { aide: "aide".into(), turns: 7 },
+            CrewScript::Supervisor,
         ] {
             let brief = format!("# Brief\n\nSome prose.\n{SCRIPT_LINE_PREFIX} {}\n", script.render());
             assert_eq!(CrewScript::from_brief(&brief, 3), Ok(script));

@@ -26,28 +26,85 @@ use crate::{
     adapter::{DUMMY_SCRIPT_ENV, SCREEN_IDLE, SCREEN_WORKING},
     crew::{Crew, CrewIdentity, CrewScript},
     fleet::{Counter, DummyFleet},
+    state::{Event, LaunchedCrew, Outcome},
 };
 
 /// Registry key of the dummy terminal pool; placement policies name it.
 pub const DUMMY_TERMINAL_POOL: &str = "dummy";
 
 pub(crate) struct DummySession {
+    pub(crate) name: String,
     role: String,
     convoy: Option<String>,
-    environment: String,
+    pub(crate) environment: String,
     command: String,
     cwd: ExecutionEnvironmentPath,
     working: AtomicBool,
+    /// The crew it hosts, as the state file names it.
+    launched: Option<LaunchedCrew>,
     turns: Option<mpsc::UnboundedSender<String>>,
+    /// The crew's end of `turns`, until the crew runs.
+    receiver: Mutex<Option<mpsc::UnboundedReceiver<String>>>,
+    record: Mutex<CrewRecord>,
     crew: Mutex<Option<JoinHandle<()>>>,
 }
 
+/// What a crew's session has seen: every turn delivered to it and the outcome of every command
+/// its crew sent, in order. A crew resumed in another process runs its script again over them.
+#[derive(Default)]
+pub(crate) struct CrewRecord {
+    pub(crate) turns: Vec<String>,
+    pub(crate) outcomes: Vec<Outcome>,
+}
+
 impl DummySession {
+    fn new(name: &str, environment: &str, command: String, cwd: ExecutionEnvironmentPath, launched: Option<LaunchedCrew>) -> Self {
+        let (sender, receiver) = mpsc::unbounded_channel();
+        Self {
+            name: name.into(),
+            role: launched.as_ref().map_or_else(|| "tool".to_string(), |crew| crew.role.clone()),
+            convoy: launched.as_ref().map(|crew| crew.convoy.clone()),
+            environment: environment.into(),
+            command,
+            cwd,
+            // A launched crew works on its launch prompt before it first idles.
+            working: AtomicBool::new(launched.is_some()),
+            turns: launched.is_some().then_some(sender),
+            receiver: Mutex::new(launched.is_some().then_some(receiver)),
+            launched,
+            record: Mutex::default(),
+            crew: Mutex::new(None),
+        }
+    }
+
+    pub(crate) fn record(&self) -> std::sync::MutexGuard<'_, CrewRecord> {
+        self.record.lock().unwrap_or_else(std::sync::PoisonError::into_inner)
+    }
+
+    /// Queue a turn a previous process delivered.
+    pub(crate) fn restore_turn(&self, text: String) {
+        if let Some(turns) = &self.turns {
+            let _ = turns.send(text.clone());
+        }
+        self.record().turns.push(text);
+    }
+
+    /// Start the hosted crew, resuming its script over what the session has recorded.
+    fn run_crew(self: &Arc<Self>, fleet: &Arc<DummyFleet>) -> Result<(), String> {
+        let Some(launched) = &self.launched else { return Ok(()) };
+        let Some(receiver) = self.receiver.lock().unwrap_or_else(std::sync::PoisonError::into_inner).take() else { return Ok(()) };
+        let script = CrewScript::parse(&launched.script, fleet.config.agent.long_runner_turns)?;
+        let replay = self.record().outcomes.iter().cloned().collect();
+        let crew = Crew::new(Arc::clone(fleet), Arc::clone(self), CrewIdentity::from(launched), receiver, replay);
+        *self.crew.lock().unwrap_or_else(std::sync::PoisonError::into_inner) = Some(tokio::spawn(crew.run(script)));
+        Ok(())
+    }
+
     pub(crate) fn set_working(&self, working: bool) {
         self.working.store(working, Ordering::Release);
     }
 
-    fn working(&self) -> bool {
+    pub(crate) fn working(&self) -> bool {
         self.working.load(Ordering::Acquire)
     }
 
@@ -68,7 +125,8 @@ impl DummySession {
 pub(crate) struct DummySessions(Mutex<HashMap<String, Arc<DummySession>>>);
 
 impl DummySessions {
-    pub(crate) fn destroy_environment(&self, environment: &str) {
+    pub(crate) fn destroy_environment(&self, fleet: &DummyFleet, environment: &str) {
+        fleet.record(&Event::SessionsDestroyed { environment: environment.into() });
         self.lock().retain(|_, session| {
             if session.environment == environment {
                 session.stop();
@@ -79,8 +137,61 @@ impl DummySessions {
         });
     }
 
-    fn lock(&self) -> std::sync::MutexGuard<'_, HashMap<String, Arc<DummySession>>> {
+    pub(crate) fn lock(&self) -> std::sync::MutexGuard<'_, HashMap<String, Arc<DummySession>>> {
         self.0.lock().unwrap_or_else(std::sync::PoisonError::into_inner)
+    }
+
+    /// A session a previous process launched, its crew not yet running.
+    pub(crate) fn restore(
+        &self,
+        name: String,
+        environment: String,
+        command: String,
+        cwd: ExecutionEnvironmentPath,
+        crew: Option<LaunchedCrew>,
+    ) {
+        let session = DummySession::new(&name, &environment, command, cwd, crew);
+        self.lock().insert(name, Arc::new(session));
+    }
+
+    /// Start every crew not yet running: those a previous process hosted.
+    pub(crate) fn resume(&self, fleet: &Arc<DummyFleet>) {
+        let sessions = self.lock().values().cloned().collect::<Vec<_>>();
+        for session in sessions {
+            if let Err(error) = session.run_crew(fleet) {
+                tracing::warn!(session = %session.name, %error, "dummy crew could not resume");
+            }
+        }
+    }
+
+    /// Stop every crew where it is, as its process's end does.
+    pub(crate) fn stop_all(&self) {
+        for session in self.lock().values() {
+            session.stop();
+        }
+    }
+
+    /// The events that restore every session: its launch, the turns delivered to it and its
+    /// crew's outcomes.
+    pub(crate) fn snapshot(&self) -> Vec<Event> {
+        let sessions = self.lock();
+        let mut names = sessions.keys().collect::<Vec<_>>();
+        names.sort();
+        let mut events = Vec::new();
+        for name in names {
+            let session = &sessions[name];
+            events.push(Event::Launched {
+                session: name.clone(),
+                environment: session.environment.clone(),
+                command: session.command.clone(),
+                cwd: session.cwd.clone(),
+                crew: session.launched.clone(),
+            });
+            let record = session.record();
+            events.extend(record.turns.iter().map(|text| Event::Turn { session: name.clone(), text: text.clone() }));
+            events.extend(record.outcomes.iter().map(|outcome| Event::Acted { session: name.clone(), outcome: outcome.clone() }));
+        }
+        events
     }
 
     pub(crate) fn remaining_for(&self, convoy: &str) -> Vec<String> {
@@ -95,7 +206,7 @@ impl DummySessions {
         self.lock().len()
     }
 
-    fn get(&self, name: &str) -> Option<Arc<DummySession>> {
+    pub(crate) fn get(&self, name: &str) -> Option<Arc<DummySession>> {
         self.lock().get(name).cloned()
     }
 }
@@ -109,29 +220,26 @@ impl DummyTerminalPool {
     fn launch(&self, name: &str, command: &str, cwd: &ExecutionEnvironmentPath, environment: &TerminalEnvVars) -> Result<(), String> {
         let identity = CrewIdentity::from_environment(environment);
         let script = environment.iter().rev().find(|(key, _)| key == DUMMY_SCRIPT_ENV).map(|(_, script)| script.as_str());
-        let script = match (&identity, script) {
-            (Some(_), Some(script)) => Some(CrewScript::parse(script, self.fleet.config.agent.long_runner_turns)?),
+        let launched = match (identity, script) {
+            (Some(identity), Some(script)) => {
+                // Refuse a script the crew could not run before anything starts.
+                CrewScript::parse(script, self.fleet.config.agent.long_runner_turns)?;
+                Some(identity.launched(script))
+            }
             (Some(_), None) => return Err(format!("session {name} was not launched by the dummy agent adapter")),
             // Tool sessions have no crew; they stay idle until killed.
             (None, _) => None,
         };
-        let (sender, receiver) = mpsc::unbounded_channel();
-        let session = Arc::new(DummySession {
-            role: identity.as_ref().map_or_else(|| "tool".to_string(), |identity| identity.role.clone()),
+        self.fleet.record(&Event::Launched {
+            session: name.into(),
             environment: self.environment.clone(),
-            convoy: identity.as_ref().map(|identity| identity.convoy.clone()),
             command: command.into(),
             cwd: cwd.clone(),
-            // A launched crew works on its launch prompt before it first idles.
-            working: AtomicBool::new(identity.is_some()),
-            turns: identity.is_some().then_some(sender),
-            crew: Mutex::new(None),
+            crew: launched.clone(),
         });
-        if let (Some(identity), Some(script)) = (identity, script) {
-            let crew = Crew::new(Arc::clone(&self.fleet), Arc::clone(&session), identity, receiver);
-            *session.crew.lock().unwrap_or_else(std::sync::PoisonError::into_inner) = Some(tokio::spawn(crew.run(script)));
-        }
-        self.fleet.sessions.lock().insert(name.into(), session);
+        let session = Arc::new(DummySession::new(name, &self.environment, command.into(), cwd.clone(), launched));
+        self.fleet.sessions.lock().insert(name.into(), Arc::clone(&session));
+        session.run_crew(&self.fleet)?;
         self.fleet.count(Counter::SessionsLaunched);
         Ok(())
     }
@@ -186,7 +294,9 @@ impl TerminalPool for DummyTerminalPool {
     }
 
     async fn kill_session(&self, session_name: &str) -> Result<(), String> {
-        if let Some(session) = self.fleet.sessions.lock().remove(session_name) {
+        let killed = self.fleet.sessions.lock().remove(session_name);
+        if let Some(session) = killed {
+            self.fleet.record(&Event::Killed { session: session_name.into() });
             session.stop();
         }
         Ok(())
@@ -199,9 +309,14 @@ impl TerminalPool for DummyTerminalPool {
     async fn deliver(&self, session_name: &str, text: &str) -> Result<(), String> {
         let session = self.fleet.sessions.get(session_name).ok_or_else(|| format!("dummy session {session_name} is not running"))?;
         let turns = session.turns.as_ref().ok_or_else(|| format!("dummy session {session_name} hosts no crew"))?;
+        if turns.is_closed() {
+            return Err(format!("dummy crew in {session_name} has stopped"));
+        }
         // The crew shows working from the moment its turn is accepted, as a
         // harness does once its composer submits.
         session.set_working(true);
+        self.fleet.record(&Event::Turn { session: session_name.into(), text: text.into() });
+        session.record().turns.push(text.into());
         turns.send(text.to_string()).map_err(|_| format!("dummy crew in {session_name} has stopped"))?;
         self.fleet.count(Counter::TurnsReceived);
         Ok(())
@@ -255,14 +370,14 @@ mod tests {
     use async_trait::async_trait;
     use flotilla_config::dummy_fleet::{DummyAgentConfig, DummyFleetConfig};
     use flotilla_protocol::{
-        commands::{CommandValue, CrewPromiseOperation, StallProposedDisposition},
+        commands::{CommandValue, CrewPromiseOperation, CrewSupervisionAction, StallProposedDisposition},
         CommandAction,
     };
     use hegel::generators as gs;
     use tokio::sync::mpsc;
 
     use super::*;
-    use crate::{adapter::DummyAgentAdapter, CrewCommandPort, LAST_TURN_MARKER};
+    use crate::{adapter::DummyAgentAdapter, CrewCommandPort, DummyFleetSnapshot, LAST_TURN_MARKER};
     use flotilla_agent::adapter::AgentAdapter;
     use flotilla_resources::TerminalAttentionState;
 
@@ -317,6 +432,9 @@ mod tests {
                     let proposal = if proposed_disposition == Some(StallProposedDisposition::Fail) { "fail" } else { "resume" };
                     (format!("stall:{proposal}"), CommandValue::Ok)
                 }
+                CommandAction::CrewSupervise { convoy, vessel, role, operation: CrewSupervisionAction::Resume, .. } => {
+                    (format!("resume:{convoy}/{vessel}/{role}"), CommandValue::Ok)
+                }
                 CommandAction::ResourceApply { document, .. } => {
                     assert_eq!(document["kind"], "Artifact");
                     ("ledger".to_string(), CommandValue::Ok)
@@ -334,6 +452,39 @@ mod tests {
         }
     }
 
+    // Behaviour: a supervisor resumes the stalled crew each supervision turn names, with the
+    // command the turn gives, and goes on waiting for the next.
+    #[tokio::test(start_paused = true)]
+    async fn a_supervisor_resumes_each_stalled_crew_its_turns_name() {
+        let fleet = DummyFleet::new(DummyFleetConfig::default());
+        let (commands, mut recorded) = mpsc::unbounded_channel();
+        let port = Arc::new(RecordingPort {
+            reference_prefix: String::new(),
+            handoff_refusals: std::sync::Mutex::new(0),
+            commands,
+            attention: Default::default(),
+        });
+        fleet.attach(Arc::clone(&port) as Arc<dyn CrewCommandPort>).expect("attach");
+        let pool = DummyTerminalPool { fleet: Arc::clone(&fleet), environment: "env-a".into() };
+        let path = ExecutionEnvironmentPath::new("/workspace");
+        pool.ensure_session(SESSION, "flotilla-dummy-crew", &path, &launch_environment(&CrewScript::Supervisor), &[])
+            .await
+            .expect("launch");
+        for convoy in ["convoy-b", "convoy-c"] {
+            let turn = format!(
+                "[from flotilla (supervision)]\n\nSupervise stalled crew coder@work in convoy fleet/{convoy}.\n\
+                 `flotilla crew supervise --convoy '{convoy}' --vessel 'work' --role 'coder' resume --message 'guidance'`\n\
+                 `flotilla crew supervise --convoy '{convoy}' --vessel 'work' --role 'coder' escalate --message 'guidance'`"
+            );
+            pool.deliver(SESSION, &turn).await.expect("deliver");
+            let acted = tokio::time::timeout(Duration::from_secs(600), recorded.recv()).await.expect("supervisor acts");
+            assert_eq!(acted.expect("port open"), format!("resume:{convoy}/work/coder"));
+        }
+        let after = tokio::time::timeout(Duration::from_secs(600), recorded.recv()).await;
+        assert!(after.is_err(), "a supervisor acts only on its turns, and does not end: {after:?}");
+        pool.kill_session(SESSION).await.expect("kill");
+    }
+
     // Container destruction removes in-process sessions only in that environment,
     // including idle tool sessions; killing another environment is not cleanup.
     #[tokio::test]
@@ -345,8 +496,8 @@ mod tests {
         one.launch("one-session", "shell", &path, &vec![]).expect("one");
         two.launch("two-session", "shell", &path, &vec![]).expect("two");
         assert_eq!(fleet.snapshot().live_sessions, 2);
-        fleet.sessions.destroy_environment("one");
-        fleet.sessions.destroy_environment("one");
+        fleet.sessions.destroy_environment(&fleet, "one");
+        fleet.sessions.destroy_environment(&fleet, "one");
         assert_eq!(fleet.snapshot().live_sessions, 1);
         assert!(fleet.sessions.get("one-session").is_none());
         assert!(fleet.sessions.get("two-session").is_some());
@@ -382,6 +533,7 @@ mod tests {
             CrewScript::Governor { aide, turns } => {
                 commands.extend((1..=*turns).map(|task| format!("handoff:{aide}{}", if task == *turns { "!" } else { "" })))
             }
+            CrewScript::Supervisor => unreachable!("a supervisor never ends; the property draws scripts that do"),
         }
         // The first handoff is refused `handoff_refusals` times: the crew retries,
         // and stalls for guidance after every third refusal.
@@ -573,8 +725,63 @@ mod tests {
         assert_eq!(next(&mut recorded).await, "ledger");
         let pull = fake.pull(&repo, 1).expect("the crew's pull request");
         assert_eq!((pull.title.as_str(), pull.user.as_str()), ("Dummy work for convoy-a", "rehearsal-crew"));
-        assert_eq!(pull.pull.expect("pull facts").head_branch, "dummy/convoy-a/implement");
+        assert_eq!(pull.pull.expect("pull facts").head_branch, "dummy/convoy-a/crew");
         assert_eq!(fleet.snapshot().change_requests_opened, 1);
         pool.kill_session(SESSION).await.expect("kill");
+    }
+
+    // Behaviour (A): a fleet opened from the state file of a fleet whose process ended holds what
+    // that fleet held: its session, the turns delivered to it, the forge's change requests and
+    // its counts. Its crew resumes where it stopped: it sends none of the commands it had sent,
+    // and acts on the next turn as it would have.
+    #[tokio::test(start_paused = true)]
+    async fn a_fleet_opened_from_its_state_file_resumes_where_it_stopped() {
+        let state = tempfile::tempdir().expect("state directory");
+        let config = DummyFleetConfig {
+            agent: DummyAgentConfig { turn_delay_ms: 1_500, fail_rate: 0.0, stall_rate: 0.0, long_runner_turns: 1 },
+            ..DummyFleetConfig::default()
+        };
+        let port = || {
+            let (commands, recorded) = mpsc::unbounded_channel();
+            let port = RecordingPort {
+                reference_prefix: "https://forge.dummy.invalid/dummy/fleet/pulls/".into(),
+                handoff_refusals: std::sync::Mutex::new(0),
+                commands,
+                attention: Default::default(),
+            };
+            (Arc::new(port), recorded)
+        };
+        async fn next(recorded: &mut mpsc::UnboundedReceiver<String>) -> String {
+            tokio::time::timeout(Duration::from_secs(600), recorded.recv()).await.expect("crew acts").expect("port open")
+        }
+        let script = CrewScript::Coder { reviewer: Some("reviewer".into()), repository: "dummy/fleet".into() };
+
+        let fleet = DummyFleet::open(config.clone(), state.path()).expect("open");
+        let (first, mut recorded) = port();
+        fleet.attach(first as Arc<dyn CrewCommandPort>).expect("attach");
+        let pool = DummyTerminalPool { fleet: Arc::clone(&fleet), environment: "env-a".into() };
+        let path = ExecutionEnvironmentPath::new("/workspace");
+        pool.ensure_session(SESSION, "flotilla-dummy-crew", &path, &launch_environment(&script), &[]).await.expect("launch");
+        assert_eq!(next(&mut recorded).await, "submit");
+        assert_eq!(next(&mut recorded).await, "handoff:reviewer!");
+        pool.deliver(SESSION, "[from implement/peer (peer)]\n\nLooks fine.").await.expect("deliver");
+        let before = fleet.snapshot();
+        // The process ends with the reviewer's answer delivered but not yet acted on.
+        fleet.stop();
+        drop((pool, fleet));
+
+        let fleet = DummyFleet::open(config, state.path()).expect("reopen");
+        assert_eq!(fleet.snapshot(), DummyFleetSnapshot { live_sessions: 1, ..before }, "the counts and the session carry over");
+        let (second, mut recorded) = port();
+        fleet.attach(second as Arc<dyn CrewCommandPort>).expect("attach");
+        assert_eq!(next(&mut recorded).await, "submit-ledger", "the crew acts on the delivered answer, sending nothing twice");
+        assert_eq!(next(&mut recorded).await, "ledger");
+        tokio::time::sleep(Duration::from_secs(120)).await;
+        assert!(recorded.try_recv().is_err(), "no command after the script ends");
+        let (number, _, opened) = fleet.forge.open(&fleet, "dummy/fleet", "dummy/convoy-a/crew", "Convoy A");
+        assert_eq!((number, opened), (1, false), "the forge holds the crew's change request");
+        assert_eq!(fleet.forge.open(&fleet, "dummy/fleet", "dummy/convoy-b/crew", "Convoy B").0, 2, "and numbers on from it");
+        let after = fleet.snapshot();
+        assert_eq!((after.change_requests_opened, after.turns_received, after.crews_completed), (1, 1, 1), "{after:?}");
     }
 }
