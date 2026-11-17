@@ -31,7 +31,7 @@ use flotilla_resources::{
     HELD_CREDENTIALS_CAPABILITY, OWNING_DAEMON_CAPABILITY, PLACEMENT_CAPABILITY, PLACEMENT_SNAPSHOT_KIND, SSH_HOST_CAPABILITY,
     TRANSPORT_CAPABILITY,
 };
-use flotilla_store::{ResourceBackend, TypedResolver};
+use flotilla_store::{Listed, ResourceBackend, TypedResolver};
 use serde_json::json;
 use tokio::sync::RwLock;
 use tracing::{debug, warn};
@@ -558,6 +558,16 @@ pub(super) struct FulfilmentProbeContext<'a> {
     /// Adapter → version of the pinned harnesses the host's crews are given (#4093);
     /// empty for a host whose crews run what it has installed.
     pub(super) pinned_harnesses: &'a BTreeMap<String, String>,
+    /// What the probe read of the store at its last pass.
+    pub(super) listings: &'a mut ProbeListings,
+}
+
+/// The Hosts and kinds a fulfilment probe reads, held between its ticks and listed again only
+/// once their collections move.
+#[derive(Default)]
+pub(super) struct ProbeListings {
+    hosts: Listed<Host>,
+    kinds: Listed<FulfilmentKind>,
 }
 
 /// The daemon's own host declares its environment through the daemon
@@ -601,14 +611,15 @@ pub(super) async fn observe_fulfilment_facts(
     model_probes: &mut ModelProbeState,
 ) -> Result<BTreeMap<String, FulfilmentFacts>, String> {
     *model_probes = ModelProbeState::default();
-    let hosts = backend.clone().using::<Host>(namespace).list().await.map_err(|error| error.to_string())?;
-    let all_kinds = backend.clone().using::<FulfilmentKind>(namespace).list().await.map_err(|error| error.to_string())?.items;
+    let listings = &mut *probe.listings;
+    let hosts = listings.hosts.read(&backend.clone().using::<Host>(namespace)).await.map_err(|error| error.to_string())?;
+    let all_kinds = listings.kinds.read(&backend.clone().using::<FulfilmentKind>(namespace)).await.map_err(|error| error.to_string())?;
     let mut kinds = Vec::new();
-    for kind in all_kinds {
+    for kind in all_kinds.iter() {
         if kind.metadata.deletion_timestamp.is_some() || is_prepared_snapshot(&kind.metadata.labels, PLACEMENT_SNAPSHOT_KIND) {
             continue;
         }
-        if kind_belongs_to_host(&hosts.items, &kind, host_ref, "fact observation") {
+        if kind_belongs_to_host(&hosts, kind, host_ref, "fact observation") {
             kinds.push(kind);
         }
     }
@@ -619,7 +630,7 @@ pub(super) async fn observe_fulfilment_facts(
     // host, as admission counts them (#4002). An SSH host's are counted
     // when its observation is published (#3793).
     let host_spec =
-        hosts.items.iter().find(|host| host.metadata.name == host_ref).map(|host| &host.spec).filter(|host| host.connection.is_daemon());
+        hosts.iter().find(|host| host.metadata.name == host_ref).map(|host| &host.spec).filter(|host| host.connection.is_daemon());
     let occupancy = match host_spec.and_then(|host| host.max_vessels) {
         Some(_) => Some(flotilla_store::occupancy::host_occupancy(backend, namespace, host_ref).await?),
         None => None,
@@ -662,7 +673,10 @@ pub(super) async fn observe_fulfilment_facts(
             // vessel's layers; resolution, not a probe, covers its image needs
             // (ADR 0062). Publish its capacity facts only.
             FulfilmentRealisation::DockerPerVessel { image: None } => {
-                facts.insert(kind.metadata.name, FulfilmentFacts { observed_at: Utc::now(), free_vessel_slots, ..Default::default() });
+                facts.insert(
+                    kind.metadata.name.clone(),
+                    FulfilmentFacts { observed_at: Utc::now(), free_vessel_slots, ..Default::default() },
+                );
                 continue;
             }
             FulfilmentRealisation::HostDirect => None,
@@ -676,7 +690,7 @@ pub(super) async fn observe_fulfilment_facts(
             // they are.
             let unknown =
                 FulfilmentFacts { image: image.map(Into::into), observed_at: Utc::now(), free_vessel_slots, ..Default::default() };
-            facts.insert(kind.metadata.name, unknown);
+            facts.insert(kind.metadata.name.clone(), unknown);
             continue;
         };
         let name = kind.metadata.name.clone();
@@ -732,7 +746,7 @@ pub(super) async fn observe_fulfilment_facts(
                 harness.models.clear();
             }
             observed.free_vessel_slots = free_vessel_slots;
-            observe_grants(&kind_store, &kind, &observed).await;
+            observe_grants(&kind_store, kind, &observed).await;
             facts.insert(name, observed);
         }
     }

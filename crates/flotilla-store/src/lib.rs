@@ -24,6 +24,8 @@ pub use engine_port::EnginePort;
 mod convoy_views;
 mod held_listing;
 mod lifecycle_views;
+mod listed;
+pub use listed::Listed;
 mod terminal_views;
 mod vessel_views;
 pub use convoy_views::ConvoyViews;

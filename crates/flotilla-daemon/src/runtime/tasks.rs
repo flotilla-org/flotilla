@@ -39,7 +39,9 @@ use tokio::{
 };
 use tracing::{debug, error, info, warn};
 
-use super::discovery::{observe_fulfilment_facts, BagEnvVars, FulfilmentProbeContext, LocalProvisioningProfile, SshHostProfile};
+use super::discovery::{
+    observe_fulfilment_facts, BagEnvVars, FulfilmentProbeContext, LocalProvisioningProfile, ProbeListings, SshHostProfile,
+};
 use super::docker::DockerControllerRuntime;
 use super::environments::reconcile_provisioned_environments;
 use super::health::{apply_host_heartbeat_with_credentials, DaemonHealthIdentity, HostObservations, RuntimeHealth};
@@ -388,6 +390,7 @@ pub(super) struct LocalFulfilmentProbe {
     scratch: PathBuf,
     observations: HostObservations,
     local_observation: StdMutex<super::discovery::LocalObservation>,
+    listings: Mutex<ProbeListings>,
 }
 
 impl LocalFulfilmentProbe {
@@ -399,11 +402,20 @@ impl LocalFulfilmentProbe {
         scratch: PathBuf,
         observations: HostObservations,
     ) -> Self {
-        Self { daemon, namespace, profile, providers, scratch, observations, local_observation: StdMutex::default() }
+        Self {
+            daemon,
+            namespace,
+            profile,
+            providers,
+            scratch,
+            observations,
+            local_observation: StdMutex::default(),
+            listings: Mutex::default(),
+        }
     }
 
     pub(super) async fn tick(&self) {
-        let Self { daemon, namespace, profile, providers, scratch, observations, local_observation } = self;
+        let Self { daemon, namespace, profile, providers, scratch, observations, local_observation, listings } = self;
         observations.record_provider_advertisements(super::discovery::observe_provider_advertisements(providers).await).await;
         // Image probes run with the scratch directory as their working directory.
         if let Err(error) = tokio::fs::create_dir_all(scratch).await {
@@ -439,6 +451,7 @@ impl LocalFulfilmentProbe {
                 observation: &observation,
                 harnesses: &harnesses,
                 pinned_harnesses: &Default::default(),
+                listings: &mut *listings.lock().await,
             },
             &mut model_probes,
         )
@@ -478,11 +491,13 @@ pub(super) fn spawn_ssh_fulfilment_probe_task(daemon: Arc<InProcessDaemon>, name
     // Compose the remote detection endpoint once, then retain that exact
     // provider instance across observation passes.
     let providers = Arc::new(command_provider_registry(&[EnvironmentInput::HostDirect], Arc::clone(&ssh.runner)));
+    let listings = Arc::new(Mutex::new(ProbeListings::default()));
     spawn_periodic_task("ssh fulfilment probe", FULFILMENT_CHANGE_CHECK_INTERVAL, PeriodicTaskStart::Immediate, move || {
         let daemon = Arc::clone(&daemon);
         let namespace = namespace.clone();
         let ssh = ssh.clone();
         let providers = Arc::clone(&providers);
+        let listings = Arc::clone(&listings);
         async move {
             let hosts = daemon.resource_backend().using::<Host>(&namespace);
             // As for the local host, probe ages come from this process's latest observation.
@@ -528,6 +543,7 @@ pub(super) fn spawn_ssh_fulfilment_probe_task(daemon: Arc<InProcessDaemon>, name
                     observation: &observation,
                     harnesses: &harnesses,
                     pinned_harnesses,
+                    listings: &mut *listings.lock().await,
                 },
                 &mut model_probes,
             )

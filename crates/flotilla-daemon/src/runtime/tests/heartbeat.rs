@@ -178,6 +178,7 @@ async fn heartbeat_does_not_wait_for_fulfilment_probe_and_publishes_later_facts(
                 observation: &Default::default(),
                 harnesses: &flotilla_agent::adapter::built_in_harnesses(&TestEnvVars::default()).collect::<Vec<_>>(),
                 pinned_harnesses: &Default::default(),
+                listings: &mut ProbeListings::default(),
             },
             &mut ModelProbeState::default(),
         )
@@ -256,6 +257,7 @@ async fn heartbeat_does_not_wait_for_fulfilment_probe_and_publishes_later_facts(
             observation: &Default::default(),
             harnesses: &flotilla_agent::adapter::built_in_harnesses(&TestEnvVars::default()).collect::<Vec<_>>(),
             pinned_harnesses: &Default::default(),
+            listings: &mut ProbeListings::default(),
         },
         &mut model_probes,
     )
@@ -285,6 +287,7 @@ async fn heartbeat_does_not_wait_for_fulfilment_probe_and_publishes_later_facts(
             observation: &Default::default(),
             harnesses: &flotilla_agent::adapter::built_in_harnesses(&TestEnvVars::default()).collect::<Vec<_>>(),
             pinned_harnesses: &Default::default(),
+            listings: &mut ProbeListings::default(),
         },
         &mut model_probes,
     )
@@ -536,6 +539,7 @@ async fn unresolved_fulfilment_provider_publishes_unknown() {
                             observation: &Default::default(),
                             harnesses: &flotilla_agent::adapter::built_in_harnesses(&TestEnvVars::default()).collect::<Vec<_>>(),
                             pinned_harnesses: &Default::default(),
+                            listings: &mut ProbeListings::default(),
                         },
                         &mut model_probes,
                     )
@@ -586,6 +590,7 @@ async fn headless_host_is_not_granted_a_gui_session() {
                 observation: &Default::default(),
                 harnesses: &flotilla_agent::adapter::built_in_harnesses(&TestEnvVars::default()).collect::<Vec<_>>(),
                 pinned_harnesses: &Default::default(),
+                listings: &mut ProbeListings::default(),
             },
             &mut ModelProbeState::default(),
         )
@@ -626,6 +631,7 @@ async fn a_host_given_pinned_harnesses_reports_their_pins_without_installing_the
                 observation: &Default::default(),
                 harnesses: &flotilla_agent::adapter::built_in_harnesses(&TestEnvVars::default()).collect::<Vec<_>>(),
                 pinned_harnesses: &pinned,
+                listings: &mut ProbeListings::default(),
             },
             &mut ModelProbeState::default(),
         )
@@ -688,6 +694,7 @@ async fn capped_docker_kind_publishes_free_slots_from_the_hosts_vessels() {
                     observation: &Default::default(),
                     harnesses: &flotilla_agent::adapter::built_in_harnesses(&TestEnvVars::default()).collect::<Vec<_>>(),
                     pinned_harnesses: &Default::default(),
+                    listings: &mut ProbeListings::default(),
                 },
                 &mut ModelProbeState::default(),
             )
@@ -766,6 +773,7 @@ async fn unknown_observation_keeps_a_gui_grant() {
             observation: &Default::default(),
             harnesses: &flotilla_agent::adapter::built_in_harnesses(&TestEnvVars::default()).collect::<Vec<_>>(),
             pinned_harnesses: &Default::default(),
+            listings: &mut ProbeListings::default(),
         },
         &mut ModelProbeState::default(),
     )

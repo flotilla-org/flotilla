@@ -75,6 +75,7 @@ async fn canonicalizes_display_name_kind_host_refs_to_the_host_id() {
             observation: &Default::default(),
             harnesses: &flotilla_agent::adapter::built_in_harnesses(&TestEnvVars::default()).collect::<Vec<_>>(),
             pinned_harnesses: &Default::default(),
+            listings: &mut ProbeListings::default(),
         },
         &mut ModelProbeState::default(),
     )
