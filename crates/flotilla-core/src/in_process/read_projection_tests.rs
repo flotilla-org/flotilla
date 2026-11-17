@@ -1520,57 +1520,29 @@ mod tests {
         assert_eq!(explain(10).await, explain(200).await);
     }
 
-    /// Seeds an old-store Message record as the retired inbox admitted one: accepted, waiting for
-    /// its receiver. These views read the old store until step 6 moves them to the engine.
-    async fn seed_old_message(backend: &ResourceBackend, name: &str, intent: &flotilla_resources::MessageSpec) {
-        use flotilla_resources::{Message, MessagePhase, MessageStatus};
-        let messages = backend.using::<Message>("flotilla");
-        let created = messages.create(&InputMeta::builder().name(name.into()).build(), intent).await.expect("admit");
-        let status = MessageStatus::builder()
-            .phase(MessagePhase::Accepted)
-            .since(created.metadata.creation_timestamp)
-            .maybe_accepted_sequence(created.metadata.resource_version.parse().ok())
-            .reason("waiting for receiver resolution".into())
-            .build();
-        messages.update_status(name, &created.metadata.resource_version, &status).await.expect("accepted");
-    }
-
     // Both crew and convoy surfaces share the durable projection. Waiting
     // reasons survive reads, and delivery identity comes only from evidence.
     #[tokio::test]
     async fn message_views_preserve_waiting_reasons_and_delivery_identity() {
-        use flotilla_resources::{Message, MessageRelation, MessageSpec, MessageStatusPatch, ResolvedMessageReceiver};
-        let backend = ResourceBackend::new(flotilla_store_memory::InMemoryBackend::default());
-        let intent = MessageSpec::builder()
-            .sender("flotilla/test".into())
-            .receiver("project/convoy/work/coder".into())
-            .relation(MessageRelation::System)
-            .body("brief".into())
-            .build();
-        seed_old_message(&backend, "view", &intent).await;
+        use flotilla_resources::MessageRelation;
+        let engine = flotilla_engine_convoys_testkit::EngineHome::open("home-a");
+        let backend = engine.backend().clone();
+        flotilla_engine_messages_testkit::designate_fleet(&backend, "flotilla").await;
+        let home = &engine.messages;
+        let mut intent = flotilla_engine_messages_testkit::intent("system:turn-rules", "flotilla/coder", MessageRelation::System, "brief");
+        // A reply is awaited, so the delivered message stays open and is listed.
+        intent.expectation = flotilla_messaging::IntentExpectation::Reply;
+        home.primitives().admit("view", &intent).await.expect("admit");
         let pending = super::crew_message_views(&backend, "flotilla").await.expect("waiting view");
-        assert_eq!(pending[0].phase, "accepted");
+        assert_eq!(pending[0].phase, "deliverable");
         assert!(pending[0].reason.as_deref().is_some_and(|reason| !reason.is_empty()));
         assert!(pending[0].crew_id.is_none());
-        flotilla_store::apply_status_patch(
-            &backend.using::<Message>("flotilla"),
-            "view",
-            &MessageStatusPatch::Delivered {
-                receiver: ResolvedMessageReceiver::builder()
-                    .crew_id("crew".into())
-                    .session("session".into())
-                    .delivered_at(Utc::now())
-                    .evidence("transport receipt".into())
-                    .build(),
-                at: Utc::now(),
-            },
-        )
-        .await
-        .expect("receipt");
+        // The receiving session takes the message and its receipt is recorded.
+        home.deliver_turn("flotilla/coder", "view", "session-coder").await;
         let delivered = super::crew_message_views(&backend, "flotilla").await.expect("delivered view");
         assert_eq!(delivered[0].phase, "delivered");
-        assert_eq!(delivered[0].crew_id.as_deref(), Some("crew"));
-        assert_eq!(delivered[0].session.as_deref(), Some("session"));
+        assert_eq!(delivered[0].crew_id.as_deref(), Some("session-coder"));
+        assert_eq!(delivered[0].session.as_deref(), Some("session-coder"));
         assert!(delivered[0].reason.is_none());
     }
 
