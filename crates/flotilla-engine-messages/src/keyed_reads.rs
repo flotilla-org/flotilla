@@ -147,11 +147,16 @@ impl KeyedReads {
     }
 
     /// The sessions of the vessel launched for the work holding `role` in `convoy`, through the
-    /// convoy's snapshot; see [`Self::work_sessions`]. `None` when the lifecycle reads are not
-    /// installed or the snapshot names no work for the role.
-    pub async fn seat_sessions(&self, convoy: &ResourceObject<Convoy>, convoy_home: &str, role: &str) -> Option<Vec<String>> {
-        let work = snapshot_work(convoy, role)?;
-        self.work_sessions(&convoy.metadata.name, convoy_home, &work, role).await.ok()
+    /// convoy's snapshot; see [`Self::work_sessions`]. None when the snapshot names no work for the
+    /// role.
+    pub async fn seat_sessions(
+        &self,
+        convoy: &ResourceObject<Convoy>,
+        convoy_home: &str,
+        role: &str,
+    ) -> Result<Vec<String>, ResourceError> {
+        let Some(work) = snapshot_work(convoy, role) else { return Ok(Vec::new()) };
+        self.work_sessions(&convoy.metadata.name, convoy_home, &work, role).await.map_err(ResourceError::other)
     }
 
     /// The sessions holding `role` in work `work` of `convoy`: those of the work's newest vessel

@@ -638,8 +638,7 @@ impl MessagePrimitives {
 
     /// Reads what `asked` names into `records`, each record by its key. A convoy role's session
     /// is read through its convoy's snapshot, the vessel launched for that work and the
-    /// sessions of that vessel; the sessions of a role whose convoy names no vessel for it are
-    /// read by their labels, as is every role's where the engine's reads are not installed.
+    /// sessions of that vessel.
     async fn read_asked(&self, records: &mut OldStoreRecords, mut asked: Wanted) -> Result<(), ResourceError> {
         let keyed = &self.keyed;
         let namespace = records.namespace.clone();
@@ -683,28 +682,12 @@ impl MessagePrimitives {
                 records.projects.insert(name.clone(), project);
             }
         }
-        let mut labelled = BTreeSet::new();
         for (convoy, role) in &asked.seats {
-            let seat = match (records.convoys.get(convoy), records.convoy_homes.get(convoy)) {
-                (Some(held), Some(home)) => keyed.seat_sessions(held, home, role).await,
-                _ => None,
-            };
-            match seat {
-                Some(sessions) => {
-                    for session in sessions {
-                        if let Some(terminal) = keyed.record::<TerminalSession>(&namespace, &session).await? {
-                            records.terminals.insert(session, terminal);
-                        }
-                    }
+            let (Some(held), Some(home)) = (records.convoys.get(convoy), records.convoy_homes.get(convoy)) else { continue };
+            for session in keyed.seat_sessions(held, home, role).await? {
+                if let Some(terminal) = keyed.record::<TerminalSession>(&namespace, &session).await? {
+                    records.terminals.insert(session, terminal);
                 }
-                None => {
-                    labelled.insert((convoy.clone(), role.clone()));
-                }
-            }
-        }
-        for (convoy, role) in &labelled {
-            for terminal in keyed.labelled_sessions(&namespace, convoy, role).await? {
-                records.terminals.insert(terminal.metadata.name.clone(), terminal);
             }
         }
         records.read.absorb(asked);
@@ -2133,8 +2116,8 @@ impl flotilla_messaging::CharterNotices for EngineCharterNotices {
     }
 }
 
-/// What spelling asked of the old-store records: each record by its key, and the two lookups no
-/// key reaches, a repository by its address and a session by its convoy role's labels.
+/// What spelling asked of the old-store records: each record by its key, a convoy role's
+/// sessions through its vessel, and the one lookup no key reaches, a repository by its address.
 #[derive(Debug, Default, Clone, PartialEq, Eq)]
 pub struct Wanted {
     forges: bool,
@@ -2360,9 +2343,11 @@ impl OldStoreRecords {
             return Err(format!("session `{session}` is no crew session"));
         };
         let project = self.convoy_project(&context.convoy).unwrap_or_else(|| self.namespace.clone());
+        // A launch's convoy is addressed as `launch_address` names it: a standing launch's record
+        // name is its address, not a segment.
         Address::project(&project)
-            .and_then(|project| project.child(AddressKind::Convoy, &context.convoy))
-            .and_then(|convoy| convoy.child(AddressKind::Role, &terminal.spec.role))
+            .map_err(|error| error.to_string())
+            .and_then(|project| flotilla_resources::convoy::engine::seat_address(&project, &context.convoy, &terminal.spec.role))
             .map_err(|error| format!("session `{session}`'s seat: {error}"))
     }
 
@@ -2385,15 +2370,19 @@ impl OldStoreRecords {
         })
     }
 
-    /// The session holding `role` in `convoy`, among the sessions read; asked for through the
-    /// convoy's vessel when not read.
-    fn seat_session(&self, convoy: &str, role: &str, seat: &Address) -> Option<&str> {
+    /// The session holding convoy role `seat`, among the sessions read; asked for through the
+    /// vessel of each convoy record the seat may name when not read.
+    fn seat_session(&self, seat: &Address) -> Option<&str> {
         let held = self.terminals.keys().find(|session| self.seat(session).as_ref() == Ok(seat)).map(String::as_str);
-        let key = (convoy.to_owned(), role.to_owned());
-        if held.is_none() && !self.read.seats.contains(&key) {
-            self.ask(|asked| {
-                asked.seats.insert(key);
-            });
+        if held.is_none() {
+            let unread: Vec<_> = flotilla_resources::convoy::engine::convoy_records(seat)
+                .into_iter()
+                .map(|convoy| (convoy, seat.name().to_owned()))
+                .filter(|key| !self.read.seats.contains(key))
+                .collect();
+            if !unread.is_empty() {
+                self.ask(|asked| asked.seats.extend(unread));
+            }
         }
         held
     }
@@ -2506,7 +2495,7 @@ impl ViewLookups for OldStoreRecords {
             // A crew session's seat: the session holding it, the old spelling's subject. It goes
             // when crew compares engine addresses (#3108 gate task).
             AddressKind::Role if address.get(AddressKind::Convoy).is_some() => {
-                let session = self.seat_session(address.get(AddressKind::Convoy).expect("checked"), address.name(), address)?;
+                let session = self.seat_session(address)?;
                 Some(OldReference::ControlRecord {
                     resource: reference("TerminalSession", session, namespace),
                     revision: revision.to_owned(),

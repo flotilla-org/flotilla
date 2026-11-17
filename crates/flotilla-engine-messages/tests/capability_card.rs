@@ -6,9 +6,10 @@ use std::collections::BTreeMap;
 use flotilla_engine_messages_testkit::{crewed_convoy, designate_fleet, intent, party, EngineMessagesHome};
 use flotilla_messaging::IntentReference;
 use flotilla_protocol::ResourceRef;
+use flotilla_provisioning_testkit::{EngineFixture, OtherHome, TerminalsFixture};
 use flotilla_resources::{
     message_record_name, ConvoySpec, InputMeta, MessageReference, MessageRelation, Selector, TerminalBrief, TerminalCrewContext,
-    TerminalSession, TerminalSessionSource, TerminalSessionSpec, CONVOY_LABEL, ROLE_LABEL, VESSEL_LABEL,
+    TerminalSession, TerminalSessionSource, TerminalSessionSpec,
 };
 use flotilla_store::ResourceBackend;
 use flotilla_store_memory::InMemoryBackend;
@@ -21,17 +22,17 @@ async fn a_capability_card_is_admitted_about_its_sessions_seat() {
     designate_fleet(&backend, NAMESPACE).await;
     let spec = ConvoySpec::builder().workflow_ref("workflow".into()).role("crew".into()).build();
     crewed_convoy(&backend, NAMESPACE, "crew", &spec, &["coder"]).await;
+    // The crew's vessel and its coder's session are launched here; the seat reaches the session
+    // through them.
+    let here = OtherHome::open("home");
+    let engine = EngineFixture::over_service(here.service());
+    let vessel = engine.vessels.request("crew", "work", here.home());
+    let launch = engine.terminals.request(&TerminalsFixture::agent(&vessel, "coder", "env"));
+    let session = engine.terminals.record(&launch).session_name().to_owned();
     backend
         .using::<TerminalSession>(NAMESPACE)
         .create(
-            &InputMeta::builder()
-                .name("session".into())
-                .labels(BTreeMap::from([
-                    (CONVOY_LABEL.into(), "crew".into()),
-                    (VESSEL_LABEL.into(), "work".into()),
-                    (ROLE_LABEL.into(), "coder".into()),
-                ]))
-                .build(),
+            &InputMeta::builder().name(session.clone()).build(),
             &TerminalSessionSpec {
                 env_ref: "env".into(),
                 role: "coder".into(),
@@ -41,7 +42,7 @@ async fn a_capability_card_is_admitted_about_its_sessions_seat() {
                     context: Box::new(TerminalCrewContext {
                         namespace: NAMESPACE.into(),
                         convoy: "crew".into(),
-                        vessel_ref: "vessel".into(),
+                        vessel_ref: vessel.clone(),
                     }),
                 },
                 cwd: "/repo".into(),
@@ -51,14 +52,15 @@ async fn a_capability_card_is_admitted_about_its_sessions_seat() {
         )
         .await
         .expect("session");
-    let home = EngineMessagesHome::open("home", NAMESPACE, &backend);
+    let home = EngineMessagesHome::over(here.service().clone(), NAMESPACE, &backend);
     let primitives = home.primitives();
+    primitives.install_lifecycle_reads(engine.reads()).expect("lifecycle reads");
 
     let receiver = "flotilla/crew/work/coder";
     let sender = "system:capabilities";
     let name = message_record_name(receiver, sender, "session:capabilities@7");
     let subject = MessageReference::ControlRecord {
-        resource: ResourceRef::new("flotilla.work/v1", "TerminalSession", NAMESPACE, "session"),
+        resource: ResourceRef::new("flotilla.work/v1", "TerminalSession", NAMESPACE, &session),
         revision: "capabilities@7".into(),
     };
     // The card's producer names the session's seat as its subject, at the card's revision.

@@ -49,6 +49,8 @@ impl EngineHome {
         crate::serve_agents(Arc::clone(&agents));
         let message_clock = Arc::new(MessageClock::default());
         let messages = EngineMessagesHome::open_with_clock(home, namespace, backend, Arc::clone(&message_clock) as Arc<dyn Clock>);
+        // As the composition root installs them: a seat is read through its vessel's launch.
+        messages.primitives().install_lifecycle_reads(Arc::clone(convoys.reads())).expect("lifecycle reads");
         Self {
             engine,
             convoys,

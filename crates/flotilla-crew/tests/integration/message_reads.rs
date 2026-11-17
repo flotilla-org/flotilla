@@ -308,6 +308,44 @@ async fn a_crew_condition_reads_its_convoy_by_key() {
     no_listing(&cost);
 }
 
+// Behaviour: a message about a crew seat is shown in the old shape with the session holding that
+// seat as its subject, for a finite launch and a standing one, whose seat's convoy segment is not
+// its record's name.
+#[tokio::test]
+async fn a_seat_subject_is_spelled_as_its_session() {
+    let mut home = Home::open(0, 0).await;
+    let standing = home.standing().await;
+    let standing_session = home.crew_here(&standing);
+    let primitives = home.messages.primitives();
+    for (launch, session) in [(home.crew.clone(), home.session.clone()), (standing, standing_session)] {
+        let seat = flotilla_resources::convoy::engine::seat_address(&Address::project(NAMESPACE).expect("project"), &launch, "coder")
+            .expect("the seat");
+        let receiver = flotilla_resources::crew_role_address(NAMESPACE, &launch, "work", "coder");
+        let name = flotilla_resources::message_record_name(&receiver, "system:capabilities", &format!("{launch}:card"));
+        let mut card = flotilla_engine_messages_testkit::intent(
+            "system:capabilities",
+            &receiver,
+            flotilla_resources::MessageRelation::System,
+            "## Your capabilities\n",
+        );
+        card.references =
+            vec![flotilla_messaging::IntentReference::subject(seat, flotilla_address::Revision::new("1".to_owned()).expect("revision"))];
+        primitives.admit(&name, &card).await.expect("admit");
+        let (view, reads) = flotilla_store::load_metrics::measure(primitives.view_to(NAMESPACE, &receiver, &name)).await;
+        let view = view.expect("view").expect("the card's view").object;
+        assert_eq!(
+            view.spec.subject,
+            Some(flotilla_resources::MessageReference::ControlRecord {
+                resource: flotilla_protocol::ResourceRef::new("flotilla.work/v1", "TerminalSession", NAMESPACE, &session),
+                revision: "1".into(),
+            }),
+            "{launch}'s seat is spelled as its coder's session"
+        );
+        let searched = reads.get("TerminalSession port").map_or(0, |counts| counts.index + counts.whole_kind);
+        assert_eq!(searched, 0, "no session search by label for {launch}: {reads:#?}");
+    }
+}
+
 // Behaviour: a standing role's inbox is held by its newest generation's running crew; an older
 // generation still running holds only its own seat.
 #[tokio::test]
