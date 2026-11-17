@@ -819,18 +819,18 @@ impl Aggregator {
                 },
                 event = fulfilment_kind_stream.next() => {
                     match event {
-                        Some(Ok(event)) => apply_readiness_event(&mut self.fulfilment_kinds, event),
+                        Some(Ok(event)) => self.fulfilment_kind_changed(event).await,
                         Some(Err(ResourceError::WatchExpired { .. })) => {
                             if let Some(source) = durable_fulfilment_kinds {
                                 let (items, watch) = Self::recover_replica_watch(source).await?;
                                 self.fulfilment_kinds = readiness_resources(items);
                                 fulfilment_kind_stream = watch;
                             }
+                            self.rebuild_local_projection().await;
                         }
                         Some(Err(error)) => return Err(error),
                         None => return Err(ResourceError::other("aggregator fulfilment kind watch ended")),
                     }
-                    self.rebuild_local_projection().await;
                 }
                 event = vessel_stream.next() => {
                     match event {
@@ -1310,15 +1310,29 @@ impl Aggregator {
             self.rebuild_local_projection().await;
             return;
         }
-        let keys: Vec<ConvoyKey> = before
-            .into_iter()
-            .chain(after)
-            .flat_map(|parent| self.convoy_keys_by_name.get(&parent).into_iter().flatten().cloned())
+        self.project_convoys_named(before.into_iter().chain(after)).await;
+    }
+
+    /// A fulfilment kind's change projects again only the convoys whose vessels are placed by it.
+    async fn fulfilment_kind_changed(&mut self, event: ReadWatchEvent<FulfilmentKind>) {
+        let (namespace, name) = match &event {
+            ReadWatchEvent::Added(source) | ReadWatchEvent::Modified(source) | ReadWatchEvent::Deleted(source) => {
+                (source.object.metadata.namespace.clone(), source.object.metadata.name.clone())
+            }
+            ReadWatchEvent::DeletedByName { tombstone, .. } => (tombstone.namespace.clone(), tombstone.name.clone()),
+        };
+        apply_readiness_event(&mut self.fulfilment_kinds, event);
+        let placed: Vec<_> = self
+            .readiness_vessels
+            .values()
+            .filter(|vessel| vessel.object.metadata.namespace == namespace)
+            .filter(|vessel| {
+                let observed = vessel.object.status.as_ref().and_then(|status| status.observed_kind_ref.as_ref());
+                observed.unwrap_or(&vessel.object.spec.fulfilment_kind_ref) == &name
+            })
+            .map(|vessel| (namespace.clone(), vessel.object.spec.convoy_ref.clone()))
             .collect();
-        if !keys.is_empty() {
-            self.projection_keys.extend(keys);
-            self.schedule_local_projection().await;
-        }
+        self.project_convoys_named(placed).await;
     }
 
     fn has_convoy(&self, namespace: &str, name: &str) -> bool {
@@ -1503,7 +1517,19 @@ impl Aggregator {
                 self.schedule_change_request_refresh(convoy);
             }
         }
-        self.rebuild_local_projection().await;
+        // Only this convoy's row shows its change request.
+        let keys: Vec<ConvoyKey> = self
+            .convoy_keys_by_name
+            .get(&(reference.namespace.clone(), reference.name.clone()))
+            .into_iter()
+            .flatten()
+            .filter(|key| self.convoy_key_ref(key).as_ref() == Some(&reference))
+            .cloned()
+            .collect();
+        if !keys.is_empty() {
+            self.projection_keys.extend(keys);
+            self.schedule_local_projection().await;
+        }
     }
 
     /// Looks up again the change request of each active home convoy that produces none yet, as
@@ -1866,20 +1892,47 @@ impl Aggregator {
         self.apply_session_read_event_from(LocalSource::Durable, event).await;
     }
 
+    /// A session's change projects again only the convoy it crews, and the one it crewed before;
+    /// one that maps a home to its host afresh projects every convoy.
     async fn apply_session_read_event_from(&mut self, source: LocalSource, event: ReadWatchEvent<TerminalSession>) {
+        let key = match &event {
+            ReadWatchEvent::Added(session) | ReadWatchEvent::Modified(session) | ReadWatchEvent::Deleted(session) => session_key(session),
+            ReadWatchEvent::DeletedByName { tombstone, provenance } => tombstone_key(tombstone, provenance),
+        };
+        let before = self.session_convoy(&key);
         match event {
             ReadWatchEvent::Added(session) | ReadWatchEvent::Modified(session) => {
-                self.sessions_by_source.entry(source).or_default().insert(session_key(&session), session);
+                self.sessions_by_source.entry(source).or_default().insert(key.clone(), session);
             }
-            ReadWatchEvent::Deleted(session) => {
-                self.sessions_by_source.entry(source).or_default().remove(&session_key(&session));
-            }
-            ReadWatchEvent::DeletedByName { tombstone, provenance } => {
-                self.sessions_by_source.entry(source).or_default().remove(&tombstone_key(&tombstone, &provenance));
+            ReadWatchEvent::Deleted(_) | ReadWatchEvent::DeletedByName { .. } => {
+                self.sessions_by_source.entry(source).or_default().remove(&key);
             }
         }
+        let hosts = self.origin_hosts.clone();
         self.rebuild_independents_projection().await;
-        self.rebuild_local_projection().await;
+        let after = self.session_convoy(&key);
+        self.reindex_session(&key, before.clone(), after.clone());
+        if self.origin_hosts != hosts {
+            self.rebuild_local_projection().await;
+        } else {
+            self.project_convoys_named(before.into_iter().chain(after)).await;
+        }
+    }
+
+    /// The convoy session `key` crews, as `(namespace, name)`.
+    fn session_convoy(&self, key: &SessionKey) -> Option<(String, String)> {
+        let session = self.terminal_sessions.get(key)?;
+        Some((session.object.metadata.namespace.clone(), session.object.metadata.labels.get(CONVOY_LABEL)?.clone()))
+    }
+
+    /// Projects again every convoy named by `parents`, each `(namespace, name)`, at any home.
+    async fn project_convoys_named(&mut self, parents: impl IntoIterator<Item = (String, String)>) {
+        let keys: Vec<ConvoyKey> =
+            parents.into_iter().flat_map(|parent| self.convoy_keys_by_name.get(&parent).into_iter().flatten().cloned()).collect();
+        if !keys.is_empty() {
+            self.projection_keys.extend(keys);
+            self.schedule_local_projection().await;
+        }
     }
 
     /// AgentSessions changed in the decided store: the convoys whose crew run in them are
@@ -1964,13 +2017,33 @@ impl Aggregator {
 
     /// An environment's engine record changed, or any of them may have (`None` or a rescan):
     /// sessions in it are attachable afresh.
+    /// Only the convoys crewed in a changed environment are projected again; a rescan projects
+    /// every convoy.
     async fn environment_changed(&mut self, change: Option<EnvironmentChange>) {
-        match change {
-            Some(EnvironmentChange::Changed(name)) => self.attach_refresh_inputs.retain(|_, input| input.environment != name),
-            Some(EnvironmentChange::Rescanned) | None => self.attach_refresh_inputs.clear(),
-        }
+        let changed = match change {
+            Some(EnvironmentChange::Changed(name)) => {
+                self.attach_refresh_inputs.retain(|_, input| input.environment != name);
+                Some(name)
+            }
+            Some(EnvironmentChange::Rescanned) | None => {
+                self.attach_refresh_inputs.clear();
+                None
+            }
+        };
+        let hosts = self.origin_hosts.clone();
         self.rebuild_independents_projection().await;
-        self.rebuild_local_projection().await;
+        match changed {
+            Some(name) if self.origin_hosts == hosts => {
+                let crewed: Vec<_> = self
+                    .terminal_sessions
+                    .iter()
+                    .filter(|(_, session)| session.object.spec.env_ref == name)
+                    .filter_map(|(key, _)| self.session_convoy(key))
+                    .collect();
+                self.project_convoys_named(crewed).await;
+            }
+            _ => self.rebuild_local_projection().await,
+        }
     }
 
     async fn apply_project_event(&mut self, event: ReadWatchEvent<Project>) {
@@ -2362,13 +2435,17 @@ impl Aggregator {
         if !self.attach_refresh_generations.get(&resolution.key).is_some_and(|(generation, _)| *generation == resolution.generation) {
             return Ok(());
         }
-        if resolution.attachable {
-            self.attachable_sessions.insert(resolution.key);
+        let changed = if resolution.attachable {
+            self.attachable_sessions.insert(resolution.key.clone())
         } else {
-            self.attachable_sessions.remove(&resolution.key);
+            self.attachable_sessions.remove(&resolution.key)
+        };
+        if !changed {
+            return Ok(());
         }
         self.publish_independents_projection(false).await;
-        self.rebuild_local_projection().await;
+        // Only the convoy the session crews shows whether it is attachable.
+        self.project_convoys_named(self.session_convoy(&resolution.key)).await;
         self.rebuild_checkout_rows().await
     }
 
@@ -7543,6 +7620,124 @@ mod tests {
             let holder = aggregator.convoys.values().find(|convoy| convoy.object.metadata.name == "convoy-1").expect("convoy-1");
             assert_eq!(aggregator.held_checkouts(&holder.object).expect("held").len(), 2, "the new checkout is held in memory");
             costs.push((reads(&vessel_reads), reads(&checkout_reads)));
+        }
+        assert_eq!(costs[0], costs[1], "engine reads for one change at 2 and at 16 convoys");
+    }
+
+    // Behaviour (stale needs_you on landed convoys): a crew session's change, a change in the
+    // environment it runs in, a convoy's change request and the fulfilment kind placing its vessel
+    // each project only the convoy they touch, so a busy fleet's convoy events are not queued
+    // behind whole projections.
+    #[tokio::test]
+    async fn a_convoys_own_inputs_project_it_alone() {
+        use flotilla_resources::{VesselPhase, VesselSpec, VesselStatus};
+        use flotilla_store::load_metrics::measure;
+
+        fn summarized(aggregator: &Aggregator) -> usize {
+            aggregator.summarized_convoys.load(Ordering::Relaxed)
+        }
+        let mut costs = Vec::new();
+        for convoys in [2, 16] {
+            let (events, _) = broadcast::channel(1024);
+            let (mut aggregator, _engine) =
+                with_convoy_engine(Aggregator::new(AggregatorProjectionState::new(), HostName::new("local"), events));
+            let mut sessions = Vec::new();
+            for index in 0..convoys {
+                let name = format!("convoy-{index}");
+                aggregator.apply_convoy_event(WatchEvent::Added(convoy_with_vessel(&name).await)).await;
+                let mut session = session_object(&format!("terminal-{name}")).await;
+                session.spec.env_ref = format!("env-{index}");
+                session.metadata.labels.insert(CONVOY_LABEL.into(), name.clone());
+                session.metadata.labels.insert(VESSEL_LABEL.into(), "implement".into());
+                aggregator.apply_session_event_from(LocalSource::Durable, WatchEvent::Added(session.clone())).await;
+                sessions.push(session);
+            }
+            aggregator.rebuild_local_projection().await;
+
+            let before = summarized(&aggregator);
+            let mut session = sessions[0].clone();
+            session.status.as_mut().expect("status").phase = TerminalSessionPhase::Stopped;
+            let ((), session_reads) =
+                measure(aggregator.apply_session_event_from(LocalSource::Durable, WatchEvent::Modified(session))).await;
+            assert_eq!(summarized(&aggregator) - before, 1, "a session's change projects its convoy alone");
+
+            let before = summarized(&aggregator);
+            let ((), environment_reads) = measure(aggregator.environment_changed(Some(EnvironmentChange::Changed("env-0".into())))).await;
+            assert_eq!(summarized(&aggregator) - before, 1, "an environment's change projects the convoy crewed in it alone");
+
+            let reference = aggregator.convoy_ref("flotilla", "convoy-0");
+            let generation = uuid::Uuid::new_v4();
+            aggregator.change_request_refresh_generations.insert(reference.clone(), generation);
+            let before = summarized(&aggregator);
+            let resolution = ChangeRequestResolution {
+                reference: reference.clone(),
+                generation,
+                branch: "feat/convoy".into(),
+                result: ConvoyBranchRefresh {
+                    primary: Ok(Some(ConvoyChangeRequest {
+                        id: "7".into(),
+                        status: flotilla_protocol::ChangeRequestStatus::Open,
+                        repository_key: RepositoryKey("repo_flotilla".into()),
+                    })),
+                    repositories: Vec::new(),
+                },
+            };
+            let ((), resolution_reads) = measure(aggregator.apply_change_request_resolution(resolution)).await;
+            assert_eq!(summarized(&aggregator) - before, 1, "a change request's resolution projects its convoy alone");
+            assert!(aggregator.convoy_change_requests.contains_key(&reference));
+
+            for index in 0..convoys {
+                let vessel = flotilla_provisioning_testkit::object::<Vessel>(
+                    &format!("vessel-{index}"),
+                    VesselSpec {
+                        convoy_ref: format!("convoy-{index}"),
+                        vessel_name: "implement".into(),
+                        fulfilment_kind_ref: format!("kind-{index}"),
+                        adopted_checkout_refs: BTreeMap::new(),
+                    },
+                    VesselStatus { phase: VesselPhase::Provisioning, ..Default::default() },
+                );
+                aggregator
+                    .vessel_changed(ReadWatchEvent::Added(ReadResourceObject { object: vessel, provenance: ResourceProvenance::Local }))
+                    .await;
+            }
+            let spec = flotilla_resources::FulfilmentKindSpec::builder()
+                .host_ref("local".into())
+                .pool("test".into())
+                .realisation(FulfilmentRealisation::HostDirect)
+                .build();
+            let mut kind = create_placement_record::<FulfilmentKind>(spec).await;
+            kind.metadata.name = "kind-0".into();
+            let before = summarized(&aggregator);
+            let ((), kind_reads) = measure(aggregator.fulfilment_kind_changed(ReadWatchEvent::Added(ReadResourceObject {
+                object: kind,
+                provenance: ResourceProvenance::Local,
+            })))
+            .await;
+            assert_eq!(summarized(&aggregator) - before, 1, "a fulfilment kind's change projects the convoy it places alone");
+
+            let key = ("flotilla".to_string(), "terminal-convoy-1".to_string(), None);
+            let generation = uuid::Uuid::new_v4();
+            aggregator.attach_refresh_generations.insert(key.clone(), (generation, tokio::spawn(async {}).abort_handle()));
+            let before = summarized(&aggregator);
+            let resolution =
+                AttachCapabilityResolution { generation, key: key.clone(), attachable: !aggregator.attachable_sessions.contains(&key) };
+            let (applied, attach_reads) = measure(aggregator.apply_attach_capability_resolution(resolution)).await;
+            applied.expect("attach resolution applied");
+            assert_eq!(summarized(&aggregator) - before, 1, "a session's attach resolution projects its convoy alone");
+
+            // A session moved to another convoy crews that one from then on.
+            let before = summarized(&aggregator);
+            let mut moved = sessions[0].clone();
+            moved.metadata.labels.insert(CONVOY_LABEL.into(), "convoy-1".into());
+            aggregator.apply_session_event_from(LocalSource::Durable, WatchEvent::Modified(moved)).await;
+            assert_eq!(summarized(&aggregator) - before, 2, "a moved session projects the convoy it left and the one it joined");
+            let crewing = |convoy: &str| {
+                aggregator.convoy_sessions("flotilla", convoy).map(|session| session.object.metadata.name.clone()).collect::<BTreeSet<_>>()
+            };
+            assert_eq!(crewing("convoy-0"), BTreeSet::new());
+            assert_eq!(crewing("convoy-1"), BTreeSet::from(["terminal-convoy-0".to_string(), "terminal-convoy-1".to_string()]));
+            costs.push((session_reads, environment_reads, resolution_reads, kind_reads, attach_reads));
         }
         assert_eq!(costs[0], costs[1], "engine reads for one change at 2 and at 16 convoys");
     }

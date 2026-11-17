@@ -1,8 +1,20 @@
 //! Secondary evidence indexes used when projecting one changed Convoy.
-//! Rebuilt at the existing coalesced secondary-input boundary, never for an
-//! ordinary Convoy event. Entries contain keys, not copied resource bodies.
+//! Rebuilt with a full projection, and moved one entry at a time as a vessel
+//! or session changes. Entries contain keys, not copied resource bodies.
 use super::*;
 type Parent = (String, String);
+/// Moves `key` in `index` from parent `from` to parent `to`.
+fn reindex<K: Clone + PartialEq>(index: &mut HashMap<Parent, Vec<K>>, key: &K, from: Option<Parent>, to: Option<Parent>) {
+    if let Some(keys) = from.and_then(|from| index.get_mut(&from)) {
+        keys.retain(|held| held != key);
+    }
+    if let Some(to) = to {
+        let keys = index.entry(to).or_default();
+        if !keys.contains(key) {
+            keys.push(key.clone());
+        }
+    }
+}
 #[derive(Default)]
 pub(super) struct ConvoyInputs {
     ready: bool,
@@ -29,17 +41,14 @@ impl Aggregator {
     /// Moves vessel `key` in the index from the convoy it served to the one it serves now, as one
     /// vessel's change does without rebuilding the index.
     pub(super) fn reindex_vessel(&mut self, key: &RepositorySourceKey, from: Option<Parent>, to: Option<Parent>) {
-        if !self.convoy_inputs.ready {
-            return;
+        if self.convoy_inputs.ready {
+            reindex(&mut self.convoy_inputs.vessels, key, from, to);
         }
-        if let Some(keys) = from.and_then(|from| self.convoy_inputs.vessels.get_mut(&from)) {
-            keys.retain(|held| held != key);
-        }
-        if let Some(to) = to {
-            let keys = self.convoy_inputs.vessels.entry(to).or_default();
-            if !keys.contains(key) {
-                keys.push(key.clone());
-            }
+    }
+    /// Moves session `key` in the index from the convoy it crewed to the one it crews now.
+    pub(super) fn reindex_session(&mut self, key: &SessionKey, from: Option<Parent>, to: Option<Parent>) {
+        if self.convoy_inputs.ready {
+            reindex(&mut self.convoy_inputs.sessions, key, from, to);
         }
     }
     pub(super) fn convoy_sessions(
