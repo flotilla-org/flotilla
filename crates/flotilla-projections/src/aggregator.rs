@@ -3678,6 +3678,55 @@ mod tests {
         assert!(!convoy.vessels[0].surface_state.needs_attention());
     }
 
+    // Behaviour (stale needs_you on landed convoys): a convoy's teardown releases its vessel
+    // before the convoy's Landed event reaches the listing. A released vessel ended on purpose:
+    // neither it nor its convoy needs anyone, before the Landed event or after.
+    #[tokio::test]
+    async fn a_released_vessel_needs_no_one() {
+        use flotilla_provisioning_testkit::{object, VesselsFixture};
+        use flotilla_resources::{vessel_records::VesselStep, VesselSpec, VesselStatus};
+
+        // The listing's convoy is still the one before its teardown: Active, its work running.
+        let mut convoy = convoy_with_work().convoy_phase(ResourceConvoyPhase::Active).work_phase(ResourceWorkPhase::Running).call();
+        let definition = convoy.status.as_ref().and_then(|status| status.workflow_snapshot.as_ref()).expect("snapshot").vessels[0].clone();
+        let fixture = VesselsFixture::default();
+        let launch = fixture.request(&convoy.metadata.name, &definition.name, "local");
+        fixture.step(&launch, VesselStep::Realised { environment: "env".into() });
+        fixture.step(&launch, VesselStep::Released);
+        let vessel = object::<Vessel>(
+            &launch,
+            VesselSpec {
+                convoy_ref: convoy.metadata.name.clone(),
+                vessel_name: definition.name.clone(),
+                fulfilment_kind_ref: "local".into(),
+                adopted_checkout_refs: Default::default(),
+            },
+            VesselStatus::default(),
+        );
+        let state = AggregatorProjectionState::new();
+        let (events, _) = broadcast::channel(8);
+        let (mut aggregator, _engine) =
+            with_convoy_engine(Aggregator::new(state.clone(), HostName::new("local"), events).with_lifecycle_reads(fixture.reads.clone()));
+        aggregator
+            .vessel_changed(ReadWatchEvent::Added(ReadResourceObject { object: vessel, provenance: ResourceProvenance::Local }))
+            .await;
+        let surfaces =
+            |rows: &[ConvoyRow]| (rows[0].surface_state, rows[0].vessels.iter().map(|vessel| vessel.surface_state).collect::<Vec<_>>());
+
+        aggregator.apply_convoy_event(WatchEvent::Added(convoy.clone())).await;
+        let result = state.result_set().await;
+        let (convoy_surface, vessel_surfaces) = surfaces(result.rows.as_convoys().expect("convoy rows"));
+        assert_ne!(convoy_surface, SurfaceState::NeedsYou, "before its Landed event");
+        assert!(!vessel_surfaces.contains(&SurfaceState::NeedsYou), "before its Landed event: {vessel_surfaces:?}");
+
+        convoy.status.as_mut().expect("status").phase = ResourceConvoyPhase::Landed;
+        aggregator.apply_convoy_event(WatchEvent::Modified(convoy)).await;
+        let result = state.result_set().await;
+        let (convoy_surface, vessel_surfaces) = surfaces(result.rows.as_convoys().expect("convoy rows"));
+        assert_ne!(convoy_surface, SurfaceState::NeedsYou, "once Landed");
+        assert!(!vessel_surfaces.contains(&SurfaceState::NeedsYou), "once Landed: {vessel_surfaces:?}");
+    }
+
     // #3460: an idle crew whose composer holds a stray reply is not "working":
     // the vessel and convoy need an operator, and the vessel names the
     // condition and the exact recovery command.
@@ -7773,7 +7822,7 @@ mod tests {
         let recorded_reason = reason;
         let ready = |environment: &str| VesselStep::Realised { environment: environment.into() };
         let (steps, expected, reason) = match mode {
-            0 => (vec![VesselStep::Released], VesselPhase::Lost, "released".to_owned()),
+            0 => (vec![VesselStep::Released], VesselPhase::Released, String::new()),
             1 => {
                 (vec![ready("env"), VesselStep::Lost { reason: "observed absent".into() }], VesselPhase::Lost, "observed absent".to_owned())
             }
@@ -7854,6 +7903,12 @@ mod tests {
             &HostName::new("host"),
             &Ok(BTreeMap::new()),
         );
+        // A released vessel ended on purpose: nothing blocks it, whatever its stale status says.
+        if expected == VesselPhase::Released {
+            assert_eq!(readiness.state, flotilla_protocol::result_set::ReadinessState::Ready);
+            assert!(readiness.blockers.is_empty(), "{:?}", readiness.blockers);
+            return;
+        }
         assert_eq!(readiness.blockers.len(), 1, "stale checkout refs are not combined with engine evidence");
         // A retrying launch's next try is at the engine's clock; the rest of its reason is fixed.
         if mode == 6 {

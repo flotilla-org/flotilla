@@ -654,7 +654,7 @@ mod tests {
             (LifecycleReading::Exhausted { cause: "c".into() }, VesselPhase::Failed, Some("c (attempts spent)")),
             (LifecycleReading::Ready { identity: "env".into() }, VesselPhase::Ready, None),
             (LifecycleReading::Lost { reason: None }, VesselPhase::Lost, Some("observed absent")),
-            (LifecycleReading::Released, VesselPhase::Lost, Some("released")),
+            (LifecycleReading::Released, VesselPhase::Released, Some("released")),
             (LifecycleReading::Failed { reason: "boom".into() }, VesselPhase::Failed, Some("boom")),
             (LifecycleReading::GaveUp { cause: "host gone".into() }, VesselPhase::Failed, Some("host gone")),
         ];

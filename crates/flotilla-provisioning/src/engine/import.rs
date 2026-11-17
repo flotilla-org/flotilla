@@ -312,7 +312,7 @@ pub fn import_vessels(
                     report.drop_rows("Vessel", "not placed yet: its home requests its work's launch", 1);
                     report.notes.push(format!("Vessel `{name}` is not placed yet: not stored; its home requests its work's launch"))
                 }
-                VesselPhase::Lost | VesselPhase::Failed => {
+                VesselPhase::Lost | VesselPhase::Failed | VesselPhase::Released => {
                     report.drop_rows("Vessel", "ended before it was placed", 1);
                     report.notes.push(format!("Vessel `{name}` ended before it was placed: not stored"))
                 }
@@ -847,6 +847,8 @@ fn vessel_state(obj: &ResourceObject<OldVessel>) -> Result<LifecycleState, Strin
         // environment.
         VesselPhase::Ready | VesselPhase::Interrupted => realised(status.and_then(|status| status.environment_ref.clone()), "environment")?,
         VesselPhase::Lost => LifecycleState::Gone { ending: Ending::Lost },
+        // No old record holds it; the match needs it.
+        VesselPhase::Released => LifecycleState::Gone { ending: Ending::Released },
         VesselPhase::Failed => {
             LifecycleState::Gone { ending: Ending::Failed { reason: status.and_then(|status| status.message.clone()).unwrap_or_default() } }
         }

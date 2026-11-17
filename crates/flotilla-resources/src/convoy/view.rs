@@ -128,7 +128,7 @@ fn crew_phases(facts: &ConvoyFacts<'_>) -> BTreeMap<String, BTreeMap<String, Cre
         .map(|requirement| {
             let interrupted = matches!(
                 facts.vessels.get(&requirement.name),
-                Some(VesselReading::At(VesselPhase::Interrupted | VesselPhase::Lost) | VesselReading::Gone)
+                Some(VesselReading::At(VesselPhase::Interrupted | VesselPhase::Lost | VesselPhase::Released) | VesselReading::Gone)
             );
             let readings = facts.crew.get(&requirement.name);
             let added =
@@ -196,7 +196,10 @@ fn work_phase(
                 WorkPhase::Running
             }
         }
-        Some(VesselReading::At(VesselPhase::Interrupted | VesselPhase::Lost) | VesselReading::Gone) => WorkPhase::Interrupted,
+        // A released vessel is as one gone: the work's next launch replaces it.
+        Some(VesselReading::At(VesselPhase::Interrupted | VesselPhase::Lost | VesselPhase::Released) | VesselReading::Gone) => {
+            WorkPhase::Interrupted
+        }
         // A failed Vessel fails the convoy, standing or not: a standing role's next launch
         // replaces it, at the cost of a strike.
         Some(VesselReading::At(VesselPhase::Failed)) => WorkPhase::Failed,

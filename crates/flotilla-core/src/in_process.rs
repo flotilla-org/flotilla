@@ -3989,6 +3989,7 @@ impl InProcessDaemon {
                         flotilla_resources::VesselPhase::Provisioning => "provisioning its environment and checkouts".into(),
                         flotilla_resources::VesselPhase::Interrupted => "interrupted; waiting for recovery".into(),
                         flotilla_resources::VesselPhase::Lost => "lost; waiting for recovery".into(),
+                        flotilla_resources::VesselPhase::Released => "released".into(),
                         flotilla_resources::VesselPhase::Failed => unreachable!("failed vessels return above"),
                     })
                 }

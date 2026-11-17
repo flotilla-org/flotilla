@@ -44,6 +44,9 @@ pub enum VesselPhase {
     Interrupted,
     Lost,
     Failed,
+    /// Ended on purpose: its lease was given back. No stored record holds it; the engine's
+    /// reading is its only source.
+    Released,
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
@@ -112,7 +115,8 @@ impl VesselPhase {
     /// The phase the engine's reading decides; without a reading, the stored phase.
     pub fn from_reading(reading: Option<&LifecycleReading>, status: Option<&VesselStatus>) -> Self {
         match reading {
-            Some(LifecycleReading::Lost { .. } | LifecycleReading::Released) => Self::Lost,
+            Some(LifecycleReading::Lost { .. }) => Self::Lost,
+            Some(LifecycleReading::Released) => Self::Released,
             // Exhaustion is the failed judgement; the engine's GiveUp write follows it.
             Some(LifecycleReading::Failed { .. } | LifecycleReading::GaveUp { .. } | LifecycleReading::Exhausted { .. }) => Self::Failed,
             Some(LifecycleReading::Ready { .. }) if status.is_some_and(|status| !status.interrupted_roles.is_empty()) => Self::Interrupted,

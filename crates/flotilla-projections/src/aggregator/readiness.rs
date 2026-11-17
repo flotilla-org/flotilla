@@ -70,6 +70,12 @@ impl Aggregator {
             };
             let status = engine.is_none().then_some(vessel.object.status.as_ref()).flatten();
             let vessel_phase = VesselPhase::from_reading(engine.as_ref(), vessel.object.status.as_ref());
+            // A released vessel ended on purpose, its children with it: nothing blocks it and it
+            // needs no one. Readiness has no ended state, so it reads Ready.
+            if vessel_phase == VesselPhase::Released {
+                result.state = ReadinessState::Ready;
+                return (result, None);
+            }
             if vessel_phase == VesselPhase::Ready {
                 result.state = ReadinessState::Ready;
             } else {
