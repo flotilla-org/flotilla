@@ -21,12 +21,18 @@ use flotilla_store::ResourceBackend;
 /// installed path is held by that backend; the composition root holds both, and so does this.
 pub struct Served<T> {
     path: T,
-    _backend: ResourceBackend,
+    _backend: Box<dyn std::any::Any + Send + Sync>,
 }
 
 impl<T> Served<T> {
     pub fn new(path: T, backend: ResourceBackend) -> Self {
-        Self { path, _backend: backend }
+        Self::holding(path, backend)
+    }
+
+    /// The path held with `backend`, a value that owns the backend it reads, such as an engine
+    /// home whose store lives as long as it does.
+    pub fn holding(path: T, backend: impl std::any::Any + Send + Sync) -> Self {
+        Self { path, _backend: Box::new(backend) }
     }
 }
 

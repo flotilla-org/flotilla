@@ -663,10 +663,10 @@ fn stored_record_corpus_imports_with_no_refusals() {
 async fn named_designation_imports_fleet_role_messages() {
     use flotilla_core::primitives::import::rehearse;
     use flotilla_engine_messages::roles::designated_fleet_roles;
+    use flotilla_provisioning_testkit::EngineBackend;
     use flotilla_resources::{FleetDesignation, FleetDesignationSpec, InputMeta, Project, ProjectSpec};
-    use flotilla_store::ResourceBackend;
-    use flotilla_store_memory::InMemoryBackend;
-    let backend = ResourceBackend::new(InMemoryBackend::default());
+    let home = EngineBackend::open(HOME);
+    let backend = home.backend.clone();
     backend
         .definitions::<Project>("flotilla")
         .apply(

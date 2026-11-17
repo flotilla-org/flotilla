@@ -6,20 +6,21 @@
 use std::sync::Arc;
 
 use flotilla_engine_messages::{MessagePrimitives, HOOK_STANDS_FOR, SCREEN_CAUSE};
+use flotilla_engine_messages_testkit::Served;
+use flotilla_provisioning_testkit::EngineBackend;
 use flotilla_resources::SystemClock;
 use flotilla_schema::Timestamp;
 use flotilla_schema_sqlite::stream::Service;
 use flotilla_state_machines::machines::agent_session::Activity;
-use flotilla_store::ResourceBackend;
-use flotilla_store_memory::InMemoryBackend;
 
 const HOME: &str = "home-a";
 
-fn primitives(dir: &tempfile::TempDir) -> MessagePrimitives {
+fn primitives(dir: &tempfile::TempDir) -> Served<MessagePrimitives> {
     let service = Arc::new(
         Service::open(&dir.path().join("decided.sqlite"), HOME, flotilla_engine_store::registry().expect("registry")).expect("store"),
     );
-    MessagePrimitives::open(HOME, service, ResourceBackend::new(InMemoryBackend::default()), Arc::new(SystemClock)).expect("primitives")
+    let home = EngineBackend::open(HOME);
+    Served::holding(MessagePrimitives::open(HOME, service, home.backend.clone(), Arc::new(SystemClock)).expect("primitives"), home)
 }
 
 fn at(seconds: i64) -> Timestamp {

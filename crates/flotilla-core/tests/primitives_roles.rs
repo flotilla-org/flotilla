@@ -7,6 +7,7 @@ use flotilla_engine_messages::MessagePrimitives;
 use flotilla_engine_messages_testkit::Served;
 use flotilla_inbox::InboxBackend;
 use flotilla_messaging::{Intent, IntentExpectation, IntentReference, StallOf};
+use flotilla_provisioning_testkit::EngineBackend;
 use flotilla_resources::{
     FleetDesignation, FleetDesignationSpec, InputMeta, MessageRelation, Project, ProjectSpec, SystemClock, FLEET_DESIGNATION_NAME,
 };
@@ -28,13 +29,17 @@ async fn primitives(dir: &tempfile::TempDir) -> Served<MessagePrimitives> {
 }
 
 async fn primitives_at(dir: &tempfile::TempDir, clock: Arc<dyn flotilla_resources::Clock>) -> Served<MessagePrimitives> {
-    primitives_over(dir, ResourceBackend::new(InMemoryBackend::default()), clock).await
+    let home = EngineBackend::open("home-a");
+    let backend = home.backend.clone();
+    primitives_over(dir, backend, home, clock).await
 }
 
-/// The Message path over `backend`, whose records the conditions read.
+/// The Message path over `backend`, whose records the conditions read, held with `held`, which
+/// owns that backend.
 async fn primitives_over(
     dir: &tempfile::TempDir,
     backend: ResourceBackend,
+    held: impl std::any::Any + Send + Sync,
     clock: Arc<dyn flotilla_resources::Clock>,
 ) -> Served<MessagePrimitives> {
     backend
@@ -61,7 +66,7 @@ async fn primitives_over(
     let service = Arc::new(
         Service::open(&dir.path().join("decided.sqlite"), "home-a", flotilla_engine_store::registry().expect("registry")).expect("store"),
     );
-    Served::new(MessagePrimitives::open("home-a", service, backend.clone(), clock).expect("primitives"), backend)
+    Served::holding(MessagePrimitives::open("home-a", service, backend, clock).expect("primitives"), held)
 }
 
 /// A message from `sender` to `receiver`, each a crew seat, a `system:` producer or an address.
@@ -206,7 +211,7 @@ async fn the_sweep_settles_held_outcomes_and_withdraws_on_a_false_delivery_condi
         .update_status("demo", &convoy.metadata.resource_version, &ConvoyStatus { phase: ConvoyPhase::Active, ..Default::default() })
         .await
         .expect("active convoy");
-    let primitives = primitives_over(&dir, backend, Arc::new(SystemClock)).await;
+    let primitives = primitives_over(&dir, backend.clone(), backend, Arc::new(SystemClock)).await;
     // A condition as the crew's project reads it.
     let leaf = |text: &str| {
         let leaf = text.parse::<flotilla_protocol::Leaf>().expect("condition");
@@ -529,7 +534,8 @@ async fn a_role_senders_awaiting_is_recorded_as_theirs() {
 #[tokio::test]
 async fn fleet_identity_is_independent_of_the_designated_project() {
     use flotilla_engine_messages::roles::designated_fleet_roles;
-    let backend = ResourceBackend::new(InMemoryBackend::default());
+    let home = EngineBackend::open("home-a");
+    let backend = home.backend.clone();
     for project in ["project-map", "renamed-charter"] {
         backend
             .definitions::<Project>(NAMESPACE)
