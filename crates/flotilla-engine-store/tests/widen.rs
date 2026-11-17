@@ -1,5 +1,6 @@
 //! Opening a store created by a build with fewer codes (#3972): the engine's real Message
-//! tables, rendered from a registry whose `receiver_kind` predates the Service consumer.
+//! tables, rendered from a registry whose `receiver_kind` predates the Service consumer. Also a
+//! store whose table predates a column (ADR 0047 N→N+1): one the table lacks.
 
 use flotilla_engine_store::registry;
 use flotilla_schema::{Address, ColumnType, KindRegistry, NewChange, State, Timestamp};
@@ -260,4 +261,74 @@ fn a_table_missing_a_defaulted_column_and_a_code_is_widened() {
     assert_eq!(count(&conn, "convoy_duties"), duties);
     let stored: String = conn.query_row("SELECT sql FROM sqlite_schema WHERE name = 'convoy'", [], |row| row.get(0)).expect("table");
     assert!(schema_ddl(&current, DdlMode::Create).contains(&format!("{stored};\n")), "{stored}");
+}
+
+/// The store an older build left: one `message` written by this build, then `column` dropped
+/// from its table, so the row reads as a build before the column stored it.
+fn predating(kinds: KindRegistry, column: &str) -> (Connection, Resource<Message>, flotilla_schema_sqlite::ResourceId) {
+    let mut store = Store::open(Connection::open_in_memory().expect("SQLite"), HOME, kinds).expect("store");
+    let id = insert(&mut store, &message("earlier", ConsumerKind::AgentSession, Relation::System)).expect("written");
+    let earlier = store.read().expect("read").load::<Resource<Message>>(id).expect("load").expect("written").value;
+    let conn = store.into_connection();
+    conn.execute_batch(&format!("DROP VIEW message_view; ALTER TABLE message DROP COLUMN {column};")).expect("predate the column");
+    (conn, earlier, id)
+}
+
+// Behaviour (ADR 0047 N→N+1): a store whose message table predates a nullable column, here
+// `delivery_condition`, opens under this build, which adds it as NULL: the message the older
+// build wrote reads it as absent, and this build writes it.
+#[test]
+fn a_store_missing_a_nullable_column_gains_it_at_open() {
+    let (conn, earlier, earlier_id) = predating(registry().expect("registry"), "delivery_condition");
+    let mut store = Store::open(conn, HOME, registry().expect("registry")).expect("opens, adding the column");
+    let loaded = store.read().expect("read").load::<Resource<Message>>(earlier_id).expect("load").expect("kept").value;
+    assert_eq!(loaded, earlier);
+    assert_eq!(loaded.spec().delivery_condition, None);
+    let later = message("later", ConsumerKind::AgentSession, Relation::System);
+    let condition = "project:fleet/convoy:demo/role:coder .phase == Done".parse().expect("a condition");
+    let later = later.clone().with_spec(MessageSpec { delivery_condition: Some(condition), ..later.spec().clone() });
+    let later_id = insert(&mut store, &later).expect("written with the column");
+    let loaded = store.read().expect("read").load::<Resource<Message>>(later_id).expect("load").expect("written").value;
+    assert!(loaded.spec().delivery_condition.is_some());
+    assert_eq!(loaded.spec(), later.spec());
+
+    let conn = store.into_connection();
+    let held: Vec<bool> = conn
+        .prepare("SELECT delivery_condition IS NOT NULL FROM message ORDER BY id")
+        .expect("statement")
+        .query_map([], |row| row.get(0))
+        .expect("rows")
+        .collect::<Result<_, _>>()
+        .expect("conditions");
+    assert_eq!(held, [false, true]);
+    Store::open(conn, HOME, registry().expect("registry")).expect("reopens unchanged");
+}
+
+// Behaviour (ADR 0047 N→N+1): a table that both lacks a nullable column and lacks codes is
+// widened, not refused: the rebuild adds the column as NULL and the codes, and keeps the row.
+#[test]
+fn a_table_missing_a_nullable_column_and_a_code_is_widened() {
+    let (conn, earlier, earlier_id) = predating(registry_without_services(), "delivery_condition");
+    let mut store = Store::open(conn, HOME, registry().expect("registry")).expect("widened, adding the column");
+    let loaded = store.read().expect("read").load::<Resource<Message>>(earlier_id).expect("load").expect("kept").value;
+    assert_eq!(loaded, earlier);
+    insert(&mut store, &message("service", ConsumerKind::Service, Relation::Dependency)).expect("a Service's message is written");
+    let conn = store.into_connection();
+    let stored: String = conn.query_row("SELECT sql FROM sqlite_schema WHERE name = 'message'", [], |row| row.get(0)).expect("table");
+    assert!(schema_ddl(&registry().expect("registry"), DdlMode::Create).contains(&format!("{stored};\n")), "{stored}");
+}
+
+// Behaviour (ADR 0047 N→N+1): a store whose message table predates a NOT NULL column with no
+// previous-generation default, here `unbound_after`, is refused at open: the older build's rows
+// have no value for it.
+#[test]
+fn a_store_missing_a_required_column_is_refused() {
+    let (conn, _, _) = predating(registry().expect("registry"), "unbound_after");
+    let refused = Store::open(conn, HOME, registry().expect("registry"));
+    assert!(
+        matches!(&refused, Err(StoreError::KindTableDrift { table, found, .. })
+            if table == "message" && !found.iter().any(|column| column == "unbound_after")),
+        "{:?}",
+        refused.err()
+    );
 }
