@@ -4,7 +4,8 @@ use super::*;
 use crate::blob_store::{BlobDigest, BlobStore, TieredBlobStore};
 use flotilla_agent::brief_artifact::BriefArtifactWriter;
 use flotilla_provisioning_testkit::EngineBackend;
-use flotilla_resources::{Artifact, ArtifactSpec, WatchEvent, WatchStart, WatchStream};
+use flotilla_resources::{Artifact, ArtifactSpec};
+use flotilla_store::TypedResolver;
 use tokio::sync::broadcast;
 
 use crate::runtime::tasks::{Retirements, BLOB_GRACE};
@@ -47,26 +48,25 @@ fn announced() -> (Retirements, Arc<StdMutex<BTreeSet<String>>>, broadcast::Send
     (retirements, retired, announce)
 }
 
-/// Waits on `changes` until artifact `name` is deleted.
-async fn deleted(changes: &mut WatchStream<Artifact>, name: &str) {
-    all_deleted(changes, &[name]).await;
+/// Waits until artifact `name` is deleted.
+async fn deleted(artifacts: &TypedResolver<Artifact>, name: &str) {
+    all_deleted(artifacts, &[name]).await;
 }
 
-/// Waits on `changes` until every artifact of `names` is deleted.
-async fn all_deleted(changes: &mut WatchStream<Artifact>, names: &[&str]) {
-    let mut waiting: BTreeSet<&str> = names.iter().copied().collect();
+/// Waits until every artifact of `names` is deleted, read by name: a watch converts each batch's
+/// names as they read when it is taken, so one written and deleted before the test takes its batch
+/// is never seen deleted there.
+async fn all_deleted(artifacts: &TypedResolver<Artifact>, names: &[&str]) {
     tokio::time::timeout(Duration::from_secs(10), async {
-        while let Some(event) = changes.next().await {
-            match event.expect("artifact watch") {
-                WatchEvent::Deleted(object) => waiting.remove(object.metadata.name.as_str()),
-                WatchEvent::DeletedByName(tombstone) => waiting.remove(tombstone.name.as_str()),
-                _ => false,
-            };
-            if waiting.is_empty() {
-                return;
+        for name in names {
+            loop {
+                match artifacts.get(name).await {
+                    Ok(_) => tokio::task::yield_now().await,
+                    Err(ResourceError::NotFound { .. }) => break,
+                    Err(error) => panic!("read artifact {name}: {error}"),
+                }
             }
         }
-        panic!("the artifact watch ended");
     })
     .await
     .unwrap_or_else(|_| panic!("artifacts {names:?} are deleted"));
@@ -110,7 +110,6 @@ async fn a_retired_convoys_unpinned_artifacts_go_with_it() {
     let (retirements, retired, announce) = announced();
     let task = tokio::spawn(run_artifact_gc(backend.clone(), NAMESPACE.into(), Arc::clone(&blobs), BLOB_GRACE, retirements));
     let artifacts = backend.using::<Artifact>(NAMESPACE);
-    let mut changes = artifacts.watch(WatchStart::Now).await.expect("watch artifacts");
     let digest = blobs.put(b"decision ledger").await.expect("put blob");
     let far = Utc::now() + chrono::Duration::days(3650);
     for (convoy, subject, pinned) in [("gone", "ledger", false), ("gone", "kept", true), ("live", "ledger", false)] {
@@ -128,11 +127,11 @@ async fn a_retired_convoys_unpinned_artifacts_go_with_it() {
     // Retention has seen them once it has reaped a probe written after them.
     let probe = spec("live", "probe", "probe", &digest, Utc::now() - chrono::Duration::seconds(1), false);
     artifacts.create(&InputMeta::builder().name(name("live", "probe", "probe")).build(), &probe).await.expect("probe");
-    deleted(&mut changes, &name("live", "probe", "probe")).await;
+    deleted(&artifacts, &name("live", "probe", "probe")).await;
 
     retired.lock().expect("retired").insert("gone".into());
     announce.send("gone".into()).expect("retention follows retirements");
-    all_deleted(&mut changes, &[&name("gone", "decision-ledger", "ledger"), &name("gone", "brief", "brief")]).await;
+    all_deleted(&artifacts, &[&name("gone", "decision-ledger", "ledger"), &name("gone", "brief", "brief")]).await;
     assert!(artifacts.get(&name("gone", "brief", "pinned")).await.is_ok(), "a pinned brief outlives its convoy");
     assert!(artifacts.get(&name("gone", "decision-ledger", "kept")).await.is_ok(), "a pinned artifact outlives its convoy");
     assert!(artifacts.get(&name("live", "decision-ledger", "ledger")).await.is_ok(), "another convoy's artifact stays");
@@ -140,7 +139,7 @@ async fn a_retired_convoys_unpinned_artifacts_go_with_it() {
     // One written after its convoy retired goes as soon as retention sees it.
     let late = spec("gone", "decision-ledger", "late", &digest, far, false);
     artifacts.create(&InputMeta::builder().name(name("gone", "decision-ledger", "late")).build(), &late).await.expect("late artifact");
-    deleted(&mut changes, &name("gone", "decision-ledger", "late")).await;
+    deleted(&artifacts, &name("gone", "decision-ledger", "late")).await;
     task.abort();
 }
 
@@ -155,7 +154,6 @@ async fn a_blob_whose_artifact_write_failed_is_collected_without_a_restart() {
     let backend = home.backend.clone();
     let task = tokio::spawn(run_artifact_gc(backend.clone(), NAMESPACE.into(), Arc::clone(&blobs), Duration::ZERO, announced().0));
     let artifacts = backend.using::<Artifact>(NAMESPACE);
-    let mut changes = artifacts.watch(WatchStart::Now).await.expect("watch artifacts");
     // The brief's slot holds an artifact of another address, so the brief's write is refused.
     let held = blobs.put(b"held body").await.expect("put blob");
     let far = Utc::now() + chrono::Duration::days(3650);
@@ -164,7 +162,7 @@ async fn a_blob_whose_artifact_write_failed_is_collected_without_a_restart() {
     // Retention has started, and seen the squatter, once it has reaped a probe written after it.
     let probe = spec("demo", "probe", "probe", &held, Utc::now() - chrono::Duration::seconds(1), false);
     artifacts.create(&InputMeta::builder().name(name("demo", "probe", "probe")).build(), &probe).await.expect("probe");
-    deleted(&mut changes, &name("demo", "probe", "probe")).await;
+    deleted(&artifacts, &name("demo", "probe", "probe")).await;
 
     let briefs = crate::artifact::SystemBriefArtifactWriter { backend: backend.clone(), blobs: Arc::clone(&blobs), retention_days: 3650 };
     briefs.put_brief(NAMESPACE, "demo", "coder", "brief", b"the brief", None).await.expect_err("the brief's write is refused");
@@ -194,7 +192,6 @@ async fn retention_reads_each_artifact_change_once() {
     let backend = home.backend.clone();
     let blobs = Arc::new(TieredBlobStore::new(directory.path(), Vec::new()));
     let artifacts = backend.using::<Artifact>(NAMESPACE);
-    let mut changes = artifacts.watch(WatchStart::Now).await.expect("watch artifacts");
     let task = tokio::spawn(flotilla_schema::reads::attributed(
         flotilla_schema::reads::caller(RETENTION),
         run_artifact_gc(backend.clone(), NAMESPACE.into(), Arc::clone(&blobs), BLOB_GRACE, announced().0),
@@ -206,7 +203,7 @@ async fn retention_reads_each_artifact_change_once() {
         artifacts.create(&InputMeta::builder().name(name(&convoy, "decision-ledger", "ledger")).build(), &ledger).await.expect("ledger");
         let probe = spec(&convoy, "probe", "probe", &digest, Utc::now() - chrono::Duration::seconds(1), false);
         artifacts.create(&InputMeta::builder().name(name(&convoy, "probe", "probe")).build(), &probe).await.expect("probe");
-        deleted(&mut changes, &name(&convoy, "probe", "probe")).await;
+        deleted(&artifacts, &name(&convoy, "probe", "probe")).await;
     }
     task.abort();
     let reads = flotilla_schema::reads::callers().remove(RETENTION).unwrap_or_default();
