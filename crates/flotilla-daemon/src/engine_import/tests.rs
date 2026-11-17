@@ -1363,7 +1363,7 @@ async fn a_host_named_manifest_stamp_imports_as_the_root_it_names() {
     assert_eq!(app.annotations[MANIFEST_RECONCILER_ROOT_ANNOTATION], declared);
     assert_eq!(app.annotations[MANIFEST_SOURCE_ANNOTATION], "project-map");
     assert_eq!(app.annotations[MANIFEST_PATH_ANNOTATION], "projects/app.yaml");
-    projects.apply("app", &app.labels, &app.annotations, &app.spec).await.expect("a read re-applies");
+    projects.apply("app", None, &app.labels, &app.annotations, &app.spec).await.expect("a read re-applies");
 
     let definitions = EngineDefinitions::open(service.clone(), clock.clone()).expect("definitions");
     let ensure =

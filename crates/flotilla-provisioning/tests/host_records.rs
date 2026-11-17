@@ -18,7 +18,7 @@ use flotilla_provisioning::{
     stored::host::{HostObservation, HostRecord},
 };
 use flotilla_resources::{
-    engine_records::{KindRecords, LogPosition, PatchStatus, Record, Since, StatusWriteError, Ticks},
+    engine_records::{KindRecords, LogPosition, PatchStatus, Record, Since, Ticks, WriteError},
     Clock, ConditionValue, FulfilmentFacts, Host, HostCondition, HostConnection, HostSpec, HostStatus, InputMeta, ResourceError,
     ResourceObject, SystemClock, IMAGE_DIGESTS_CAPABILITY,
 };
@@ -258,18 +258,24 @@ async fn the_daemons_blocking_conditions_hold_readiness() {
     }
 }
 
-/// Host's port with a second writer that patches a fulfilment fact in once armed: after the first
-/// read of the Host, or before its first status write or patch, whichever comes first. That is
-/// between a writer's read and its write.
+/// Host's port with a second writer that, once armed, writes its `spec` when it has one and
+/// otherwise patches a fulfilment fact in: after the first read of the Host, or before its first
+/// status write or patch, whichever comes first. That is between a writer's read and its write.
 #[derive(Debug)]
 struct SecondWriter {
     inner: Arc<EngineHosts>,
     armed: AtomicBool,
+    spec: std::sync::Mutex<Option<HostSpec>>,
 }
 
 impl SecondWriter {
     async fn interleave(&self, name: &str) -> Result<(), String> {
         if self.armed.swap(false, Ordering::SeqCst) {
+            let spec = self.spec.lock().expect("spec").take();
+            if let Some(spec) = spec {
+                self.inner.apply(name, None, &BTreeMap::new(), &BTreeMap::new(), &spec).await?;
+                return Ok(());
+            }
             let fact = FulfilmentFacts { gui_session_logged_in: true, observed_at: at(5), ..FulfilmentFacts::default() };
             let patch = |status: &mut HostStatus| {
                 status.fulfilment_facts.insert("dummy-crews".to_owned(), fact.clone());
@@ -319,13 +325,14 @@ impl KindRecords<Host> for SecondWriter {
     async fn apply(
         &self,
         name: &str,
+        version: Option<u64>,
         labels: &BTreeMap<String, String>,
         annotations: &BTreeMap<String, String>,
         spec: &HostSpec,
-    ) -> Result<Record<Host>, String> {
-        self.inner.apply(name, labels, annotations, spec).await
+    ) -> Result<Record<Host>, WriteError> {
+        self.inner.apply(name, version, labels, annotations, spec).await
     }
-    async fn set_status(&self, name: &str, version: u64, status: &HostStatus) -> Result<Record<Host>, StatusWriteError> {
+    async fn set_status(&self, name: &str, version: u64, status: &HostStatus) -> Result<Record<Host>, WriteError> {
         self.interleave(name).await?;
         self.inner.set_status(name, version, status).await
     }
@@ -349,7 +356,7 @@ async fn observed_with_second_writer(directory: &std::path::Path) -> (Arc<Second
     flotilla_provisioning::stored::host::register(&mut kinds).expect("register");
     let service = Arc::new(Service::open(&directory.join("decided.sqlite"), "alpha", kinds).expect("store"));
     let inner = Arc::new(EngineHosts::open(service, "kiwi".into(), Arc::new(SystemClock) as Arc<dyn Clock>).expect("open"));
-    let port = Arc::new(SecondWriter { inner, armed: AtomicBool::new(false) });
+    let port = Arc::new(SecondWriter { inner, armed: AtomicBool::new(false), spec: Default::default() });
     let backend = ResourceBackend::new(InMemoryBackend::default());
     backend.install_engine_kind::<Host>(port.clone());
     let hosts = backend.using::<Host>(NS);
@@ -375,6 +382,24 @@ async fn a_status_written_back_over_another_writers_patch_is_refused() {
     assert!(matches!(written, Err(ResourceError::Conflict { .. })), "the first writer's stale status is refused: {written:?}");
     let facts = hosts.get("kiwi").await.expect("read").status.expect("status").fulfilment_facts;
     assert!(facts.contains_key("dummy-crews"), "the second writer's patch stands: {:?}", facts.keys().collect::<Vec<_>>());
+}
+
+// Behaviour (two Host writers): a writer that reads a Host and writes its spec back loses nothing
+// another writer wrote in between. The version it read is checked in the port's own order of
+// writes: its write is refused as stale, and the other writer's spec stands.
+#[tokio::test]
+async fn a_spec_written_back_over_another_writers_edit_is_refused() {
+    let directory = tempfile::tempdir().expect("temp dir");
+    let (port, backend, first) = observed_with_second_writer(directory.path()).await;
+    let hosts = backend.using::<Host>(NS);
+
+    *port.spec.lock().expect("spec") = Some(HostSpec { display_name: "theirs".into(), ..HostSpec::default() });
+    port.armed.store(true, Ordering::SeqCst);
+    let ours = HostSpec { display_name: "ours".into(), ..HostSpec::default() };
+    let written = hosts.update(&InputMeta { name: "kiwi".into(), ..Default::default() }, &first.metadata.resource_version, &ours).await;
+    assert!(!port.armed.load(Ordering::SeqCst), "the second writer wrote between the first's read and its write");
+    assert!(matches!(written, Err(ResourceError::Conflict { .. })), "the first writer's stale spec is refused: {written:?}");
+    assert_eq!(hosts.get("kiwi").await.expect("read").spec.display_name, "theirs", "the second writer's spec stands");
 }
 
 /// One image cache holding `held`.

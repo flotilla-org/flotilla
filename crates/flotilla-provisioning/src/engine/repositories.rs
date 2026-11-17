@@ -18,7 +18,7 @@ use flotilla_engine_store::{
 };
 use flotilla_resources::{
     definition_provenance::{SUPERSEDED_BY_ANNOTATION, VERIFICATION_PROJECT_ANNOTATION, VERIFICATION_PROVENANCE_ANNOTATION},
-    engine_records::{CommitMark, KindRecords, LogPosition, Record, Since, StatusWriteError, Ticks},
+    engine_records::{CommitMark, KindRecords, LogPosition, Record, Since, Ticks, WriteError},
     Repository, RepositoryKey, RepositorySpec, RepositoryStatus,
 };
 use flotilla_schema::{Kind, KindCode, NewChange, Timestamp};
@@ -210,13 +210,11 @@ impl EngineRepositories {
         name: &str,
         expected: Option<u64>,
         edit: impl Fn(Option<RepositoryRecord>) -> Result<RepositoryRecord, String>,
-    ) -> Result<Record<Repository>, StatusWriteError> {
+    ) -> Result<Record<Repository>, WriteError> {
         for _ in 0..WRITE_ATTEMPTS {
             let current = self.log.get::<RepositoryRecord>(name, &self.home).map_err(|error| error.to_string())?;
             let version = current.as_ref().map(|current| current.version);
-            if expected.is_some_and(|expected| version.is_some_and(|version| version != expected)) {
-                return Err(StatusWriteError::Stale);
-            }
+            WriteError::unless_at(expected, version)?;
             let value = edit(current.as_ref().map(|current| current.spec.clone()))?;
             let written = match (current, version) {
                 (Some(current), Some(version)) if current.spec == value => Ok(version),
@@ -326,17 +324,18 @@ impl KindRecords<Repository> for EngineRepositories {
     async fn apply(
         &self,
         name: &str,
+        version: Option<u64>,
         _labels: &BTreeMap<String, String>,
         annotations: &BTreeMap<String, String>,
         spec: &RepositorySpec,
-    ) -> Held {
+    ) -> Result<Record<Repository>, WriteError> {
         spec.verify_key(&RepositoryKey(name.to_owned()))?;
         let verification_provenance = match annotations.get(VERIFICATION_PROVENANCE_ANNOTATION) {
             Some(json) => serde_json::from_str::<Vec<VerificationProvenance>>(json)
                 .map_err(|error| format!("`{VERIFICATION_PROVENANCE_ANNOTATION}` does not decode: {error}"))?,
             None => Vec::new(),
         };
-        self.write(name, None, |current| {
+        self.write(name, version, |current| {
             // The observations stay: they are the reconciler's, written through the status.
             let mut record = RepositoryRecord::new(spec.clone())?;
             record.verification_project = annotations.get(VERIFICATION_PROJECT_ANNOTATION).cloned();
@@ -348,10 +347,9 @@ impl KindRecords<Repository> for EngineRepositories {
             }
             Ok(record)
         })
-        .map_err(|error| error.to_string())
     }
 
-    async fn set_status(&self, name: &str, version: u64, status: &RepositoryStatus) -> Result<Record<Repository>, StatusWriteError> {
+    async fn set_status(&self, name: &str, version: u64, status: &RepositoryStatus) -> Result<Record<Repository>, WriteError> {
         self.write(name, Some(version), |current| {
             let mut record = current.ok_or_else(|| format!("{KIND} {name} is not held here"))?;
             // Checkouts by host and diagnostics have no reader and are not kept (#3824 layer 3a).

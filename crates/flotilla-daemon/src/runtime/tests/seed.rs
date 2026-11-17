@@ -18,6 +18,7 @@ async fn canonicalizes_display_name_kind_host_refs_to_the_host_id() {
     hosts
         .apply(
             host_id,
+            None,
             &Default::default(),
             &Default::default(),
             &HostSpec { display_name: "udder".into(), connection: Default::default(), ..HostSpec::default() },
@@ -29,6 +30,7 @@ async fn canonicalizes_display_name_kind_host_refs_to_the_host_id() {
         hosts
             .apply(
                 name,
+                None,
                 &Default::default(),
                 &Default::default(),
                 &HostSpec { display_name: "collision".into(), connection, ..HostSpec::default() },

@@ -34,7 +34,7 @@ use flotilla_protocol::{LifecycleReading, NodeId};
 use flotilla_resources::{
     convoy::view::VesselReading,
     convoy_records::{ConvoyChange, ConvoyJoins, ConvoyListing, ConvoyNotes, ConvoyRecord, ConvoyRecords, UnreadableLaunch, WorkFacts},
-    engine_records::{IndexCover, KindRecords, LogPosition, Record, Since, UnloggedJournal},
+    engine_records::{IndexCover, KindRecords, LogPosition, Record, Since, UnloggedJournal, WriteError},
     held_joins::{JoinChange, JoinChanges, JoinsReader},
     lifecycle_reads::{ChangeCursor, LifecycleReads},
     terminal_records::{newest_launches, TerminalRecord},
@@ -888,11 +888,12 @@ impl KindRecords<Convoy> for ConvoyViews {
     async fn apply(
         &self,
         name: &str,
+        _version: Option<u64>,
         _labels: &BTreeMap<String, String>,
         _annotations: &BTreeMap<String, String>,
         _spec: &ConvoySpec,
-    ) -> Result<Record<Convoy>, String> {
-        Err(format!("convoy {name} is admitted on the engine, not written"))
+    ) -> Result<Record<Convoy>, WriteError> {
+        Err(format!("convoy {name} is admitted on the engine, not written").into())
     }
 
     async fn set_status(
@@ -900,7 +901,7 @@ impl KindRecords<Convoy> for ConvoyViews {
         name: &str,
         _version: u64,
         _status: &ConvoyStatus,
-    ) -> Result<Record<Convoy>, flotilla_resources::engine_records::StatusWriteError> {
+    ) -> Result<Record<Convoy>, flotilla_resources::engine_records::WriteError> {
         Err(format!("convoy {name}'s status is derived from the engine's records; it is not written").into())
     }
 

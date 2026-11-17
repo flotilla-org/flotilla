@@ -17,7 +17,7 @@ use futures::{stream::BoxStream, StreamExt};
 
 use flotilla_protocol::{LifecycleReading, NodeId};
 use flotilla_resources::{
-    engine_records::{IndexCover, KindRecords, LogPosition, Record, Since, UnloggedJournal},
+    engine_records::{IndexCover, KindRecords, LogPosition, Record, Since, UnloggedJournal, WriteError},
     environment_records::{EnvironmentChange, EnvironmentRecord},
     held_joins::{self, JoinChange, JoinChanges, JoinsReader},
     lifecycle_reads::{ChangeCursor, LifecycleReads},
@@ -727,11 +727,12 @@ impl KindRecords<TerminalSession> for TerminalViews {
     async fn apply(
         &self,
         name: &str,
+        _version: Option<u64>,
         _labels: &BTreeMap<String, String>,
         _annotations: &BTreeMap<String, String>,
         _spec: &TerminalSessionSpec,
-    ) -> Result<Record<TerminalSession>, String> {
-        Err(format!("terminal session {name} is requested through the engine's terminal sessions, not written"))
+    ) -> Result<Record<TerminalSession>, WriteError> {
+        Err(format!("terminal session {name} is requested through the engine's terminal sessions, not written").into())
     }
 
     async fn set_status(
@@ -739,7 +740,7 @@ impl KindRecords<TerminalSession> for TerminalViews {
         name: &str,
         _version: u64,
         _status: &TerminalSessionStatus,
-    ) -> Result<Record<TerminalSession>, flotilla_resources::engine_records::StatusWriteError> {
+    ) -> Result<Record<TerminalSession>, flotilla_resources::engine_records::WriteError> {
         Err(format!("terminal session {name}'s status is the engine's; it is not written").into())
     }
 

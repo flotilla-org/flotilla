@@ -70,7 +70,7 @@ impl OtherHome {
             HostConnection::SshHost { owning_daemon, .. } => owning_daemon.clone(),
         };
         let hosts = EngineHosts::open(Arc::clone(&self.service), own_host, Arc::new(SystemClock)).expect("other home hosts");
-        let written = hosts.apply(name, &Default::default(), &Default::default(), spec).await.expect("write host at its home");
+        let written = hosts.apply(name, None, &Default::default(), &Default::default(), spec).await.expect("write host at its home");
         if let Some(status) = status {
             hosts.set_status(name, written.version, status).await.expect("observe host at its home");
         }
@@ -80,13 +80,13 @@ impl OtherHome {
     pub async fn kind(&self, name: &str, spec: &flotilla_resources::FulfilmentKindSpec) {
         let kinds = flotilla_provisioning::engine::kinds::EngineKinds::open(Arc::clone(&self.service), Arc::new(SystemClock))
             .expect("other home kinds");
-        kinds.apply(name, &Default::default(), &Default::default(), spec).await.expect("write kind at its home");
+        kinds.apply(name, None, &Default::default(), &Default::default(), spec).await.expect("write kind at its home");
     }
 
     /// Writes Repository `name` here, as this home's observer or operator would.
     pub async fn repository(&self, name: &str, spec: &RepositorySpec) {
         let repositories = EngineRepositories::open(Arc::clone(&self.service), Arc::new(SystemClock)).expect("other home repositories");
-        repositories.apply(name, &Default::default(), &Default::default(), spec).await.expect("write repository at its home");
+        repositories.apply(name, None, &Default::default(), &Default::default(), spec).await.expect("write repository at its home");
     }
 
     /// Records what this home's Repository reconciler observed of Repository `name`.
@@ -99,7 +99,7 @@ impl OtherHome {
     /// Writes Project `name` here with its writer's stamps, as this home declares it.
     pub async fn project(&self, name: &str, labels: &BTreeMap<String, String>, annotations: &BTreeMap<String, String>, spec: &ProjectSpec) {
         let projects = EngineProjects::open(Arc::clone(&self.service), Arc::new(SystemClock)).expect("other home projects");
-        projects.apply(name, labels, annotations, spec).await.expect("write project at its home");
+        projects.apply(name, None, labels, annotations, spec).await.expect("write project at its home");
     }
 
     /// Writes definition `name` of kind `R` (a Forge, a credential declaration, ...) here, as this
@@ -117,7 +117,9 @@ impl OtherHome {
         EngineDefinitions: KindRecords<R>,
     {
         let definitions = EngineDefinitions::open(Arc::clone(&self.service), Arc::new(SystemClock)).expect("other home definitions");
-        KindRecords::<R>::apply(&definitions, name, &Default::default(), annotations, spec).await.expect("write definition at its home");
+        KindRecords::<R>::apply(&definitions, name, None, &Default::default(), annotations, spec)
+            .await
+            .expect("write definition at its home");
     }
 
     /// Deletes definition `name` of kind `R` here, as this home's operator would.
@@ -238,7 +240,10 @@ impl Seed {
         let name = name.into();
         Self(Box::new(move |ports| {
             Box::pin(async move {
-                KindRecords::<R>::apply(&ports.definitions, &name, &Default::default(), &Default::default(), &spec).await.map(drop)
+                KindRecords::<R>::apply(&ports.definitions, &name, None, &Default::default(), &Default::default(), &spec)
+                    .await
+                    .map(drop)
+                    .map_err(String::from)
             })
         }))
     }
@@ -247,7 +252,9 @@ impl Seed {
     pub fn repository(name: impl Into<String>, spec: RepositorySpec) -> Self {
         let name = name.into();
         Self(Box::new(move |ports| {
-            Box::pin(async move { ports.repositories.apply(&name, &Default::default(), &Default::default(), &spec).await.map(drop) })
+            Box::pin(async move {
+                ports.repositories.apply(&name, None, &Default::default(), &Default::default(), &spec).await.map(drop).map_err(String::from)
+            })
         }))
     }
 }

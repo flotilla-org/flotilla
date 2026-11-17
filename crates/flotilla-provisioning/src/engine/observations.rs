@@ -27,7 +27,7 @@ use flotilla_resources::{
     address::record_name,
     engine_records::{
         BranchChangeRequest, ChangeRequestBranches, CommitMark, KindRecords, LogPosition, ObservationFailures, Record, Since,
-        SourceObservers, StatusWriteError, Ticks,
+        SourceObservers, Ticks, WriteError,
     },
     ChangeRequest, ChangeRequestSpec, ChangeRequestStatus, Issue, IssueSpec, IssueStatus, Resource,
 };
@@ -412,10 +412,15 @@ impl EngineObservations {
     }
 
     /// Writes this home's record `name` of `K` from `spec`, as its observer.
-    async fn apply_observed<K: Observed>(&self, name: &str, spec: &K::Spec) -> Result<Record<K::Resource>, String> {
+    async fn apply_observed<K: Observed>(
+        &self,
+        name: &str,
+        version: Option<u64>,
+        spec: &K::Spec,
+    ) -> Result<Record<K::Resource>, WriteError> {
         K::check_name(name, spec)?;
         self.observer_write(K::NAME, name, K::spec_source(spec)).await?;
-        self.apply_as::<K>(name, spec)
+        self.apply_as::<K>(name, version, spec)
     }
 
     /// Brings the resident map up to the store: every entry written since the last refresh.
@@ -545,22 +550,36 @@ impl EngineObservations {
         written.map_err(|error| format!("write {} {name}: {error}", K::KIND))
     }
 
-    fn apply_as<K: Observed>(&self, name: &str, spec: &K::Spec) -> Result<Record<K::Resource>, String> {
-        let current = self.log.get::<K>(name, &self.home).map_err(|error| error.to_string())?.map(|current| current.spec);
-        self.write(name, &K::of_subject(current, spec))?;
-        self.written::<K>(name)
+    /// Refused as stale when a `version` is given and the record has moved from it: the log's
+    /// edit at that version checks it again.
+    fn apply_as<K: Observed>(&self, name: &str, version: Option<u64>, spec: &K::Spec) -> Result<Record<K::Resource>, WriteError> {
+        let current = self.log.get::<K>(name, &self.home).map_err(|error| error.to_string())?;
+        WriteError::unless_at(version, current.as_ref().map(|current| current.version))?;
+        match (version, current) {
+            (Some(version), Some(current)) => {
+                match self.log.edit(name, version, &K::of_subject(Some(current.spec), spec), &self.change()) {
+                    Ok(_) => {}
+                    Err(PlainError::Conflict { .. }) => return Err(WriteError::Stale),
+                    Err(error) => return Err(format!("write {} {name}: {error}", K::KIND).into()),
+                }
+            }
+            (_, current) => {
+                self.write(name, &K::of_subject(current.map(|current| current.spec), spec))?;
+            }
+        }
+        Ok(self.written::<K>(name)?)
     }
 
     /// Refused as stale unless the record is at `version`: the log's edit checks it again.
-    fn set_status_as<K: Observed>(&self, name: &str, version: u64, status: &K::Status) -> Result<Record<K::Resource>, StatusWriteError> {
+    fn set_status_as<K: Observed>(&self, name: &str, version: u64, status: &K::Status) -> Result<Record<K::Resource>, WriteError> {
         let current = self.log.get::<K>(name, &self.home).map_err(|error| error.to_string())?;
         let current = current.ok_or_else(|| format!("{} {name} is not held at {}", K::NAME, self.home))?;
         if current.version != version {
-            return Err(StatusWriteError::Stale);
+            return Err(WriteError::Stale);
         }
         match self.log.edit(name, version, &current.spec.observed(&self.home, status), &self.change()) {
             Ok(_) => Ok(self.written::<K>(name)?),
-            Err(PlainError::Conflict { .. }) => Err(StatusWriteError::Stale),
+            Err(PlainError::Conflict { .. }) => Err(WriteError::Stale),
             Err(error) => Err(format!("write {} {name}: {error}", K::KIND).into()),
         }
     }
@@ -649,14 +668,15 @@ impl<R: ObservedAs> KindRecords<R> for EngineObservations {
     async fn apply(
         &self,
         name: &str,
+        version: Option<u64>,
         _labels: &BTreeMap<String, String>,
         _annotations: &BTreeMap<String, String>,
         spec: &R::Spec,
-    ) -> Result<Record<R>, String> {
-        self.apply_observed::<R::Record>(name, spec).await
+    ) -> Result<Record<R>, WriteError> {
+        self.apply_observed::<R::Record>(name, version, spec).await
     }
 
-    async fn set_status(&self, name: &str, version: u64, status: &R::Status) -> Result<Record<R>, StatusWriteError> {
+    async fn set_status(&self, name: &str, version: u64, status: &R::Status) -> Result<Record<R>, WriteError> {
         self.observer_rewrite::<R::Record>(R::Record::NAME, name).await?;
         self.set_status_as::<R::Record>(name, version, status)
     }

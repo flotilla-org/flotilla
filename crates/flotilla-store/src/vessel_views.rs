@@ -19,7 +19,7 @@ use flotilla_protocol::{LifecycleReading, NodeId};
 use flotilla_resources::{
     checkout_records::{latest_launches, CheckoutChange, CheckoutHolder, CheckoutLaunch, Launches},
     convoy_records::ConvoyChange,
-    engine_records::{KindRecords, LogPosition, Record, Since, UnloggedJournal},
+    engine_records::{KindRecords, LogPosition, Record, Since, UnloggedJournal, WriteError},
     environment_records::{EnvironmentChange, EnvironmentRecord},
     lifecycle_reads::{ChangeCursor, LifecycleReads},
     terminal_records::{TerminalChange, TerminalRecord},
@@ -709,11 +709,12 @@ impl KindRecords<Vessel> for VesselViews {
     async fn apply(
         &self,
         name: &str,
+        _version: Option<u64>,
         _labels: &BTreeMap<String, String>,
         _annotations: &BTreeMap<String, String>,
         _spec: &VesselSpec,
-    ) -> Result<Record<Vessel>, String> {
-        Err(format!("vessel {name} is launched by its convoy's home, not written; {EXPLAIN}"))
+    ) -> Result<Record<Vessel>, WriteError> {
+        Err(format!("vessel {name} is launched by its convoy's home, not written; {EXPLAIN}").into())
     }
 
     async fn set_status(
@@ -721,7 +722,7 @@ impl KindRecords<Vessel> for VesselViews {
         name: &str,
         _version: u64,
         _status: &VesselStatus,
-    ) -> Result<Record<Vessel>, flotilla_resources::engine_records::StatusWriteError> {
+    ) -> Result<Record<Vessel>, flotilla_resources::engine_records::WriteError> {
         Err(format!("vessel {name}'s status is its launch's, not written; {EXPLAIN}").into())
     }
 

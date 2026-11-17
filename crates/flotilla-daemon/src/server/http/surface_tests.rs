@@ -337,7 +337,7 @@ async fn a_cursor_moves_only_with_its_tables_kinds_at_any_home() {
         Arc::new(flotilla_resources::SystemClock),
     )
     .unwrap();
-    deliveries.apply("remote", &BTreeMap::new(), &BTreeMap::new(), &delivery("demo")).await.unwrap();
+    deliveries.apply("remote", None, &BTreeMap::new(), &BTreeMap::new(), &delivery("demo")).await.unwrap();
     replicate_home_tail(other.service(), other.home(), &store.service);
     assert_eq!(resumed(&mut client, "table-kind", &cursor).await, ["resync", "table", "rows", "synced"]);
 }

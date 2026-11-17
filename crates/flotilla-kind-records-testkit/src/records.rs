@@ -6,7 +6,7 @@ use std::{
 };
 
 use flotilla_resources::{
-    engine_records::{KindRecords, LogPosition, Record, Since, StatusWriteError},
+    engine_records::{KindRecords, LogPosition, Record, Since, WriteError},
     Resource,
 };
 use futures::stream::BoxStream;
@@ -169,17 +169,19 @@ impl<R: Resource> KindRecords<R> for MemoryRecords<R> {
     async fn apply(
         &self,
         name: &str,
+        version: Option<u64>,
         labels: &BTreeMap<String, String>,
         annotations: &BTreeMap<String, String>,
         spec: &R::Spec,
-    ) -> Result<Record<R>, String> {
+    ) -> Result<Record<R>, WriteError> {
         if !self.profile.writes {
-            return Err(self.refused(name, "writing"));
+            return Err(self.refused(name, "writing").into());
         }
         let labels = if self.profile.labels { labels.clone() } else { BTreeMap::new() };
         let annotations = if self.profile.annotations { annotations.clone() } else { BTreeMap::new() };
         let mut state = self.state();
         let key = (name.to_owned(), self.home.clone());
+        WriteError::unless_at(version, state.records.get(&key).map(|held| held.version))?;
         let record = match state.records.get(&key) {
             Some(held) => {
                 // Only an edit of the spec moves the version, as on the engine.
@@ -202,7 +204,7 @@ impl<R: Resource> KindRecords<R> for MemoryRecords<R> {
         Ok(record)
     }
 
-    async fn set_status(&self, name: &str, version: u64, status: &R::Status) -> Result<Record<R>, StatusWriteError> {
+    async fn set_status(&self, name: &str, version: u64, status: &R::Status) -> Result<Record<R>, WriteError> {
         if !self.profile.status {
             return Err(self.refused(name, "writing a status").into());
         }
@@ -210,7 +212,7 @@ impl<R: Resource> KindRecords<R> for MemoryRecords<R> {
         let key = (name.to_owned(), self.home.clone());
         let record = state.records.get_mut(&key).ok_or_else(|| format!("{} {name} is not held at {}", R::API_PATHS.kind, self.home))?;
         if record.version != version {
-            return Err(StatusWriteError::Stale);
+            return Err(WriteError::Stale);
         }
         record.status = Some(status.clone());
         record.version += u64::from(self.profile.status_moves_version);

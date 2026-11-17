@@ -13,7 +13,7 @@ use flotilla_engine_store::{
     watch::EngineWatch,
 };
 use flotilla_resources::{
-    engine_records::{KindRecords, LogPosition, Record, Since},
+    engine_records::{KindRecords, LogPosition, Record, Since, WriteError},
     Message as OldMessage, MessageSpec, MessageStatus, ReadResourceObject, ResourceProvenance,
 };
 use flotilla_schema::Kind as _;
@@ -145,11 +145,12 @@ impl KindRecords<OldMessage> for MessageRecords {
     async fn apply(
         &self,
         name: &str,
+        _version: Option<u64>,
         _labels: &BTreeMap<String, String>,
         _annotations: &BTreeMap<String, String>,
         _spec: &MessageSpec,
-    ) -> Result<Record<OldMessage>, String> {
-        Err(format!("Message {name} is admitted from its sender's intent, not written in the old shape; apply a Message document whose spec is that intent"))
+    ) -> Result<Record<OldMessage>, WriteError> {
+        Err(format!("Message {name} is admitted from its sender's intent, not written in the old shape; apply a Message document whose spec is that intent").into())
     }
 
     async fn set_status(
@@ -157,7 +158,7 @@ impl KindRecords<OldMessage> for MessageRecords {
         name: &str,
         _version: u64,
         _status: &MessageStatus,
-    ) -> Result<Record<OldMessage>, flotilla_resources::engine_records::StatusWriteError> {
+    ) -> Result<Record<OldMessage>, flotilla_resources::engine_records::WriteError> {
         Err(format!("Message {name}'s state moves only through delivery and receipts; acknowledge it with `flotilla message acknowledge`")
             .into())
     }

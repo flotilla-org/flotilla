@@ -206,8 +206,9 @@ impl Fixture {
             .number(subject.id.parse().expect("number"))
             .observing_authority("test".into())
             .build();
-        let observed =
-            KindRecords::<ChangeRequest>::apply(&observations, &name, &BTreeMap::new(), &BTreeMap::new(), &spec).await.expect("observed");
+        let observed = KindRecords::<ChangeRequest>::apply(&observations, &name, None, &BTreeMap::new(), &BTreeMap::new(), &spec)
+            .await
+            .expect("observed");
         let status = ChangeRequestStatus {
             title: Default::default(),
             author: Default::default(),
@@ -345,7 +346,9 @@ async fn each_unreleased_dependent_holds_the_convoy() {
         retry: None,
     };
     let deliveries = EngineAccessDeliveries::open(Arc::clone(&fixture.service), Arc::new(SystemClock)).expect("deliveries");
-    KindRecords::<AccessDelivery>::apply(&deliveries, "access-1", &BTreeMap::new(), &BTreeMap::new(), &delivery).await.expect("delivered");
+    KindRecords::<AccessDelivery>::apply(&deliveries, "access-1", None, &BTreeMap::new(), &BTreeMap::new(), &delivery)
+        .await
+        .expect("delivered");
 
     // Account bindings of its crew: open holds, closed does not.
     let accounts = EngineAccounts::open(Arc::clone(&fixture.service), Arc::new(SystemClock)).expect("accounts");

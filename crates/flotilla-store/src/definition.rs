@@ -8,7 +8,7 @@ use std::{
 use chrono::{DateTime, Utc};
 use flotilla_protocol::NodeId;
 use flotilla_resources::{
-    engine_records::{IndexCover, KindRecords, LogPosition, Record, Since},
+    engine_records::{IndexCover, KindRecords, LogPosition, Record, Since, WriteError},
     ObjectMeta, ReadResourceObject, ReadWatchEvent,
 };
 use futures::{stream::BoxStream, FutureExt, StreamExt};
@@ -23,6 +23,9 @@ use crate::{
 };
 
 const DELETION_FIELD: &str = "$deleted";
+
+/// How often a metadata update whose spec another writer moved reads it again.
+const METADATA_ATTEMPTS: usize = 3;
 
 #[derive(Debug)]
 struct DefinitionSource<T: Resource> {
@@ -502,9 +505,13 @@ impl<T: Resource> DefinitionResolver<T> {
         &self,
         records: &dyn KindRecords<T>,
         meta: &InputMeta,
+        version: Option<u64>,
         spec: &T::Spec,
     ) -> Result<ResourceObject<T>, ResourceError> {
-        let record = records.apply(&meta.name, &meta.labels, &meta.annotations, spec).await.map_err(ResourceError::other)?;
+        let record = records.apply(&meta.name, version, &meta.labels, &meta.annotations, spec).await.map_err(|error| match error {
+            WriteError::Stale => ResourceError::conflict(&meta.name, "stale resourceVersion"),
+            WriteError::Failed(reason) => ResourceError::other(reason),
+        })?;
         Ok(self.object(record))
     }
 
@@ -637,6 +644,23 @@ impl<T: Resource> DefinitionResolver<T> {
     }
 
     pub async fn apply_as(&self, writer: &WriterIdentity, meta: &InputMeta, spec: &T::Spec) -> Result<ResourceObject<T>, ResourceError> {
+        self.admit(writer, meta, None, spec).await
+    }
+
+    /// `spec` written over this home's engine record, refused as stale unless that record is still
+    /// at `version`: the port checks it in its own order of writes.
+    pub(crate) async fn apply_at(&self, meta: &InputMeta, version: u64, spec: &T::Spec) -> Result<ResourceObject<T>, ResourceError> {
+        self.admit(&WriterIdentity::operator().with_source("definition-apply"), meta, Some(version), spec).await
+    }
+
+    /// A `version` is checked only by the engine's port.
+    async fn admit(
+        &self,
+        writer: &WriterIdentity,
+        meta: &InputMeta,
+        version: Option<u64>,
+        spec: &T::Spec,
+    ) -> Result<ResourceObject<T>, ResourceError> {
         ensure_definitions::<T>()?;
         refuse_builtin::<T>(&meta.name)?;
         self.refuse_write_elsewhere()?;
@@ -664,7 +688,7 @@ impl<T: Resource> DefinitionResolver<T> {
             T::validate_spec_with_named_siblings(meta, spec, &siblings)?;
         }
         if let Some(records) = self.records() {
-            return self.engine_apply(&*records, meta, spec).await;
+            return self.engine_apply(&*records, meta, version, spec).await;
         }
         let local_root = self.backend.local_root()?;
         let sources = self.sources_for_name(&meta.name).await?;
@@ -819,8 +843,22 @@ impl<T: Resource> DefinitionResolver<T> {
         let current = self.get(&meta.name).await?;
         if let Some(records) = self.records() {
             // The engine keeps an origin, not metadata: the stamps that name it are written as it;
-            // any others (the manifest's hashes, now the root's records) are not kept.
-            return self.engine_apply(&*records, meta, &current.spec).await;
+            // any others (the manifest's hashes, now the root's records) are not kept. The spec
+            // read is written back only over the version it was read at: this home's record when
+            // it holds one, read again after a writer moves it.
+            for _ in 0..METADATA_ATTEMPTS {
+                let home = records.home();
+                let held = port_reads::copies(&*records, &meta.name).await.map_err(ResourceError::other)?;
+                let (version, spec) = match held.into_iter().find(|record| record.home == home) {
+                    Some(record) => (Some(record.version), record.spec),
+                    None => (None, current.spec.clone()),
+                };
+                match self.engine_apply(&*records, meta, version, &spec).await {
+                    Err(ResourceError::Conflict { .. }) if version.is_some() => continue,
+                    written => return written,
+                }
+            }
+            return Err(ResourceError::conflict(&meta.name, format!("lost {METADATA_ATTEMPTS} races with writers of its spec")));
         }
         let merge = current.metadata.merge.clone().unwrap_or_else(|| MergeMetadata {
             fields: BTreeMap::new(),

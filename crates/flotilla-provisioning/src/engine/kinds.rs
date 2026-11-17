@@ -21,7 +21,7 @@ use flotilla_engine_store::{
 use flotilla_resources::{
     definition_provenance::SEEDING_MANAGER,
     definitions::{origin, stamp},
-    engine_records::{CommitMark, KindRecords, LogPosition, Record, Since, Ticks},
+    engine_records::{CommitMark, KindRecords, LogPosition, Record, Since, Ticks, WriteError},
     FulfilmentKind, FulfilmentKindSpec, CONVOY_LABEL, MANAGED_BY_LABEL, PLACEMENT_SNAPSHOT_KIND, PREPARED_SNAPSHOT_LABEL,
 };
 use flotilla_schema::{ChangeHeader, ChangeItem, Identity, Kind, KindCode, NewChange, Timestamp};
@@ -252,16 +252,21 @@ impl EngineKinds {
         Timestamp::from_datetime(&self.clock.now())
     }
 
+    /// Refused as stale when a `version` is given and the record has moved from it: the log's
+    /// edit at the version read checks it again.
     fn write(
         &self,
         name: &str,
+        version: Option<u64>,
         labels: &BTreeMap<String, String>,
         annotations: &BTreeMap<String, String>,
         value: &FulfilmentKindDefinition,
-    ) -> Result<Held, String> {
+    ) -> Result<Held, WriteError> {
         for _ in 0..WRITE_ATTEMPTS {
             let change = PendingChange::joining(change_of(labels, annotations, &self.home, self.now())?);
-            let written = match self.log.get::<FulfilmentKindDefinition>(name, &self.home).map_err(|error| error.to_string())? {
+            let current = self.log.get::<FulfilmentKindDefinition>(name, &self.home).map_err(|error| error.to_string())?;
+            WriteError::unless_at(version, current.as_ref().map(|current| current.version))?;
+            let written = match current {
                 // An unchanged kind written again for the same reason logs nothing; for a new reason
                 // it is written again under that change.
                 Some(current) if current.spec == *value => {
@@ -290,10 +295,10 @@ impl EngineKinds {
                     });
                 }
                 Err(PlainError::Conflict { .. } | PlainError::Exists { .. } | PlainError::Missing { .. }) => continue,
-                Err(error) => return Err(format!("write {KIND} {name}: {error}")),
+                Err(error) => return Err(format!("write {KIND} {name}: {error}").into()),
             }
         }
-        Err(format!("write {KIND} {name}: lost {WRITE_ATTEMPTS} races with concurrent writers"))
+        Err(format!("write {KIND} {name}: lost {WRITE_ATTEMPTS} races with concurrent writers").into())
     }
 }
 
@@ -381,19 +386,15 @@ impl KindRecords<FulfilmentKind> for EngineKinds {
     async fn apply(
         &self,
         name: &str,
+        version: Option<u64>,
         labels: &BTreeMap<String, String>,
         annotations: &BTreeMap<String, String>,
         spec: &FulfilmentKindSpec,
-    ) -> Result<Held, String> {
-        self.write(name, labels, annotations, &FulfilmentKindDefinition::new(spec)?)
+    ) -> Result<Held, WriteError> {
+        self.write(name, version, labels, annotations, &FulfilmentKindDefinition::new(spec)?)
     }
 
-    async fn set_status(
-        &self,
-        name: &str,
-        _version: u64,
-        _status: &(),
-    ) -> Result<Held, flotilla_resources::engine_records::StatusWriteError> {
+    async fn set_status(&self, name: &str, _version: u64, _status: &()) -> Result<Held, WriteError> {
         Err(format!("{KIND} {name}: a fulfilment kind has no status").into())
     }
 

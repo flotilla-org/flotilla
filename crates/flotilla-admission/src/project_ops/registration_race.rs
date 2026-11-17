@@ -79,7 +79,9 @@ impl RacingRepositories {
                 let mut commands = held.spec.verification_commands().clone();
                 let writes = commands.get("storage-writes").and_then(|count| count.parse::<u64>().ok()).unwrap_or(0);
                 commands.insert("storage-writes".to_owned(), (writes + 1).to_string());
-                self.inner.apply(name, &held.labels, &held.annotations, &held.spec.clone().with_verification_commands(commands)).await?;
+                self.inner
+                    .apply(name, None, &held.labels, &held.annotations, &held.spec.clone().with_verification_commands(commands))
+                    .await?;
             }
         }
         Ok(())
@@ -123,21 +125,22 @@ impl KindRecords<Repository> for RacingRepositories {
     async fn apply(
         &self,
         name: &str,
+        version: Option<u64>,
         labels: &BTreeMap<String, String>,
         annotations: &BTreeMap<String, String>,
         spec: &RepositorySpec,
-    ) -> Result<Record<Repository>, String> {
+    ) -> Result<Record<Repository>, flotilla_resources::engine_records::WriteError> {
         if matches!(self.contention, Contention::Once) && !self.racing.load(Ordering::SeqCst) && self.armed.swap(false, Ordering::SeqCst) {
             self.controller_pass(name).await?;
         }
-        self.inner.apply(name, labels, annotations, spec).await
+        self.inner.apply(name, version, labels, annotations, spec).await
     }
     async fn set_status(
         &self,
         name: &str,
         version: u64,
         status: &RepositoryStatus,
-    ) -> Result<Record<Repository>, flotilla_resources::engine_records::StatusWriteError> {
+    ) -> Result<Record<Repository>, flotilla_resources::engine_records::WriteError> {
         self.inner.set_status(name, version, status).await
     }
     async fn delete(&self, name: &str) -> Result<(), String> {

@@ -572,13 +572,14 @@ impl<R: flotilla_resources::Resource> KindRecords<R> for EveryKindEmpty {
     async fn apply(
         &self,
         _: &str,
+        _: Option<u64>,
         _: &std::collections::BTreeMap<String, String>,
         _: &std::collections::BTreeMap<String, String>,
         _: &R::Spec,
-    ) -> Result<Record<R>, String> {
-        Err("read only".into())
+    ) -> Result<Record<R>, flotilla_resources::engine_records::WriteError> {
+        Err("read only".to_owned().into())
     }
-    async fn set_status(&self, _: &str, _: u64, _: &R::Status) -> Result<Record<R>, flotilla_resources::engine_records::StatusWriteError> {
+    async fn set_status(&self, _: &str, _: u64, _: &R::Status) -> Result<Record<R>, flotilla_resources::engine_records::WriteError> {
         Err(String::from("read only").into())
     }
     async fn delete(&self, _: &str) -> Result<(), String> {

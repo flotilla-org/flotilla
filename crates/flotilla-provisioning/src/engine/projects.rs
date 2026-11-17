@@ -23,7 +23,7 @@ use flotilla_engine_store::{
 };
 use flotilla_resources::{
     definitions::{origin, stamp, DefinitionOrigin},
-    engine_records::{CommitMark, KindRecords, LogPosition, Record, Since, StatusWriteError, Ticks, UnloggedJournal},
+    engine_records::{CommitMark, KindRecords, LogPosition, Record, Since, Ticks, UnloggedJournal, WriteError},
     DeclarationRefusedCondition, DispatchQueueAttention, DispatchQueueEntry, OperationalEntriesCondition, Project, ProjectSpec,
     ProjectStatus,
 };
@@ -529,13 +529,17 @@ impl KindRecords<Project> for EngineProjects {
     async fn apply(
         &self,
         name: &str,
+        version: Option<u64>,
         labels: &BTreeMap<String, String>,
         annotations: &BTreeMap<String, String>,
         spec: &ProjectSpec,
-    ) -> Object {
+    ) -> Result<Record<Project>, WriteError> {
         let origin = provenance::resolve_stamped_root(&self.service, &self.home, origin(labels, annotations)?)?;
         let value = ProjectDefinition::new(spec).map_err(|error| format!("{KIND} {name}: {error}"))?;
         let _writing = locked(&self.writing);
+        if version.is_some() {
+            WriteError::unless_at(version, self.current(name).ok().map(|current| current.version))?;
+        }
         if self.log.get::<ProjectDefinition>(name, &self.home).map_err(|error| error.to_string())?.is_none() {
             // A new Project starts with no conditions: an operations record left by a delete that
             // stopped part-way belongs to the one before. `writing` keeps any other write of the
@@ -543,13 +547,13 @@ impl KindRecords<Project> for EngineProjects {
             self.remove::<ProjectOpsRecord>(name)?;
         }
         self.write::<ProjectDefinition>(name, Some(&origin), |_| Ok(Some(value.clone())))?;
-        self.current(name)
+        Ok(self.current(name)?)
     }
 
-    async fn set_status(&self, name: &str, version: u64, status: &ProjectStatus) -> Result<Record<Project>, StatusWriteError> {
+    async fn set_status(&self, name: &str, version: u64, status: &ProjectStatus) -> Result<Record<Project>, WriteError> {
         let _writing = locked(&self.writing);
         if self.current(name)?.version != version {
-            return Err(StatusWriteError::Stale);
+            return Err(WriteError::Stale);
         }
         // Project operations' conditions are their record; once written it stays, emptied, until
         // the Project goes, so its version only moves forward.

@@ -23,7 +23,7 @@ use flotilla_engine_store::{
 };
 use flotilla_resources::{
     definitions::{origin, stamp, DefinitionOrigin},
-    engine_records::{CommitMark, KindRecords, LogPosition, Record, Since, Ticks},
+    engine_records::{CommitMark, KindRecords, LogPosition, Record, Since, Ticks, WriteError},
     ConvoyEnsure, CredentialGrant, CredentialSpec, CrewDefaults, FleetDesignation, Forge, ImageLayer, ImageLayerResourceSpec, Resource,
     WorkflowTemplate,
 };
@@ -401,14 +401,23 @@ impl EngineDefinitions {
         Timestamp::from_datetime(&self.clock.now())
     }
 
-    fn write<K: Definition>(&self, name: &str, origin: DefinitionOrigin, spec: &SpecOf<K>) -> Result<Record<K::Resource>, String> {
+    fn write<K: Definition>(
+        &self,
+        name: &str,
+        version: Option<u64>,
+        origin: DefinitionOrigin,
+        spec: &SpecOf<K>,
+    ) -> Result<Record<K::Resource>, WriteError> {
         let value = K::build(provenance::materialized_project(&origin), spec.clone())?;
         // Writers of one name at this home are not serialised (the manifest reconciler, the CLI,
         // project ops): a write that loses a race reads again and writes over the winner, as the
-        // old store's last writer won.
+        // old store's last writer won. A write made from a `version` is refused as stale instead
+        // once the record has moved from it; the log's edit at that version checks it again.
         for _ in 0..WRITE_ATTEMPTS {
             let change = PendingChange::joining(provenance::change_of(&origin, &self.home, self.now()));
-            let written = match self.log.get::<K>(name, &self.home).map_err(|error| error.to_string())? {
+            let current = self.log.get::<K>(name, &self.home).map_err(|error| error.to_string())?;
+            WriteError::unless_at(version, current.as_ref().map(|current| current.version))?;
+            let written = match current {
                 // An unchanged record declared again for the same reason logs nothing; for a new
                 // reason, such as a manifest's next revision, it is written again under that change.
                 Some(current) if current.spec == value => {
@@ -430,10 +439,10 @@ impl EngineDefinitions {
                     return Ok(object(name.to_owned(), self.home.clone(), version, created_at, &value, &origin));
                 }
                 Err(PlainError::Conflict { .. } | PlainError::Exists { .. } | PlainError::Missing { .. }) => continue,
-                Err(error) => return Err(format!("write {} {name}: {error}", K::NAME)),
+                Err(error) => return Err(format!("write {} {name}: {error}", K::NAME).into()),
             }
         }
-        Err(format!("write {} {name}: lost {WRITE_ATTEMPTS} races with concurrent writers", K::NAME))
+        Err(format!("write {} {name}: lost {WRITE_ATTEMPTS} races with concurrent writers", K::NAME).into())
     }
 
     fn remove<K: Definition>(&self, name: &str) -> Result<(), String> {
@@ -533,10 +542,11 @@ impl<R: Defined> KindRecords<R> for EngineDefinitions {
     async fn apply(
         &self,
         name: &str,
+        version: Option<u64>,
         labels: &BTreeMap<String, String>,
         annotations: &BTreeMap<String, String>,
         spec: &R::Spec,
-    ) -> Result<Record<R>, String> {
+    ) -> Result<Record<R>, WriteError> {
         let origin = provenance::resolve_stamped_root(&self.service, &self.home, origin(labels, annotations)?)?;
         if R::Stored::retired(spec) {
             // ADR 0053's retired layers stay admissible for one roll, so that previous-generation
@@ -556,15 +566,10 @@ impl<R: Defined> KindRecords<R> for EngineDefinitions {
                 status: None,
             });
         }
-        self.write::<R::Stored>(name, origin, spec)
+        self.write::<R::Stored>(name, version, origin, spec)
     }
 
-    async fn set_status(
-        &self,
-        name: &str,
-        _version: u64,
-        _status: &R::Status,
-    ) -> Result<Record<R>, flotilla_resources::engine_records::StatusWriteError> {
+    async fn set_status(&self, name: &str, _version: u64, _status: &R::Status) -> Result<Record<R>, WriteError> {
         Err(format!("{} {name}: a definition has no status", R::API_PATHS.kind).into())
     }
 

@@ -1210,13 +1210,14 @@ impl KindRecords<Forge> for Forges {
     async fn apply(
         &self,
         _: &str,
+        _: Option<u64>,
         _: &BTreeMap<String, String>,
         _: &BTreeMap<String, String>,
         _: &flotilla_resources::ForgeSpec,
-    ) -> Result<Record<Forge>, String> {
-        Err("read only".into())
+    ) -> Result<Record<Forge>, flotilla_resources::engine_records::WriteError> {
+        Err("read only".to_owned().into())
     }
-    async fn set_status(&self, _: &str, _: u64, _: &()) -> Result<Record<Forge>, flotilla_resources::engine_records::StatusWriteError> {
+    async fn set_status(&self, _: &str, _: u64, _: &()) -> Result<Record<Forge>, flotilla_resources::engine_records::WriteError> {
         Err(String::from("read only").into())
     }
     async fn delete(&self, _: &str) -> Result<(), String> {

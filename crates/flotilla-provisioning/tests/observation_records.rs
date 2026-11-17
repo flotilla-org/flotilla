@@ -174,11 +174,11 @@ async fn a_change_request_under_another_name_is_refused() {
     let (_, records) = open(&directory, "alpha", ManualClock::at(1_800_000_000));
     let records = cr_port(&records);
     let spec = cr_spec(1, "alpha");
-    let refused = records.apply("cr-1", &BTreeMap::new(), &BTreeMap::new(), &spec).await;
-    let error = refused.expect_err("a name that is not the record name is refused");
+    let refused = records.apply("cr-1", None, &BTreeMap::new(), &BTreeMap::new(), &spec).await;
+    let error = String::from(refused.expect_err("a name that is not the record name is refused"));
     assert!(error.contains("cr-1") && error.contains(&cr_1()), "{error}");
     assert!(records.sources().await.expect("sources").is_empty(), "nothing is written");
-    records.apply(&cr_1(), &BTreeMap::new(), &BTreeMap::new(), &spec).await.expect("the record name is written");
+    records.apply(&cr_1(), None, &BTreeMap::new(), &BTreeMap::new(), &spec).await.expect("the record name is written");
 }
 
 /// The observation records as the ChangeRequest port.
@@ -199,11 +199,11 @@ async fn a_publish_that_changes_no_value_writes_nothing() {
     let (_, records) = open(&directory, "alpha", clock.clone());
     let records = cr_port(&records);
     let spec = cr_spec(1, "alpha");
-    let created = records.apply(&cr_1(), &BTreeMap::new(), &BTreeMap::new(), &spec).await.expect("create");
+    let created = records.apply(&cr_1(), None, &BTreeMap::new(), &BTreeMap::new(), &spec).await.expect("create");
     let status = |checks, at| cr_status(ObservedChangeRequestState::Open, checks, epoch(at));
     let first = records.set_status(&cr_1(), created.version, &status(ObservedChecks::Pending, 10)).await.expect("publish");
     let again = records.set_status(&cr_1(), first.version, &status(ObservedChecks::Pending, 20)).await.expect("publish again");
-    let reapplied = records.apply(&cr_1(), &BTreeMap::new(), &BTreeMap::new(), &spec).await.expect("ensure again");
+    let reapplied = records.apply(&cr_1(), None, &BTreeMap::new(), &BTreeMap::new(), &spec).await.expect("ensure again");
     assert_eq!((again.version, reapplied.version), (first.version, first.version));
     let changed = records.set_status(&cr_1(), reapplied.version, &status(ObservedChecks::Pass, 30)).await.expect("publish change");
     assert!(changed.version > first.version);
@@ -218,7 +218,7 @@ async fn a_failing_observer_ages_its_values_from_the_first_failure() {
     let clock = ManualClock::at(1_800_000_000);
     let (_, observations) = open(&directory, "alpha", clock.clone());
     let records = cr_port(&observations);
-    let created = records.apply(&cr_1(), &BTreeMap::new(), &BTreeMap::new(), &cr_spec(1, "alpha")).await.expect("create");
+    let created = records.apply(&cr_1(), None, &BTreeMap::new(), &BTreeMap::new(), &cr_spec(1, "alpha")).await.expect("create");
     let open = cr_status(ObservedChangeRequestState::Open, ObservedChecks::Pass, epoch(0));
     records.set_status(&cr_1(), created.version, &open).await.expect("publish");
     let read = || async { status_of(&records.get(&cr_1()).await.expect("get").expect("held")).state.observed_at };
@@ -264,7 +264,7 @@ async fn another_homes_values_are_confirmed_when_that_home_was_last_heard() {
     let (alpha, alpha_observations) = open(&directory, "alpha", clock.clone());
     let (beta_records, alpha_records) = (cr_port(&beta_observations), cr_port(&alpha_observations));
     let spec = cr_spec(1, "beta");
-    let created = beta_records.apply(&cr_1(), &BTreeMap::new(), &BTreeMap::new(), &spec).await.expect("create");
+    let created = beta_records.apply(&cr_1(), None, &BTreeMap::new(), &BTreeMap::new(), &spec).await.expect("create");
     let merged = cr_status(ObservedChangeRequestState::Merged, ObservedChecks::Pass, epoch(0));
     beta_records.set_status(&cr_1(), created.version, &merged).await.expect("publish");
     let cursor = pump(&beta, "beta", &alpha, None, epoch(1_800_000_050));
@@ -274,7 +274,7 @@ async fn another_homes_values_are_confirmed_when_that_home_was_last_heard() {
     assert_eq!(status_of(&read().await).state.observed_at, epoch(1_800_000_070));
 
     // A former observer's own copy, failing since before beta was last heard, reads below beta's.
-    alpha_records.apply(&cr_1(), &BTreeMap::new(), &BTreeMap::new(), &spec).await.expect("own copy");
+    alpha_records.apply(&cr_1(), None, &BTreeMap::new(), &BTreeMap::new(), &spec).await.expect("own copy");
     clock.set(1_800_000_060);
     alpha_observations.failing("ChangeRequest", &cr_1()).await.expect("failing");
     clock.set(1_800_000_100);
@@ -313,7 +313,8 @@ async fn a_home_that_does_not_observe_the_source_writes_nothing_and_reads_the_ob
     backend.install_engine_records(alpha_records.clone());
 
     let beta_port = cr_port(&beta_records);
-    let created = beta_port.apply(&cr_1(), &BTreeMap::new(), &BTreeMap::new(), &cr_spec(1, "beta")).await.expect("the observer's record");
+    let created =
+        beta_port.apply(&cr_1(), None, &BTreeMap::new(), &BTreeMap::new(), &cr_spec(1, "beta")).await.expect("the observer's record");
     let merged = cr_status(ObservedChangeRequestState::Merged, ObservedChecks::Pass, epoch(0));
     beta_port.set_status(&cr_1(), created.version, &merged).await.expect("publish");
     pump(&beta, "beta", &alpha, None, epoch(1_800_000_050));

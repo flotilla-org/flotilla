@@ -2130,18 +2130,19 @@ impl KindRecords<PrimaryResource> for HeldListingPort {
     async fn apply(
         &self,
         _name: &str,
+        _version: Option<u64>,
         _labels: &std::collections::BTreeMap<String, String>,
         _annotations: &std::collections::BTreeMap<String, String>,
         _spec: &PrimarySpec,
-    ) -> Result<Record<PrimaryResource>, String> {
-        Err("read only".into())
+    ) -> Result<Record<PrimaryResource>, flotilla_resources::engine_records::WriteError> {
+        Err("read only".to_owned().into())
     }
     async fn set_status(
         &self,
         _name: &str,
         _version: u64,
         _status: &(),
-    ) -> Result<Record<PrimaryResource>, flotilla_resources::engine_records::StatusWriteError> {
+    ) -> Result<Record<PrimaryResource>, flotilla_resources::engine_records::WriteError> {
         Err(String::from("read only").into())
     }
     async fn delete(&self, _name: &str) -> Result<(), String> {

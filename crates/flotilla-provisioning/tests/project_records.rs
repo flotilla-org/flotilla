@@ -10,7 +10,7 @@ use flotilla_provisioning::engine::projects::EngineProjects;
 use flotilla_resources::{
     definition_provenance::{BOOTSTRAP_COMMIT_ANNOTATION, BOOTSTRAP_REPOSITORY_ANNOTATION, DECLARATION_FILE, DECLARATION_FILE_ANNOTATION},
     Clock, DeclarationRefusedCondition, DispatchQueueEntry, InputMeta, Project, ProjectRepositorySpec, ProjectSpec, ProjectStatusPatch,
-    RepositoryKey, SystemClock,
+    RepositoryKey, ResourceError, SystemClock,
 };
 use flotilla_schema_sqlite::stream::{Follower, Service};
 use flotilla_store::{apply_status_patch, watch_resource_kind_including_replicas, ResourceBackend, StoreQuery};
@@ -158,6 +158,30 @@ async fn the_engine_keeps_the_project_contract() {
     let (_, backend) = engine(directory.path());
     contract(&backend).await;
     assert!(backend.store().list_raw(flotilla_store::ResourceKind::of::<Project>(), NS).await.expect("old rows").items.is_empty());
+}
+
+// Behaviour (two Project writers): an edit made from a read the Project has moved past, here by
+// project operations' conditions, is refused, and the Project keeps what it holds; the port checks
+// the version read in its own order of writes.
+#[tokio::test]
+async fn a_project_edited_from_a_read_it_has_moved_past_is_refused() {
+    let directory = tempfile::tempdir().expect("temp dir");
+    let (_, backend) = engine(directory.path());
+    let projects = backend.using::<Project>(NS);
+    let meta = InputMeta::builder().name("widgets".into()).build();
+    let read = backend.definitions::<Project>(NS).apply(&meta, &spec("widgets", None)).await.expect("declare");
+    apply_status_patch(&projects, "widgets", &ProjectStatusPatch::ReplaceOperationalEntries { ready: true, message: "ready".into() })
+        .await
+        .expect("status");
+    let moved = projects.get("widgets").await.expect("read");
+    assert_ne!(moved.metadata.resource_version, read.metadata.resource_version, "the conditions move the version");
+
+    let stale = projects.update(&meta, &read.metadata.resource_version, &spec("renamed", None)).await;
+    assert!(matches!(stale, Err(ResourceError::Conflict { .. })), "a stale edit is refused: {stale:?}");
+    assert_eq!(projects.get("widgets").await.expect("read").spec.display_name, "widgets", "the Project keeps its spec");
+    let current =
+        projects.update(&meta, &moved.metadata.resource_version, &spec("renamed", None)).await.expect("an edit from the version held");
+    assert_eq!(current.spec.display_name, "renamed");
 }
 
 // Behaviour (#3824 layer 3b, the 2026-10-26 ruling): the dispatch queue is a judgement, not stored.

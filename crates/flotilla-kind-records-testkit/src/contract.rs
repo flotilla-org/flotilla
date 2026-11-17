@@ -5,7 +5,7 @@
 use std::{collections::BTreeSet, sync::Arc, time::Duration};
 
 use flotilla_resources::{
-    engine_records::{IndexCover, KindRecords, LogPosition, Record, Since, StatusWriteError},
+    engine_records::{IndexCover, KindRecords, LogPosition, Record, Since, WriteError},
     Resource,
 };
 use futures::StreamExt;
@@ -42,7 +42,7 @@ pub trait Subject<R: Resource>: Send + Sync {
     /// the engine's machines would.
     async fn hold(&self, index: usize) {
         let (name, spec) = self.samples().sample(index);
-        self.port().apply(&name, &Default::default(), &Default::default(), &spec).await.expect("the port takes its sample");
+        self.port().apply(&name, None, &Default::default(), &Default::default(), &spec).await.expect("the port takes its sample");
     }
     /// Has this home's engine change the record it holds as `index`, as its machines would; `None`
     /// where the kind changes only by writes through the port.
@@ -83,6 +83,7 @@ pub async fn check<R: Resource, S: Subject<R>>(subject: &S) {
     selects_by_its_index(subject).await;
     if profile.writes {
         versions_move_with_edits(subject, profile).await;
+        refuses_stale_writes(subject).await;
         statuses(subject, profile).await;
         deletes(subject).await;
         resolves_this_homes_copy_first(subject).await;
@@ -160,21 +161,60 @@ async fn versions_move_with_edits<R: Resource, S: Subject<R>>(subject: &S, profi
     let (name, spec) = subject.samples().sample(0);
     let held = port.get(&name).await.expect("get").expect("held");
     let none = Default::default();
-    let again = port.apply(&name, &none, &none, &spec).await.expect("the same spec again");
+    let again = port.apply(&name, None, &none, &none, &spec).await.expect("the same spec again");
     assert_eq!(again.version, held.version, "the same spec again keeps the version");
     assert_eq!(again.created_at, held.created_at, "a rewrite keeps when it was created");
-    let edited = port.apply(&name, &none, &none, &subject.samples().edited(0)).await.expect("an edit");
+    let edited = port.apply(&name, None, &none, &none, &subject.samples().edited(0)).await.expect("an edit");
     assert!(edited.version > again.version, "an edit moves the version");
     let read = port.get(&name).await.expect("get").expect("held");
     assert_eq!(read.version, edited.version, "a read finds the edit's version");
     assert_eq!(json(&read.spec), json(&subject.samples().edited(0)), "a read finds the edit's spec");
     let labels = std::collections::BTreeMap::from([("contract/label".to_owned(), "kept".to_owned())]);
     let annotations = std::collections::BTreeMap::from([("contract/annotation".to_owned(), "kept".to_owned())]);
-    let stamped = port.apply(&name, &labels, &annotations, &subject.samples().edited(0)).await.expect("a write with metadata");
+    let stamped = port.apply(&name, None, &labels, &annotations, &subject.samples().edited(0)).await.expect("a write with metadata");
     let read = port.get(&name).await.expect("get").expect("held");
     assert_eq!(read.labels.contains_key("contract/label"), profile.labels, "labels kept as the port keeps them: {profile:?}");
     assert_eq!(stamped.labels.contains_key("contract/label"), profile.labels, "the write returns what it kept");
     assert_eq!(read.annotations.contains_key("contract/annotation"), profile.annotations, "annotations as the port keeps them");
+}
+
+/// A write made from a read the record has moved past is refused, in the port's own order of
+/// writes, and writes nothing; one made from the version now held is taken. The spec's and, where
+/// the port keeps one, the status's: the record is moved by a status write where it keeps one,
+/// since some kinds' specs only name their subject, and by an edit otherwise. Run alone for a kind
+/// whose port keeps more than the rest of the contract describes, such as a status it composes.
+pub async fn refuses_stale_writes<R: Resource, S: Subject<R>>(subject: &S) {
+    const INDEX: usize = 3;
+    let port = subject.port();
+    let (name, spec) = subject.samples().sample(INDEX);
+    let none = Default::default();
+    let status = subject.profile().status.then(|| subject.samples().status().expect("a subject whose port keeps a status names one"));
+    subject.hold(INDEX).await;
+    let read = port.get(&name).await.expect("get").expect("held");
+    let moved = match &status {
+        Some(status) => port.set_status(&name, read.version, status).await.expect("a status from the version held"),
+        None => port
+            .apply(&name, Some(read.version), &none, &none, &subject.samples().edited(INDEX))
+            .await
+            .expect("an edit from the version held"),
+    };
+    assert!(moved.version > read.version, "the write moves the version");
+    let stale = port.apply(&name, Some(read.version), &none, &none, &spec).await.map(|_| ());
+    assert_eq!(stale, Err(WriteError::Stale), "an edit made from a read the record has moved past is refused");
+    if let Some(status) = &status {
+        let stale = port.set_status(&name, read.version, status).await.map(|_| ());
+        assert_eq!(stale, Err(WriteError::Stale), "a status made from a read the record has moved past is refused");
+    }
+    let after = port.get(&name).await.expect("get").expect("held");
+    assert_eq!(after.version, moved.version, "a refused write writes nothing");
+    assert_eq!(json(&after.spec), json(&moved.spec), "a refused edit leaves the spec it would have replaced");
+    let unheld = port.apply("held-by-no-home", Some(read.version), &none, &none, &spec).await;
+    assert!(unheld.is_err(), "an edit made from a record no longer held is refused");
+    assert!(port.get("held-by-no-home").await.expect("get").is_none(), "a refused edit creates nothing");
+    let current = port.apply(&name, Some(after.version), &none, &none, &spec).await.expect("an edit from the version now held");
+    if let Some(status) = &status {
+        port.set_status(&name, current.version, status).await.expect("a status from the version now held");
+    }
 }
 
 /// A status is written to a record this home holds, kept as the port keeps it; one for a record
@@ -204,10 +244,10 @@ async fn statuses<R: Resource, S: Subject<R>>(subject: &S, profile: Profile) {
         // A second writer that read the record before the first wrote made its status from an
         // older one: refused, in the port's own order of writes, so nothing of the first is lost.
         let stale = port.set_status(&name, held.version, &status).await.map(|_| ());
-        assert_eq!(stale, Err(StatusWriteError::Stale), "a status made from a read the record has moved past is refused");
+        assert_eq!(stale, Err(WriteError::Stale), "a status made from a read the record has moved past is refused");
         assert_eq!(port.get(&name).await.expect("get").expect("held").version, read.version, "a refused status writes nothing");
     }
-    let respec = port.apply(&name, &Default::default(), &Default::default(), &subject.samples().sample(0).1).await.expect("an edit");
+    let respec = port.apply(&name, None, &Default::default(), &Default::default(), &subject.samples().sample(0).1).await.expect("an edit");
     assert!(respec.status.is_some(), "an edit keeps the status");
 }
 
@@ -261,8 +301,8 @@ async fn refuses_writes<R: Resource, S: Subject<R>>(subject: &S) {
     let port = subject.port();
     let (name, spec) = subject.samples().sample(0);
     let none = Default::default();
-    assert!(port.apply(&name, &none, &none, &spec).await.is_err(), "a write is refused");
-    assert!(port.apply("held-by-no-home", &none, &none, &spec).await.is_err(), "a create is refused");
+    assert!(port.apply(&name, None, &none, &none, &spec).await.is_err(), "a write is refused");
+    assert!(port.apply("held-by-no-home", None, &none, &none, &spec).await.is_err(), "a create is refused");
     assert!(port.delete(&name).await.is_err(), "a delete is refused");
     if let Some(status) = subject.samples().status() {
         let version = port.get(&name).await.expect("get").expect("held").version;

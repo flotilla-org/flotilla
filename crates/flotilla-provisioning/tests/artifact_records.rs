@@ -173,7 +173,7 @@ async fn another_homes_artifacts_read_here_and_this_homes_own_win() {
     let (beta, beta_records) = home(&directory, "beta");
     let put = |records: &Arc<EngineArtifacts>, name: &'static str, digest: &'static str| {
         let records = Arc::clone(records);
-        async move { records.apply(name, &BTreeMap::new(), &BTreeMap::new(), &spec("demo", digest)).await.expect("put") }
+        async move { records.apply(name, None, &BTreeMap::new(), &BTreeMap::new(), &spec("demo", digest)).await.expect("put") }
     };
     put(&beta_records, "shared", "beta").await;
     put(&beta_records, "remote", "beta").await;

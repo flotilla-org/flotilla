@@ -7270,7 +7270,7 @@ async fn forge_identity_sweep_includes_replica_only_legacy_repository() {
     let source = flotilla_provisioning_testkit::OtherHome::open("source-root");
     EngineRepositories::open(Arc::clone(source.service()), Arc::new(flotilla_resources::SystemClock))
         .expect("source repositories")
-        .apply(&old.key().to_string(), &BTreeMap::new(), &BTreeMap::new(), &old)
+        .apply(&old.key().to_string(), None, &BTreeMap::new(), &BTreeMap::new(), &old)
         .await
         .expect("author legacy Repository");
     source.replicate_to(&daemon.decided_store().expect("decided store"));

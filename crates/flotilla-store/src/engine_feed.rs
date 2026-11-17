@@ -287,7 +287,7 @@ mod tests {
     };
 
     use flotilla_resources::{
-        engine_records::{LogPosition, Since},
+        engine_records::{LogPosition, Since, WriteError},
         FulfilmentKind, FulfilmentKindSpec, FulfilmentRealisation, ReadWatchEvent, Vessel, VesselSpec,
     };
     use futures::stream::BoxStream;
@@ -433,18 +433,19 @@ mod tests {
         async fn apply(
             &self,
             _name: &str,
+            _version: Option<u64>,
             _labels: &BTreeMap<String, String>,
             _annotations: &BTreeMap<String, String>,
             _spec: &R::Spec,
-        ) -> Result<Record<R>, String> {
-            Err("read only".into())
+        ) -> Result<Record<R>, WriteError> {
+            Err("read only".to_owned().into())
         }
         async fn set_status(
             &self,
             _name: &str,
             _version: u64,
             _status: &R::Status,
-        ) -> Result<Record<R>, flotilla_resources::engine_records::StatusWriteError> {
+        ) -> Result<Record<R>, flotilla_resources::engine_records::WriteError> {
             Err(String::from("read only").into())
         }
         async fn delete(&self, _name: &str) -> Result<(), String> {

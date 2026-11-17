@@ -73,11 +73,18 @@ impl<R: Resource> KindRecords<R> for Uncomposed<R> {
         self.refused()
     }
 
-    async fn apply(&self, _: &str, _: &BTreeMap<String, String>, _: &BTreeMap<String, String>, _: &R::Spec) -> Result<Record<R>, String> {
-        self.refused()
+    async fn apply(
+        &self,
+        _: &str,
+        _: Option<u64>,
+        _: &BTreeMap<String, String>,
+        _: &BTreeMap<String, String>,
+        _: &R::Spec,
+    ) -> Result<Record<R>, flotilla_resources::engine_records::WriteError> {
+        Ok(self.refused()?)
     }
 
-    async fn set_status(&self, _: &str, _: u64, _: &R::Status) -> Result<Record<R>, flotilla_resources::engine_records::StatusWriteError> {
+    async fn set_status(&self, _: &str, _: u64, _: &R::Status) -> Result<Record<R>, flotilla_resources::engine_records::WriteError> {
         Ok(self.refused()?)
     }
 

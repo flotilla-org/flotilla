@@ -20,7 +20,7 @@ use flotilla_engine_store::{
     plain::{PendingChange, PlainError, PlainLog},
 };
 use flotilla_resources::{
-    engine_records::{CommitMark, KindRecords, LogPosition, Record, Since, Ticks},
+    engine_records::{CommitMark, KindRecords, LogPosition, Record, Since, Ticks, WriteError},
     Resource,
 };
 use flotilla_schema::{Kind, NewChange, Timestamp};
@@ -200,25 +200,28 @@ impl<K: PlainKind> PlainRecords<K> {
 
     /// Writes this home's record `name` as `value`, created or replaced, re-reading and trying
     /// again when another writer of the name wins the race.
-    fn write(&self, name: &str, value: &K) -> Held<K> {
+    /// Refused as stale when a `version` is given and the record has moved from it: the log's
+    /// edit at the version read checks it again.
+    fn write(&self, name: &str, version: Option<u64>, value: &K) -> Result<Record<K::Resource>, WriteError> {
         let mut lost = None;
         for _ in 0..WRITE_ATTEMPTS {
             let current = self.log.get::<K>(name, &self.home).map_err(|error| error.to_string())?;
+            WriteError::unless_at(version, current.as_ref().map(|current| current.version))?;
             let written = match current {
                 Some(current) => self.log.edit(name, current.version, value, &PendingChange::new(NewChange::new(K::WRITER, self.now()))),
                 None => self.log.create(name, value, &PendingChange::new(NewChange::new(K::WRITER, self.now()))),
             };
             match written {
-                Ok(version) => {
+                Ok(written) => {
                     let created_at = self.log.created::<K>(name, &self.home).map_err(|error| error.to_string())?.to_datetime();
-                    return object(name.to_owned(), self.home.clone(), version, created_at, value);
+                    return Ok(object(name.to_owned(), self.home.clone(), written, created_at, value)?);
                 }
                 Err(error @ (PlainError::Conflict { .. } | PlainError::Exists { .. } | PlainError::Missing { .. })) => lost = Some(error),
-                Err(error) => return Err(format!("write {} {name}: {error}", K::KIND)),
+                Err(error) => return Err(format!("write {} {name}: {error}", K::KIND).into()),
             }
         }
         let last = lost.map(|error| error.to_string()).unwrap_or_default();
-        Err(format!("write {} {name}: lost {WRITE_ATTEMPTS} races with concurrent writers, the last: {last}", K::KIND))
+        Err(format!("write {} {name}: lost {WRITE_ATTEMPTS} races with concurrent writers, the last: {last}", K::KIND).into())
     }
 }
 
@@ -311,11 +314,12 @@ impl<K: PlainKind> KindRecords<K::Resource> for PlainRecords<K> {
     async fn apply(
         &self,
         name: &str,
+        version: Option<u64>,
         _labels: &BTreeMap<String, String>,
         _annotations: &BTreeMap<String, String>,
         spec: &<K::Resource as Resource>::Spec,
-    ) -> Result<Record<K::Resource>, String> {
-        self.write(name, &K::from_spec(spec.clone())?)
+    ) -> Result<Record<K::Resource>, WriteError> {
+        self.write(name, version, &K::from_spec(spec.clone())?)
     }
 
     async fn set_status(
@@ -323,7 +327,7 @@ impl<K: PlainKind> KindRecords<K::Resource> for PlainRecords<K> {
         name: &str,
         _version: u64,
         _status: &<K::Resource as Resource>::Status,
-    ) -> Result<Record<K::Resource>, flotilla_resources::engine_records::StatusWriteError> {
+    ) -> Result<Record<K::Resource>, WriteError> {
         Err(format!("{} {name} keeps no status", K::KIND).into())
     }
 

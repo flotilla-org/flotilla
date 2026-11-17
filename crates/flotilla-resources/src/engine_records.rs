@@ -272,22 +272,39 @@ impl IndexCover {
 /// A patch to a status, as [`KindRecords::patch_status`] applies it.
 pub type PatchStatus<'patch, S> = dyn for<'status> Fn(&'status mut S) + Sync + 'patch;
 
-/// Why [`KindRecords::set_status`] wrote nothing.
+/// Why [`KindRecords::apply`] or [`KindRecords::set_status`] wrote nothing.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub enum StatusWriteError {
-    /// The record moved past the version its writer read: the status was made from an older one.
+pub enum WriteError {
+    /// The record moved past the version its writer read: the write was made from an older one.
     Stale,
     /// Refused, or failed, for the reason given.
     Failed(String),
 }
 
-impl From<String> for StatusWriteError {
+impl WriteError {
+    /// Refuses a write made from `version` of a record now `held` at another version, or held no
+    /// longer; a write made from no version is refused nothing here.
+    pub fn unless_at(version: Option<u64>, held: Option<u64>) -> Result<(), Self> {
+        match version {
+            Some(version) if held != Some(version) => Err(Self::Stale),
+            _ => Ok(()),
+        }
+    }
+}
+
+impl From<String> for WriteError {
     fn from(reason: String) -> Self {
         Self::Failed(reason)
     }
 }
 
-impl std::fmt::Display for StatusWriteError {
+impl From<WriteError> for String {
+    fn from(error: WriteError) -> Self {
+        error.to_string()
+    }
+}
+
+impl std::fmt::Display for WriteError {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             Self::Stale => formatter.write_str("stale resourceVersion"),
@@ -365,17 +382,19 @@ pub trait KindRecords<R: crate::Resource>: Send + Sync + std::fmt::Debug {
         None
     }
     /// Writes this home's record `name` from its metadata and spec: created, or replaced, keeping
-    /// its status. Stamps the kind does not keep are not kept.
+    /// its status. Stamps the kind does not keep are not kept. With a `version`, only a record
+    /// still at it is replaced, checked in the port's own order of writes.
     async fn apply(
         &self,
         name: &str,
+        version: Option<u64>,
         labels: &BTreeMap<String, String>,
         annotations: &BTreeMap<String, String>,
         spec: &R::Spec,
-    ) -> Result<Record<R>, String>;
+    ) -> Result<Record<R>, WriteError>;
     /// Replaces this home's record's status, if the record is still at `version`, checked in the
     /// port's own order of writes; refused for a kind with none.
-    async fn set_status(&self, name: &str, version: u64, status: &R::Status) -> Result<Record<R>, StatusWriteError>;
+    async fn set_status(&self, name: &str, version: u64, status: &R::Status) -> Result<Record<R>, WriteError>;
     /// Applies `patch` to this home's record `name`'s status, in the port's own order of writes
     /// and against what it holds, writing only where that changes; whether it wrote. `None` when
     /// the port keeps no order of its own, and the writer reads, patches and sets the status

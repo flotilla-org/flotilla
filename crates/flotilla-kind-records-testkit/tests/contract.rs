@@ -36,7 +36,7 @@ impl<R: Resource, S: Samples<R>> Subject<R> for InMemory<R, S> {
     async fn hold(&self, index: usize) {
         let (name, spec) = self.samples.sample(index);
         if self.profile().writes {
-            self.records.apply(&name, &Default::default(), &Default::default(), &spec).await.expect("the port takes its sample");
+            self.records.apply(&name, None, &Default::default(), &Default::default(), &spec).await.expect("the port takes its sample");
         } else {
             self.records.hold("alpha", &name, spec, None);
         }

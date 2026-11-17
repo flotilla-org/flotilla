@@ -24,7 +24,7 @@ use flotilla_protocol::LifecycleReading;
 use flotilla_resources::{
     checkout_records::{CheckoutLaunch, Launches},
     clone_records::{launched, CloneRecord},
-    engine_records::{KindRecords, LogPosition, Record, Since},
+    engine_records::{KindRecords, LogPosition, Record, Since, WriteError},
     environment_records::EnvironmentRecord,
     lifecycle_reads::{ChangeCursor, CursorSince, LifecycleReads, RecordSet},
     Checkout, ClonePhase, CloneStatus, Environment, EnvironmentPhase, EnvironmentStatus, ImageBuild, Resource,
@@ -568,11 +568,12 @@ impl<R: LifecycleKind> KindRecords<R> for LifecycleViews {
     async fn apply(
         &self,
         name: &str,
+        _version: Option<u64>,
         _labels: &BTreeMap<String, String>,
         _annotations: &BTreeMap<String, String>,
         _spec: &R::Spec,
-    ) -> Result<Record<R>, String> {
-        Err(R::written(name))
+    ) -> Result<Record<R>, WriteError> {
+        Err(R::written(name).into())
     }
 
     async fn set_status(
@@ -580,7 +581,7 @@ impl<R: LifecycleKind> KindRecords<R> for LifecycleViews {
         name: &str,
         _version: u64,
         _status: &R::Status,
-    ) -> Result<Record<R>, flotilla_resources::engine_records::StatusWriteError> {
+    ) -> Result<Record<R>, flotilla_resources::engine_records::WriteError> {
         Err(R::status_written(name).into())
     }
 

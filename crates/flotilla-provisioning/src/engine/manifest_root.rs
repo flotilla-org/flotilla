@@ -700,11 +700,12 @@ impl flotilla_resources::engine_records::KindRecords<flotilla_resources::Manifes
     async fn apply(
         &self,
         name: &str,
+        _version: Option<u64>,
         _labels: &BTreeMap<String, String>,
         _annotations: &BTreeMap<String, String>,
         _spec: &flotilla_resources::ManifestRootSpec,
-    ) -> Result<RootRecord, String> {
-        Err(root_refusal(name))
+    ) -> Result<RootRecord, flotilla_resources::engine_records::WriteError> {
+        Err(root_refusal(name).into())
     }
 
     async fn set_status(
@@ -712,7 +713,7 @@ impl flotilla_resources::engine_records::KindRecords<flotilla_resources::Manifes
         name: &str,
         _version: u64,
         _status: &flotilla_resources::ManifestRootStatus,
-    ) -> Result<RootRecord, flotilla_resources::engine_records::StatusWriteError> {
+    ) -> Result<RootRecord, flotilla_resources::engine_records::WriteError> {
         Err(root_refusal(name).into())
     }
 

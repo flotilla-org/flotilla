@@ -26,7 +26,7 @@ use flotilla_resources::account_access::{
     BindingState as OldState, EpochEntry, GrantName, GrantScope, PendingBinding, ProvisionRecord, ProvisionWrite, ACCOUNT_BINDING_LABEL,
     ACCOUNT_CREDENTIAL_LABEL,
 };
-use flotilla_resources::engine_records::{CommitMark, KindRecords, LogPosition, Record, Since, Ticks};
+use flotilla_resources::engine_records::{CommitMark, KindRecords, LogPosition, Record, Since, Ticks, WriteError as RecordWriteError};
 use flotilla_resources::CONVOY_LABEL;
 use flotilla_schema::{CreatedAt, Identity, Kind, KindCode, NewChange, Ref, State, Timestamp};
 use flotilla_schema_sqlite::{stream::Service, Read, StoreError};
@@ -937,19 +937,15 @@ impl KindRecords<BindingResource> for EngineAccounts {
     async fn apply(
         &self,
         name: &str,
+        _version: Option<u64>,
         _labels: &BTreeMap<String, String>,
         _annotations: &BTreeMap<String, String>,
         _spec: &AccountBindingSpec,
-    ) -> Result<Record<BindingResource>, String> {
-        Err(binding_refusal(name))
+    ) -> Result<Record<BindingResource>, RecordWriteError> {
+        Err(binding_refusal(name).into())
     }
 
-    async fn set_status(
-        &self,
-        name: &str,
-        _version: u64,
-        _status: &(),
-    ) -> Result<Record<BindingResource>, flotilla_resources::engine_records::StatusWriteError> {
+    async fn set_status(&self, name: &str, _version: u64, _status: &()) -> Result<Record<BindingResource>, RecordWriteError> {
         Err(format!("{BINDING_KIND} {name} keeps no status").into())
     }
 
@@ -1040,22 +1036,32 @@ impl KindRecords<ProvisionResource> for EngineAccounts {
     async fn apply(
         &self,
         name: &str,
+        version: Option<u64>,
         labels: &BTreeMap<String, String>,
         _annotations: &BTreeMap<String, String>,
         spec: &AccountProvisionSpec,
-    ) -> Result<Record<ProvisionResource>, String> {
-        let convoy = labels.get(CONVOY_LABEL).map(String::as_str).unwrap_or_default();
-        self.record_provision("", name, convoy, spec, true).await?;
+    ) -> Result<Record<ProvisionResource>, RecordWriteError> {
+        match version {
+            // Made from a version read: the log's edit at it refuses a provision that has moved.
+            Some(version) => {
+                let held = self.provisions.get::<ProvisionSpec>(name, &self.home).map_err(|error| error.to_string())?;
+                RecordWriteError::unless_at(Some(version), held.map(|held| held.version))?;
+                match self.provisions.edit(name, version, &provision_spec(spec), &PendingChange::new(NewChange::new(WRITER, self.now()))) {
+                    Ok(_) => {}
+                    Err(PlainError::Conflict { .. } | PlainError::Missing { .. }) => return Err(RecordWriteError::Stale),
+                    Err(error) => return Err(format!("record account provision `{name}`: {error}").into()),
+                }
+            }
+            None => {
+                let convoy = labels.get(CONVOY_LABEL).map(String::as_str).unwrap_or_default();
+                self.record_provision("", name, convoy, spec, true).await?;
+            }
+        }
         let written = self.provisions(Some(name))?.into_iter().find(|object| object.home == self.home);
-        written.ok_or_else(|| format!("{PROVISION_KIND} {name} was written but does not read back"))
+        Ok(written.ok_or_else(|| format!("{PROVISION_KIND} {name} was written but does not read back"))?)
     }
 
-    async fn set_status(
-        &self,
-        name: &str,
-        _version: u64,
-        _status: &(),
-    ) -> Result<Record<ProvisionResource>, flotilla_resources::engine_records::StatusWriteError> {
+    async fn set_status(&self, name: &str, _version: u64, _status: &()) -> Result<Record<ProvisionResource>, RecordWriteError> {
         Err(format!("{PROVISION_KIND} {name} keeps no status").into())
     }
 

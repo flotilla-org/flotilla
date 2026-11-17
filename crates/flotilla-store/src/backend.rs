@@ -1,6 +1,6 @@
 use crate::store::transcode_request;
 use crate::StoreExt;
-use flotilla_resources::engine_records::StatusWriteError;
+use flotilla_resources::engine_records::WriteError;
 use flotilla_resources::lifecycle_reads::LifecycleReads;
 use std::{
     collections::{BTreeMap, HashSet},
@@ -894,7 +894,7 @@ impl<T: Resource> TypedResolver<T> {
             if self.engine_home_record(&*records, &meta.name).await?.is_some() {
                 return Err(ResourceError::conflict(&meta.name, "resource already exists"));
             }
-            return self.engine_apply(&*records, meta, spec).await;
+            return self.engine_apply(&*records, meta, None, spec).await;
         }
         dispatch_backend!(self, create_typed, meta, spec)
     }
@@ -957,44 +957,48 @@ impl<T: Resource> TypedResolver<T> {
         Ok(ResourceError::conflict(name, format!("{} {name} is homed at {homes}; {verb} it there", T::API_PATHS.kind)))
     }
 
-    /// The engine record `name` at this home, refused unless it is at `resource_version`.
-    async fn engine_current(
-        &self,
-        records: &dyn flotilla_resources::engine_records::KindRecords<T>,
-        name: &str,
-        resource_version: &str,
-    ) -> Result<(), ResourceError> {
-        match self.engine_home_record(records, name).await? {
-            None => Err(self.not_held_here(name, "write").await?),
-            Some(current) if current.version.to_string() != resource_version => Err(ResourceError::conflict(name, "stale resourceVersion")),
-            Some(_) => Ok(()),
-        }
-    }
-
+    /// `spec` written by the port; with a `version`, only over this home's record still at it.
     async fn engine_apply(
         &self,
         records: &dyn flotilla_resources::engine_records::KindRecords<T>,
         meta: &InputMeta,
+        version: Option<u64>,
         spec: &T::Spec,
     ) -> Result<ResourceObject<T>, ResourceError> {
-        let record = records.apply(&meta.name, &meta.labels, &meta.annotations, spec).await.map_err(ResourceError::other)?;
-        Ok(crate::definition::record_object(&self.namespace, record))
+        match records.apply(&meta.name, version, &meta.labels, &meta.annotations, spec).await {
+            Ok(record) => Ok(crate::definition::record_object(&self.namespace, record)),
+            Err(WriteError::Stale) => Err(ResourceError::conflict(&meta.name, "stale resourceVersion")),
+            Err(WriteError::Failed(reason)) => Err(ResourceError::other(reason)),
+        }
     }
 
     pub async fn update(&self, meta: &InputMeta, resource_version: &str, spec: &T::Spec) -> Result<ResourceObject<T>, ResourceError> {
         self.refuse_engine_write_elsewhere()?;
         if let Some(records) = self.engine_owned() {
             if !records.writes() {
-                return self.engine_apply(&*records, meta, spec).await;
+                return self.engine_apply(&*records, meta, None, spec).await;
             }
-            self.engine_current(&*records, &meta.name, resource_version).await?;
-            let current = self.get(&meta.name).await?;
+            let version = resource_version.parse::<u64>().map_err(|_| ResourceError::conflict(&meta.name, "stale resourceVersion"))?;
+            let Some(current) = self.engine_home_record(&*records, &meta.name).await? else {
+                return Err(self.not_held_here(&meta.name, "write").await?);
+            };
             T::validate_spec_update(&current.spec, spec)?;
             T::validate_spec(meta, spec)?;
-            return self.engine_apply(&*records, meta, spec).await;
+            // The port checks the version in its own order of writes, so no other write lands
+            // between the check and this one.
+            return self.engine_apply(&*records, meta, Some(version), spec).await;
         }
         if T::REPLICATION_CLASS == crate::ReplicationClass::Definitions {
             let definitions = self.backend.definitions::<T>(&self.namespace);
+            if let Some(records) = self.backend.engine_records::<T>() {
+                // This home's record is written over only at the version read, checked by the port
+                // in its own order of writes; where this home holds none, the write makes its copy
+                // of what the reader saw.
+                let version = resource_version.parse::<u64>().map_err(|_| ResourceError::conflict(&meta.name, "stale resourceVersion"))?;
+                if self.engine_home_record(&*records, &meta.name).await?.is_some() {
+                    return definitions.apply_at(meta, version, spec).await;
+                }
+            }
             let current = definitions.get(&meta.name).await?;
             let local_version_matches = self.get(&meta.name).await.is_ok_and(|local| local.metadata.resource_version == resource_version);
             if current.metadata.resource_version != resource_version && !local_version_matches {
@@ -1034,8 +1038,8 @@ impl<T: Resource> TypedResolver<T> {
             };
             return match records.set_status(name, version, status).await {
                 Ok(record) => Ok(crate::definition::record_object(&self.namespace, record)),
-                Err(StatusWriteError::Stale) => Err(ResourceError::conflict(name, "stale resourceVersion")),
-                Err(StatusWriteError::Failed(reason)) => {
+                Err(WriteError::Stale) => Err(ResourceError::conflict(name, "stale resourceVersion")),
+                Err(WriteError::Failed(reason)) => {
                     // A record this home does not hold is not found, or named as another home's.
                     if records.writes() && self.engine_home_record(&*records, name).await?.is_none() {
                         return Err(self.not_held_here(name, "write").await?);
@@ -1127,7 +1131,7 @@ mod tests {
     use std::{collections::BTreeMap, sync::Arc};
 
     use flotilla_resources::{
-        engine_records::{KindRecords, LogPosition, Record, Since},
+        engine_records::{KindRecords, LogPosition, Record, Since, WriteError},
         Artifact, ImageBuild, Resource, Vessel, VesselSpec,
     };
     use futures::stream::BoxStream;
@@ -1199,18 +1203,19 @@ mod tests {
         async fn apply(
             &self,
             _name: &str,
+            _version: Option<u64>,
             _labels: &BTreeMap<String, String>,
             _annotations: &BTreeMap<String, String>,
             _spec: &R::Spec,
-        ) -> Result<Record<R>, String> {
-            Err("read only".into())
+        ) -> Result<Record<R>, WriteError> {
+            Err("read only".to_owned().into())
         }
         async fn set_status(
             &self,
             _name: &str,
             _version: u64,
             _status: &R::Status,
-        ) -> Result<Record<R>, flotilla_resources::engine_records::StatusWriteError> {
+        ) -> Result<Record<R>, flotilla_resources::engine_records::WriteError> {
             Err(String::from("read only").into())
         }
         async fn delete(&self, _name: &str) -> Result<(), String> {

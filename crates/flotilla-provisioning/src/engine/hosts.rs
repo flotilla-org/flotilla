@@ -30,7 +30,7 @@ use flotilla_protocol::{
     EnvironmentId, HostSummary, NodeId, NodeInfo, SystemInfo,
 };
 use flotilla_resources::{
-    engine_records::{CommitMark, KindRecords, LogPosition, PatchStatus, Record, Since, StatusWriteError, Ticks, UnloggedJournal},
+    engine_records::{CommitMark, KindRecords, LogPosition, PatchStatus, Record, Since, Ticks, UnloggedJournal, WriteError},
     CredentialExpiry, FulfilmentFacts, HarnessFacts, Host, HostCondition, HostConnection, HostSpec, HostStatus, LocalImageInventories,
     AGENT_ADAPTERS_CAPABILITY, CODEX_CENTRAL_LOGIN_CAPABILITY, CREDENTIAL_EXPIRY_CAPABILITY, ENVIRONMENT_PROVIDERS_CAPABILITY,
     HELD_CREDENTIALS_CAPABILITY, IMAGE_DIGESTS_CAPABILITY, OWNING_DAEMON_CAPABILITY, PLACEMENT_CAPABILITY, SSH_HOST_CAPABILITY,
@@ -511,7 +511,7 @@ impl EngineHosts {
     /// only where the observation it maps to differs from the resident map's: an unchanged
     /// status reads nothing from the store and writes nothing. Whether it wrote. Refused as stale
     /// when an `expected` version is given and the Host has moved from it.
-    fn write_status(&self, name: &str, expected: Option<u64>, patch: &PatchStatus<'_, HostStatus>) -> Result<bool, StatusWriteError> {
+    fn write_status(&self, name: &str, expected: Option<u64>, patch: &PatchStatus<'_, HostStatus>) -> Result<bool, WriteError> {
         let key = (name.to_owned(), self.home.clone());
         for _ in 0..WRITE_ATTEMPTS {
             let (observation, version) = {
@@ -520,7 +520,7 @@ impl EngineHosts {
                     return Err(format!("{KIND} {name} is not held at {}", self.home).into());
                 };
                 if expected.is_some_and(|expected| held.version() != Some(expected)) {
-                    return Err(StatusWriteError::Stale);
+                    return Err(WriteError::Stale);
                 }
                 let mut status = match &held.observation {
                     Some((observation, _)) => {
@@ -639,17 +639,22 @@ impl KindRecords<Host> for EngineHosts {
     async fn apply(
         &self,
         name: &str,
+        version: Option<u64>,
         _labels: &BTreeMap<String, String>,
         _annotations: &BTreeMap<String, String>,
         spec: &HostSpec,
-    ) -> Result<Record<Host>, String> {
+    ) -> Result<Record<Host>, WriteError> {
         self.homed_here(name, spec)?;
         let _writing = self.writing.lock().await;
+        if version.is_some() {
+            let held = self.refresh()?.records.get(&(name.to_owned(), self.home.clone())).and_then(Held::version);
+            WriteError::unless_at(version, held)?;
+        }
         self.write_spec(name, &HostRecord::new(spec))?;
-        self.own_object(name)
+        Ok(self.own_object(name)?)
     }
 
-    async fn set_status(&self, name: &str, version: u64, status: &HostStatus) -> Result<Record<Host>, StatusWriteError> {
+    async fn set_status(&self, name: &str, version: u64, status: &HostStatus) -> Result<Record<Host>, WriteError> {
         let _writing = self.writing.lock().await;
         self.write_status(name, Some(version), &|held: &mut HostStatus| held.clone_from(status))?;
         Ok(self.own_object(name)?)
