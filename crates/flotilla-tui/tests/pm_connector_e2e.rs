@@ -175,8 +175,8 @@ impl RemoteObserver {
             .observing_authority("remote".into())
             .build();
         let records: &dyn KindRecords<ChangeRequest> = &self.records;
-        records.apply(&cr_name(), &Default::default(), &Default::default(), &spec).await.expect("observed");
-        records.set_status(&cr_name(), &status(title, time)).await.expect("observed status");
+        let written = records.apply(&cr_name(), &Default::default(), &Default::default(), &spec).await.expect("observed");
+        records.set_status(&cr_name(), written.version, &status(title, time)).await.expect("observed status");
         self.home.replicate_to(&self.daemon);
     }
     async fn forget(&self) {

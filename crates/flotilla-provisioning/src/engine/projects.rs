@@ -23,7 +23,7 @@ use flotilla_engine_store::{
 };
 use flotilla_resources::{
     definitions::{origin, stamp, DefinitionOrigin},
-    engine_records::{CommitMark, KindRecords, LogPosition, Record, Since, Ticks, UnloggedJournal},
+    engine_records::{CommitMark, KindRecords, LogPosition, Record, Since, StatusWriteError, Ticks, UnloggedJournal},
     DeclarationRefusedCondition, DispatchQueueAttention, DispatchQueueEntry, OperationalEntriesCondition, Project, ProjectSpec,
     ProjectStatus,
 };
@@ -546,9 +546,11 @@ impl KindRecords<Project> for EngineProjects {
         self.current(name)
     }
 
-    async fn set_status(&self, name: &str, status: &ProjectStatus) -> Object {
+    async fn set_status(&self, name: &str, version: u64, status: &ProjectStatus) -> Result<Record<Project>, StatusWriteError> {
         let _writing = locked(&self.writing);
-        self.current(name)?;
+        if self.current(name)?.version != version {
+            return Err(StatusWriteError::Stale);
+        }
         // Project operations' conditions are their record; once written it stays, emptied, until
         // the Project goes, so its version only moves forward.
         let ops = ProjectOpsRecord::from_status(status);
@@ -567,7 +569,7 @@ impl KindRecords<Project> for EngineProjects {
                 attention: status.dispatch_queue_attention.clone(),
             },
         );
-        self.current(name)
+        Ok(self.current(name)?)
     }
 
     async fn delete(&self, name: &str) -> Result<(), String> {

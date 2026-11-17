@@ -578,8 +578,8 @@ impl<R: flotilla_resources::Resource> KindRecords<R> for EveryKindEmpty {
     ) -> Result<Record<R>, String> {
         Err("read only".into())
     }
-    async fn set_status(&self, _: &str, _: &R::Status) -> Result<Record<R>, String> {
-        Err("read only".into())
+    async fn set_status(&self, _: &str, _: u64, _: &R::Status) -> Result<Record<R>, flotilla_resources::engine_records::StatusWriteError> {
+        Err(String::from("read only").into())
     }
     async fn delete(&self, _: &str) -> Result<(), String> {
         Err("read only".into())

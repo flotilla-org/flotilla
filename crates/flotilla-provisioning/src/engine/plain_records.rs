@@ -318,8 +318,13 @@ impl<K: PlainKind> KindRecords<K::Resource> for PlainRecords<K> {
         self.write(name, &K::from_spec(spec.clone())?)
     }
 
-    async fn set_status(&self, name: &str, _status: &<K::Resource as Resource>::Status) -> Result<Record<K::Resource>, String> {
-        Err(format!("{} {name} keeps no status", K::KIND))
+    async fn set_status(
+        &self,
+        name: &str,
+        _version: u64,
+        _status: &<K::Resource as Resource>::Status,
+    ) -> Result<Record<K::Resource>, flotilla_resources::engine_records::StatusWriteError> {
+        Err(format!("{} {name} keeps no status", K::KIND).into())
     }
 
     async fn delete(&self, name: &str) -> Result<(), String> {

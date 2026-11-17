@@ -272,6 +272,30 @@ impl IndexCover {
 /// A patch to a status, as [`KindRecords::patch_status`] applies it.
 pub type PatchStatus<'patch, S> = dyn for<'status> Fn(&'status mut S) + Sync + 'patch;
 
+/// Why [`KindRecords::set_status`] wrote nothing.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum StatusWriteError {
+    /// The record moved past the version its writer read: the status was made from an older one.
+    Stale,
+    /// Refused, or failed, for the reason given.
+    Failed(String),
+}
+
+impl From<String> for StatusWriteError {
+    fn from(reason: String) -> Self {
+        Self::Failed(reason)
+    }
+}
+
+impl std::fmt::Display for StatusWriteError {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Stale => formatter.write_str("stale resourceVersion"),
+            Self::Failed(reason) => formatter.write_str(reason),
+        }
+    }
+}
+
 /// An engine port serving resource kind `R`. A name several homes hold reads as this home's
 /// record, else the lexically first home's; writes are this home's alone.
 #[async_trait::async_trait]
@@ -349,8 +373,9 @@ pub trait KindRecords<R: crate::Resource>: Send + Sync + std::fmt::Debug {
         annotations: &BTreeMap<String, String>,
         spec: &R::Spec,
     ) -> Result<Record<R>, String>;
-    /// Replaces this home's record's status; refused for a kind with none.
-    async fn set_status(&self, name: &str, status: &R::Status) -> Result<Record<R>, String>;
+    /// Replaces this home's record's status, if the record is still at `version`, checked in the
+    /// port's own order of writes; refused for a kind with none.
+    async fn set_status(&self, name: &str, version: u64, status: &R::Status) -> Result<Record<R>, StatusWriteError>;
     /// Applies `patch` to this home's record `name`'s status, in the port's own order of writes
     /// and against what it holds, writing only where that changes; whether it wrote. `None` when
     /// the port keeps no order of its own, and the writer reads, patches and sets the status

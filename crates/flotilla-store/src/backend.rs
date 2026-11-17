@@ -1,5 +1,6 @@
 use crate::store::transcode_request;
 use crate::StoreExt;
+use flotilla_resources::engine_records::StatusWriteError;
 use flotilla_resources::lifecycle_reads::LifecycleReads;
 use std::{
     collections::{BTreeMap, HashSet},
@@ -1022,12 +1023,26 @@ impl<T: Resource> TypedResolver<T> {
             _ => false,
         };
         // A definition kind with a status (Project, #3824 layer 3b) writes it through its port too.
+        // The port checks the version in its own order of writes, so no other write lands between
+        // the check and the status.
         if let Some(records) = self.backend.engine_records::<T>() {
-            if records.writes() {
-                self.engine_current(&*records, name, resource_version).await?;
-            }
-            let record = records.set_status(name, status).await.map_err(ResourceError::other)?;
-            return Ok(crate::definition::record_object(&self.namespace, record));
+            let version = match resource_version.parse::<u64>() {
+                Ok(version) => version,
+                // A port that refuses every status write refuses it for that reason, whatever version.
+                Err(_) if !records.writes() => 0,
+                Err(_) => return Err(ResourceError::conflict(name, "stale resourceVersion")),
+            };
+            return match records.set_status(name, version, status).await {
+                Ok(record) => Ok(crate::definition::record_object(&self.namespace, record)),
+                Err(StatusWriteError::Stale) => Err(ResourceError::conflict(name, "stale resourceVersion")),
+                Err(StatusWriteError::Failed(reason)) => {
+                    // A record this home does not hold is not found, or named as another home's.
+                    if records.writes() && self.engine_home_record(&*records, name).await?.is_none() {
+                        return Err(self.not_held_here(name, "write").await?);
+                    }
+                    Err(ResourceError::other(reason))
+                }
+            };
         }
         if !engine_owned {
             return dispatch_backend!(self, update_status_typed, name, resource_version, status);
@@ -1190,8 +1205,13 @@ mod tests {
         ) -> Result<Record<R>, String> {
             Err("read only".into())
         }
-        async fn set_status(&self, _name: &str, _status: &R::Status) -> Result<Record<R>, String> {
-            Err("read only".into())
+        async fn set_status(
+            &self,
+            _name: &str,
+            _version: u64,
+            _status: &R::Status,
+        ) -> Result<Record<R>, flotilla_resources::engine_records::StatusWriteError> {
+            Err(String::from("read only").into())
         }
         async fn delete(&self, _name: &str) -> Result<(), String> {
             Err("read only".into())

@@ -18,7 +18,7 @@ use flotilla_engine_store::{
 };
 use flotilla_resources::{
     definition_provenance::{SUPERSEDED_BY_ANNOTATION, VERIFICATION_PROJECT_ANNOTATION, VERIFICATION_PROVENANCE_ANNOTATION},
-    engine_records::{CommitMark, KindRecords, LogPosition, Record, Since, Ticks},
+    engine_records::{CommitMark, KindRecords, LogPosition, Record, Since, StatusWriteError, Ticks},
     Repository, RepositoryKey, RepositorySpec, RepositoryStatus,
 };
 use flotilla_schema::{Kind, KindCode, NewChange, Timestamp};
@@ -203,11 +203,20 @@ impl EngineRepositories {
     }
 
     /// Writes this home's record `name` as `edit` makes it from the current one (or none),
-    /// re-reading and trying again when another writer of the name wins the race.
-    fn write(&self, name: &str, edit: impl Fn(Option<RepositoryRecord>) -> Result<RepositoryRecord, String>) -> Held {
+    /// re-reading and trying again when another writer of the name wins the race; refused as
+    /// stale instead when an `expected` version is given and the record has moved from it.
+    fn write(
+        &self,
+        name: &str,
+        expected: Option<u64>,
+        edit: impl Fn(Option<RepositoryRecord>) -> Result<RepositoryRecord, String>,
+    ) -> Result<Record<Repository>, StatusWriteError> {
         for _ in 0..WRITE_ATTEMPTS {
             let current = self.log.get::<RepositoryRecord>(name, &self.home).map_err(|error| error.to_string())?;
             let version = current.as_ref().map(|current| current.version);
+            if expected.is_some_and(|expected| version.is_some_and(|version| version != expected)) {
+                return Err(StatusWriteError::Stale);
+            }
             let value = edit(current.as_ref().map(|current| current.spec.clone()))?;
             let written = match (current, version) {
                 (Some(current), Some(version)) if current.spec == value => Ok(version),
@@ -218,13 +227,13 @@ impl EngineRepositories {
                 Ok(version) => {
                     let created_at =
                         self.log.created::<RepositoryRecord>(name, &self.home).map_err(|error| error.to_string())?.to_datetime();
-                    return object(name.to_owned(), self.home.clone(), version, created_at, &value);
+                    return Ok(object(name.to_owned(), self.home.clone(), version, created_at, &value)?);
                 }
                 Err(PlainError::Conflict { .. } | PlainError::Exists { .. } | PlainError::Missing { .. }) => continue,
-                Err(error) => return Err(format!("write {KIND} {name}: {error}")),
+                Err(error) => return Err(format!("write {KIND} {name}: {error}").into()),
             }
         }
-        Err(format!("write {KIND} {name}: lost {WRITE_ATTEMPTS} races with concurrent writers"))
+        Err(format!("write {KIND} {name}: lost {WRITE_ATTEMPTS} races with concurrent writers").into())
     }
 }
 
@@ -327,7 +336,7 @@ impl KindRecords<Repository> for EngineRepositories {
                 .map_err(|error| format!("`{VERIFICATION_PROVENANCE_ANNOTATION}` does not decode: {error}"))?,
             None => Vec::new(),
         };
-        self.write(name, |current| {
+        self.write(name, None, |current| {
             // The observations stay: they are the reconciler's, written through the status.
             let mut record = RepositoryRecord::new(spec.clone())?;
             record.verification_project = annotations.get(VERIFICATION_PROJECT_ANNOTATION).cloned();
@@ -339,10 +348,11 @@ impl KindRecords<Repository> for EngineRepositories {
             }
             Ok(record)
         })
+        .map_err(|error| error.to_string())
     }
 
-    async fn set_status(&self, name: &str, status: &RepositoryStatus) -> Held {
-        self.write(name, |current| {
+    async fn set_status(&self, name: &str, version: u64, status: &RepositoryStatus) -> Result<Record<Repository>, StatusWriteError> {
+        self.write(name, Some(version), |current| {
             let mut record = current.ok_or_else(|| format!("{KIND} {name} is not held here"))?;
             // Checkouts by host and diagnostics have no reader and are not kept (#3824 layer 3a).
             record.default_branch.clone_from(&status.default_branch);

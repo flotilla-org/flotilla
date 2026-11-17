@@ -524,7 +524,7 @@ async fn the_views_refuse_writes() {
     let none = BTreeMap::new();
     let held = KindRecords::get(&views, "fix-it#1").await.expect("get").expect("held");
     assert!(views.apply("fix-it#1", &none, &none, &held.spec).await.is_err());
-    assert!(views.set_status("fix-it#1", &held.status.expect("status")).await.is_err());
+    assert!(views.set_status("fix-it#1", held.version, &held.status.expect("status")).await.is_err());
     assert!(KindRecords::delete(&views, "fix-it#1").await.is_err());
     assert_eq!(KindRecords::list(&views).await.expect("list").len(), 1);
 }

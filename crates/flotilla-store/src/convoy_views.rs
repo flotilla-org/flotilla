@@ -895,8 +895,13 @@ impl KindRecords<Convoy> for ConvoyViews {
         Err(format!("convoy {name} is admitted on the engine, not written"))
     }
 
-    async fn set_status(&self, name: &str, _status: &ConvoyStatus) -> Result<Record<Convoy>, String> {
-        Err(format!("convoy {name}'s status is derived from the engine's records; it is not written"))
+    async fn set_status(
+        &self,
+        name: &str,
+        _version: u64,
+        _status: &ConvoyStatus,
+    ) -> Result<Record<Convoy>, flotilla_resources::engine_records::StatusWriteError> {
+        Err(format!("convoy {name}'s status is derived from the engine's records; it is not written").into())
     }
 
     async fn delete(&self, name: &str) -> Result<(), String> {

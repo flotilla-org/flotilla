@@ -944,8 +944,13 @@ impl KindRecords<BindingResource> for EngineAccounts {
         Err(binding_refusal(name))
     }
 
-    async fn set_status(&self, name: &str, _status: &()) -> Result<Record<BindingResource>, String> {
-        Err(format!("{BINDING_KIND} {name} keeps no status"))
+    async fn set_status(
+        &self,
+        name: &str,
+        _version: u64,
+        _status: &(),
+    ) -> Result<Record<BindingResource>, flotilla_resources::engine_records::StatusWriteError> {
+        Err(format!("{BINDING_KIND} {name} keeps no status").into())
     }
 
     async fn delete(&self, name: &str) -> Result<(), String> {
@@ -1045,8 +1050,13 @@ impl KindRecords<ProvisionResource> for EngineAccounts {
         written.ok_or_else(|| format!("{PROVISION_KIND} {name} was written but does not read back"))
     }
 
-    async fn set_status(&self, name: &str, _status: &()) -> Result<Record<ProvisionResource>, String> {
-        Err(format!("{PROVISION_KIND} {name} keeps no status"))
+    async fn set_status(
+        &self,
+        name: &str,
+        _version: u64,
+        _status: &(),
+    ) -> Result<Record<ProvisionResource>, flotilla_resources::engine_records::StatusWriteError> {
+        Err(format!("{PROVISION_KIND} {name} keeps no status").into())
     }
 
     async fn delete(&self, name: &str) -> Result<(), String> {

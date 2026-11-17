@@ -734,8 +734,13 @@ impl KindRecords<TerminalSession> for TerminalViews {
         Err(format!("terminal session {name} is requested through the engine's terminal sessions, not written"))
     }
 
-    async fn set_status(&self, name: &str, _status: &TerminalSessionStatus) -> Result<Record<TerminalSession>, String> {
-        Err(format!("terminal session {name}'s status is the engine's; it is not written"))
+    async fn set_status(
+        &self,
+        name: &str,
+        _version: u64,
+        _status: &TerminalSessionStatus,
+    ) -> Result<Record<TerminalSession>, flotilla_resources::engine_records::StatusWriteError> {
+        Err(format!("terminal session {name}'s status is the engine's; it is not written").into())
     }
 
     async fn delete(&self, name: &str) -> Result<(), String> {

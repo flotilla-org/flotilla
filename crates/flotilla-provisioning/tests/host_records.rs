@@ -2,7 +2,13 @@
 //! records are the only copy, an observation is written only when a value changes, and a Host
 //! reads back with the judgements its readers expect.
 
-use std::{collections::BTreeMap, sync::Arc};
+use std::{
+    collections::BTreeMap,
+    sync::{
+        atomic::{AtomicBool, Ordering},
+        Arc,
+    },
+};
 
 use chrono::{DateTime, TimeZone, Utc};
 use flotilla_protocol::provider::{EnvironmentClass, ProviderAdvertisement, ProviderKind, ProviderReadiness};
@@ -11,12 +17,15 @@ use flotilla_provisioning::{
     stored::host::{HostObservation, HostRecord},
 };
 use flotilla_resources::{
-    Clock, ConditionValue, FulfilmentFacts, Host, HostCondition, HostConnection, HostSpec, HostStatus, InputMeta, SystemClock,
+    engine_records::{KindRecords, LogPosition, PatchStatus, Record, Since, StatusWriteError, Ticks},
+    Clock, ConditionValue, FulfilmentFacts, Host, HostCondition, HostConnection, HostSpec, HostStatus, InputMeta, ResourceError,
+    SystemClock,
 };
-use flotilla_schema::Kind;
+use flotilla_schema::{Kind, KindCode};
 use flotilla_schema_sqlite::stream::Service;
 use flotilla_store::ResourceBackend;
 use flotilla_store_memory::InMemoryBackend;
+use futures::stream::BoxStream;
 use serde_json::json;
 
 const NS: &str = "flotilla";
@@ -246,4 +255,113 @@ async fn the_daemons_blocking_conditions_hold_readiness() {
         let held = status.conditions.iter().find(|condition| condition.condition_type == blocking.condition_type).expect("recorded");
         assert_eq!((held.value, held.blocks_readiness, held.blocks_forge_observation), (ConditionValue::False, true, forge));
     }
+}
+
+/// Host's port with a second writer that patches a fulfilment fact in once armed: after the first
+/// read of the Host, or before its first status write, whichever comes first. That is between a
+/// writer's read and its write.
+#[derive(Debug)]
+struct SecondWriter {
+    inner: Arc<EngineHosts>,
+    armed: AtomicBool,
+}
+
+impl SecondWriter {
+    async fn interleave(&self, name: &str) -> Result<(), String> {
+        if self.armed.swap(false, Ordering::SeqCst) {
+            let fact = FulfilmentFacts { gui_session_logged_in: true, observed_at: at(5), ..FulfilmentFacts::default() };
+            let patch = |status: &mut HostStatus| {
+                status.fulfilment_facts.insert("dummy-crews".to_owned(), fact.clone());
+            };
+            self.inner.patch_status(name, &patch).await.expect("Host patches its status")?;
+        }
+        Ok(())
+    }
+}
+
+#[async_trait::async_trait]
+impl KindRecords<Host> for SecondWriter {
+    fn codes(&self) -> Vec<KindCode> {
+        self.inner.codes()
+    }
+    fn ticks(&self) -> Ticks {
+        self.inner.ticks()
+    }
+    fn home(&self) -> String {
+        self.inner.home()
+    }
+    async fn get(&self, name: &str) -> Result<Option<Record<Host>>, String> {
+        let read = self.inner.get(name).await;
+        self.interleave(name).await?;
+        read
+    }
+    async fn list(&self) -> Result<Vec<Record<Host>>, String> {
+        self.inner.list().await
+    }
+    async fn sources(&self) -> Result<Vec<Record<Host>>, String> {
+        self.inner.sources().await
+    }
+    async fn positioned(&self) -> Result<(Vec<Record<Host>>, LogPosition), String> {
+        self.inner.positioned().await
+    }
+    async fn position(&self) -> Result<LogPosition, String> {
+        self.inner.position().await
+    }
+    async fn changed_since(&self, position: &LogPosition) -> Result<Since, String> {
+        self.inner.changed_since(position).await
+    }
+    async fn copies(&self, name: &str) -> Result<Vec<Record<Host>>, String> {
+        let read = self.inner.copies(name).await;
+        self.interleave(name).await?;
+        read
+    }
+    async fn apply(
+        &self,
+        name: &str,
+        labels: &BTreeMap<String, String>,
+        annotations: &BTreeMap<String, String>,
+        spec: &HostSpec,
+    ) -> Result<Record<Host>, String> {
+        self.inner.apply(name, labels, annotations, spec).await
+    }
+    async fn set_status(&self, name: &str, version: u64, status: &HostStatus) -> Result<Record<Host>, StatusWriteError> {
+        self.interleave(name).await?;
+        self.inner.set_status(name, version, status).await
+    }
+    async fn patch_status(&self, name: &str, patch: &PatchStatus<'_, HostStatus>) -> Option<Result<bool, String>> {
+        self.inner.patch_status(name, patch).await
+    }
+    async fn delete(&self, name: &str) -> Result<(), String> {
+        self.inner.delete(name).await
+    }
+    async fn changes(&self) -> Result<BoxStream<'static, ()>, String> {
+        self.inner.changes().await
+    }
+}
+
+// Behaviour (two Host writers): a writer that reads a Host and writes its whole status back, as the
+// image inventory did, loses nothing another writer patched in between. The version it read is
+// checked in the port's own order of writes: its write is refused as stale, and the patch stands.
+#[tokio::test]
+async fn a_status_written_back_over_another_writers_patch_is_refused() {
+    let directory = tempfile::tempdir().expect("temp dir");
+    let mut kinds = flotilla_schema::KindRegistry::new();
+    flotilla_provisioning::stored::host::register(&mut kinds).expect("register");
+    let service = Arc::new(Service::open(&directory.path().join("decided.sqlite"), "alpha", kinds).expect("store"));
+    let inner = Arc::new(EngineHosts::open(Arc::clone(&service), "kiwi".into(), Arc::new(SystemClock) as Arc<dyn Clock>).expect("open"));
+    let port = Arc::new(SecondWriter { inner, armed: AtomicBool::new(false) });
+    let backend = ResourceBackend::new(InMemoryBackend::default());
+    backend.install_engine_kind::<Host>(port.clone());
+    let hosts = backend.using::<Host>(NS);
+    let host = hosts.create(&InputMeta { name: "kiwi".into(), ..Default::default() }, &HostSpec::default()).await.expect("create");
+    let first = hosts.update_status("kiwi", &host.metadata.resource_version, &observed(at(0), "12 GB free")).await.expect("first");
+
+    let mut edited = first.status.clone().expect("status");
+    edited.capabilities.insert("image_digests".to_owned(), json!({"docker": ["sha256:b"]}));
+    port.armed.store(true, Ordering::SeqCst);
+    let written = hosts.update_status("kiwi", &first.metadata.resource_version, &edited).await;
+    assert!(!port.armed.load(Ordering::SeqCst), "the second writer wrote between the first's read and its write");
+    assert!(matches!(written, Err(ResourceError::Conflict { .. })), "the first writer's stale status is refused: {written:?}");
+    let facts = hosts.get("kiwi").await.expect("read").status.expect("status").fulfilment_facts;
+    assert!(facts.contains_key("dummy-crews"), "the second writer's patch stands: {:?}", facts.keys().collect::<Vec<_>>());
 }

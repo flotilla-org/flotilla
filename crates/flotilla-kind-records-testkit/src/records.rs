@@ -6,7 +6,7 @@ use std::{
 };
 
 use flotilla_resources::{
-    engine_records::{KindRecords, LogPosition, Record, Since},
+    engine_records::{KindRecords, LogPosition, Record, Since, StatusWriteError},
     Resource,
 };
 use futures::stream::BoxStream;
@@ -202,13 +202,16 @@ impl<R: Resource> KindRecords<R> for MemoryRecords<R> {
         Ok(record)
     }
 
-    async fn set_status(&self, name: &str, status: &R::Status) -> Result<Record<R>, String> {
+    async fn set_status(&self, name: &str, version: u64, status: &R::Status) -> Result<Record<R>, StatusWriteError> {
         if !self.profile.status {
-            return Err(self.refused(name, "writing a status"));
+            return Err(self.refused(name, "writing a status").into());
         }
         let mut state = self.state();
         let key = (name.to_owned(), self.home.clone());
         let record = state.records.get_mut(&key).ok_or_else(|| format!("{} {name} is not held at {}", R::API_PATHS.kind, self.home))?;
+        if record.version != version {
+            return Err(StatusWriteError::Stale);
+        }
         record.status = Some(status.clone());
         record.version += u64::from(self.profile.status_moves_version);
         let record = record.clone();

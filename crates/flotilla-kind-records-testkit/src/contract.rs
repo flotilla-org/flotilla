@@ -5,7 +5,7 @@
 use std::{collections::BTreeSet, sync::Arc, time::Duration};
 
 use flotilla_resources::{
-    engine_records::{IndexCover, KindRecords, LogPosition, Record, Since},
+    engine_records::{IndexCover, KindRecords, LogPosition, Record, Since, StatusWriteError},
     Resource,
 };
 use futures::StreamExt;
@@ -186,20 +186,27 @@ async fn statuses<R: Resource, S: Subject<R>>(subject: &S, profile: Profile) {
         assert!(!profile.status, "a subject whose port keeps a status names one");
         return;
     };
+    let held = port.get(&name).await.expect("get").expect("held");
     if !profile.status {
-        assert!(port.set_status(&name, &status).await.is_err(), "a kind with no status refuses one");
+        assert!(port.set_status(&name, held.version, &status).await.is_err(), "a kind with no status refuses one");
         return;
     }
-    assert!(port.set_status("held-by-no-home", &status).await.is_err(), "a status for a record not held here is refused");
-    let held = port.get(&name).await.expect("get").expect("held");
+    assert!(port.set_status("held-by-no-home", held.version, &status).await.is_err(), "a status for a record not held here is refused");
     let mut feed = port.changes().await.expect("changes");
-    let written = port.set_status(&name, &status).await.expect("a status write");
+    let written = port.set_status(&name, held.version, &status).await.expect("a status write");
     ticked(&mut feed, "a status write").await;
     assert_eq!(json(&written.status), json(&Some(status.clone())), "the write returns the status kept");
     let read = port.get(&name).await.expect("get").expect("held");
-    assert_eq!(json(&read.status), json(&Some(status)), "a read finds the status");
+    assert_eq!(json(&read.status), json(&Some(status.clone())), "a read finds the status");
     assert_eq!(json(&read.spec), json(&held.spec), "a status write keeps the spec");
     assert_eq!(read.version > held.version, profile.status_moves_version, "a status write moves the version: {profile:?}");
+    if profile.status_moves_version {
+        // A second writer that read the record before the first wrote made its status from an
+        // older one: refused, in the port's own order of writes, so nothing of the first is lost.
+        let stale = port.set_status(&name, held.version, &status).await.map(|_| ());
+        assert_eq!(stale, Err(StatusWriteError::Stale), "a status made from a read the record has moved past is refused");
+        assert_eq!(port.get(&name).await.expect("get").expect("held").version, read.version, "a refused status writes nothing");
+    }
     let respec = port.apply(&name, &Default::default(), &Default::default(), &subject.samples().sample(0).1).await.expect("an edit");
     assert!(respec.status.is_some(), "an edit keeps the status");
 }
@@ -258,7 +265,8 @@ async fn refuses_writes<R: Resource, S: Subject<R>>(subject: &S) {
     assert!(port.apply("held-by-no-home", &none, &none, &spec).await.is_err(), "a create is refused");
     assert!(port.delete(&name).await.is_err(), "a delete is refused");
     if let Some(status) = subject.samples().status() {
-        assert!(port.set_status(&name, &status).await.is_err(), "a status write is refused");
+        let version = port.get(&name).await.expect("get").expect("held").version;
+        assert!(port.set_status(&name, version, &status).await.is_err(), "a status write is refused");
     }
     assert!(port.get(&name).await.expect("get").is_some(), "a refused write leaves the record");
 }

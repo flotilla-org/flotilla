@@ -716,8 +716,13 @@ impl KindRecords<Vessel> for VesselViews {
         Err(format!("vessel {name} is launched by its convoy's home, not written; {EXPLAIN}"))
     }
 
-    async fn set_status(&self, name: &str, _status: &VesselStatus) -> Result<Record<Vessel>, String> {
-        Err(format!("vessel {name}'s status is its launch's, not written; {EXPLAIN}"))
+    async fn set_status(
+        &self,
+        name: &str,
+        _version: u64,
+        _status: &VesselStatus,
+    ) -> Result<Record<Vessel>, flotilla_resources::engine_records::StatusWriteError> {
+        Err(format!("vessel {name}'s status is its launch's, not written; {EXPLAIN}").into())
     }
 
     async fn delete(&self, name: &str) -> Result<(), String> {

@@ -388,8 +388,13 @@ impl KindRecords<FulfilmentKind> for EngineKinds {
         self.write(name, labels, annotations, &FulfilmentKindDefinition::new(spec)?)
     }
 
-    async fn set_status(&self, name: &str, _status: &()) -> Result<Held, String> {
-        Err(format!("{KIND} {name}: a fulfilment kind has no status"))
+    async fn set_status(
+        &self,
+        name: &str,
+        _version: u64,
+        _status: &(),
+    ) -> Result<Held, flotilla_resources::engine_records::StatusWriteError> {
+        Err(format!("{KIND} {name}: a fulfilment kind has no status").into())
     }
 
     async fn delete(&self, name: &str) -> Result<(), String> {

@@ -30,7 +30,7 @@ use flotilla_protocol::{
     EnvironmentId, HostSummary, NodeId, NodeInfo, SystemInfo,
 };
 use flotilla_resources::{
-    engine_records::{CommitMark, KindRecords, LogPosition, PatchStatus, Record, Since, Ticks, UnloggedJournal},
+    engine_records::{CommitMark, KindRecords, LogPosition, PatchStatus, Record, Since, StatusWriteError, Ticks, UnloggedJournal},
     CredentialExpiry, FulfilmentFacts, HarnessFacts, Host, HostCondition, HostConnection, HostSpec, HostStatus, LocalImageInventories,
     AGENT_ADAPTERS_CAPABILITY, CODEX_CENTRAL_LOGIN_CAPABILITY, CREDENTIAL_EXPIRY_CAPABILITY, ENVIRONMENT_PROVIDERS_CAPABILITY,
     HELD_CREDENTIALS_CAPABILITY, IMAGE_DIGESTS_CAPABILITY, OWNING_DAEMON_CAPABILITY, PLACEMENT_CAPABILITY, SSH_HOST_CAPABILITY,
@@ -77,6 +77,14 @@ impl Held {
             _ => BTreeMap::new(),
         };
         Self { host, observation, capabilities }
+    }
+
+    /// A change token for the writers' version checks, which read it back from this home: it
+    /// moves with each write of either record. Delete ends both, and a Host made again starts as
+    /// a new object.
+    fn version(&self) -> Option<u64> {
+        let (_, host_version, _) = self.host.as_ref()?;
+        Some(host_version + self.observation.as_ref().map_or(0, |(_, version)| *version))
     }
 }
 
@@ -425,7 +433,7 @@ impl EngineHosts {
 
     /// `held`, at `home`, as the resource; None for an observation whose Host is gone.
     fn object(&self, name: &str, home: &str, held: &Held) -> Option<Record<Host>> {
-        let (spec, host_version, created_at) = held.host.as_ref()?;
+        let (spec, _, created_at) = held.host.as_ref()?;
         let status = held
             .observation
             .as_ref()
@@ -433,10 +441,7 @@ impl EngineHosts {
         Some(Record {
             name: name.to_owned(),
             home: home.to_owned(),
-            // A change token for the writers' version checks, which read it back from this home: it
-            // moves with each write of either record. Delete ends both, and a Host made again
-            // starts as a new object.
-            version: host_version + held.observation.as_ref().map_or(0, |(_, version)| *version),
+            version: held.version()?,
             created_at: *created_at,
             labels: BTreeMap::new(),
             annotations: BTreeMap::new(),
@@ -504,15 +509,19 @@ impl EngineHosts {
 
     /// Writes this home's observation of `name` from the status `patch` makes of the one held,
     /// only where the observation it maps to differs from the resident map's: an unchanged
-    /// status reads nothing from the store and writes nothing. Whether it wrote.
-    fn write_status(&self, name: &str, patch: &PatchStatus<'_, HostStatus>) -> Result<bool, String> {
+    /// status reads nothing from the store and writes nothing. Whether it wrote. Refused as stale
+    /// when an `expected` version is given and the Host has moved from it.
+    fn write_status(&self, name: &str, expected: Option<u64>, patch: &PatchStatus<'_, HostStatus>) -> Result<bool, StatusWriteError> {
         let key = (name.to_owned(), self.home.clone());
         for _ in 0..WRITE_ATTEMPTS {
             let (observation, version) = {
                 let resident = self.refresh()?;
                 let Some((held, spec)) = resident.records.get(&key).and_then(|held| Some((held, &held.host.as_ref()?.0))) else {
-                    return Err(format!("{KIND} {name} is not held at {}", self.home));
+                    return Err(format!("{KIND} {name} is not held at {}", self.home).into());
                 };
+                if expected.is_some_and(|expected| held.version() != Some(expected)) {
+                    return Err(StatusWriteError::Stale);
+                }
                 let mut status = match &held.observation {
                     Some((observation, _)) => {
                         judged(name, &self.home, spec, observation, held.capabilities.clone(), self.heard(&self.home), self.now())
@@ -534,10 +543,10 @@ impl EngineHosts {
             match written {
                 Ok(_) => return Ok(true),
                 Err(PlainError::Conflict { .. } | PlainError::Exists { .. } | PlainError::Missing { .. }) => continue,
-                Err(error) => return Err(format!("write {KIND} {name} observation: {error}")),
+                Err(error) => return Err(format!("write {KIND} {name} observation: {error}").into()),
             }
         }
-        Err(format!("write {KIND} {name} observation: lost {WRITE_ATTEMPTS} races with concurrent writers"))
+        Err(format!("write {KIND} {name} observation: lost {WRITE_ATTEMPTS} races with concurrent writers").into())
     }
 }
 
@@ -640,17 +649,17 @@ impl KindRecords<Host> for EngineHosts {
         self.own_object(name)
     }
 
-    async fn set_status(&self, name: &str, status: &HostStatus) -> Result<Record<Host>, String> {
+    async fn set_status(&self, name: &str, version: u64, status: &HostStatus) -> Result<Record<Host>, StatusWriteError> {
         let _writing = self.writing.lock().await;
-        self.write_status(name, &|held: &mut HostStatus| held.clone_from(status))?;
-        self.own_object(name)
+        self.write_status(name, Some(version), &|held: &mut HostStatus| held.clone_from(status))?;
+        Ok(self.own_object(name)?)
     }
 
     /// Patched under this port's write lock against the resident map, so an unchanged status
     /// reads nothing from the store.
     async fn patch_status(&self, name: &str, patch: &PatchStatus<'_, HostStatus>) -> Option<Result<bool, String>> {
         let _writing = self.writing.lock().await;
-        Some(self.write_status(name, patch))
+        Some(self.write_status(name, None, patch).map_err(|error| error.to_string()))
     }
 
     async fn delete(&self, name: &str) -> Result<(), String> {

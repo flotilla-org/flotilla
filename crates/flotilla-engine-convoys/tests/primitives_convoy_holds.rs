@@ -206,7 +206,8 @@ impl Fixture {
             .number(subject.id.parse().expect("number"))
             .observing_authority("test".into())
             .build();
-        KindRecords::<ChangeRequest>::apply(&observations, &name, &BTreeMap::new(), &BTreeMap::new(), &spec).await.expect("observed");
+        let observed =
+            KindRecords::<ChangeRequest>::apply(&observations, &name, &BTreeMap::new(), &BTreeMap::new(), &spec).await.expect("observed");
         let status = ChangeRequestStatus {
             title: Default::default(),
             author: Default::default(),
@@ -218,7 +219,7 @@ impl Fixture {
             review: ChangeRequestReviewObservation { actionable_at_head: Default::default() },
             mergeable: Default::default(),
         };
-        KindRecords::<ChangeRequest>::set_status(&observations, &name, &status).await.expect("observed status");
+        KindRecords::<ChangeRequest>::set_status(&observations, &name, observed.version, &status).await.expect("observed status");
     }
 
     /// Opens crew member `role`'s binding at `opened_at` as admission does, and ends it when

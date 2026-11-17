@@ -77,8 +77,8 @@ impl<R: Resource> KindRecords<R> for Uncomposed<R> {
         self.refused()
     }
 
-    async fn set_status(&self, _: &str, _: &R::Status) -> Result<Record<R>, String> {
-        self.refused()
+    async fn set_status(&self, _: &str, _: u64, _: &R::Status) -> Result<Record<R>, flotilla_resources::engine_records::StatusWriteError> {
+        Ok(self.refused()?)
     }
 
     async fn delete(&self, _: &str) -> Result<(), String> {

@@ -439,8 +439,13 @@ mod tests {
         ) -> Result<Record<R>, String> {
             Err("read only".into())
         }
-        async fn set_status(&self, _name: &str, _status: &R::Status) -> Result<Record<R>, String> {
-            Err("read only".into())
+        async fn set_status(
+            &self,
+            _name: &str,
+            _version: u64,
+            _status: &R::Status,
+        ) -> Result<Record<R>, flotilla_resources::engine_records::StatusWriteError> {
+            Err(String::from("read only").into())
         }
         async fn delete(&self, _name: &str) -> Result<(), String> {
             Err("read only".into())

@@ -152,8 +152,14 @@ impl KindRecords<OldMessage> for MessageRecords {
         Err(format!("Message {name} is admitted from its sender's intent, not written in the old shape; apply a Message document whose spec is that intent"))
     }
 
-    async fn set_status(&self, name: &str, _status: &MessageStatus) -> Result<Record<OldMessage>, String> {
-        Err(format!("Message {name}'s state moves only through delivery and receipts; acknowledge it with `flotilla message acknowledge`"))
+    async fn set_status(
+        &self,
+        name: &str,
+        _version: u64,
+        _status: &MessageStatus,
+    ) -> Result<Record<OldMessage>, flotilla_resources::engine_records::StatusWriteError> {
+        Err(format!("Message {name}'s state moves only through delivery and receipts; acknowledge it with `flotilla message acknowledge`")
+            .into())
     }
 
     async fn delete(&self, name: &str) -> Result<(), String> {

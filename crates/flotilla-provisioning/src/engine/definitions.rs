@@ -559,8 +559,13 @@ impl<R: Defined> KindRecords<R> for EngineDefinitions {
         self.write::<R::Stored>(name, origin, spec)
     }
 
-    async fn set_status(&self, name: &str, _status: &R::Status) -> Result<Record<R>, String> {
-        Err(format!("{} {name}: a definition has no status", R::API_PATHS.kind))
+    async fn set_status(
+        &self,
+        name: &str,
+        _version: u64,
+        _status: &R::Status,
+    ) -> Result<Record<R>, flotilla_resources::engine_records::StatusWriteError> {
+        Err(format!("{} {name}: a definition has no status", R::API_PATHS.kind).into())
     }
 
     async fn delete(&self, name: &str) -> Result<(), String> {

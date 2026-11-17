@@ -27,7 +27,7 @@ use flotilla_resources::{
     address::record_name,
     engine_records::{
         BranchChangeRequest, ChangeRequestBranches, CommitMark, KindRecords, LogPosition, ObservationFailures, Record, Since,
-        SourceObservers, Ticks,
+        SourceObservers, StatusWriteError, Ticks,
     },
     ChangeRequest, ChangeRequestSpec, ChangeRequestStatus, Issue, IssueSpec, IssueStatus, Resource,
 };
@@ -551,11 +551,18 @@ impl EngineObservations {
         self.written::<K>(name)
     }
 
-    fn set_status_as<K: Observed>(&self, name: &str, status: &K::Status) -> Result<Record<K::Resource>, String> {
+    /// Refused as stale unless the record is at `version`: the log's edit checks it again.
+    fn set_status_as<K: Observed>(&self, name: &str, version: u64, status: &K::Status) -> Result<Record<K::Resource>, StatusWriteError> {
         let current = self.log.get::<K>(name, &self.home).map_err(|error| error.to_string())?;
         let current = current.ok_or_else(|| format!("{} {name} is not held at {}", K::NAME, self.home))?;
-        self.write(name, &current.spec.observed(&self.home, status))?;
-        self.written::<K>(name)
+        if current.version != version {
+            return Err(StatusWriteError::Stale);
+        }
+        match self.log.edit(name, version, &current.spec.observed(&self.home, status), &self.change()) {
+            Ok(_) => Ok(self.written::<K>(name)?),
+            Err(PlainError::Conflict { .. }) => Err(StatusWriteError::Stale),
+            Err(error) => Err(format!("write {} {name}: {error}", K::KIND).into()),
+        }
     }
 
     fn delete_as<K: Observed>(&self, name: &str) -> Result<(), String> {
@@ -649,9 +656,9 @@ impl<R: ObservedAs> KindRecords<R> for EngineObservations {
         self.apply_observed::<R::Record>(name, spec).await
     }
 
-    async fn set_status(&self, name: &str, status: &R::Status) -> Result<Record<R>, String> {
+    async fn set_status(&self, name: &str, version: u64, status: &R::Status) -> Result<Record<R>, StatusWriteError> {
         self.observer_rewrite::<R::Record>(R::Record::NAME, name).await?;
-        self.set_status_as::<R::Record>(name, status)
+        self.set_status_as::<R::Record>(name, version, status)
     }
 
     async fn delete(&self, name: &str) -> Result<(), String> {

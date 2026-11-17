@@ -70,9 +70,9 @@ impl OtherHome {
             HostConnection::SshHost { owning_daemon, .. } => owning_daemon.clone(),
         };
         let hosts = EngineHosts::open(Arc::clone(&self.service), own_host, Arc::new(SystemClock)).expect("other home hosts");
-        hosts.apply(name, &Default::default(), &Default::default(), spec).await.expect("write host at its home");
+        let written = hosts.apply(name, &Default::default(), &Default::default(), spec).await.expect("write host at its home");
         if let Some(status) = status {
-            hosts.set_status(name, status).await.expect("observe host at its home");
+            hosts.set_status(name, written.version, status).await.expect("observe host at its home");
         }
     }
 
@@ -92,7 +92,8 @@ impl OtherHome {
     /// Records what this home's Repository reconciler observed of Repository `name`.
     pub async fn repository_status(&self, name: &str, status: &flotilla_resources::RepositoryStatus) {
         let repositories = EngineRepositories::open(Arc::clone(&self.service), Arc::new(SystemClock)).expect("other home repositories");
-        repositories.set_status(name, status).await.expect("observe repository at its home");
+        let held = repositories.get(name).await.expect("read repository at its home").expect("held at its home");
+        repositories.set_status(name, held.version, status).await.expect("observe repository at its home");
     }
 
     /// Writes Project `name` here with its writer's stamps, as this home declares it.

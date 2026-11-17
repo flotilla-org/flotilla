@@ -2136,8 +2136,13 @@ impl KindRecords<PrimaryResource> for HeldListingPort {
     ) -> Result<Record<PrimaryResource>, String> {
         Err("read only".into())
     }
-    async fn set_status(&self, _name: &str, _status: &()) -> Result<Record<PrimaryResource>, String> {
-        Err("read only".into())
+    async fn set_status(
+        &self,
+        _name: &str,
+        _version: u64,
+        _status: &(),
+    ) -> Result<Record<PrimaryResource>, flotilla_resources::engine_records::StatusWriteError> {
+        Err(String::from("read only").into())
     }
     async fn delete(&self, _name: &str) -> Result<(), String> {
         Err("read only".into())

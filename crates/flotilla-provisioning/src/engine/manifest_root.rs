@@ -707,8 +707,13 @@ impl flotilla_resources::engine_records::KindRecords<flotilla_resources::Manifes
         Err(root_refusal(name))
     }
 
-    async fn set_status(&self, name: &str, _status: &flotilla_resources::ManifestRootStatus) -> Result<RootRecord, String> {
-        Err(root_refusal(name))
+    async fn set_status(
+        &self,
+        name: &str,
+        _version: u64,
+        _status: &flotilla_resources::ManifestRootStatus,
+    ) -> Result<RootRecord, flotilla_resources::engine_records::StatusWriteError> {
+        Err(root_refusal(name).into())
     }
 
     async fn delete(&self, name: &str) -> Result<(), String> {

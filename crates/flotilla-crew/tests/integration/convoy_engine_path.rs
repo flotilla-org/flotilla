@@ -1216,8 +1216,8 @@ impl KindRecords<Forge> for Forges {
     ) -> Result<Record<Forge>, String> {
         Err("read only".into())
     }
-    async fn set_status(&self, _: &str, _: &()) -> Result<Record<Forge>, String> {
-        Err("read only".into())
+    async fn set_status(&self, _: &str, _: u64, _: &()) -> Result<Record<Forge>, flotilla_resources::engine_records::StatusWriteError> {
+        Err(String::from("read only").into())
     }
     async fn delete(&self, _: &str) -> Result<(), String> {
         Err("read only".into())

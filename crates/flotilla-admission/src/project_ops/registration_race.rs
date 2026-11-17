@@ -132,8 +132,13 @@ impl KindRecords<Repository> for RacingRepositories {
         }
         self.inner.apply(name, labels, annotations, spec).await
     }
-    async fn set_status(&self, name: &str, status: &RepositoryStatus) -> Result<Record<Repository>, String> {
-        self.inner.set_status(name, status).await
+    async fn set_status(
+        &self,
+        name: &str,
+        version: u64,
+        status: &RepositoryStatus,
+    ) -> Result<Record<Repository>, flotilla_resources::engine_records::StatusWriteError> {
+        self.inner.set_status(name, version, status).await
     }
     async fn delete(&self, name: &str) -> Result<(), String> {
         self.inner.delete(name).await
