@@ -41,7 +41,13 @@ pub struct Convoys {
     world: Mutex<MemoryConvoyWorld>,
     /// What this home observes of its launches, shared with their readers.
     memory: Arc<ConvoyMemory>,
+    /// Told each launch retired here.
+    retirements: tokio::sync::broadcast::Sender<String>,
 }
+
+/// How many retirements a slow follower may fall behind by; one that lags reads which have
+/// retired afresh.
+const RETIREMENTS: usize = 256;
 
 fn locked<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
     mutex.lock().unwrap_or_else(PoisonError::into_inner)
@@ -80,7 +86,13 @@ impl Convoys {
             home: Mutex::new(convoys),
             world: Mutex::new(MemoryConvoyWorld::default()),
             memory: Arc::default(),
+            retirements: tokio::sync::broadcast::channel(RETIREMENTS).0,
         })
+    }
+
+    /// Each launch this home retires from now on, by name, as its Retire is written.
+    pub fn retirements(&self) -> tokio::sync::broadcast::Receiver<String> {
+        self.retirements.subscribe()
     }
 
     /// The home these records are homed at.
@@ -228,6 +240,8 @@ impl Convoys {
             Ok((vec![Retire { holds: Ref::new(reference) }.into()], ()))
         })
         .map_err(|error| error.to_string())?;
+        // No follower is no reason to fail: one may subscribe later, and reads which retired.
+        drop(self.retirements.send(name.to_owned()));
         Ok(Retirement::Retired)
     }
 }

@@ -729,6 +729,53 @@ impl TieredBlobStore {
             Err(failures.join("; "))
         }
     }
+
+    /// Deletes `digest`'s copy from each tier that holds one once `grace` has passed since it was
+    /// written there: the blob no artifact references any more. Returns how long until a copy
+    /// still inside its grace passes it. A failed fleet deletion keeps its marker, for the next.
+    pub async fn collect(&self, digest: &BlobDigest, grace: Duration) -> Result<Option<Duration>, String> {
+        let mut failures = Vec::new();
+        let mut next = None;
+        let local = self.local.path(digest);
+        if tokio::fs::try_exists(&local).await.map_err(|error| error.to_string())? {
+            match grace_left(&local, grace).await? {
+                Some(left) => next = Some(left),
+                None => match self.local.delete(digest).await {
+                    Ok(()) => {
+                        let _ = tokio::fs::remove_file(self.media_types.join(digest.as_str())).await;
+                        let mut inventory = self.inventory.lock().await;
+                        inventory.known.remove(digest);
+                        inventory.pending.remove(digest);
+                    }
+                    Err(error) => failures.push(format!("local {}: {error}", digest.as_str())),
+                },
+            }
+        }
+        for target in &self.fleet {
+            let marker = self.marker(&target.id, digest);
+            if !tokio::fs::try_exists(&marker).await.map_err(|error| error.to_string())? {
+                continue;
+            }
+            if let Some(left) = grace_left(&marker, grace).await? {
+                next = next.min(Some(left)).or(Some(left));
+                continue;
+            }
+            match target.store.delete(digest).await {
+                Ok(()) => {
+                    if let Err(error) = tokio::fs::remove_file(&marker).await {
+                        failures.push(format!("{} marker {}: {error}", target.id, digest.as_str()));
+                    }
+                }
+                Err(error) => failures.push(format!("{} {}: {error}", target.id, digest.as_str())),
+            }
+        }
+        if failures.is_empty() {
+            Ok(next)
+        } else {
+            Err(failures.join("; "))
+        }
+    }
+
     pub async fn sync_once(&self) -> Result<BlobSyncStatus, String> {
         let _sync = self.sync_lock.lock().await;
         self.recover_inventory().await?;
@@ -1408,5 +1455,27 @@ mod tests {
         assert_eq!(tiered.status().await.pending_count, 1);
         assert_eq!(tiered.sync_once().await.expect("repeat sync").pending_count, 0);
         assert!(fleet.has(&digest).await.expect("fleet copy restored"));
+    }
+
+    // Behaviour (#3108): collecting one blob deletes each tier's copy once its grace has passed,
+    // and before then says how long is left; another blob is left alone.
+    #[tokio::test]
+    async fn collect_deletes_one_blobs_copies_after_its_grace() {
+        let state = tempfile::tempdir().expect("state dir");
+        let fleet = Arc::new(MemoryBlobStore::default());
+        let tiered = TieredBlobStore::new(state.path(), vec![("fleet".into(), fleet.clone())]);
+        let gone = tiered.put(b"unreferenced").await.expect("put");
+        let kept = tiered.put(b"another").await.expect("put");
+        assert_eq!(tiered.sync_once().await.expect("sync").pending_count, 0);
+
+        let left = tiered.collect(&gone, Duration::from_secs(3600)).await.expect("collect within grace");
+        assert!(left.is_some_and(|left| left > Duration::ZERO), "{left:?}");
+        assert!(tiered.local.has(&gone).await.expect("local copy kept within its grace"));
+        assert!(fleet.has(&gone).await.expect("fleet copy kept within its grace"));
+
+        assert_eq!(tiered.collect(&gone, Duration::ZERO).await.expect("collect"), None);
+        assert!(!tiered.local.has(&gone).await.expect("local copy collected"));
+        assert!(!fleet.has(&gone).await.expect("fleet copy collected"));
+        assert!(tiered.has(&kept).await.expect("another blob kept") && fleet.has(&kept).await.expect("its fleet copy kept"));
     }
 }

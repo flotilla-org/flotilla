@@ -1,20 +1,22 @@
 use std::{
-    collections::{BTreeMap, HashSet},
+    collections::BTreeMap,
     path::{Path, PathBuf},
     sync::Arc,
 };
+
+pub(crate) mod retention;
 
 use async_trait::async_trait;
 use chrono::{Duration, Utc};
 use flotilla_agent::brief_artifact::BriefArtifactWriter;
 use flotilla_protocol::CallerCrew;
 use flotilla_resources::{
-    address::artifact_slot_record_name, Artifact, ArtifactSpec, InputMeta, ResourceError, ResourceObject, TerminalSession,
+    address::artifact_slot_record_name, Artifact, ArtifactSpec, InputMeta, ReadWatchEvent, ResourceError, ResourceObject, TerminalSession,
     TerminalSessionSource,
 };
 use flotilla_store::ResourceBackend;
-use tracing::warn;
 
+use self::retention::Retention;
 use crate::blob_store::{BlobDigest, BlobStore, TieredBlobStore};
 
 const DEFAULT_RETENTION_DAYS: u64 = 30;
@@ -307,53 +309,30 @@ impl ArtifactService<'_> {
         Ok(digest)
     }
 
-    /// Deletes this home's unpinned artifacts past their expiry: the digests still referenced, and
-    /// when the next unpinned artifact expires.
-    pub async fn reap_expired(&self) -> Result<Reaped, String> {
-        self.reap(&|_| false).await
-    }
-
-    /// [`Self::reap_expired`], also deleting the unpinned artifacts of each convoy `retired` says
-    /// has retired: an artifact goes with its convoy unless it is pinned.
-    pub async fn reap(&self, retired: &(dyn Fn(&str) -> bool + Sync)) -> Result<Reaped, String> {
-        let resolver = self.backend.using::<Artifact>(self.namespace);
+    /// What retention reads, from one listing of every home's artifacts; a blob's last reference
+    /// going makes it collectable `grace` later.
+    pub(crate) async fn retention(&self, grace: std::time::Duration) -> Result<Retention, String> {
+        let listed = self.backend.including_replicas::<Artifact>(self.namespace).list_replica_sources().await;
+        let mut retention = Retention::new(grace);
         let now = Utc::now();
-        let mut next_expiry = None;
-        for artifact in resolver.list().await.map_err(|error| error.to_string())?.items {
-            if artifact.spec.pinned {
-                continue;
-            }
-            if artifact.spec.expires_at <= now || retired(&artifact.spec.convoy) {
-                resolver.delete(&artifact.metadata.name).await.map_err(|error| error.to_string())?;
-            } else {
-                next_expiry = next_expiry.min(Some(artifact.spec.expires_at)).or(Some(artifact.spec.expires_at));
-            }
+        for item in listed.map_err(|error| error.to_string())?.items {
+            retention.apply(ReadWatchEvent::Added(item), now);
         }
-        // A record stored before artifacts were refused a non-digest, here or at another home,
-        // names no blob: it is reported and the rest are still collected.
-        let mut referenced = HashSet::new();
-        let mut unreadable = Vec::new();
-        for item in self.list(None, None, None).await? {
-            match BlobDigest::parse(&item.spec.digest) {
-                Ok(digest) => {
-                    referenced.insert(digest);
-                }
-                Err(error) => {
-                    warn!(artifact = %item.metadata.name, %error, "artifact retention skips an artifact whose digest names no blob");
-                    unreadable.push(item.metadata.name);
-                }
-            }
-        }
-        Ok(Reaped { referenced, unreadable, next_expiry })
+        Ok(retention)
     }
-}
 
-/// What a reap left: the digests still referenced, the artifacts whose digest names no blob, and
-/// when the next unpinned artifact expires.
-pub struct Reaped {
-    pub referenced: HashSet<BlobDigest>,
-    pub unreadable: Vec<String>,
-    pub next_expiry: Option<chrono::DateTime<Utc>>,
+    /// Deletes this home's artifacts `names`, each leaving `retention` as it goes. The first that
+    /// fails stops it; the rest stay held.
+    pub(crate) async fn delete(&self, retention: &mut Retention, names: impl IntoIterator<Item = String>) -> Result<(), String> {
+        let resolver = self.backend.using::<Artifact>(self.namespace);
+        for name in names {
+            match resolver.delete(&name).await {
+                Ok(()) | Err(ResourceError::NotFound { .. }) => retention.deleted(&name, Utc::now()),
+                Err(error) => return Err(format!("delete artifact {name}: {error}")),
+            }
+        }
+        Ok(())
+    }
 }
 
 #[cfg(test)]
@@ -544,7 +523,7 @@ mod tests {
             .update(&InputMeta::builder().name(second.metadata.name.clone()).build(), &second.metadata.resource_version, &expired)
             .await
             .expect("expire artifact");
-        assert!(service.reap_expired().await.expect("reap").referenced.is_empty());
+        assert!(reap_expired(&service).await.referenced().is_empty());
         assert!(service.list(None, None, None).await.expect("list after reap").is_empty());
 
         expired.subject = "pinned-head".into();
@@ -554,7 +533,7 @@ mod tests {
         )
         .expect("record name");
         resolver.create(&InputMeta::builder().name(pinned_name).build(), &expired).await.expect("create pinned artifact");
-        assert_eq!(service.reap_expired().await.expect("reap pinned").referenced.len(), 1);
+        assert_eq!(reap_expired(&service).await.referenced().len(), 1);
         assert_eq!(service.list(None, None, None).await.expect("list pinned").len(), 1);
     }
 
@@ -591,9 +570,17 @@ mod tests {
             .expect("expired artifact");
         let service = ArtifactService { backend: &backend, blobs: &blobs, namespace };
 
-        let reaped = service.reap_expired().await.expect("a sweep");
-        assert!(reaped.referenced.is_empty());
-        blobs.gc_unreferenced(&reaped.referenced, std::time::Duration::ZERO).await.expect("collect");
+        let reaped = reap_expired(&service).await;
+        assert!(reaped.referenced().is_empty());
+        blobs.gc_unreferenced(&reaped.referenced(), std::time::Duration::ZERO).await.expect("collect");
         assert!(!blobs.has(&digest).await.expect("blob lookup"), "the expired artifact's blob is collected");
+    }
+
+    /// Retention read from one listing, with this home's expired artifacts deleted.
+    async fn reap_expired(service: &ArtifactService<'_>) -> retention::Retention {
+        let mut retention = service.retention(std::time::Duration::ZERO).await.expect("list artifacts");
+        let expired = retention.expired(Utc::now());
+        service.delete(&mut retention, expired).await.expect("reap");
+        retention
     }
 }
