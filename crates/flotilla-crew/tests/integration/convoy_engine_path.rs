@@ -1369,7 +1369,7 @@ impl flotilla_messaging::EngineMessages for Turns {
         _: &flotilla_messaging::Intent,
         _: &str,
         _: &str,
-        _: Option<&str>,
+        _: Option<&flotilla_messaging::StallOf>,
     ) -> Result<bool, String> {
         unreachable!("the convoy reconciler records no replies")
     }

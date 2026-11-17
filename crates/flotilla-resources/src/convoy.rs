@@ -1414,6 +1414,14 @@ impl StalledCondition {
         leaves_seat(&self.leaves)
     }
 
+    /// What its crew reported when it declared it, as `status` holds the stalled seat: none for
+    /// an inferred stall, where no crew declared anything.
+    pub fn report<'a>(&self, status: &'a ConvoyStatus) -> Option<&'a str> {
+        let (work, role) = self.seat().filter(|_| self.source == StallEvidenceSource::Crew)?;
+        let state = status.crew_work.get(work)?.get(role)?;
+        state.message.as_deref().filter(|_| state.phase == CrewWorkPhase::Stalled)
+    }
+
     /// Whether any of its leaves is seat `(work, role)`'s crew phase.
     pub fn names_seat(&self, work: &str, role: &str) -> bool {
         self.leaves.iter().any(|leaf| {
@@ -1826,6 +1834,14 @@ pub struct CrewWorkState {
     pub finished_at: Option<DateTime<Utc>>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub message: Option<String>,
+    /// A stalled seat's declared reason and proposed disposition as its stall record carries them
+    /// to every home (#3108); none where no crew declared the stall. Where the home notes the stall
+    /// itself, its condition holds them. Remove the decoder defaults one fleet roll after this
+    /// change (ADR 0047).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub stall_reason: Option<StallReason>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub stall_proposed_disposition: Option<StallProposedDisposition>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub disposition: Option<String>,
     /// Optional pointer to the PR projection of the claim's decision ledger.

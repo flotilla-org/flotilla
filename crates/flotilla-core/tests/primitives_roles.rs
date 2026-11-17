@@ -6,7 +6,7 @@ use std::sync::Arc;
 use flotilla_engine_messages::MessagePrimitives;
 use flotilla_engine_messages_testkit::Served;
 use flotilla_inbox::InboxBackend;
-use flotilla_messaging::{Intent, IntentExpectation, IntentReference};
+use flotilla_messaging::{Intent, IntentExpectation, IntentReference, StallOf};
 use flotilla_resources::{
     FleetDesignation, FleetDesignationSpec, InputMeta, MessageRelation, Project, ProjectSpec, SystemClock, FLEET_DESIGNATION_NAME,
 };
@@ -17,6 +17,11 @@ use flotilla_store_memory::InMemoryBackend;
 
 const NAMESPACE: &str = "flotilla";
 const CREW: &str = "flotilla/demo/work/coder";
+
+/// An inferred stall about `about`: no crew declared it, so it carries no evidence.
+fn stall_of(about: &str) -> StallOf {
+    StallOf { about: about.to_owned(), report: None, reason: None, proposed_disposition: None }
+}
 
 async fn primitives(dir: &tempfile::TempDir) -> Served<MessagePrimitives> {
     primitives_at(dir, Arc::new(SystemClock)).await
@@ -341,10 +346,21 @@ async fn a_stall_is_open_until_the_supervisors_reply_lands() {
     };
     let (name, stall) = send("stall-1");
     primitives.admit(&name, &stall).await.expect("stall sent");
-    assert!(primitives.await_reply(NAMESPACE, &name, &stall, "home-a", "stall", Some(CREW)).await.expect("recorded"));
+    // The crew declared this stall: its record carries what the crew said, so every home can show it.
+    let declared = StallOf {
+        report: Some("needs scope".into()),
+        reason: Some(flotilla_protocol::StallReason::Scope),
+        proposed_disposition: Some(flotilla_protocol::StallProposedDisposition::ReduceScope),
+        ..stall_of(CREW)
+    };
+    assert!(primitives.await_reply(NAMESPACE, &name, &stall, "home-a", "stall", Some(&declared)).await.expect("recorded"));
     assert!(primitives.awaiting().stalled(&seat).expect("read"), "the seat is stalled");
     let awaited = MessageRef::new(format!("project:fleet/role:governor/message:{name}"), "home-a");
     assert_eq!(primitives.awaiting().get(&awaited).expect("record").spec().recipient.as_str(), "project:fleet/role:governor");
+    let evidence = primitives.awaiting().open_records().stall(&seat).expect("the seat's stall");
+    assert_eq!(evidence.report.as_deref(), Some("needs scope"));
+    assert_eq!(evidence.reason, Some(flotilla_protocol::StallReason::Scope));
+    assert_eq!(evidence.proposed_disposition, Some(flotilla_protocol::StallProposedDisposition::ReduceScope));
 
     let resume = |id: &str, original: &str| {
         let mut reply = intent("fleet/governor", CREW);
@@ -367,7 +383,8 @@ async fn a_stall_is_open_until_the_supervisors_reply_lands() {
     partial.message = MessageRef::new(format!("project:fleet/role:governor/message:{late}"), "home-a");
     primitives.awaiting().record(partial.clone(), flotilla_schema::Timestamp(1)).expect("record persisted before retry");
     assert_eq!(primitives.awaiting().get(&partial.message).expect("partial record").label(), AwaitingReplyLabel::Open);
-    assert!(!primitives.await_reply(NAMESPACE, &late, &stall, "home-a", "stall", Some(CREW)).await.expect("retry reconciles reply"));
+    // The retry repeats the send that persisted the record, the same stall's evidence included.
+    assert!(!primitives.await_reply(NAMESPACE, &late, &stall, "home-a", "stall", Some(&declared)).await.expect("retry reconciles reply"));
     let awaited = MessageRef::new(format!("project:fleet/role:governor/message:{late}"), "home-a");
     assert_eq!(primitives.awaiting().get(&awaited).expect("record").label(), AwaitingReplyLabel::Answered);
     // A send expecting nothing records nothing.
@@ -391,7 +408,7 @@ async fn a_superseded_send_withdraws_its_awaiting_record() {
     stall.expectation = IntentExpectation::Reply;
     let first = flotilla_resources::message_record_name(supervisor, CREW, "stall-1");
     primitives.admit(&first, &stall).await.expect("first");
-    primitives.await_reply(NAMESPACE, &first, &stall, "home-a", "stall", Some(CREW)).await.expect("recorded");
+    primitives.await_reply(NAMESPACE, &first, &stall, "home-a", "stall", Some(&stall_of(CREW))).await.expect("recorded");
     let mut again = stall.clone();
     again.supersedes = Some(first.clone());
     let second = flotilla_resources::message_record_name(supervisor, CREW, "stall-2");
@@ -399,7 +416,7 @@ async fn a_superseded_send_withdraws_its_awaiting_record() {
     let awaited = MessageRef::new(format!("project:fleet/role:governor/message:{first}"), "home-a");
     assert_eq!(primitives.awaiting().get(&awaited).expect("open").label(), AwaitingReplyLabel::Open, "kept until the successor's record");
     assert!(primitives.awaiting().stalled(&seat).expect("read"), "still stalled between admission and record");
-    primitives.await_reply(NAMESPACE, &second, &again, "home-a", "stall", Some(CREW)).await.expect("the successor's record");
+    primitives.await_reply(NAMESPACE, &second, &again, "home-a", "stall", Some(&stall_of(CREW))).await.expect("the successor's record");
     assert_eq!(primitives.awaiting().get(&awaited).expect("read from the store").label(), AwaitingReplyLabel::Withdrawn);
     assert_eq!(primitives.awaiting().open_about(&seat).expect("read").len(), 1, "only the successor's stall is open");
 
@@ -431,22 +448,22 @@ async fn a_newer_stall_about_the_seat_replaces_the_older_once_written() {
     // The crew's stall to its bosun, then the judge's escalation to the governor.
     let (to_bosun, first) = stall(CREW, "fleet/bosun", "stall-1");
     primitives.admit(&to_bosun, &first).await.expect("to the bosun");
-    primitives.await_reply(NAMESPACE, &to_bosun, &first, "home-a", "stall", Some(CREW)).await.expect("recorded");
+    primitives.await_reply(NAMESPACE, &to_bosun, &first, "home-a", "stall", Some(&stall_of(CREW))).await.expect("recorded");
     let (to_governor, second) = stall(CREW, "fleet/governor", "stall-2");
     primitives.admit(&to_governor, &second).await.expect("to the governor");
     assert_eq!(primitives.awaiting().open_about(&seat).expect("read").len(), 1, "admission alone replaces nothing");
-    primitives.await_reply(NAMESPACE, &to_governor, &second, "home-a", "stall", Some(CREW)).await.expect("recorded");
+    primitives.await_reply(NAMESPACE, &to_governor, &second, "home-a", "stall", Some(&stall_of(CREW))).await.expect("recorded");
     assert_eq!(primitives.awaiting().get(&record("bosun", &to_bosun)).expect("bosun").label(), AwaitingReplyLabel::Withdrawn);
     assert_eq!(primitives.awaiting().get(&record("governor", &to_governor)).expect("governor").label(), AwaitingReplyLabel::Open);
     // The bosun escalating it in turn: its record, about the crew's seat, replaces the crew's.
     let (from_bosun, third) = stall("fleet/bosun", "fleet/admiral", "stall-3");
     primitives.admit(&from_bosun, &third).await.expect("to the admiral");
-    primitives.await_reply(NAMESPACE, &from_bosun, &third, "home-a", "stall", Some(CREW)).await.expect("recorded");
+    primitives.await_reply(NAMESPACE, &from_bosun, &third, "home-a", "stall", Some(&stall_of(CREW))).await.expect("recorded");
     assert_eq!(primitives.awaiting().get(&record("governor", &to_governor)).expect("governor").label(), AwaitingReplyLabel::Withdrawn);
     let open = primitives.awaiting().open_about(&seat).expect("read");
     assert_eq!(open.iter().map(|record| record.spec().sender.as_str()).collect::<Vec<_>>(), vec!["project:fleet/role:bosun"]);
     // A repeat of an earlier send records nothing more and leaves the newest stall open.
-    primitives.await_reply(NAMESPACE, &from_bosun, &third, "home-a", "stall", Some(CREW)).await.expect("repeat");
+    primitives.await_reply(NAMESPACE, &from_bosun, &third, "home-a", "stall", Some(&stall_of(CREW))).await.expect("repeat");
     assert!(primitives.awaiting().stalled(&seat).expect("read"));
 }
 
@@ -466,7 +483,7 @@ async fn a_cleared_stall_withdraws_its_subjects_records() {
         stall.expectation = IntentExpectation::Reply;
         let name = flotilla_resources::message_record_name("fleet/governor", "system:stall-judge", "stall-1");
         primitives.admit(&name, &stall).await.expect("sent");
-        primitives.await_reply(NAMESPACE, &name, &stall, "home-a", "stall", Some(subject)).await.expect("recorded");
+        primitives.await_reply(NAMESPACE, &name, &stall, "home-a", "stall", Some(&stall_of(subject))).await.expect("recorded");
         // Another vessel's seat of the same role shares the record's subject: it keeps the records.
         let twin = "flotilla/demo/other/coder";
         assert!(primitives.end_stalls(NAMESPACE, &[twin.to_owned()], &[subject.to_owned()], "cleared").await.expect("kept").is_empty());

@@ -1099,8 +1099,9 @@ fn awaiting_records_take_the_stall_or_the_expectations_kind() {
     use flotilla_messaging::IntentExpectation;
     let outcome =
         IntentExpectation::Outcome { condition: "project:p/convoy:c/role:coder .phase == Done".parse().expect("a canonical condition") };
-    assert_eq!(super::super::awaiting_kind(&IntentExpectation::Nothing, Some("p/c/work/coder")), None);
-    assert_eq!(super::super::awaiting_kind(&IntentExpectation::Reply, Some("p/c/work/coder")), Some("stall"));
+    let stall = flotilla_messaging::StallOf { about: "p/c/work/coder".into(), report: None, reason: None, proposed_disposition: None };
+    assert_eq!(super::super::awaiting_kind(&IntentExpectation::Nothing, Some(&stall)), None);
+    assert_eq!(super::super::awaiting_kind(&IntentExpectation::Reply, Some(&stall)), Some("stall"));
     assert_eq!(super::super::awaiting_kind(&IntentExpectation::Reply, None), Some("reply"));
     assert_eq!(super::super::awaiting_kind(&outcome, None), Some("outcome"));
 }

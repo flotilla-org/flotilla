@@ -11,11 +11,12 @@ use flotilla_engine_convoys::convoy_import::{
 use flotilla_resources::{
     promises::{self, PromiseKind, PromiseOperation, PromiseSource, Submission, SubmissionVerdict},
     AdmissionDocument, Convoy, ConvoyPhase, ConvoySpec, ConvoyStatus, CrewSource, CrewSpec, CrewWorkPhase, CrewWorkState, LeafMaker,
-    ObjectMeta, ResourceObject, Selector, StallEvidenceSource, StallRung, StalledCondition, VesselRequirement, WorkCompletionAuthority,
-    WorkPhase, WorkState, WorkflowSnapshot, ENSURED_FROM_ANNOTATION,
+    ObjectMeta, ResourceObject, Selector, StallEvidenceSource, StallProposedDisposition, StallReason, StallRung, StalledCondition,
+    VesselRequirement, WorkCompletionAuthority, WorkPhase, WorkState, WorkflowSnapshot, ENSURED_FROM_ANNOTATION,
 };
 use flotilla_schema::Address;
 use flotilla_state_machines::machines::{
+    awaiting_reply,
     convoy::{DutyScope, Progress, SeatName},
     message::MessageRef,
 };
@@ -281,10 +282,16 @@ fn a_standing_convoy_waits_for_the_ruling_then_holds_lifetime_duties() {
 #[test]
 fn an_open_stall_becomes_the_seats_stall_record() {
     let mut old = convoy("c", ConvoyPhase::Active, vec![agent("coder", true)]);
+    // The coder declared its stall: its seat reads Stalled with the report it made.
     let stall = |message: Option<&str>, rung: StallRung| StalledCondition {
-        leaves: Vec::new(),
+        leaves: vec![flotilla_protocol::Leaf {
+            address: flotilla_protocol::LeafAddress::Work { convoy: "c".into(), work: "work".into() },
+            field_path: ".crew.coder.phase".into(),
+            operator: flotilla_protocol::LeafOperator::Equal,
+            literal: "Done".into(),
+        }],
         maker: Some(LeafMaker::Actor { vessel: "work".into(), role: "coder".into() }),
-        evidence: "blocked".into(),
+        evidence: "blocked; supervisor delivery failed: unreachable".into(),
         source: StallEvidenceSource::Crew,
         cause: None,
         began_at: Utc::now(),
@@ -293,16 +300,23 @@ fn an_open_stall_becomes_the_seats_stall_record() {
         supervision_message: message.map(|name| flotilla_protocol::ResourceRef::new("flotilla.work/v1", "Message", "flotilla", name)),
         supervision_index: Some(0),
         supervision_exhausted: false,
-        reason: None,
-        proposed_disposition: None,
+        reason: Some(StallReason::Scope),
+        proposed_disposition: Some(StallProposedDisposition::ReduceScope),
         nudge_history: Vec::new(),
     };
-    old.status.as_mut().expect("status").stalled = Some(stall(Some("supervision-1"), StallRung::Bosun));
+    let status = old.status.as_mut().expect("status");
+    let coder = status.crew_work.get_mut("work").and_then(|crew| crew.get_mut("coder")).expect("the coder");
+    (coder.phase, coder.message) = (CrewWorkPhase::Stalled, Some("blocked".into()));
+    status.stalled = Some(stall(Some("supervision-1"), StallRung::Bosun));
     let convoy = imported(import_convoy(&old, HOME, &[], &WORLD));
     let record = convoy.stall.as_ref().expect("a stall record").spec.clone();
     assert_eq!(record.kind, "stall");
     assert_eq!(record.subject.as_ref().map(Address::as_str), Some("project:fleet/convoy:c/role:coder"));
     assert_eq!(record.recipient.as_str(), "project:fleet/convoy:c/role:bosun");
+    // It carries the crew's declaration: its report, not the judge's evidence, and why.
+    assert_eq!(record.report.as_deref(), Some("blocked"));
+    assert_eq!(record.stall_reason, Some(awaiting_reply::StallReason::Scope));
+    assert_eq!(record.proposed_disposition, Some(awaiting_reply::ProposedDisposition::ReduceScope));
     // The import writes the record beside the convoy, Open, and the rehearsal reads it back.
     assert_eq!(rehearse(std::slice::from_ref(&convoy)), Vec::new());
     // Numeric engine IDs are internal to the promise table. A carried stall

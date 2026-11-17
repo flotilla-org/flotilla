@@ -361,7 +361,7 @@ fn live_leases_and_the_live_by_host_index_agree() {
 fn convoy_and_awaiting_reply_round_trip() {
     use flotilla_schema::Records;
     use flotilla_state_machines::machines::{
-        awaiting_reply::{Awaited, AwaitingReply, AwaitingReplySpec, AwaitingReplyState},
+        awaiting_reply::{Awaited, AwaitingReply, AwaitingReplySpec, AwaitingReplyState, ProposedDisposition, StallReason},
         convoy::{AbandonCause, ConvoySpec, ConvoyState, LinkSource, Progress, Promise, PromiseKind, SubjectLink, Submission},
     };
 
@@ -463,6 +463,9 @@ fn convoy_and_awaiting_reply_round_trip() {
         kind: "stall".into(),
         awaited: Awaited::Reply,
         deadline: Some(Timestamp(9)),
+        report: Some("the build host is out of disk".into()),
+        stall_reason: Some(StallReason::Infra),
+        proposed_disposition: Some(ProposedDisposition::ReduceScope),
     };
     let record = Resource::<AwaitingReply>::stored(
         "",

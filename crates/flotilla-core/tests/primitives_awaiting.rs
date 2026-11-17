@@ -35,6 +35,9 @@ fn stall(id: &str, deadline: Option<i64>) -> AwaitingReplySpec {
         kind: STALL.into(),
         awaited: Awaited::Reply,
         deadline: deadline.map(Timestamp),
+        report: None,
+        stall_reason: None,
+        proposed_disposition: None,
     }
 }
 

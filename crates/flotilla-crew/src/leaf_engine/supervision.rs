@@ -250,7 +250,7 @@ impl super::LeafSubscriptionTable {
                 .relation(flotilla_resources::MessageRelation::Supervisor)
                 .expectation(super::stalls::supervision_expectation(rung))
                 .references(vec![super::stalls::convoy_reference(convoy)?])
-                .maybe_stall_of((rung != StallRung::Operator).then(|| super::stalls::stall_subject(namespace, convoy, stalled)))
+                .maybe_stall_of((rung != StallRung::Operator).then(|| super::stalls::stall_of(namespace, convoy, stalled)))
                 .build();
             let actuator = self.inner.turn_delivery.lock().await.clone();
             let admission = match actuator.deliver(&intent).await {

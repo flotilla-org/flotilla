@@ -236,6 +236,9 @@ mod tests {
                     kind: flotilla_resources::STALL_KIND.into(),
                     awaited: flotilla_state_machines::machines::awaiting_reply::Awaited::Reply,
                     deadline: None,
+                    report: None,
+                    stall_reason: None,
+                    proposed_disposition: None,
                 },
                 flotilla_schema::Timestamp(0),
             )
@@ -300,6 +303,69 @@ mod tests {
             assert_eq!(row.evidence.as_deref(), Some(report));
             assert_eq!(row.supervisor_absence_reason.as_deref(), Some(report), "{role}");
         }
+    }
+
+    // A seat's stall is listed at another home with the evidence its crew declared (#3108): the
+    // stall note stays at the launch's home, and its stall record carries the report, reason and
+    // proposed disposition, so the row groups with the home's own row of the same stall.
+    #[tokio::test]
+    async fn crew_stalls_show_another_homes_stall_with_its_evidence() {
+        let (home_a, home_b) =
+            (flotilla_engine_convoys_testkit::EngineHome::open("home-a"), flotilla_engine_convoys_testkit::EngineHome::open("home-b"));
+        let launch = home_a
+            .admit(
+                "stalled",
+                ConvoySpec::builder().workflow_ref("scratch".into()).build(),
+                flotilla_engine_convoys_testkit::single_agent("coder"),
+            )
+            .await;
+        let convoys = home_a.backend().using::<flotilla_resources::Convoy>("flotilla");
+        let declare = flotilla_resources::external_patches::mark_crew_stalled(
+            launch.clone(),
+            "work".into(),
+            "coder".into(),
+            Utc::now(),
+            flotilla_protocol::StallReason::Scope,
+            Some(flotilla_protocol::StallProposedDisposition::ReduceScope),
+            "needs scope".into(),
+        );
+        flotilla_store::note_convoy(&home_a.convoys.path(), &convoys, &launch, &declare).await.expect("the coder declares");
+        // Its supervision opens the stall record about its seat, carrying what the coder declared.
+        let project = flotilla_address::Address::project("flotilla").expect("project");
+        let seat = flotilla_resources::convoy::engine::seat_address(&project, &launch, "coder").expect("the coder's seat");
+        let records = flotilla_engine_messages::awaiting::AwaitingReplies::open("home-a", home_a.service()).expect("records");
+        records
+            .record(
+                flotilla_state_machines::machines::awaiting_reply::AwaitingReplySpec {
+                    message: flotilla_state_machines::machines::message::MessageRef::new("stall-report", "home-a"),
+                    sender: seat.clone(),
+                    recipient: "project:flotilla/role:governor".parse().expect("recipient"),
+                    subject: Some(seat),
+                    kind: flotilla_resources::STALL_KIND.into(),
+                    awaited: flotilla_state_machines::machines::awaiting_reply::Awaited::Reply,
+                    deadline: None,
+                    report: Some("needs scope".into()),
+                    stall_reason: Some(flotilla_state_machines::machines::awaiting_reply::StallReason::Scope),
+                    proposed_disposition: Some(flotilla_state_machines::machines::awaiting_reply::ProposedDisposition::ReduceScope),
+                },
+                flotilla_schema::Timestamp(0),
+            )
+            .expect("the stall record");
+        home_a.replicate_to(&home_b);
+
+        let row_at = |response: flotilla_protocol::CrewStallsResponse| {
+            assert_eq!(response.rows.len(), 1, "{:?}", response.rows);
+            response.rows.into_iter().next().expect("the coder's row")
+        };
+        let here = row_at(ReadProjections::crew_stalls(home_a.backend(), false, Utc::now()).await.expect("stalls at home-a"));
+        let there = row_at(ReadProjections::crew_stalls(home_b.backend(), false, Utc::now()).await.expect("stalls at home-b"));
+        assert_eq!((there.convoy.as_str(), there.vessel.as_deref(), there.role.as_str()), (launch.as_str(), Some("work"), "coder"));
+        assert_eq!(there.evidence.as_deref(), Some("needs scope"));
+        assert_eq!(there.proposed_disposition, Some(flotilla_protocol::StallProposedDisposition::ReduceScope));
+        assert_eq!(there.cause_group, here.cause_group, "the same stall groups alike at either home");
+        // What the judge holds of its ladder stays at the launch's home.
+        assert_eq!((there.rung, there.age_seconds), (None, None));
+        assert_eq!(there.supervisor_absence_reason.as_deref(), Some("no current stall condition recorded for this obligation"));
     }
 
     // Behaviour (#3587 ruling 6353447431): until the operator has an inbox at a home (#3457), a stall

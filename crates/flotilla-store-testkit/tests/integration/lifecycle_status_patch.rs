@@ -218,6 +218,8 @@ fn crew_state(phase: CrewWorkPhase, started_at: Option<DateTime<Utc>>, finished_
         started_at,
         finished_at,
         message: None,
+        stall_reason: None,
+        stall_proposed_disposition: None,
         disposition: None,
         decision_ledger_ref: None,
         decision_ledger_digest: None,

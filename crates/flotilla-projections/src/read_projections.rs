@@ -268,15 +268,14 @@ impl ReadProjections<'_> {
                     projects.iter().find(|project| &project.metadata.name == name).map(|project| project.spec.display_name.clone())
                 });
                 for ((vessel, role), stall) in obligations {
-                    let evidence = stall.map(|stall| stall.evidence.clone()).or_else(|| {
-                        vessel
-                            .as_ref()
-                            .and_then(|vessel| status.crew_work.get(vessel))
-                            .and_then(|crew| crew.get(&role))
-                            .and_then(|state| state.message.clone())
-                    });
+                    // With no stall noted here, the seat's view holds what its stall record carries.
+                    let crew = vessel.as_ref().and_then(|vessel| status.crew_work.get(vessel)).and_then(|crew| crew.get(&role));
+                    let evidence = stall.map(|stall| stall.evidence.clone()).or_else(|| crew.and_then(|state| state.message.clone()));
+                    let reason = stall.map_or(crew.and_then(|state| state.stall_reason), |stall| stall.reason);
+                    let proposed_disposition =
+                        stall.map_or(crew.and_then(|state| state.stall_proposed_disposition), |stall| stall.proposed_disposition);
                     let group = serde_json::to_string(&(
-                        stall.and_then(|stall| stall.reason),
+                        reason,
                         stall.and_then(|stall| stall.cause.as_ref()),
                         evidence.as_ref().map(|evidence| evidence.split_whitespace().collect::<Vec<_>>().join(" ")),
                     ))
@@ -313,7 +312,7 @@ impl ReadProjections<'_> {
                             .maybe_began_at(stall.map(|stall| stall.began_at))
                             .maybe_age_seconds(stall.map(|stall| now.signed_duration_since(stall.began_at).num_seconds().max(0) as u64))
                             .maybe_raised_at(raised_at)
-                            .maybe_proposed_disposition(stall.and_then(|stall| stall.proposed_disposition))
+                            .maybe_proposed_disposition(proposed_disposition)
                             .maybe_evidence(evidence)
                             .cause_group(group)
                             .shared_cause_count(1)

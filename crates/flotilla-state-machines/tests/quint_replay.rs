@@ -1576,6 +1576,10 @@ fn awaiting_spec(record: &Value) -> AwaitingReplySpec {
             "At" => Some(moment(number(payload(&request["deadline"])))),
             other => panic!("deadline {other}"),
         },
+        // A stall's evidence is data no rule reads, so the spec does not model it.
+        report: None,
+        stall_reason: None,
+        proposed_disposition: None,
     }
 }
 

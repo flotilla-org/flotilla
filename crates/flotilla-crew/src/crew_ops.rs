@@ -90,7 +90,10 @@ pub use flotilla_store::resolve_convoy_record;
 /// The sender's awaiting-reply record kind for a send (#3587 layer 7): none
 /// for a send expecting nothing, a stall for a stalled crew's supervision,
 /// else the expectation's own.
-fn awaiting_kind(expectation: &flotilla_messaging::IntentExpectation, stall_of: Option<&str>) -> Option<&'static str> {
+fn awaiting_kind(
+    expectation: &flotilla_messaging::IntentExpectation,
+    stall_of: Option<&flotilla_messaging::StallOf>,
+) -> Option<&'static str> {
     use flotilla_messaging::IntentExpectation;
     match (expectation, stall_of) {
         (IntentExpectation::Nothing, _) => None,
@@ -2642,7 +2645,7 @@ impl CrewService {
         let name = turn_record_name(request, &intent);
         if let Some(existing) = self.admitted_message(&intent, &name).await.map_err(|error| error.to_string())? {
             // A repeat records what an earlier send could not (record is idempotent).
-            self.record_awaiting(&request.namespace, &name, &intent, Some(existing.home), request.stall_of.as_deref()).await?;
+            self.record_awaiting(&request.namespace, &name, &intent, Some(existing.home), request.stall_of.as_ref()).await?;
             return Ok(CrewTurnAdmission {
                 new_turn: false,
                 rung: TurnDeliveryRung::WarmSession,
@@ -2667,7 +2670,7 @@ impl CrewService {
         let (message, new_turn) = if let Some(publisher) = publisher {
             let (reference, home) =
                 publisher.publish_admitted(&request.namespace, message_document(&request.namespace, &name, &intent)).await?;
-            self.record_awaiting(&request.namespace, &name, &intent, home, request.stall_of.as_deref()).await?;
+            self.record_awaiting(&request.namespace, &name, &intent, home, request.stall_of.as_ref()).await?;
             (reference, true)
         } else {
             if holder.as_ref().is_some_and(|holder| matches!(holder.provenance, ResourceProvenance::Replica { .. })) {
@@ -2675,7 +2678,7 @@ impl CrewService {
             }
             let existing = self.admitted_message(&intent, &name).await.map_err(|error| error.to_string())?.is_some();
             let admitted = self.admit_message(&name, &intent).await.map_err(|error| error.to_string())?;
-            self.record_awaiting(&request.namespace, &admitted.record, &intent, Some(admitted.home), request.stall_of.as_deref()).await?;
+            self.record_awaiting(&request.namespace, &admitted.record, &intent, Some(admitted.home), request.stall_of.as_ref()).await?;
             (ResourceRef::new("flotilla.work/v1", "Message", &request.namespace, admitted.record), !existing)
         };
         Ok(CrewTurnAdmission { message, new_turn, rung: TurnDeliveryRung::WarmSession })
@@ -2940,7 +2943,7 @@ impl CrewService {
     ) -> Result<Option<CrewTurnAdmission>, String> {
         if let Some(existing) = self.admitted_message(intent, name).await.map_err(|error| error.to_string())? {
             // A repeat records what an earlier send could not (record is idempotent).
-            self.record_awaiting(&request.namespace, name, intent, Some(existing.home), request.stall_of.as_deref()).await?;
+            self.record_awaiting(&request.namespace, name, intent, Some(existing.home), request.stall_of.as_ref()).await?;
             return Ok(Some(CrewTurnAdmission {
                 new_turn: false,
                 rung,
@@ -3062,7 +3065,7 @@ impl CrewService {
             let (reference, home) =
                 publisher.publish_admitted(&request.namespace, message_document(&request.namespace, name, intent)).await?;
             // A suppressed turn answers with the message that suppressed it: the sender awaits that.
-            self.record_awaiting(&request.namespace, &reference.name, intent, home, request.stall_of.as_deref()).await?;
+            self.record_awaiting(&request.namespace, &reference.name, intent, home, request.stall_of.as_ref()).await?;
             reference
         } else {
             if matches!(target.provenance, ResourceProvenance::Replica { .. })
@@ -3071,7 +3074,7 @@ impl CrewService {
                 return Err("receiver-home resource mutation router unavailable".into());
             }
             let admitted = self.admit_message(name, intent).await.map_err(|error| error.to_string())?;
-            self.record_awaiting(&request.namespace, &admitted.record, intent, Some(admitted.home), request.stall_of.as_deref()).await?;
+            self.record_awaiting(&request.namespace, &admitted.record, intent, Some(admitted.home), request.stall_of.as_ref()).await?;
             ResourceRef::new("flotilla.work/v1", "Message", &request.namespace, admitted.record)
         };
         Ok(message)
@@ -3207,7 +3210,7 @@ impl CrewService {
         name: &str,
         intent: &Intent,
         home: Option<String>,
-        stall_of: Option<&str>,
+        stall_of: Option<&flotilla_messaging::StallOf>,
     ) -> Result<(), String> {
         let Some(kind) = awaiting_kind(&intent.expectation, stall_of) else { return Ok(()) };
         let Some(home) = home else {

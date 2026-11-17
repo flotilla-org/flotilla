@@ -39,6 +39,9 @@ fn spec(deadline: Option<Timestamp>) -> AwaitingReplySpec {
         kind: "stall".into(),
         awaited: Awaited::Reply,
         deadline,
+        report: None,
+        stall_reason: None,
+        proposed_disposition: None,
     }
 }
 

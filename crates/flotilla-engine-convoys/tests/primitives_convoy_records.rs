@@ -10,7 +10,7 @@ use flotilla_protocol::{PrincipalRef, Relationship};
 use flotilla_resources::{
     address::{stored_change_request_address, subject_for},
     convoy::{admission::AdmissionDocument, engine::seat_address},
-    convoy_records::{ConvoyEnd, ConvoyRecords, SeatRecord},
+    convoy_records::{ConvoyEnd, ConvoyRecords, SeatRecord, SeatStall},
     workflow_template::single_agent_workflow_spec,
     SubjectDiscoverySource, WorkflowSnapshot,
 };
@@ -19,7 +19,7 @@ use flotilla_schema_sqlite::stream::Service;
 use flotilla_state_machines::{
     kinds::{stock, Catalog},
     machines::{
-        awaiting_reply::{Awaited, AwaitingReplySpec},
+        awaiting_reply::{Awaited, AwaitingReplySpec, ProposedDisposition, StallReason},
         convoy::{
             Abandon, AbandonCause, AddSeat, AdmissionBytes, AdmittedPromise, Authority, ConvoyRequest, FailSeat, Link, LinkSource,
             Priority, PromiseId, PromiseSource, Reassign, Seat, SeatName, VesselClass,
@@ -144,6 +144,9 @@ fn a_launch_reads_its_seats_links_stalls_and_end() {
         kind: STALL.into(),
         awaited: Awaited::Reply,
         deadline: None,
+        report: Some("rate limit".into()),
+        stall_reason: Some(StallReason::Infra),
+        proposed_disposition: Some(ProposedDisposition::Resume),
     };
     assert!(awaiting.record(stall, Timestamp(2_000_000)).expect("stall recorded"));
 
@@ -175,7 +178,17 @@ fn a_launch_reads_its_seats_links_stalls_and_end() {
     let record = records.get(&launch, None).expect("read").expect("held");
     assert_eq!(
         record.seats["work"]["coder"],
-        SeatRecord { failed: Some("it looped".into()), handed_back: false, stalled: true, kept_at: None }
+        SeatRecord {
+            failed: Some("it looped".into()),
+            handed_back: false,
+            // The stall's evidence, as its record carries it.
+            stalled: Some(SeatStall {
+                report: Some("rate limit".into()),
+                reason: Some(flotilla_resources::StallReason::Infra),
+                proposed_disposition: Some(flotilla_resources::StallProposedDisposition::Resume),
+            }),
+            kept_at: None
+        }
     );
     assert_eq!(record.subjects.len(), 1);
     let linked = &record.subjects[0];

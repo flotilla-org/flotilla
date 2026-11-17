@@ -203,6 +203,17 @@ pub(super) fn stall_subject(namespace: &str, convoy: &ResourceObject<Convoy>, co
         .unwrap_or_else(|| convoy_stall_subject(project, &convoy.metadata.name))
 }
 
+/// What a supervision send records of the stall it escalates: its subject, and the evidence its
+/// stall record carries to every home.
+pub(super) fn stall_of(namespace: &str, convoy: &ResourceObject<Convoy>, condition: &StalledCondition) -> flotilla_messaging::StallOf {
+    flotilla_messaging::StallOf {
+        about: stall_subject(namespace, convoy, condition),
+        report: convoy.status.as_ref().and_then(|status| condition.report(status)).map(str::to_owned),
+        reason: condition.reason,
+        proposed_disposition: condition.proposed_disposition,
+    }
+}
+
 pub(super) fn supervision_expectation(rung: StallRung) -> flotilla_messaging::IntentExpectation {
     // An operator-rung escalation expects nothing: on the engine path the
     // person's acknowledgement settles it (#3938), and their ruling acts on the stall.
@@ -1799,7 +1810,7 @@ impl ReconcilerWake {
                         .relation(flotilla_resources::MessageRelation::Supervisor)
                         .expectation(supervision_expectation(rung))
                         .references(vec![convoy_reference])
-                        .maybe_stall_of((rung != StallRung::Operator).then(|| stall_subject(namespace, convoy, &*condition)))
+                        .maybe_stall_of((rung != StallRung::Operator).then(|| stall_of(namespace, convoy, &*condition)))
                         .build()
                 });
                 let actuator = self.subscriptions.inner.turn_delivery.lock().await.clone();

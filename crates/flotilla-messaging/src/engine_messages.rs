@@ -13,6 +13,18 @@ pub enum MessageResolution {
     Unknown(String),
 }
 
+/// What a stalled seat's supervision send is about (#3108): the stalled crew role or canonical
+/// convoy address, and the stall's evidence, which its stall record carries to every home. The
+/// evidence is none for an inferred stall, where no crew declared anything.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct StallOf {
+    pub about: String,
+    /// What the crew reported when it declared.
+    pub report: Option<String>,
+    pub reason: Option<flotilla_protocol::StallReason>,
+    pub proposed_disposition: Option<flotilla_protocol::StallProposedDisposition>,
+}
+
 /// One message in a crew seat's inbox as the stall judge reads it (#3108): where it stands, and
 /// nothing else of the message.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -128,7 +140,8 @@ pub trait EngineMessages: Send + Sync {
     fn home(&self) -> String;
     /// Records the sender's half of a send expecting a reply or an outcome,
     /// once it is admitted at `home` (#3587 layer 7): an AwaitingReply record
-    /// of `kind` at this home, the sender's, about `about` when given.
+    /// of `kind` at this home, the sender's, about a stall and carrying its
+    /// evidence when `stall` is given.
     async fn await_reply(
         &self,
         namespace: &str,
@@ -136,7 +149,7 @@ pub trait EngineMessages: Send + Sync {
         intent: &crate::Intent,
         home: &str,
         kind: &str,
-        about: Option<&str>,
+        stall: Option<&StallOf>,
     ) -> Result<bool, String>;
     /// Why delivery waits, when the fleet's FleetDesignation is missing or invalid.
     async fn delivery_wait(&self, namespace: &str) -> Result<Option<String>, String>;

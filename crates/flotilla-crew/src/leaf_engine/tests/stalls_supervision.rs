@@ -651,21 +651,46 @@ async fn two_declared_seats_climb_their_own_ladders() {
     let now = Utc::now();
     let work = case.work.clone();
     case.note(|status| {
-        let reason = flotilla_resources::StallReason::Scope;
-        external_patches::mark_crew_stalled(work, "work".into(), "reviewer".into(), now, reason, None, "needs scope".into()).apply(status)
+        let (reason, disposition) = (flotilla_resources::StallReason::Scope, Some(flotilla_resources::StallProposedDisposition::Fail));
+        external_patches::mark_crew_stalled(work, "work".into(), "reviewer".into(), now, reason, disposition, "needs scope".into())
+            .apply(status)
     })
     .await;
     let stall = |status: &ConvoyStatus, role: &str| status.stalls.about(Some(("work", role))).cloned().expect("the seat's stall");
-    // Each seat's stall, as the deliveries to `role` name it; each delivery is its own message.
+    // Each seat's stall, as the deliveries to `role` name it with its evidence; each delivery is
+    // its own message.
     let delivered_to = |role: &str| {
         let requests = case.delivery.requests.lock().expect("deliveries");
         let requests = requests.iter().filter(|request| request.role == role).collect::<Vec<_>>();
         let sources = requests.iter().map(|request| request.source.as_str()).collect::<BTreeSet<_>>();
         assert_eq!(sources.len(), requests.len(), "one message source per seat: {sources:?}");
-        requests.iter().map(|request| request.stall_of.clone()).collect::<BTreeSet<_>>()
+        requests
+            .iter()
+            .map(|request| request.stall_of.clone().expect("a stall's supervision"))
+            .map(|stall| (stall.about.clone(), stall))
+            .collect::<BTreeMap<_, _>>()
     };
-    let seats =
-        BTreeSet::from([Some(format!("wheelhouse/{}/work/coder", case.work)), Some(format!("wheelhouse/{}/work/reviewer", case.work))]);
+    // Each seat's escalation carries its own crew's declaration: its report, reason and proposal.
+    let seats = BTreeMap::from([
+        (
+            format!("wheelhouse/{}/work/coder", case.work),
+            flotilla_messaging::StallOf {
+                about: format!("wheelhouse/{}/work/coder", case.work),
+                report: Some("needs decision".into()),
+                reason: Some(flotilla_resources::StallReason::Other),
+                proposed_disposition: None,
+            },
+        ),
+        (
+            format!("wheelhouse/{}/work/reviewer", case.work),
+            flotilla_messaging::StallOf {
+                about: format!("wheelhouse/{}/work/reviewer", case.work),
+                report: Some("needs scope".into()),
+                reason: Some(flotilla_resources::StallReason::Scope),
+                proposed_disposition: Some(flotilla_resources::StallProposedDisposition::Fail),
+            },
+        ),
+    ]);
     sync_work_rows(&case).await;
     case.judge(&case.wake, now).await;
     let first = case.status().await;

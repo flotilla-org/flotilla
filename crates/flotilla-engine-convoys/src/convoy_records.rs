@@ -324,7 +324,7 @@ fn entry(
             .filter(|promise| promise.owner == name && promise.progress.value == Progress::Kept)
             .map(|promise| time(promise.progress.since))
             .max();
-        let record = SeatRecord { failed: seat.failed.clone(), handed_back, stalled: stalls.stalled(&subject), kept_at };
+        let record = SeatRecord { failed: seat.failed.clone(), handed_back, stalled: stalls.stall(&subject), kept_at };
         seats.entry(work).or_default().insert(role, record);
     }
 

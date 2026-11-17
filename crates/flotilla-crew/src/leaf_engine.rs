@@ -59,8 +59,8 @@ pub struct CrewTurnIntent {
     pub delivery_condition: Option<flotilla_address::Condition>,
     #[builder(default)]
     pub expectation: flotilla_messaging::IntentExpectation,
-    /// The stalled crew role or canonical convoy address this supervision is about.
-    pub stall_of: Option<String>,
+    /// The stall this supervision is about, with its evidence.
+    pub stall_of: Option<flotilla_messaging::StallOf>,
 }
 
 /// One end of a crew message: whom it is from or to.

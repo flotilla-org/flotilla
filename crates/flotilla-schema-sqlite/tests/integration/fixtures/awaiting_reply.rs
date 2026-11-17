@@ -5,7 +5,7 @@ use flotilla_schema::{Edge, State};
 use flotilla_state_machines::{
     machines::awaiting_reply::{
         Answer, Awaited, AwaitingReply, AwaitingReplySpec, AwaitingReplyState, AwaitingReplyWorld, Expire, MemoryAwaitingReplyWorld,
-        Withdraw,
+        ProposedDisposition, StallReason, Withdraw,
     },
     Ref, Resource,
 };
@@ -18,8 +18,9 @@ use super::{
 };
 
 /// Covering indexes: the label is digit 0 (base 4) and the awaited reply digit 1 (base 2); the
-/// subject is present for shapes below 4 and the deadline for shapes below 8, so each is reached
-/// both present and absent.
+/// subject is present for shapes below 4, the deadline below 8 and the report below 12, so each is
+/// reached both present and absent. The stall reason and proposed disposition cycle through absent
+/// and each code.
 pub const COVERING: usize = 16;
 
 pub fn state_value(tc: &TestCase, pick: Pick) -> AwaitingReplyState {
@@ -44,6 +45,24 @@ pub fn spec(tc: &TestCase, pick: Pick) -> AwaitingReplySpec {
             _ => Awaited::Outcome,
         },
         deadline: pick.some(tc, 8).then(|| timestamp(tc)),
+        report: pick.some(tc, 12).then(|| text(tc)),
+        stall_reason: code_enum(
+            tc,
+            pick.nth(1),
+            &[
+                None,
+                Some(StallReason::Infra),
+                Some(StallReason::Scope),
+                Some(StallReason::Decision),
+                Some(StallReason::Access),
+                Some(StallReason::Other),
+            ],
+        ),
+        proposed_disposition: code_enum(
+            tc,
+            pick.nth(2),
+            &[None, Some(ProposedDisposition::Resume), Some(ProposedDisposition::ReduceScope), Some(ProposedDisposition::Fail)],
+        ),
     }
 }
 

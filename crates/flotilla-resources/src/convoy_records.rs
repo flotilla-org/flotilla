@@ -50,10 +50,19 @@ pub struct SeatRecord {
     pub failed: Option<String>,
     /// Its promises were reassigned to another seat (a handoff).
     pub handed_back: bool,
-    /// An open AwaitingReply is raised about it.
-    pub stalled: bool,
+    /// The open stall AwaitingReply raised about it, any home's.
+    pub stalled: Option<SeatStall>,
     /// When the last of the promises it owns was kept; none while none is.
     pub kept_at: Option<DateTime<Utc>>,
+}
+
+/// A seat's stall as its open stall record carries it to every home: the evidence its crew
+/// declared, none of it for an inferred stall.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct SeatStall {
+    pub report: Option<String>,
+    pub reason: Option<crate::StallReason>,
+    pub proposed_disposition: Option<crate::StallProposedDisposition>,
 }
 
 /// One launch of a convoy, as its home's engine holds it, in the old shapes its readers take.
@@ -371,7 +380,7 @@ impl ConvoyRecord {
                 let reading = readings.entry(work.clone()).or_default().entry(role.clone()).or_default();
                 reading.failed = seat.failed.is_some();
                 reading.handed_back = seat.handed_back;
-                reading.stalled = seat.stalled;
+                reading.stalled = seat.stalled.is_some();
             }
         }
         for (work, role) in notes.into_iter().flat_map(|notes| &notes.stalls).filter_map(StalledCondition::seat) {
@@ -438,19 +447,21 @@ impl ConvoyRecord {
                         let noted = notes.crew.get(work).and_then(|roles| roles.get(role)).cloned().unwrap_or_default();
                         // A Done seat's claim is its settled promises; nothing of it is stored.
                         let (claimed_at, decision_ledger_ref) = self.claim(work, role).filter(|_| *phase == CrewWorkPhase::Done).unzip();
+                        let seat = self.seats.get(work).and_then(|seats| seats.get(role));
+                        // A stalled seat's stall as its record carries it to every home.
+                        let recorded = seat.and_then(|seat| seat.stalled.as_ref()).filter(|_| *phase == CrewWorkPhase::Stalled);
                         // A failed seat says why it failed; a seat the end overtook says how the launch
-                        // ended; a stalled seat gives the report its crew made.
+                        // ended; a stalled seat gives the report its crew made, as this home noted it
+                        // or as its stall record carries it.
                         let message = match phase {
                             CrewWorkPhase::Ended => self.ended.as_ref().map(|(end, _)| match end {
                                 ConvoyEnd::Delivered { disposition } => disposition.clone(),
                                 ConvoyEnd::Failed { reason } | ConvoyEnd::Abandoned { reason } => reason.clone(),
                             }),
-                            _ => self
-                                .seats
-                                .get(work)
-                                .and_then(|seats| seats.get(role))
-                                .and_then(|seat| seat.failed.clone())
-                                .or(noted.stall_report.filter(|_| *phase == CrewWorkPhase::Stalled)),
+                            _ => seat.and_then(|seat| seat.failed.clone()).or(noted
+                                .stall_report
+                                .filter(|_| *phase == CrewWorkPhase::Stalled)
+                                .or_else(|| recorded.and_then(|stall| stall.report.clone()))),
                         };
                         let state = CrewWorkState::builder()
                             .task_assigned(noted.task_assigned)
@@ -466,6 +477,8 @@ impl ConvoyRecord {
                             .maybe_finished_at(claimed_at)
                             .maybe_decision_ledger_ref(decision_ledger_ref.flatten())
                             .maybe_message(message)
+                            .maybe_stall_reason(recorded.and_then(|stall| stall.reason))
+                            .maybe_stall_proposed_disposition(recorded.and_then(|stall| stall.proposed_disposition))
                             .build();
                         (role.clone(), state)
                     })

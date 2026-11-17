@@ -96,7 +96,8 @@ impl CrewService {
     }
 
     /// Records the sender's half of a send expecting a reply or an outcome once it is admitted at
-    /// `home`: an AwaitingReply record of `kind`, about `about` when given.
+    /// `home`: an AwaitingReply record of `kind`, about a stall and carrying its evidence when
+    /// `stall` is given.
     pub(crate) async fn await_reply(
         &self,
         namespace: &str,
@@ -104,9 +105,9 @@ impl CrewService {
         intent: &Intent,
         home: &str,
         kind: &str,
-        about: Option<&str>,
+        stall: Option<&flotilla_messaging::StallOf>,
     ) -> Result<bool, String> {
         let engine = self.message_primitives().map_err(|error| error.to_string())?;
-        engine.await_reply(namespace, name, intent, home, kind, about).await
+        engine.await_reply(namespace, name, intent, home, kind, stall).await
     }
 }

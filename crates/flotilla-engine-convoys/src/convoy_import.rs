@@ -16,7 +16,7 @@
 //! | an agent seat of a finite convoy owing nothing | a Pending template decision ledger, as admission gives one |
 //! | crew Done, HandedBack | dropped: derived from the promises |
 //! | crew Failed | dropped: its promises stay, for an operator verdict |
-//! | an open stall with a supervision message | an open stall record ([`ImportedStall`]), written beside the convoy |
+//! | an open stall with a supervision message | an open stall record ([`ImportedStall`]), written beside the convoy, carrying its declared report, reason and proposed disposition |
 //! | claim history (message, `finished_at`, overrides, superseded claims, `landing_entry`) | the creation's log entry payload ([`ClaimHistory`]) |
 //! | `completion_refusal`, `legacy_checks` | dropped |
 //! | Landing | Open |
@@ -32,6 +32,7 @@
 use std::collections::{BTreeMap, BTreeSet};
 
 use flotilla_address::{Address, Kind as AddressKind};
+use flotilla_engine_messages::awaiting::{stored_disposition, stored_reason};
 use flotilla_resources::{
     convoy::reconcile::is_ensured, promises::PromiseState as OldState, Convoy as OldConvoy, ConvoyPhase, CrewSource, ForgeSpec,
     ResourceObject, WorkCompletionAuthority,
@@ -407,6 +408,9 @@ pub fn import_convoy(
                         kind: STALL.into(),
                         awaited: Awaited::Reply,
                         deadline: None,
+                        report: stalled.report(status).map(str::to_owned),
+                        stall_reason: stalled.reason.map(stored_reason),
+                        proposed_disposition: stalled.proposed_disposition.map(stored_disposition),
                     };
                     (Some(ImportedStall { spec }), None)
                 }

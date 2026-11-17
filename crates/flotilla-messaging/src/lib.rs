@@ -5,7 +5,7 @@
 use flotilla_resources::*;
 use flotilla_store::*;
 mod engine_messages;
-pub use engine_messages::{AdmittedMessage, EngineMessages, MessageResolution, SeatMessage, SentMessage};
+pub use engine_messages::{AdmittedMessage, EngineMessages, MessageResolution, SeatMessage, SentMessage, StallOf};
 mod intent;
 pub use intent::{Admitted, Intent, IntentExpectation, IntentReference};
 mod framing;

@@ -38,6 +38,9 @@ fn spec(n: usize) -> AwaitingReplySpec {
         kind: if stall { STALL.into() } else { "reply".into() },
         awaited: Awaited::Reply,
         deadline: n.is_multiple_of(2).then_some(Timestamp(1_000_000 + n as i64)),
+        report: None,
+        stall_reason: None,
+        proposed_disposition: None,
     }
 }
 

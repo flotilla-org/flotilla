@@ -28,12 +28,14 @@ use std::{
 
 use flotilla_address::Address;
 use flotilla_engine_store::StoreLog;
+use flotilla_resources::convoy_records::SeatStall;
 use flotilla_schema::Timestamp;
 use flotilla_schema_sqlite::{stream::Service, Observed, Observer, Staged};
 use flotilla_state_machines::{
     machines::{
         awaiting_reply::{
-            Answer, AwaitingReply, AwaitingReplyLabel, AwaitingReplyRefusal, AwaitingReplySpec, Expire, MemoryAwaitingReplyWorld, Withdraw,
+            Answer, AwaitingReply, AwaitingReplyLabel, AwaitingReplyRefusal, AwaitingReplySpec, Expire, MemoryAwaitingReplyWorld,
+            ProposedDisposition, StallReason as StoredStallReason, Withdraw,
         },
         message::{Message, MessageRef},
     },
@@ -45,6 +47,48 @@ pub const STALL: &str = flotilla_resources::STALL_KIND;
 
 /// A record, by `(home, name)`.
 type Key = (String, String);
+
+/// A declared stall's reason as its record stores it.
+pub fn stored_reason(reason: flotilla_protocol::StallReason) -> StoredStallReason {
+    use flotilla_protocol::StallReason;
+    match reason {
+        StallReason::Infra => StoredStallReason::Infra,
+        StallReason::Scope => StoredStallReason::Scope,
+        StallReason::Decision => StoredStallReason::Decision,
+        StallReason::Access => StoredStallReason::Access,
+        StallReason::Other => StoredStallReason::Other,
+    }
+}
+
+fn read_reason(reason: StoredStallReason) -> flotilla_protocol::StallReason {
+    use flotilla_protocol::StallReason;
+    match reason {
+        StoredStallReason::Infra => StallReason::Infra,
+        StoredStallReason::Scope => StallReason::Scope,
+        StoredStallReason::Decision => StallReason::Decision,
+        StoredStallReason::Access => StallReason::Access,
+        StoredStallReason::Other => StallReason::Other,
+    }
+}
+
+/// A declared stall's proposed disposition as its record stores it.
+pub fn stored_disposition(disposition: flotilla_protocol::StallProposedDisposition) -> ProposedDisposition {
+    use flotilla_protocol::StallProposedDisposition;
+    match disposition {
+        StallProposedDisposition::Resume => ProposedDisposition::Resume,
+        StallProposedDisposition::ReduceScope => ProposedDisposition::ReduceScope,
+        StallProposedDisposition::Fail => ProposedDisposition::Fail,
+    }
+}
+
+fn read_disposition(disposition: ProposedDisposition) -> flotilla_protocol::StallProposedDisposition {
+    use flotilla_protocol::StallProposedDisposition;
+    match disposition {
+        ProposedDisposition::Resume => StallProposedDisposition::Resume,
+        ProposedDisposition::ReduceScope => StallProposedDisposition::ReduceScope,
+        ProposedDisposition::Fail => StallProposedDisposition::Fail,
+    }
+}
 
 /// Every home's open AwaitingReply records as this store holds them (#3108 open-stall set), by
 /// home and name and by the subject each is about. The store's writes keep it inside each write's
@@ -176,9 +220,24 @@ impl OpenAwaiting {
 
     /// Whether `subject` is stalled: an open stall record, of any home, is about it.
     pub fn stalled(&self, subject: &Address) -> bool {
+        self.stall(subject).is_some()
+    }
+
+    /// The stall about `subject` with the evidence its record carries: the newest open stall
+    /// record about it, of any home. None while `subject` is not stalled.
+    pub fn stall(&self, subject: &Address) -> Option<SeatStall> {
         let held = self.locked();
         let keys = held.about.get(subject).into_iter().flatten();
-        keys.filter_map(|key| held.records.get(key)).any(|record| record.spec().kind == STALL)
+        let newest = keys
+            .filter_map(|key| held.records.get(key))
+            .filter(|record| record.spec().kind == STALL)
+            .max_by_key(|record| record.since())?;
+        let spec = newest.spec();
+        Some(SeatStall {
+            report: spec.report.clone(),
+            reason: spec.stall_reason.map(read_reason),
+            proposed_disposition: spec.proposed_disposition.map(read_disposition),
+        })
     }
 
     /// The open records `sender` holds, every home's.

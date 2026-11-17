@@ -1138,7 +1138,8 @@ impl MessagePrimitives {
     /// (#3587 layer 7), once the message is admitted at `home`, its
     /// receiver's. The record is homed here, the sender's home, and named by
     /// the message. A reply that already landed in the sender's inbox here
-    /// answers it at once. A send expecting nothing records nothing.
+    /// answers it at once. A send expecting nothing records nothing. A stall's record carries the
+    /// stall's evidence, so every home can show it.
     pub async fn await_reply(
         &self,
         namespace: &str,
@@ -1146,7 +1147,7 @@ impl MessagePrimitives {
         intent: &flotilla_messaging::Intent,
         home: &str,
         kind: &str,
-        about: Option<&str>,
+        stall: Option<&flotilla_messaging::StallOf>,
     ) -> Result<bool, String> {
         use flotilla_messaging::IntentExpectation;
         use flotilla_state_machines::machines::awaiting_reply::{Awaited, AwaitingReplySpec};
@@ -1158,7 +1159,7 @@ impl MessagePrimitives {
         let roles = self.roles(namespace).await?;
         let (sender, recipient) = (intent.sender.clone(), intent.inbox.clone());
         let message = MessageRef::new(Address::message(&recipient, name).map_err(|error| error.to_string())?.as_str(), home);
-        let subject = about.map(|about| roles.stall_subject(about)).transpose()?;
+        let subject = stall.map(|stall| roles.stall_subject(&stall.about)).transpose()?;
         // The predecessor whose record this send's record replaces, wherever it is homed.
         let superseded = match &intent.supersedes {
             Some(older) => {
@@ -1175,6 +1176,9 @@ impl MessagePrimitives {
             kind: kind.to_owned(),
             awaited,
             deadline: intent.deadline.as_ref().map(Timestamp::from_datetime),
+            report: stall.and_then(|stall| stall.report.clone()),
+            stall_reason: stall.and_then(|stall| stall.reason).map(awaiting::stored_reason),
+            proposed_disposition: stall.and_then(|stall| stall.proposed_disposition).map(awaiting::stored_disposition),
         };
         let awaiting = Arc::clone(&self.awaiting);
         let service = Arc::clone(&self.service);
@@ -2065,9 +2069,9 @@ impl flotilla_messaging::EngineMessages for MessagePrimitives {
         intent: &flotilla_messaging::Intent,
         home: &str,
         kind: &str,
-        about: Option<&str>,
+        stall: Option<&flotilla_messaging::StallOf>,
     ) -> Result<bool, String> {
-        MessagePrimitives::await_reply(self, namespace, name, intent, home, kind, about).await
+        MessagePrimitives::await_reply(self, namespace, name, intent, home, kind, stall).await
     }
     async fn end_stalls(&self, namespace: &str, seats: &[String], stalled: &[String], reason: &str) -> Result<Vec<String>, String> {
         MessagePrimitives::end_stalls(self, namespace, seats, stalled, reason).await

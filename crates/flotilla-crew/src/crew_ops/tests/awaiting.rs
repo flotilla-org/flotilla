@@ -171,7 +171,7 @@ impl EngineMessages for RecordingMessages {
         _intent: &Intent,
         home: &str,
         kind: &str,
-        _about: Option<&str>,
+        _stall: Option<&flotilla_messaging::StallOf>,
     ) -> Result<bool, String> {
         assert_eq!(home, "home-a", "the admitting home is the receiver's");
         if self.failures.try_update(Ordering::SeqCst, Ordering::SeqCst, |left| left.checked_sub(1)).is_ok() {
