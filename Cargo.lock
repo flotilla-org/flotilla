@@ -2823,6 +2823,7 @@ dependencies = [
  "flotilla-build-features-tracing",
  "flotilla-build-features-types",
  "flotilla-engine-messages",
+ "flotilla-engine-messages-testkit",
  "flotilla-engine-store",
  "flotilla-protocol",
  "flotilla-provisioning",

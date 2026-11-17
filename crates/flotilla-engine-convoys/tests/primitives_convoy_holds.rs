@@ -6,6 +6,7 @@ use std::{
     sync::Arc,
 };
 
+use flotilla_address::record_name;
 use flotilla_engine_convoys::{
     convoy_records::EngineConvoyRecords,
     convoys::{Convoys, Retirement},
@@ -13,30 +14,37 @@ use flotilla_engine_convoys::{
     retire,
 };
 use flotilla_engine_messages::awaiting::{AwaitingReplies, OpenAwaiting, STALL};
+use flotilla_engine_messages_testkit::{designate_fleet, intent, EngineMessagesHome};
 use flotilla_engine_store::{watch::EngineWatch, StoreLog};
 use flotilla_protocol::PrincipalRef;
 use flotilla_provisioning::{
-    engine::{account::binding_spec, standing_roles::EngineStandingRoles, LifecycleHome, Lifecycles, Step},
+    engine::{
+        access_deliveries::EngineAccessDeliveries, account::EngineAccounts, observations::EngineObservations,
+        standing_roles::EngineStandingRoles, LifecycleHome, Lifecycles, Step,
+    },
     stored::{
         self,
-        account::{AccountBinding, BindingState},
         checkout::{CheckoutKind, CheckoutRequest, Source},
-        forge_observation::{ChangeRequestRecord, ChangeRequestState},
         Holder,
     },
 };
 use flotilla_resources::{
     access_delivery::access_key,
-    account_access::{requester_address, AccessName, AccountBindingSpec, CredentialName, EpochEntry, Selection},
+    account_access::{
+        binding_name, requester_address, AccessName, AccountBindingSpec, AccountRecords, BindingState as OldBindingState, CredentialName,
+        EpochEntry, PendingBinding, Selection,
+    },
     address::{stored_change_request_address, subject_for},
     convoy::{admission::AdmissionDocument, engine::seat_address},
     convoy_records::ConvoyRecords,
+    engine_records::KindRecords,
     standing_roles::{RunningValues, StandingRoles},
     vessel_resource_name,
     workflow_template::single_agent_workflow_spec,
-    AccessDeliverySpec, ConvoyEnsureSpec, SystemClock, WorkflowSnapshot, ENSURED_FROM_ANNOTATION,
+    AccessDelivery, AccessDeliverySpec, ChangeRequest, ChangeRequestReviewObservation, ChangeRequestSpec, ChangeRequestStatus,
+    ConvoyEnsureSpec, MessageRelation, Observation, ObservedChangeRequestState, SystemClock, WorkflowSnapshot, ENSURED_FROM_ANNOTATION,
 };
-use flotilla_schema::{Address, Frozen, Kind, NewChange, Records, State, Timestamp};
+use flotilla_schema::{Address, Frozen, Kind, Records, State, Timestamp};
 use flotilla_schema_sqlite::stream::Service;
 use flotilla_state_machines::{
     kinds::{stock, Catalog},
@@ -46,14 +54,17 @@ use flotilla_state_machines::{
             Abandon, AbandonCause, AdmissionBytes, AdmittedPromise, Convoy, ConvoyId, ConvoyLabel, ConvoyRequest, Link, LinkSource,
             Priority, PromiseId, PromiseSource, Seat, SeatName, VesselClass,
         },
-        message::{Message, MessageBody, MessageRef, MessageSpec, MessageState, Relation},
+        message::MessageRef,
         vessel::{VesselKind, VesselSpec},
     },
     placement::{Host, Lease, Request},
-    Home, Ref, Resource, Version,
+    Home, Ref, Resource,
 };
+use flotilla_store::ResourceBackend;
+use flotilla_store_memory::InMemoryBackend;
 
 const HOME: &str = "home-a";
+const NAMESPACE: &str = "flotilla";
 
 fn project() -> Address {
     Address::project("fleet").expect("project")
@@ -171,16 +182,6 @@ impl Fixture {
         self.service.with_store(|store| holds(&mut store.read()?, &convoy, HOME)).expect("holds")
     }
 
-    fn insert<K: flotilla_schema::Kind>(&self, name: &str, value: &K) {
-        self.service
-            .with_store(|store| {
-                let mut write = store.write()?;
-                write.insert(name, value, &NewChange::new("test", Timestamp(2_000_000)))?;
-                write.commit()
-            })
-            .expect("inserted");
-    }
-
     fn seat(&self) -> Address {
         seat_address(&project(), &self.launch, "coder").expect("seat")
     }
@@ -193,39 +194,42 @@ impl Fixture {
         change
     }
 
-    fn observe(&self, change: &Address, state: ChangeRequestState) {
+    /// Records `change` observed in `state`, as its source's observer writes it.
+    async fn observe(&self, change: &Address, state: ObservedChangeRequestState) {
+        let observations = EngineObservations::open(Arc::clone(&self.service), Arc::new(SystemClock)).expect("observations");
         let subject = subject_for(change).expect("subject");
-        let record = ChangeRequestRecord {
-            service: subject.source.service,
-            scope: subject.source.scope,
-            number: subject.id.parse().expect("number"),
-            title: None,
-            author: None,
-            state: Some(state),
-            review_decision: None,
-            review_requested_from_owner: None,
-            head_sha: None,
-            head_branch: None,
-            checks: None,
-            actionable_at_head: None,
-            mergeable: None,
-            failing_since: None,
+        let name = record_name(change).expect("record name");
+        let spec = ChangeRequestSpec::builder()
+            .service(subject.source.service)
+            .scope(subject.source.scope)
+            .number(subject.id.parse().expect("number"))
+            .observing_authority("test".into())
+            .build();
+        KindRecords::<ChangeRequest>::apply(&observations, &name, &BTreeMap::new(), &BTreeMap::new(), &spec).await.expect("observed");
+        let status = ChangeRequestStatus {
+            title: Default::default(),
+            author: Default::default(),
+            review_decision: Default::default(),
+            review_requested_from_owner: Default::default(),
+            state: Observation::known(state, chrono::Utc::now()),
+            head_sha: Default::default(),
+            checks: Default::default(),
+            review: ChangeRequestReviewObservation { actionable_at_head: Default::default() },
+            mergeable: Default::default(),
         };
-        self.insert(&format!("cr-{}", record.number), &record);
+        KindRecords::<ChangeRequest>::set_status(&observations, &name, &status).await.expect("observed status");
     }
 
-    fn message(&self, name: &str, state: MessageState) {
-        let spec = MessageSpec::new(operator(), self.seat(), Relation::Supervisor, MessageBody::text("hello").expect("body"));
-        self.insert(name, &Resource::<Message>::stored(String::new(), spec, State::new(state, Timestamp(2_000_000)), Version(0)));
-    }
-
-    fn binding(&self, name: &str, role: &str, state: BindingState) {
+    /// Opens crew member `role`'s binding at `opened_at` as admission does, and ends it when
+    /// `closed`; returns its record name.
+    async fn binding(&self, accounts: &EngineAccounts, role: &str, opened_at: Timestamp, closed: bool) -> String {
         let mut epochs = Records::new();
-        epochs.append(1, EpochEntry { epoch: "1".into(), observed_at: Timestamp(2_000_000) }).expect("epoch");
-        let old = AccountBindingSpec {
+        epochs.append(1, EpochEntry { epoch: "1".into(), observed_at: opened_at }).expect("epoch");
+        let requirement = AccessName("claude-subscription".into());
+        let spec = AccountBindingSpec {
             requester: requester_address(Some("fleet"), &self.launch, role).expect("requester"),
             item: "claude-code".into(),
-            requirement: AccessName("claude-subscription".into()),
+            requirement: requirement.clone(),
             credential: CredentialName("cred".into()),
             account: None,
             grants: BTreeMap::new(),
@@ -233,26 +237,41 @@ impl Fixture {
             exclusions: BTreeMap::new(),
             selection: Selection::Pin { pinned_by: "test".into() },
             epochs,
-            opened_at: Timestamp(2_000_000),
-            state: State::new(flotilla_resources::account_access::BindingState::Open, Timestamp(2_000_000)),
+            opened_at,
+            state: State::new(OldBindingState::Open, opened_at),
         };
-        let binding =
-            Resource::<AccountBinding>::stored(String::new(), binding_spec(&old), State::new(state, Timestamp(2_000_000)), Version(0));
-        self.insert(name, &binding);
+        let name = binding_name(&self.launch, role, &requirement);
+        accounts.open(NAMESPACE, vec![PendingBinding { name, spec }]).await.expect("opened");
+        let bindings = accounts.convoy_bindings(NAMESPACE, &self.launch, true).await.expect("bindings");
+        let opened = bindings.into_iter().find(|binding| binding.spec.opened_at == opened_at).expect("the binding opened");
+        if closed {
+            let state = OldBindingState::Closed { reason: "rebind".into(), delivered_until: None };
+            accounts.end(NAMESPACE, &opened, state, Timestamp(opened_at.0 + 1)).await.expect("closed");
+        }
+        opened.name
     }
 }
 
 // Behaviour: every dependent that names the convoy on its own record holds it while its writer has
 // not released it, found through its own index, and each is named; a released one holds nothing.
-#[test]
-fn each_unreleased_dependent_holds_the_convoy() {
+#[tokio::test]
+async fn each_unreleased_dependent_holds_the_convoy() {
     let dir = tempfile::tempdir().expect("tempdir");
     let fixture = Fixture::new(&dir);
     assert_eq!(fixture.holds(), BTreeSet::new(), "a convoy no dependent names is held by nothing");
 
-    // Messages to a seat: pending holds, settled does not.
-    fixture.message("m-pending", MessageState::Pending);
-    fixture.message("m-settled", MessageState::Settled { receiver: None, delivered_at: None });
+    // Messages to a seat, admitted as the seat's sender's are: pending holds; one delivered and
+    // settled does not.
+    let backend = ResourceBackend::new(InMemoryBackend::default());
+    designate_fleet(&backend, NAMESPACE).await;
+    let messages = EngineMessagesHome::over(Arc::clone(&fixture.service), NAMESPACE, &backend);
+    let receiver = format!("fleet/{}/work/coder", fixture.launch);
+    assert_eq!(messages.primitives().inbox_for(NAMESPACE, &receiver).await.expect("inbox"), fixture.seat());
+    for record in ["m-pending", "m-settled"] {
+        let intent = intent("fleet/operator", &receiver, MessageRelation::Supervisor, "hello");
+        messages.primitives().admit(record, &intent).await.expect("admitted");
+    }
+    messages.deliver_turn(&receiver, "m-settled", "session").await;
 
     // A stall about the seat.
     let awaiting = AwaitingReplies::open(HOME, &fixture.service).expect("awaiting");
@@ -272,11 +291,11 @@ fn each_unreleased_dependent_holds_the_convoy() {
 
     // Linked change requests: open and unobserved hold; merged and closed do not.
     let open = fixture.link(1);
-    fixture.observe(&open, ChangeRequestState::Open);
+    fixture.observe(&open, ObservedChangeRequestState::Open).await;
     let unobserved = fixture.link(2);
-    for (number, state) in [(3, ChangeRequestState::Merged), (4, ChangeRequestState::Closed)] {
+    for (number, state) in [(3, ObservedChangeRequestState::Merged), (4, ObservedChangeRequestState::Closed)] {
         let change = fixture.link(number);
-        fixture.observe(&change, state);
+        fixture.observe(&change, state).await;
     }
 
     // Checkouts it holds: a live one holds, a released one does not.
@@ -323,21 +342,23 @@ fn each_unreleased_dependent_holds_the_convoy() {
         needs: BTreeMap::new(),
         retry: None,
     };
-    fixture.insert("access-1", &delivery);
+    let deliveries = EngineAccessDeliveries::open(Arc::clone(&fixture.service), Arc::new(SystemClock)).expect("deliveries");
+    KindRecords::<AccessDelivery>::apply(&deliveries, "access-1", &BTreeMap::new(), &BTreeMap::new(), &delivery).await.expect("delivered");
 
     // Account bindings of its crew: open holds, closed does not.
-    fixture.binding("binding-open", "coder", BindingState::Open);
-    fixture.binding("binding-closed", "coder", BindingState::Closed { reason: "rebind".into(), delivered_until: None });
+    let accounts = EngineAccounts::open(Arc::clone(&fixture.service), Arc::new(SystemClock)).expect("accounts");
+    fixture.binding(&accounts, "coder", Timestamp(2_000_000), true).await;
+    let binding = fixture.binding(&accounts, "coder", Timestamp(2_100_000), false).await;
 
     let expected: BTreeSet<String> = [
-        "message:m-pending".to_owned(),
+        format!("message:{}/message:m-pending", fixture.seat()),
         format!("awaiting-reply:{}", fixture.service.with_store(first_awaiting).expect("stall")),
         format!("change-request:{open}"),
         format!("change-request:{unobserved}"),
         format!("checkout:{live}"),
         format!("vessel:{}", vessel.name()),
         "access-delivery:access-1".to_owned(),
-        "account-binding:binding-open".to_owned(),
+        format!("account-binding:{binding}"),
     ]
     .into();
     assert_eq!(fixture.holds(), expected);
