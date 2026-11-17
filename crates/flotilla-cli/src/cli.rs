@@ -10,10 +10,12 @@ use chrono::{DateTime, Utc};
 use comfy_table::{presets::UTF8_FULL_CONDENSED, Cell, Table};
 use flotilla_daemon_api::daemon::DaemonHandle;
 use flotilla_protocol::{
-    commands::ExplainedSubjectFact, output::OutputFormat, CliListKind, CliListResponse, Command, CommandValue, CrewListResponse,
-    DaemonEvent, EnvironmentInfo, EnvironmentStatus, EvidenceFreshness, FleetHealthResponse, FleetHostStaleness, FleetListResponse,
-    FleetObservationAgreement, FleetStaleness, FulfilmentListResponse, FulfilmentRow, HostProvidersResponse, HostStatusResponse, NodeId,
-    NodeInfo, PeerConnectionState, ProjectListResponse, RepoProvidersResponse, StatusResponse, StreamKey, TopologyResponse,
+    commands::{ExplainedHolds, ExplainedSubjectFact},
+    output::OutputFormat,
+    CliListKind, CliListResponse, Command, CommandValue, CrewListResponse, DaemonEvent, EnvironmentInfo, EnvironmentStatus,
+    EvidenceFreshness, FleetHealthResponse, FleetHostStaleness, FleetListResponse, FleetObservationAgreement, FleetStaleness,
+    FulfilmentListResponse, FulfilmentRow, HostProvidersResponse, HostStatusResponse, NodeId, NodeInfo, PeerConnectionState,
+    ProjectListResponse, RepoProvidersResponse, StatusResponse, StreamKey, TopologyResponse,
 };
 
 use crate::socket::{DaemonEndpoint, SocketDaemon};
@@ -1124,6 +1126,31 @@ pub(crate) fn format_convoy_explanation_human(explanation: &flotilla_protocol::C
         output.push_str("\nCrew work needing a settlement claim:\n");
         for work in &explanation.unclaimed_work {
             let _ = writeln!(output, "  - {}/{} ({})", work.vessel, work.role, work.evidence.replace('_', " "));
+        }
+    }
+
+    if let Some(held_by) = &explanation.held_by {
+        output.push_str("\nHeld by:\n");
+        let holds = match held_by {
+            ExplainedHolds::Retired => {
+                output.push_str("  retired\n");
+                &[][..]
+            }
+            ExplainedHolds::Open { holds } => {
+                output.push_str("  open: it retires once it ends and nothing holds it\n");
+                holds.as_slice()
+            }
+            ExplainedHolds::Ended { holds } if holds.is_empty() => {
+                output.push_str("  nothing holds it\n");
+                &[][..]
+            }
+            ExplainedHolds::Ended { holds } => holds.as_slice(),
+        };
+        for hold in holds {
+            let _ = match hold.split_once(':') {
+                Some((kind, name)) => writeln!(output, "  - {kind}: {name}"),
+                None => writeln!(output, "  - {hold}"),
+            };
         }
     }
 

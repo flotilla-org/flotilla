@@ -286,6 +286,7 @@ fn convoy_explanation_renders_linked_and_missing_decision_ledgers() {
         settlement: ExplainedSettlement { mode: "world_terminal".into(), satisfied: false, unmet: Vec::new(), discharged: Vec::new() },
         account_bindings: Vec::new(),
         access_deliveries: Vec::new(),
+        held_by: None,
     };
 
     // Every claim renders the active-process marker, including a superseded
@@ -562,9 +563,17 @@ fn convoy_explanation_shows_reserved_platform_fallback_without_escalation() {
         },
         account_bindings: Vec::new(),
         access_deliveries: Vec::new(),
+        held_by: Some(flotilla_protocol::commands::ExplainedHolds::Ended {
+            holds: vec!["change-request:forge:dummy-forge/repo:dummy%2Ffleet/cr:1".into(), "message:message-1".into()],
+        }),
     };
 
     let output = format_convoy_explanation_human(&explanation);
+    // Each hold is named by its kind and what it names.
+    assert!(
+        output.contains("Held by:\n  - change-request: forge:dummy-forge/repo:dummy%2Ffleet/cr:1\n  - message: message-1\n"),
+        "{output}"
+    );
     // An unread checkout dropped rather than met is named with the vessel whose end dropped it.
     assert!(output.contains("Discharged unread (no vessel left to read them):"), "{output}");
     assert!(output.contains("  - missing_status: checkout/checkout-dead — no inspection of the checkout has been read"), "{output}");

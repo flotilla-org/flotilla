@@ -297,6 +297,9 @@ impl ConvoyRecords for Convoys {
         let home = home.unwrap_or(HERE);
         Ok(self.records().into_iter().filter(|record| record.launch_of == of && record.home == home).max_by_key(|record| record.launch))
     }
+    fn holds(&self, _: &str, _: Option<&str>) -> Result<Option<flotilla_resources::convoy_records::LaunchHolds>, String> {
+        unreachable!("the views read no holds")
+    }
     // A listing leaves retired launches out, as the engine's does.
     fn at(&self, home: &str) -> Result<ConvoyListing, String> {
         let records = self.records().into_iter().filter(|record| record.home == home && !record.retired).collect();

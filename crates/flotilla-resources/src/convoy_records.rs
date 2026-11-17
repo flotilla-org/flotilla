@@ -115,6 +115,16 @@ pub struct UnreadableLaunch {
     pub reason: String,
 }
 
+/// What holds a launch from retiring (#3108 retirement): each dependent as `kind:name`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum LaunchHolds {
+    /// It is open: it retires once it ends and these release.
+    Open(BTreeSet<String>),
+    /// It ended: it retires once these release; none when nothing holds it.
+    Ended(BTreeSet<String>),
+    Retired,
+}
+
 /// The launches a read found: those read whole, and those that could not be.
 #[derive(Debug, Clone, Default, PartialEq)]
 pub struct ConvoyListing {
@@ -609,6 +619,9 @@ pub trait ConvoyRecords: Send + Sync {
     }
     /// The newest launch of `of` in `project` held at `home`, or at this home when `None`.
     fn newest(&self, of: &str, project: &str, home: Option<&str>) -> Result<Option<ConvoyRecord>, String>;
+    /// What holds launch `name` held at `home`, or at this home when `None`, from retiring; none
+    /// when no such launch is held.
+    fn holds(&self, name: &str, home: Option<&str>) -> Result<Option<LaunchHolds>, String>;
     /// Every launch held at `home`; one that cannot be read is listed as unreadable.
     fn at(&self, home: &str) -> Result<ConvoyListing, String>;
     /// Every launch at every home this store holds; one that cannot be read is listed as

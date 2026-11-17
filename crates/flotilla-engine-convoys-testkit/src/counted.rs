@@ -247,6 +247,11 @@ impl ConvoyRecords for CountedConvoys {
         self.records.newest(of, project, home)
     }
 
+    fn holds(&self, name: &str, home: Option<&str>) -> Result<Option<flotilla_resources::convoy_records::LaunchHolds>, String> {
+        Meter::count(&self.meter.convoys);
+        self.records.holds(name, home)
+    }
+
     fn at(&self, home: &str) -> Result<ConvoyListing, String> {
         Meter::count(&self.meter.convoy_listings);
         self.records.at(home)

@@ -519,6 +519,25 @@ pub struct ConvoyExplanation {
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub artifacts: Vec<ExplainedArtifact>,
     pub settlement: ExplainedSettlement,
+    /// What holds the launch from retiring; none where its holds are not read (#3108).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub held_by: Option<ExplainedHolds>,
+}
+
+/// What holds a convoy's launch from retiring (#3108 retirement): each dependent as
+/// `kind:name`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "state", rename_all = "snake_case")]
+pub enum ExplainedHolds {
+    /// It is open: it retires once it ends and these release.
+    Open {
+        holds: Vec<String>,
+    },
+    /// It ended: it retires once these release; none when nothing holds it.
+    Ended {
+        holds: Vec<String>,
+    },
+    Retired,
 }
 
 /// One requester's account binding (#3907): which managed credential and account it selected,

@@ -1319,6 +1319,17 @@ impl ReadProjections<'_> {
         let convoy_source = convoy_name.select(&convoy_sources.items)?.ok_or_else(|| format!("no convoy matches `{convoy_name}`"))?;
         // With the engine holding the convoy, the promises explained are the engine's (#3587 layer 8).
         let convoy = flotilla_resources::convoy::engine::viewed_read(self.convoy_engine, convoy_source)?;
+        // What holds the launch from retiring, read at its home where the engine holds it (#3108).
+        let held_by = match convoy.status.as_ref().and_then(|status| status.engine_launch.as_ref()) {
+            Some(launch) => {
+                let home = match &convoy_source.provenance {
+                    ResourceProvenance::Local => None,
+                    ResourceProvenance::Replica { origin_root, .. } => Some(origin_root.as_str()),
+                };
+                self.lifecycles.convoys()?.holds(launch, home)?.map(explained_holds)
+            }
+            None => None,
+        };
         let (receivers, project, receiver_aliases) =
             convoy_receiver_evidence(self.message_receivers, self.backend, namespace, &convoy_sources.items, &convoy).await?;
         let repositories = self
@@ -1858,6 +1869,7 @@ impl ReadProjections<'_> {
                 .filter_map(|condition| serde_json::to_value(condition).ok())
                 .collect(),
             message: convoy.status.as_ref().and_then(|status| status.message.clone()),
+            held_by,
             evidence_ttl_seconds: LANDING_EVIDENCE_TTL.as_secs(),
             change_request_stale_after_seconds: change_request_stale_after.as_secs(),
             checkouts,
@@ -2373,6 +2385,16 @@ pub async fn message_views(
 
 /// The record name a change-request record's spec addresses, resolving a
 /// host-spelled service through `forges`.
+fn explained_holds(holds: flotilla_resources::convoy_records::LaunchHolds) -> flotilla_protocol::commands::ExplainedHolds {
+    use flotilla_protocol::commands::ExplainedHolds;
+    use flotilla_resources::convoy_records::LaunchHolds;
+    match holds {
+        LaunchHolds::Open(holds) => ExplainedHolds::Open { holds: holds.into_iter().collect() },
+        LaunchHolds::Ended(holds) => ExplainedHolds::Ended { holds: holds.into_iter().collect() },
+        LaunchHolds::Retired => ExplainedHolds::Retired,
+    }
+}
+
 fn spec_record_name(spec: &flotilla_resources::ChangeRequestSpec, forges: &[flotilla_resources::ForgeSpec]) -> Option<String> {
     spec.address(forges).ok().and_then(|address| record_name(&address))
 }

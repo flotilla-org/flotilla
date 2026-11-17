@@ -494,7 +494,8 @@ mod tests {
             ))));
             Self {
                 receivers,
-                lifecycles: home.engine.reads(),
+                // The daemon's reads, which serve its convoys as well.
+                lifecycles: Arc::clone(home.convoys.reads()),
                 convoy_engine,
                 home,
                 temp,
@@ -1251,6 +1252,64 @@ mod tests {
         let response = fixture.projections().explain_convoy("flotilla", &launch).await.expect("explanation");
         assert_eq!(response.convoy, launch);
         assert_eq!(response.phase, "Failed");
+    }
+
+    // Behaviour (#3108 retirement): explain says what holds a launch from retiring, by kind and
+    // what it names, while it is open and once it ends; then that it retired.
+    #[tokio::test]
+    async fn convoy_explanation_says_what_holds_it_from_retiring() {
+        use flotilla_protocol::commands::ExplainedHolds;
+
+        let now = Utc::now();
+        let fixture = ProjectionFixture::new();
+        let launch = fixture
+            .admit(
+                "held",
+                ConvoySpec::builder().workflow_ref("review".to_string()).build(),
+                flotilla_engine_convoys_testkit::single_agent("coder"),
+            )
+            .await;
+        // Its crew's claim links the change request it produced.
+        let produced = Subject {
+            kind: SubjectKind::ChangeRequest,
+            source: IssueSource { service: "github.com".into(), scope: "owner/one".into() },
+            id: "42".into(),
+        };
+        let engine = fixture.convoy_engine.get().expect("the Convoy path");
+        let convoy = fixture.home.convoy(&launch).await;
+        engine.link(&convoy, &produced, flotilla_resources::SubjectDiscoverySource::Claim, "coder").await.expect("link");
+        let (explained, name) = (&fixture, launch.as_str());
+        let held_by = move || async move { explained.projections().explain_convoy("flotilla", name).await.expect("explain").held_by };
+        let change_request = |holds: &[String]| matches!(holds, [hold] if hold.starts_with("change-request:") && hold.ends_with("/cr:42"));
+        let open = held_by().await;
+        assert!(matches!(&open, Some(ExplainedHolds::Open { holds }) if change_request(holds)), "{open:?}");
+
+        flotilla_engine_convoys_testkit::land(&fixture.convoy_engine, &fixture.home.convoy(&launch).await).await;
+        // The change request it links has no record yet: absent is not closed.
+        let ended = held_by().await;
+        assert!(matches!(&ended, Some(ExplainedHolds::Ended { holds }) if change_request(holds)), "{ended:?}");
+
+        let requests = fixture.backend.using::<ChangeRequest>("flotilla");
+        let record = requests
+            .create(
+                &InputMeta::builder().name(cr_name("github.com", "owner/one", 42)).build(),
+                &ChangeRequestSpec::builder()
+                    .service("github.com".into())
+                    .scope("owner/one".into())
+                    .number(42)
+                    .observing_authority("local".into())
+                    .build(),
+            )
+            .await
+            .expect("request");
+        let mut status = subject_status(now);
+        status.state.value = Some(ObservedChangeRequestState::Merged);
+        requests.update_status(&record.metadata.name, &record.metadata.resource_version, &status).await.expect("merged");
+        assert_eq!(held_by().await, Some(ExplainedHolds::Ended { holds: Vec::new() }), "nothing holds it");
+
+        let retired = fixture.home.convoys.convoys().retire(&launch, flotilla_schema::Timestamp::from_datetime(&now)).expect("retire");
+        assert_eq!(retired, flotilla_engine_convoys::convoys::Retirement::Retired);
+        assert_eq!(held_by().await, Some(ExplainedHolds::Retired));
     }
 
     // Convoy explanation uses typed health evidence, so operators can distinguish

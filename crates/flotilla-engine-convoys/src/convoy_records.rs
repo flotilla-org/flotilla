@@ -17,7 +17,9 @@ use flotilla_provisioning::engine::{log_cursor::LogCursor, reads::StoreReads};
 use flotilla_resources::{
     address::subject_for,
     convoy::{admission::AdmissionDocument, engine::seat_address},
-    convoy_records::{ConvoyChange, ConvoyEnd, ConvoyListing, ConvoyMemory, ConvoyRecord, ConvoyRecords, SeatRecord, UnreadableLaunch},
+    convoy_records::{
+        ConvoyChange, ConvoyEnd, ConvoyListing, ConvoyMemory, ConvoyRecord, ConvoyRecords, LaunchHolds, SeatRecord, UnreadableLaunch,
+    },
     lifecycle_reads::{ChangeCursor, CursorSince},
     ConvoyStatus, DiscoveredSubject, SubjectDiscovery, SubjectDiscoverySource,
 };
@@ -26,12 +28,14 @@ use flotilla_schema_sqlite::{stream::Service, Loaded, Read, ResourceId, Snapshot
 use flotilla_state_machines::{
     machines::{
         awaiting_reply::{AwaitingReply, AwaitingReplySpec},
-        convoy::{AbandonCause, Convoy, ConvoyEdge, ConvoyEdgeKind, ConvoySpec, ConvoyState, LinkSource, Progress, PromiseSource},
+        convoy::{
+            AbandonCause, Convoy, ConvoyEdge, ConvoyEdgeKind, ConvoyLabel, ConvoySpec, ConvoyState, LinkSource, Progress, PromiseSource,
+        },
     },
     Resource,
 };
 
-use super::convoy_map as map;
+use super::{convoy_map as map, holds::holds};
 use flotilla_engine_messages::awaiting::{OpenAwaiting, STALL};
 
 /// How many changes a slow follower may fall behind by; one that lags rereads everything.
@@ -154,6 +158,20 @@ impl ConvoyRecords for EngineConvoyRecords {
             let Some((id, _)) = read.integer_index_keys_before(&query, &home, i64::MAX, 1)?.first().copied() else { return Ok(None) };
             let Some(loaded) = read.load::<Resource<Convoy>>(id)? else { return Ok(None) };
             record(read, &self.stalls, loaded)
+        })
+    }
+
+    fn holds(&self, name: &str, home: Option<&str>) -> Result<Option<LaunchHolds>, String> {
+        let home = home.unwrap_or(&self.home).to_owned();
+        self.read(&format!("{name}'s holds at {home}"), |read| {
+            let Some(id) = read.resolve(<Resource<Convoy> as Kind>::CODE, name, &home)? else { return Ok(None) };
+            let Some(loaded) = read.load::<Resource<Convoy>>(id)? else { return Ok(None) };
+            let label = loaded.value.label();
+            if label == ConvoyLabel::Retired {
+                return Ok(Some(LaunchHolds::Retired));
+            }
+            let held = holds(read, &loaded.value, &home)?;
+            Ok(Some(if label == ConvoyLabel::Open { LaunchHolds::Open(held) } else { LaunchHolds::Ended(held) }))
         })
     }
 
