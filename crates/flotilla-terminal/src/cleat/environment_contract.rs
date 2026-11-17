@@ -344,6 +344,47 @@ mod real_launch_environment_contract {
     async fn new_declared_session_runs_without_a_login_profile() {
         declared_session_contract().await;
     }
+
+    #[tokio::test]
+    async fn new_launch_named_session_goes_through_real_cleat() {
+        launch_named_session_contract().await;
+    }
+}
+
+// An engine launch's session name carries `#`, which cleat refuses as an id. Through the pinned
+// cleat, the pool launches, finds, sends to, captures and kills it by its encoded id, and lists
+// it under its own name.
+#[cfg(feature = "cleat-environment-contract")]
+async fn launch_named_session_contract() {
+    const NAME: &str = "terminal-convoy-2d327f85c7a64b039d4a2734c7900e86-work#52-coder";
+    use crate::TerminalSessionLiveness;
+
+    let harness = Harness::new(true, Scenario::HostBaseline, true).await;
+    let runtime = harness.root.path().display().to_string();
+    let bag = EnvironmentBag::new()
+        .with(EnvironmentAssertion::env_var("SHELL", format!("{runtime}/probe")))
+        .with(EnvironmentAssertion::env_var("CLEAT_RUNTIME_DIR", &runtime))
+        .with(EnvironmentAssertion::env_var("CLEAT_DAEMON", "contract"));
+    let pool = CleatTerminalPool::new(harness.runner.clone(), &harness.binary, &bag);
+    let raw = harness.raw(&["launch", "--json", NAME, "--cmd", "unused"]).await.expect_err("cleat refuses the raw name");
+    assert!(raw.contains("invalid filesystem-safe name"), "{raw}");
+
+    pool.ensure_session(NAME, "unused-by-first-exec-probe", &ExecutionEnvironmentPath::new("/"), &Vec::new(), &[])
+        .await
+        .expect("launch under the encoded id");
+    harness.child().await;
+    let listed = pool.list_sessions().await.expect("list");
+    assert_eq!(listed.iter().map(|session| session.session_name.as_str()).collect::<Vec<_>>(), [NAME]);
+    assert!(matches!(pool.session_liveness(NAME).await.expect("liveness"), TerminalSessionLiveness::Running));
+    let endpoint = pool.cleat_endpoint(NAME).await.expect("endpoint").expect("one daemon holds the session");
+    assert_ne!(endpoint.session, NAME);
+    pool.operator_deliver(NAME, "hello").await.expect("send");
+    pool.capture_screen(NAME).await.expect("capture");
+    pool.kill_session(NAME).await.expect("kill");
+    assert!(matches!(pool.session_liveness(NAME).await.expect("liveness"), TerminalSessionLiveness::Absent));
+    let pids = harness.daemon_pids.lock().expect("daemon PIDs").clone();
+    drop(harness);
+    assert_daemons_stopped(&pids).await;
 }
 
 // #4173: a declared session runs its script with exactly the declared

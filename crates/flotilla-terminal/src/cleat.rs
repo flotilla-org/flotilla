@@ -14,7 +14,10 @@ use super::{
     environment::ControlledTerminalEnvironment, ScreenActivity, TerminalEnvVars, TerminalPool, TerminalSession, TerminalSessionLiveness,
     TerminalSessionTag, TerminalSize, TerminalSubmission,
 };
-use flotilla_paths::path_context::ExecutionEnvironmentPath;
+use flotilla_paths::{
+    name_component::{decode_name_component, encode_name_component},
+    path_context::ExecutionEnvironmentPath,
+};
 use flotilla_provider_runtime::run;
 use flotilla_provider_runtime::ChannelLabel;
 use flotilla_provider_runtime::CommandRunner;
@@ -133,6 +136,13 @@ struct EndpointCache {
     endpoints: HashMap<String, Option<(CleatEndpoint, bool)>>,
 }
 
+/// The id cleat knows a session by. Cleat takes only filesystem-safe names, and a session's
+/// name carries its vessel's launch (`work#52`), so every call that names a session encodes it
+/// and [`TerminalPool::list_sessions`] decodes it.
+fn cleat_id(session_name: &str) -> String {
+    encode_name_component(session_name)
+}
+
 impl CleatTerminalPool {
     pub fn new(runner: Arc<dyn CommandRunner>, binary: impl Into<String>, bag: &EnvironmentBag) -> Self {
         let environment = ControlledTerminalEnvironment::from_bag(bag);
@@ -155,7 +165,7 @@ impl CleatTerminalPool {
         let mut cache = self.endpoint_cache.lock().await;
         if let Some(snapshot) = cache.as_ref() {
             if snapshot.updated.elapsed() < ENDPOINT_CACHE_TTL {
-                return Ok(snapshot.endpoints.get(session_id).cloned().flatten());
+                return Ok(snapshot.endpoints.get(&cleat_id(session_id)).cloned().flatten());
             }
         }
         let output = run!(self.runner, &self.binary, &["daemons", "--json"], Path::new("/"))?;
@@ -174,7 +184,7 @@ impl CleatTerminalPool {
                 endpoints.entry(session.id).and_modify(|existing| *existing = None).or_insert(Some((endpoint, keyed)));
             }
         }
-        let endpoint = endpoints.get(session_id).cloned().flatten();
+        let endpoint = endpoints.get(&cleat_id(session_id)).cloned().flatten();
         *cache = Some(EndpointCache { updated: Instant::now(), endpoints });
         Ok(endpoint)
     }
@@ -213,11 +223,12 @@ impl CleatTerminalPool {
         // Cleat owns paste encoding and Enter in the same daemon transaction.
         // End option parsing before either positional argument: raw crew text
         // can itself be an option spelling such as --help or a Markdown bullet.
+        let session = cleat_id(session_name);
         let mut args = vec!["send", "--submit", "--if", "composer[value='']", "--controller-idle", "2s"];
         if let Some(key) = key {
             args.extend(["--key", key]);
         }
-        args.extend(["--", session_name, text]);
+        args.extend(["--", &session, text]);
         let label = flotilla_provider_runtime::command_channel_label(&self.binary, &args);
         // Inspect the raw process result. Runner/spawn errors must never be
         // mistaken for a daemon's explicit pre-write rejection, even if their
@@ -293,8 +304,8 @@ impl CleatTerminalPool {
             AttachMode::Strict => args.push(Arg::Literal("--strict".into())),
             AttachMode::Take => args.push(Arg::Literal("--take".into())),
         }
-        // Session names are UUIDs (attachable IDs) — always shell-safe, no quoting needed.
-        args.push(Arg::Literal(session_name.into()));
+        // Encoded session ids are filesystem-safe, and so shell-safe: no quoting needed.
+        args.push(Arg::Literal(cleat_id(session_name)));
         args
     }
 
@@ -332,11 +343,12 @@ impl CleatTerminalPool {
             .await?;
 
         let cwd = cwd.as_path().display().to_string();
+        let session = cleat_id(session_name);
         let mut args = vec!["launch"];
         if capability.env_clear {
             args.push("--env-clear");
         }
-        args.extend(["--json", "--record", session_name, "--cwd", &cwd]);
+        args.extend(["--json", "--record", &session, "--cwd", &cwd]);
         let argv = match program {
             SessionProgram::Declared(script) if capability.argv => Some(script),
             // A cleat older than CLEAT_NEW_REVISION would run the script through `$SHELL -lc`,
@@ -402,9 +414,12 @@ fn valid_recording_daemon(daemon: &DaemonInfo) -> bool {
 #[async_trait]
 impl TerminalPool for CleatTerminalPool {
     async fn retain_recovered_recording(&self, session_id: &str) -> Result<(), String> {
-        if session_id.is_empty() || session_id == "." || session_id == ".." || session_id.contains('/') {
+        if session_id.is_empty() {
             return Err("invalid recovered cleat session id".to_string());
         }
+        // The encoded id is one path component: never `.`, `..` or containing `/`.
+        let session_id = cleat_id(session_id);
+        let session_id = session_id.as_str();
         // The old ID may have recordings in more than one dead generation.
         for daemon in Self::dead_recording_daemons(self.runner.as_ref(), &self.binary).await? {
             self.runner
@@ -421,6 +436,7 @@ impl TerminalPool for CleatTerminalPool {
     async fn session_liveness(&self, session_id: &str) -> Result<TerminalSessionLiveness, String> {
         let output = run!(self.runner, &self.binary, &["list", "--json"], Path::new("/"))?;
         let sessions = Self::parse_list_output(&output)?;
+        let session_id = cleat_id(session_id);
         Ok(match sessions.into_iter().find(|session| session.id == session_id) {
             Some(SessionInfo { error: Some(reason), .. }) => TerminalSessionLiveness::Lost(reason),
             Some(_) => TerminalSessionLiveness::Running,
@@ -448,7 +464,8 @@ impl TerminalPool for CleatTerminalPool {
                     SessionStatus::Detached => flotilla_protocol::TerminalStatus::Disconnected,
                 };
                 TerminalSession {
-                    session_name: session.id,
+                    // A session flotilla did not name keeps cleat's id.
+                    session_name: decode_name_component(&session.id).unwrap_or(session.id),
                     status,
                     command: session_command(session.cmd, session.argv),
                     working_directory: session.cwd.map(ExecutionEnvironmentPath::new),
@@ -540,11 +557,12 @@ impl TerminalPool for CleatTerminalPool {
     }
 
     async fn kill_session(&self, session_name: &str) -> Result<(), String> {
-        run!(self.runner, &self.binary, &["kill", session_name], Path::new("/"))?;
+        run!(self.runner, &self.binary, &["kill", &cleat_id(session_name)], Path::new("/"))?;
         Ok(())
     }
 
     async fn ensure_recognizer(&self, session: &str, harness: &str) -> Result<(), String> {
+        let session = &cleat_id(session);
         let raw = run!(self.runner, &self.binary, &["inspect", session, "--json"], Path::new("/"))?;
         let inspection: serde_json::Value = serde_json::from_str(&raw).map_err(|error| error.to_string())?;
         if inspection.pointer("/recognizer/id").and_then(|id| id.as_str()) == Some(harness)
@@ -557,6 +575,7 @@ impl TerminalPool for CleatTerminalPool {
     }
 
     async fn abandoned_draft(&self, session: &str) -> Result<Option<String>, String> {
+        let session = &cleat_id(session);
         let raw = run!(self.runner, &self.binary, &["inspect", session, "--json"], Path::new("/"))?;
         let inspection: serde_json::Value = serde_json::from_str(&raw).map_err(|error| error.to_string())?;
         // No controller history also means quiet. Cleat rechecks this predicate
@@ -578,7 +597,8 @@ impl TerminalPool for CleatTerminalPool {
     async fn clear_draft(&self, session: &str, draft: &str) -> Result<bool, String> {
         // Bind the value to its option so a draft such as --help stays text.
         let draft = format!("--draft={draft}");
-        let args = ["clear-composer", session, &draft, "--controller-idle", "2m"];
+        let session = cleat_id(session);
+        let args = ["clear-composer", &session, &draft, "--controller-idle", "2m"];
         let label = flotilla_provider_runtime::command_channel_label(&self.binary, &args);
         let output = self.runner.run_output(&self.binary, &args, Path::new("/"), &label).await?;
         if output.success() {
@@ -591,7 +611,7 @@ impl TerminalPool for CleatTerminalPool {
     }
 
     async fn capture_screen(&self, session_name: &str) -> Result<Option<String>, String> {
-        run!(self.runner, &self.binary, &["capture", session_name], Path::new("/")).map(Some)
+        run!(self.runner, &self.binary, &["capture", &cleat_id(session_name)], Path::new("/")).map(Some)
     }
 
     async fn deliver(&self, session_name: &str, text: &str) -> Result<(), String> {
@@ -607,14 +627,19 @@ impl TerminalPool for CleatTerminalPool {
     }
 
     async fn operator_deliver(&self, session_name: &str, text: &str) -> Result<(), String> {
-        run!(self.runner, &self.binary, &["send", "--submit", "--", session_name, text], Path::new("/"))?;
+        run!(self.runner, &self.binary, &["send", "--submit", "--", &cleat_id(session_name), text], Path::new("/"))?;
         Ok(())
     }
 
     async fn type_without_submit(&self, session_name: &str, text: &str) -> Result<(), String> {
         // Cleat paste-encodes the text and sends no Enter; the controller fence keeps it off a
         // person's input.
-        run!(self.runner, &self.binary, &["send", "--paste", "--controller-idle", "2s", "--", session_name, text], Path::new("/"))?;
+        run!(
+            self.runner,
+            &self.binary,
+            &["send", "--paste", "--controller-idle", "2s", "--", &cleat_id(session_name), text],
+            Path::new("/")
+        )?;
         Ok(())
     }
 }
@@ -1539,3 +1564,7 @@ mod tests {
 #[cfg(test)]
 #[path = "cleat/environment_tests.rs"]
 mod environment_tests;
+
+#[cfg(test)]
+#[path = "cleat/session_names_tests.rs"]
+mod session_names_tests;
