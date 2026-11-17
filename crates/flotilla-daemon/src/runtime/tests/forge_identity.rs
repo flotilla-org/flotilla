@@ -72,6 +72,8 @@ struct LabForge {
     daemon: Arc<InProcessDaemon>,
     clones: RoutingCloneRuntime,
     url: String,
+    /// The lab forge's `https_url`, which a Repository on it names as its service.
+    service_url: String,
     head: String,
 }
 
@@ -179,6 +181,7 @@ async fn lab_forge() -> LabForge {
         daemon,
         clones: RoutingCloneRuntime { state: Arc::new(state) },
         url: format!("{origin}/lab/acme/widgets.git"),
+        service_url: format!("{origin}/lab"),
         head,
     };
     forge.map_identity(true);
@@ -201,6 +204,23 @@ async fn the_managed_clone_signs_in_as_the_daemon_and_fails_without_its_identity
     assert!(target.join(".git").is_dir());
     let config = fs::read_to_string(target.join(".git/config")).expect("clone config");
     assert!(!config.contains(LAB_TOKEN) && !config.contains("credential"), "{config}");
+    forge.running.shutdown().await;
+}
+
+// A fresh host has no checkout or clone of the repository to observe its default branch from.
+// What the Repository controller reads it from asks the forge's Git remote, as the daemon.
+#[tokio::test]
+async fn a_fresh_host_reads_a_forge_repositorys_default_branch_from_its_remote_as_the_daemon() {
+    let forge = lab_forge().await;
+    let resolver = super::super::forge_default_branches(&forge.clones.state);
+    let repository = flotilla_resources::ForgeIdentity { service_url: forge.service_url.clone(), repository: "acme/widgets".into() };
+
+    forge.map_identity(false);
+    let refused = resolver.default_branch(&repository).await.expect_err("an anonymous read is refused");
+    assert!(refused.contains("could not read Username"), "{refused}");
+
+    forge.map_identity(true);
+    assert_eq!(resolver.default_branch(&repository).await.expect("read as the daemon").as_deref(), Some("main"));
     forge.running.shutdown().await;
 }
 

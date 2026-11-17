@@ -27,6 +27,7 @@ impl Stage4aGitRunner {
         let remote_index = command_start
             + match &args[command_start..] {
                 ["ls-remote", "--heads" | "--refs", "origin", ..] => 2,
+                ["ls-remote", "--symref", _, "HEAD"] => 2,
                 ["fetch", "origin", ..] => 1,
                 _ => return None,
             };

@@ -223,6 +223,44 @@ impl ForgeDefaultBranchResolver for GhForgeDefaultBranchResolver {
     }
 }
 
+/// Any forge's default branch, as its Git remote advertises HEAD to the daemon's identity for the
+/// forge. A fresh host has no checkout or clone of a repository to observe it from, and a project
+/// is not ready to dispatch until its repositories' default branches resolve.
+pub(super) struct GitForgeDefaultBranchResolver {
+    daemon: Arc<InProcessDaemon>,
+    /// Successes by remote URL, kept as long as the GitHub resolver keeps its own.
+    resolved: StdMutex<HashMap<String, (tokio::time::Instant, String)>>,
+}
+
+impl GitForgeDefaultBranchResolver {
+    pub(super) fn new(daemon: Arc<InProcessDaemon>) -> Self {
+        Self { daemon, resolved: Default::default() }
+    }
+}
+
+#[async_trait]
+impl ForgeDefaultBranchResolver for GitForgeDefaultBranchResolver {
+    #[tracing::instrument(name = "repository_default_branch_git", skip_all)]
+    async fn default_branch(&self, forge: &ForgeIdentity) -> Result<Option<String>, String> {
+        let url = format!("{}/{}", forge.service_url.trim_end_matches('/'), forge.repository);
+        let now = tokio::time::Instant::now();
+        {
+            let mut resolved = self.resolved.lock().expect("default branch cache lock");
+            resolved.retain(|_, (expires, _)| *expires > now);
+            if let Some((_, branch)) = resolved.get(&url) {
+                return Ok(Some(branch.clone()));
+            }
+        }
+        let runner = self.daemon.local_forge_git_runner().ok_or("the local environment has no command runner")?;
+        let branch = flotilla_vcs::vcs::remote_default_branch(runner.as_ref(), &url).await?;
+        if let Some(branch) = &branch {
+            let expires = now + std::time::Duration::from_secs(6 * 60 * 60);
+            self.resolved.lock().expect("default branch cache lock").insert(url, (expires, branch.clone()));
+        }
+        Ok(branch)
+    }
+}
+
 /// The first resolver that knows the forge answers. A failing resolver does
 /// not hide a later one's answer; its error is reported only when none answers.
 pub(super) struct ChainedForgeDefaultBranchResolver(pub(super) Vec<Arc<dyn ForgeDefaultBranchResolver>>);

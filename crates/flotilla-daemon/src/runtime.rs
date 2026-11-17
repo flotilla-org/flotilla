@@ -55,7 +55,8 @@ use self::docker::DockerControllerRuntime;
 use self::environments::reconcile_provisioned_environments;
 use self::health::{apply_host_heartbeat_with_credentials, DaemonHealthIdentity, RuntimeHealth};
 use self::ports::{
-    ChainedForgeDefaultBranchResolver, GhForgeDefaultBranchResolver, RoutingCheckoutRuntime, RoutingCloneRuntime, RuntimeOperatorReconciler,
+    ChainedForgeDefaultBranchResolver, GhForgeDefaultBranchResolver, GitForgeDefaultBranchResolver, RoutingCheckoutRuntime,
+    RoutingCloneRuntime, RuntimeOperatorReconciler,
 };
 use self::seed::register_startup_resources;
 use self::state::ControllerRuntimeState;
@@ -749,6 +750,17 @@ impl Drop for DaemonRuntime {
     }
 }
 
+/// What the Repository controller reads a forge's default branch from: the dummy fleet's forge when
+/// configured, then GitHub's API for GitHub, then any forge's Git remote.
+fn forge_default_branches(state: &ControllerRuntimeState) -> Arc<dyn ForgeDefaultBranchResolver> {
+    let mut resolvers = Vec::from_iter(state.forge_default_branches.clone());
+    if let Some(runner) = state.daemon.local_command_runner() {
+        resolvers.push(Arc::new(GhForgeDefaultBranchResolver::new(runner)));
+    }
+    resolvers.push(Arc::new(GitForgeDefaultBranchResolver::new(Arc::clone(&state.daemon))));
+    Arc::new(ChainedForgeDefaultBranchResolver(resolvers))
+}
+
 fn spawn_controller_loops(
     state: Arc<ControllerRuntimeState>,
     provisioning: &ProvisioningLifecycles,
@@ -758,16 +770,7 @@ fn spawn_controller_loops(
 ) -> Vec<JoinHandle<()>> {
     let backend = state.daemon.resource_backend();
     let status_lifecycle_reads = state.daemon.lifecycle_reads();
-    let gh_default_branches = state
-        .daemon
-        .local_command_runner()
-        .map(|runner| Arc::new(GhForgeDefaultBranchResolver::new(runner)) as Arc<dyn ForgeDefaultBranchResolver>);
-    let forge_default_branch_resolver = match (state.forge_default_branches.clone(), gh_default_branches) {
-        (Some(first), Some(then)) => {
-            Some(Arc::new(ChainedForgeDefaultBranchResolver(vec![first, then])) as Arc<dyn ForgeDefaultBranchResolver>)
-        }
-        (first, then) => first.or(then),
-    };
+    let forge_default_branch_resolver = Some(forge_default_branches(&state));
     let namespace_string = namespace.to_string();
 
     macro_rules! controller {

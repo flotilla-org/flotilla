@@ -1,6 +1,7 @@
 //! Git's smart-HTTP transport for fetching, as Forgejo serves it: each forge's
 //! bare repositories under `<git_root>/<forge>/<owner>/<repo>.git`, reached at
-//! `<public_url>/<forge>/<owner>/<repo>.git`.
+//! `<public_url>/<forge>/<owner>/<repo>.git` or, as Forgejo also serves it,
+//! `<public_url>/<forge>/<owner>/<repo>`.
 //!
 //! Every request must sign in with HTTP Basic authentication as the forge's
 //! login, its token as the password. Without one, or with a wrong one, the
@@ -78,9 +79,11 @@ impl Repositories {
             return response;
         }
         let named = |part: &str| !part.is_empty() && !part.starts_with('.') && !part.contains(['/', '\\']);
-        let Some(name) = repo.strip_suffix(".git").filter(|name| named(owner) && named(name)) else {
+        // Forgejo serves a repository at its web path as well as at `.git`.
+        let name = repo.strip_suffix(".git").unwrap_or(repo);
+        if !named(owner) || !named(name) {
             return plain(StatusCode::NOT_FOUND, "no such repository");
-        };
+        }
         let project_root = self.root.join(forge);
         if !project_root.join(owner).join(format!("{name}.git")).is_dir() {
             return plain(StatusCode::NOT_FOUND, "no such repository");
@@ -101,7 +104,7 @@ impl Repositories {
             .env("GIT_HTTP_EXPORT_ALL", "1")
             .env("GIT_CONFIG_NOSYSTEM", "1")
             .env("GIT_CONFIG_GLOBAL", "/dev/null")
-            .env("PATH_INFO", format!("/{owner}/{repo}/{endpoint}"))
+            .env("PATH_INFO", format!("/{owner}/{name}.git/{endpoint}"))
             .env("REQUEST_METHOD", method)
             .env("QUERY_STRING", query)
             .env("REMOTE_USER", &settings.login)

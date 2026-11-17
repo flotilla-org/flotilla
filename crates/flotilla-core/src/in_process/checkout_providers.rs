@@ -259,6 +259,13 @@ impl CheckoutProviders {
         self.checkout_provider(env_id, checkout).await.map(|provider| Arc::clone(&provider.vcs))
     }
 
+    /// The local environment's runner for Git that reaches a forge without a checkout, signing in
+    /// as the daemon's identity for that forge, as local checkouts' Git does.
+    pub fn local_forge_git_runner(&self) -> Option<Arc<dyn flotilla_provider_runtime::CommandRunner>> {
+        let runner = self.environment_manager.environment_runner(&self.local_environment_id)?;
+        Some(super::with_forge_identities(runner, &self.forge_credentials))
+    }
+
     async fn provisioning_namespace(&self) -> String {
         self.provisioning_namespace.read().expect("provisioning namespace lock poisoned").clone()
     }
@@ -291,6 +298,10 @@ impl InProcessDaemon {
 
     pub async fn vcs_for_checkout(&self, env_id: &EnvironmentId, checkout: &Path) -> Result<Arc<dyn Vcs>, String> {
         self.checkout_providers.vcs_for_checkout(env_id, checkout).await
+    }
+
+    pub fn local_forge_git_runner(&self) -> Option<Arc<dyn flotilla_provider_runtime::CommandRunner>> {
+        self.checkout_providers.local_forge_git_runner()
     }
 
     pub(super) async fn execution_registry(

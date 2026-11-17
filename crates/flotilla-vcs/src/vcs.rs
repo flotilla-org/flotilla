@@ -150,6 +150,18 @@ pub enum CheckoutRemoval {
     PreservedCheckout { path: String, reason: CheckoutPreservationReason },
 }
 
+/// The branch the remote at `url` names as its HEAD, read without a clone through `runner`, which
+/// carries whatever identity the remote asks for; `None` when the remote names none.
+pub async fn remote_default_branch(runner: &dyn CommandRunner, url: &str) -> Result<Option<String>, String> {
+    let args = ["ls-remote", "--symref", url, "HEAD"];
+    let advertised = runner.run("git", &args, Path::new("/"), &command_channel_label("git", &args)).await?;
+    // `ref: refs/heads/main<TAB>HEAD` names the branch HEAD points at.
+    Ok(advertised.lines().find_map(|line| {
+        let (target, name) = line.strip_prefix("ref: ")?.split_once('\t')?;
+        (name == "HEAD").then(|| target.strip_prefix("refs/heads/")).flatten().map(str::to_owned)
+    }))
+}
+
 /// Prune expired checkout archives and interrupted staging directories beneath one Flotilla-owned archive root.
 pub async fn prune_checkout_archives(runner: &dyn CommandRunner, archive_root: &Path, retention_days: u64) -> Result<(), String> {
     if !runner.path_exists(archive_root).await? {
@@ -2686,6 +2698,26 @@ mod tests {
     use crate::fixture_path;
     use flotilla_replay_testkit as replay;
     use flotilla_replay_testkit::testing::TimeoutOnlyRunner;
+
+    // The remote's HEAD names its default branch, whatever it is called; a remote whose HEAD
+    // names no branch has none.
+    #[tokio::test]
+    async fn a_remotes_default_branch_is_the_branch_its_head_names() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let git = |args: &[&str]| {
+            let status = std::process::Command::new("git").args(args).current_dir(temp.path()).status().expect("git");
+            assert!(status.success(), "{args:?}");
+        };
+        git(&["init", "-q", "-b", "trunk", "source"]);
+        git(&["-C", "source", "-c", "user.name=t", "-c", "user.email=t@t", "commit", "-q", "--allow-empty", "-m", "seed"]);
+        git(&["clone", "-q", "--bare", "source", "remote.git"]);
+        let url = temp.path().join("remote.git").to_string_lossy().into_owned();
+        let runner = flotilla_provider_runtime::ProcessCommandRunner;
+        assert_eq!(remote_default_branch(&runner, &url).await.expect("ls-remote").as_deref(), Some("trunk"));
+
+        git(&["-C", "remote.git", "symbolic-ref", "HEAD", "refs/heads/absent"]);
+        assert_eq!(remote_default_branch(&runner, &url).await.expect("ls-remote"), None);
+    }
 
     // A subprocess double holds fetch open. Cache contention must not consume
     // its 60-second reader deadline. The detached writer retains exclusion

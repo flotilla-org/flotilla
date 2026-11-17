@@ -559,6 +559,11 @@ async fn forge_for_remote(
     Ok(matching.into_iter().next())
 }
 
+/// The local environment's runner, whose Git signs in to each forge as the daemon's identity for it.
+fn with_forge_identities(runner: Arc<dyn CommandRunner>, forge_credentials: &Arc<dyn GitHttpCredentials>) -> Arc<dyn CommandRunner> {
+    Arc::new(ForgeCredentialRunner::new(runner, Arc::clone(forge_credentials)))
+}
+
 #[allow(clippy::too_many_arguments)]
 async fn discover_vcs_for_checkout(
     environment_manager: &EnvironmentManager,
@@ -575,7 +580,7 @@ async fn discover_vcs_for_checkout(
         .ok_or_else(|| format!("command runner unavailable for environment {environment_id}"))?;
     // The daemon's forge identities live in this host's files; Git elsewhere cannot read them.
     if environment_id == local_environment_id {
-        runner = Arc::new(ForgeCredentialRunner::new(runner, Arc::clone(forge_credentials)));
+        runner = with_forge_identities(runner, forge_credentials);
     }
     let host_bag = environment_manager
         .environment_bag(environment_id)
