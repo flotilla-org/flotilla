@@ -412,7 +412,8 @@ fn opening_adds(column: &ColumnDef) -> bool {
 
 /// Refuses a kind table whose columns differ from its kind's: the backend's own columns (`id` and
 /// `version` on the root, the parent key below it), and the key and data columns. Order is not
-/// compared: statements name their columns, and an additive upgrade (`ADD COLUMN`) appends.
+/// compared: statements name their columns, and a table an earlier build altered appends. A
+/// column opening adds is added by [`check_kind_codes`]' rebuild, which runs first.
 pub(crate) fn check_kind_columns(conn: &Connection, kinds: &KindRegistry) -> Result<(), StoreError> {
     let mut statement = conn.prepare("SELECT name FROM pragma_table_info(?1) ORDER BY cid")?;
     for set in kinds.iter() {
@@ -422,16 +423,7 @@ pub(crate) fn check_kind_columns(conn: &Connection, kinds: &KindRegistry) -> Res
                 Some(_) => vec![set.parent_key_column().to_owned()],
             };
             expected.extend(table.key.iter().chain(&table.columns).map(|column| column.name.clone()));
-            let mut found = statement.query_map([&table.name], |row| row.get(0))?.collect::<rusqlite::Result<Vec<String>>>()?;
-            // ADR 0047 N→N+1: a missing data column opening may add ([`opening_adds`]); no
-            // broader migration policy. Remove each declared default one roll after its field
-            // lands. The open transaction rolls this back if any other drift remains.
-            for column in &table.columns {
-                if !found.contains(&column.name) && opening_adds(column) {
-                    conn.execute_batch(&format!("ALTER TABLE {} ADD COLUMN {};", quote_ident(&table.name), crate::ddl::column(column)))?;
-                    found.push(column.name.clone());
-                }
-            }
+            let found = statement.query_map([&table.name], |row| row.get(0))?.collect::<rusqlite::Result<Vec<String>>>()?;
             if found.iter().collect::<BTreeSet<_>>() != expected.iter().collect::<BTreeSet<_>>() {
                 return Err(StoreError::KindTableDrift { table: table.name.clone(), expected, found });
             }
@@ -444,12 +436,13 @@ pub(crate) fn check_kind_columns(conn: &Connection, kinds: &KindRegistry) -> Res
 /// a CHECK in place, so a table whose stored code lists are each a subset of its kind's, at least
 /// one strictly, and which is otherwise exactly the table this build renders, is rebuilt with the
 /// current definition by [`widen_table`]. "Otherwise exactly" is an exact match of the stored
-/// `CREATE TABLE` text, less only the columns [`check_kind_columns`] may add ([`opening_adds`]),
-/// which the rebuild adds as NULL or with their default; it runs first, so a
-/// table needing both is widened rather than refused. A table whose text an earlier `ALTER TABLE`
-/// changed is not widened: it refuses with [`StoreError::KindCodeDrift`]. A table whose stored
-/// text differs only in holding NOT NULL on columns this build declares nullable is widened the
-/// same way (ADR 0047 N→N+1), with or without missing codes.
+/// `CREATE TABLE` text. A table whose stored text differs only in holding NOT NULL on columns this
+/// build declares nullable is widened the same way (ADR 0047 N→N+1), with or without missing codes.
+///
+/// Two more tables are rebuilt to this build's text (ADR 0047 N→N+1), whatever their codes: one
+/// lacking only columns opening adds ([`opening_adds`]), which the rebuild adds as NULL or with
+/// their default, and one an earlier build's opening altered by `ADD COLUMN` ([`added_in_place`]),
+/// whose text, and lost CHECKs, would otherwise stop it from ever widening.
 ///
 /// Any other difference refuses: a stored code the kind no longer declares, a missing code in a
 /// table that differs in more than its codes, or a coded column whose CHECK cannot be read, which
@@ -504,6 +497,20 @@ pub(crate) fn check_kind_codes(conn: &Connection, kinds: &KindRegistry) -> Resul
                 }
             }
             let nullability_widens = was_required != stored_table && crate::ddl::create_table(set, &was_required, "") == sql;
+            // A table lacking only columns opening adds is rebuilt with them (ADR 0047 N→N+1),
+            // never altered in place: `ADD COLUMN` would leave text this build does not render.
+            let absent: Vec<&ColumnDef> = table.columns.iter().filter(|column| !present.contains(&column.name)).collect();
+            let lacks_columns = !absent.is_empty() && absent.iter().all(|column| opening_adds(column));
+            // A table an earlier build's `ADD COLUMN` changed is rebuilt once to this build's text.
+            let altered = absent.is_empty()
+                && !nullability_widens
+                && crate::ddl::create_table(set, &stored_table, "") != sql
+                && added_in_place(set, &stored_table, &present, &sql);
+            if lacks_columns || altered {
+                widen_table(conn, set, table, &present)?;
+                tables = stored_schema(conn, "table")?;
+                continue;
+            }
             let Some((column, missing)) = missing else {
                 if nullability_widens {
                     widen_table(conn, set, table, &present)?;
@@ -571,6 +578,38 @@ fn widen_table(conn: &Connection, set: &TableSet, table: &Table, present: &[Stri
         return Err(StoreError::KindCodeWidening { table: table.name.clone(), violations });
     }
     Ok(())
+}
+
+/// Whether `sql`, a stored table's text, is `table` (as this build renders it with the stored
+/// codes) as an earlier build's opening left it: created without its last columns in `present`
+/// (the order the table stores them), each one opening adds, and then given each by `ADD COLUMN`.
+/// The earlier statements are replayed on an empty database, so the comparison is SQLite's own
+/// edit of the text, which also drops the table CHECKs an `ADD COLUMN` cannot add.
+fn added_in_place(set: &TableSet, table: &Table, present: &[String], sql: &str) -> bool {
+    let mut added = Vec::new();
+    for name in present.iter().rev() {
+        let Some(column) = table.columns.iter().find(|column| &column.name == name).filter(|column| opening_adds(column)) else {
+            break;
+        };
+        added.insert(0, column);
+        let created = Table {
+            columns: table.columns.iter().filter(|kept| !added.iter().any(|column| column.name == kept.name)).cloned().collect(),
+            ..table.clone()
+        };
+        // A table these columns' CHECKs need cannot have been created without them: no match.
+        let replayed = || -> rusqlite::Result<String> {
+            let replay = Connection::open_in_memory()?;
+            replay.execute_batch(&crate::ddl::create_table(set, &created, ""))?;
+            for column in &added {
+                replay.execute_batch(&format!("ALTER TABLE {} ADD COLUMN {};", quote_ident(&table.name), crate::ddl::column(column)))?;
+            }
+            replay.query_row("SELECT sql FROM sqlite_schema WHERE type = 'table' AND name = ?1", [&table.name], |row| row.get(0))
+        };
+        if replayed().is_ok_and(|replayed| replayed == sql) {
+            return true;
+        }
+    }
+    false
 }
 
 /// Shared progress views use the same sync-on-open policy as kind views.

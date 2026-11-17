@@ -282,8 +282,8 @@ impl Store {
         if !has_string_domain(&tx)? {
             return Err(StoreError::LegacyDictionarySchema);
         }
-        // Codes first: a widened table is rebuilt with every column, so it needs no `ADD COLUMN`,
-        // whose change to the stored text would stop the table from widening.
+        // Codes first: a table lacking a column opening adds is rebuilt there with every column,
+        // which the column check then finds.
         check_kind_codes(&tx, &kinds)?;
         check_kind_columns(&tx, &kinds)?;
         sync_indexes(&tx, &kinds)?;

@@ -301,7 +301,46 @@ fn a_store_missing_a_nullable_column_gains_it_at_open() {
         .collect::<Result<_, _>>()
         .expect("conditions");
     assert_eq!(held, [false, true]);
+    assert_eq!(table_sql(&conn, "message"), rendered(&registry().expect("registry"), "message"), "rebuilt, not altered");
     Store::open(conn, HOME, registry().expect("registry")).expect("reopens unchanged");
+}
+
+/// `table`'s stored `CREATE TABLE` text.
+fn table_sql(conn: &Connection, table: &str) -> String {
+    conn.query_row("SELECT sql FROM sqlite_schema WHERE type = 'table' AND name = ?1", [table], |row| row.get(0)).expect("table")
+}
+
+/// `table`'s `CREATE TABLE` text as `kinds` renders it.
+fn rendered(kinds: &KindRegistry, table: &str) -> String {
+    let ddl = schema_ddl(kinds, DdlMode::Create);
+    let start = ddl.find(&format!("CREATE TABLE \"{table}\" (")).expect("rendered table");
+    let end = start + ddl[start..].find(";\n").expect("end of table");
+    ddl[start..end].to_owned()
+}
+
+// Behaviour (ADR 0047 N→N+1): an earlier build's opening added a missing column with `ALTER TABLE
+// … ADD COLUMN`, which left text it does not render and dropped the table's CHECKs. Opening
+// rebuilds that table once to the text it renders, keeping every row and its children, and a
+// later build's new codes then widen it instead of being refused as drift.
+#[test]
+fn a_table_an_earlier_open_altered_is_rebuilt_and_later_widens() {
+    let (conn, earlier, earlier_id) = predating(registry_without_services(), "delivery_condition");
+    // The statement an earlier opening ran for the missing column.
+    conn.execute_batch(r#"ALTER TABLE "message" ADD COLUMN "delivery_condition" INTEGER REFERENCES "strings" ("id");"#)
+        .expect("the earlier opening's ADD COLUMN");
+    assert_ne!(table_sql(&conn, "message"), rendered(&registry_without_services(), "message"));
+    let references = count(&conn, "message_references");
+
+    let store = Store::open(conn, HOME, registry_without_services()).expect("rebuilt to its text");
+    let conn = store.into_connection();
+    assert_eq!(table_sql(&conn, "message"), rendered(&registry_without_services(), "message"));
+    assert_eq!((count(&conn, "message"), count(&conn, "message_references")), (1, references));
+
+    let mut store = Store::open(conn, HOME, registry().expect("registry")).expect("a later build's codes widen it");
+    let loaded = store.read().expect("read").load::<Resource<Message>>(earlier_id).expect("load").expect("kept").value;
+    assert_eq!(loaded, earlier);
+    insert(&mut store, &message("service", ConsumerKind::Service, Relation::Dependency)).expect("a Service's message is written");
+    assert_eq!(table_sql(&store.into_connection(), "message"), rendered(&registry().expect("registry"), "message"));
 }
 
 // Behaviour (ADR 0047 N→N+1): a table that both lacks a nullable column and lacks codes is
