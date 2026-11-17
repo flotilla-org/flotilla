@@ -400,12 +400,11 @@ impl<T: Resource> ReplicaReadResolver<T> {
             return backend.get_including_replicas_typed::<T>(&self.namespace, name).await;
         }
         if T::REPLICATION_CLASS == crate::ReplicationClass::Definitions {
-            return self
-                .backend
-                .definitions::<T>(&self.namespace)
-                .get(name)
-                .await
-                .map(|object| ReadResourceObject { object, provenance: ResourceProvenance::Local });
+            let definitions = self.backend.definitions::<T>(&self.namespace);
+            if let Some(read) = definitions.engine_resolved(name).await {
+                return read;
+            }
+            return definitions.get(name).await.map(|object| ReadResourceObject { object, provenance: ResourceProvenance::Local });
         }
         match self.backend.using::<T>(&self.namespace).get(name).await {
             Ok(object) => Ok(ReadResourceObject { object, provenance: ResourceProvenance::Local }),
@@ -469,9 +468,11 @@ impl<T: Resource> ReplicaReadResolver<T> {
             return backend.list_including_replicas_typed::<T>(&self.namespace).await;
         }
         if T::REPLICATION_CLASS == crate::ReplicationClass::Definitions {
-            let items = self
-                .backend
-                .definitions::<T>(&self.namespace)
+            let definitions = self.backend.definitions::<T>(&self.namespace);
+            if let Some(reads) = definitions.engine_resolved_list().await {
+                return reads.map(|items| ReadResourceList { items });
+            }
+            let items = definitions
                 .list()
                 .await?
                 .into_iter()
@@ -923,10 +924,10 @@ impl<T: Resource> TypedResolver<T> {
     }
 
     /// Why `verb` on `name` fails when this home holds no copy: other homes' copies, named,
-    /// since only a record's home writes it; otherwise not found.
+    /// since only a record's home writes it, a definition's too; otherwise not found.
     pub(crate) async fn not_held_here(&self, name: &str, verb: &str) -> Result<ResourceError, ResourceError> {
         self.refuse_engine_write_elsewhere()?;
-        let Some(records) = self.engine_owned() else {
+        let Some(records) = self.backend.engine_records::<T>() else {
             return Ok(ResourceError::not_found(name));
         };
         let copies = crate::port_reads::copies(&*records, name).await.map_err(ResourceError::other)?;

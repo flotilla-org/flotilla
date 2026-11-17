@@ -222,12 +222,7 @@ impl<T: Resource> DefinitionResolver<T> {
     fn reads(&self, home: &str, listed: Vec<Record<T>>, name: Option<&str>) -> Result<Vec<ReadResourceObject<T>>, ResourceError> {
         let mut reads = Vec::with_capacity(listed.len());
         for record in listed {
-            let provenance = if record.home == home {
-                ResourceProvenance::Local
-            } else {
-                ResourceProvenance::Replica { origin_root: NodeId::new(record.home.clone()), last_synced_at: Utc::now() }
-            };
-            reads.push(ReadResourceObject { object: self.object(record), provenance });
+            reads.push(self.read(home, record));
         }
         let builtins = builtin_objects::<T>(T::API_PATHS.kind, &self.namespace)?;
         reads.extend(
@@ -237,6 +232,45 @@ impl<T: Resource> DefinitionResolver<T> {
                 .map(|object| ReadResourceObject { object, provenance: ResourceProvenance::Local }),
         );
         Ok(reads)
+    }
+
+    /// `record` as a read: this home's as local, another home's as a replica of that home.
+    fn read(&self, home: &str, record: Record<T>) -> ReadResourceObject<T> {
+        let provenance = if record.home == home {
+            ResourceProvenance::Local
+        } else {
+            ResourceProvenance::Replica { origin_root: NodeId::new(record.home.clone()), last_synced_at: Utc::now() }
+        };
+        ReadResourceObject { object: self.object(record), provenance }
+    }
+
+    /// The record `name` [`Self::get`] reads, with its home as provenance: a definition is
+    /// written at its home, so an edit of it is routed there. `None` unless the kind is served by
+    /// the engine.
+    pub(crate) async fn engine_resolved(&self, name: &str) -> Option<Result<ReadResourceObject<T>, ResourceError>> {
+        let records = self.records()?;
+        if flotilla_resources::builtins::is_builtin(T::API_PATHS.kind, name) || !self.holds_engine_records() {
+            return Some(self.get(name).await.map(|object| ReadResourceObject { object, provenance: ResourceProvenance::Local }));
+        }
+        Some(match port_reads::get(&*records, name).await {
+            Ok(Some(record)) => Ok(self.read(&records.home(), record)),
+            Ok(None) => Err(ResourceError::not_found(name)),
+            Err(error) => Err(ResourceError::other(error)),
+        })
+    }
+
+    /// The records [`Self::list`] reads, each with its home as provenance, and the built-ins as
+    /// local. `None` unless the kind is served by the engine.
+    pub(crate) async fn engine_resolved_list(&self) -> Option<Result<Vec<ReadResourceObject<T>>, ResourceError>> {
+        let records = self.records()?;
+        let listed = match self.holds_engine_records() {
+            false => Vec::new(),
+            true => match port_reads::list(&*records).await {
+                Ok(listed) => listed,
+                Err(error) => return Some(Err(ResourceError::other(error))),
+            },
+        };
+        Some(self.reads(&records.home(), listed, None))
     }
 
     /// The engine's records of this kind as a watch: the current reads, then each change of any
@@ -426,14 +460,7 @@ impl<T: Resource> DefinitionResolver<T> {
     fn read_of(&self, home: &str, record: &Record<T>, stamp: &RecordStamp, seen: &SeenReads<T>) -> ReadResourceObject<T> {
         match seen.reads.get(&record.name) {
             Some((Some(before), read)) if before == stamp => clone_read(read),
-            _ => {
-                let provenance = if record.home == home {
-                    ResourceProvenance::Local
-                } else {
-                    ResourceProvenance::Replica { origin_root: NodeId::new(record.home.clone()), last_synced_at: Utc::now() }
-                };
-                ReadResourceObject { object: self.object(record.clone()), provenance }
-            }
+            _ => self.read(home, record.clone()),
         }
     }
 

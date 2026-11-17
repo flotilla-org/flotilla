@@ -75,7 +75,7 @@ use flotilla_resources::{
     CrewWorkPhase, CrewWorkState, FulfilmentKind, FulfilmentKindSpec, Host, HostSpec, HostStatus, InputMeta, Message, RepositoryKey,
     Resource, ResourceError, ResourceProvenance, Selector, SystemClock, TerminalBrief, TerminalCrewContext, TerminalSession,
     TerminalSessionSource, TerminalSessionSpec, Vessel, VesselRequirement, WorkPhase as ResourceWorkPhase, WorkState, WorkflowSnapshot,
-    WorkflowTemplate, AGENT_ADAPTERS_CAPABILITY, HELD_CREDENTIALS_CAPABILITY, ROLE_LABEL,
+    WorkflowTemplate, WorkflowTemplateSpec, AGENT_ADAPTERS_CAPABILITY, HELD_CREDENTIALS_CAPABILITY, ROLE_LABEL,
 };
 use flotilla_store::off_frame;
 use flotilla_store::{controller::ControllerLoop, ResourceBackend};
@@ -2379,6 +2379,93 @@ async fn resource_mutations_targeting_a_peer_modify_only_the_peer_store() {
         ),
         "peer-targeted delete should remove the resource from the peer store"
     );
+}
+
+/// A ResourceApply or ResourceDelete of `template`, addressed to no host.
+fn template_mutation(namespace: &str, name: &str, delete: bool) -> Command {
+    let action = if delete {
+        CommandAction::ResourceDelete {
+            namespace: namespace.to_string(),
+            kind: "workflowtemplates".to_string(),
+            name: name.to_string(),
+            replica_origin: None,
+        }
+    } else {
+        CommandAction::ResourceApply {
+            namespace: namespace.to_string(),
+            document: serde_json::json!({
+                "kind": "WorkflowTemplate",
+                "metadata": {"name": name},
+                "spec": {"vessels": [], "repository_refs": ["edited"]},
+            }),
+        }
+    };
+    Command::builder().action(action).build()
+}
+
+// A definition is written at its home (#3108): an edit or delete issued at another host, addressed
+// to no host, runs at the definition's home and writes nothing where it was issued; with its home
+// unreachable, it is refused.
+#[tokio::test]
+async fn definition_mutations_from_another_host_run_at_its_home() {
+    let leader = empty_daemon_named("leader").await;
+    let follower = empty_daemon_named("follower").await;
+    let topology = spawn_in_memory_request_topology_stateful(leader, follower).await.expect("spawn stateful topology");
+    let namespace = "flotilla";
+    let (leader, follower) = (&topology.leader, &topology.follower);
+    let decided = leader.decided_store().expect("leader decided store");
+    let spec: WorkflowTemplateSpec = serde_json::from_value(serde_json::json!({"vessels": []})).expect("template spec");
+    let held_here = |name: &'static str| async move {
+        !matches!(leader.resource_backend().using::<WorkflowTemplate>(namespace).get(name).await, Err(ResourceError::NotFound { .. }))
+    };
+
+    follower
+        .resource_backend()
+        .definitions::<WorkflowTemplate>(namespace)
+        .apply(&InputMeta::builder().name("homed-template".to_string()).build(), &spec)
+        .await
+        .expect("declare the template at its home");
+    flotilla_provisioning_testkit::replicate_home(
+        &follower.decided_store().expect("home decided store"),
+        follower.node_id().as_str(),
+        &decided,
+    );
+    let read = leader.resource_backend().including_replicas::<WorkflowTemplate>(namespace).get("homed-template").await.expect("replica");
+    assert!(matches!(&read.provenance, ResourceProvenance::Replica { origin_root, .. } if origin_root == follower.node_id()));
+
+    let mut events = leader.subscribe();
+    let id = topology.client.execute(template_mutation(namespace, "homed-template", false)).await.expect("dispatch the edit");
+    let (node, result) = await_command_finished(&mut events, id).await;
+    assert_eq!(node, *follower.node_id());
+    assert!(matches!(result, CommandValue::ResourceObject(_)), "{result:?}");
+    let edited = follower.resource_backend().definitions::<WorkflowTemplate>(namespace).get("homed-template").await.expect("home's copy");
+    assert_eq!(edited.spec.repository_refs, Some(vec![RepositoryKey("edited".to_string())]));
+    assert!(!held_here("homed-template").await, "the edit wrote no copy where it was issued");
+
+    let id = topology.client.execute(template_mutation(namespace, "homed-template", true)).await.expect("dispatch the delete");
+    let (node, result) = await_command_finished(&mut events, id).await;
+    assert_eq!(node, *follower.node_id());
+    assert!(matches!(result, CommandValue::ResourceDeleted(_)), "{result:?}");
+    assert!(matches!(
+        follower.resource_backend().definitions::<WorkflowTemplate>(namespace).get("homed-template").await,
+        Err(ResourceError::NotFound { .. })
+    ));
+
+    // Feta, which no peer of this mesh reaches, declared this one.
+    let feta = flotilla_provisioning_testkit::other_home_for(&decided, "feta-root");
+    feta.definition::<WorkflowTemplate>("stranded-template", &spec).await;
+    feta.replicate_to(&decided);
+    for delete in [false, true] {
+        let error = topology
+            .client
+            .execute(template_mutation(namespace, "stranded-template", delete))
+            .await
+            .expect_err("an unreachable home refuses the mutation");
+        assert!(error.starts_with("resource origin feta-root is unreachable"), "{error}");
+    }
+    assert!(!held_here("stranded-template").await, "the refused edit wrote no copy here");
+    let read = leader.resource_backend().including_replicas::<WorkflowTemplate>(namespace).get("stranded-template").await.expect("kept");
+    assert_eq!(read.object.spec, spec, "feta's declaration stands");
 }
 
 #[tokio::test]

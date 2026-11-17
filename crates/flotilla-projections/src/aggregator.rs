@@ -4296,6 +4296,54 @@ mod tests {
         let _ = run.await;
     }
 
+    // A role another home declares is seeded under that home, as its events name it (#3108): when
+    // its home deletes it, the role is withdrawn here too.
+    #[tokio::test]
+    async fn a_role_another_home_declares_is_withdrawn_when_that_home_deletes_it() {
+        let durable = flotilla_provisioning_testkit::EngineBackend::open("kiwi-root");
+        let feta = durable.other_home("feta-root");
+        let ensure = convoy_ensure_object("governor").await;
+        feta.definition::<ConvoyEnsure>(&ensure.metadata.name, &ensure.spec).await;
+        durable.receive(&feta);
+        // Its convoys on the engine too, as the daemon composes them.
+        let _convoys = flotilla_engine_convoys_testkit::EngineConvoysHome::over(
+            &durable.service,
+            "flotilla",
+            &durable.backend,
+            Arc::new(flotilla_resources::SystemClock),
+            durable.reads(),
+        );
+
+        let state = AggregatorProjectionState::new();
+        let (event_tx, _) = broadcast::channel(64);
+        let resolvers = namespace_resolvers(&durable);
+        let run = tokio::spawn(Aggregator::new(state.clone(), HostName::new("kiwi"), event_tx).run(resolvers));
+        let roles = |state: AggregatorProjectionState| async move {
+            let set = state.result_set_for(&QueryId::StandingRoles { scope: None }).await.expect("standing roles");
+            set.rows.as_standing_roles().expect("standing role rows").iter().map(|row| row.role.clone()).collect::<Vec<_>>()
+        };
+        timeout(Duration::from_secs(5), async {
+            while roles(state.clone()).await != ["governor"] {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("feta's role is declared here");
+
+        feta.delete_definition::<ConvoyEnsure>(&ensure.metadata.name).await;
+        flotilla_provisioning_testkit::replicate_home_tail(feta.service(), feta.home(), &durable.service);
+        timeout(Duration::from_secs(5), async {
+            while !roles(state.clone()).await.is_empty() {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("feta's deletion withdraws its role here");
+
+        run.abort();
+        let _ = run.await;
+    }
+
     fn namespace_resolvers(durable: &ResourceBackend) -> AggregatorResolvers {
         AggregatorResolvers::builder()
             .durable_convoys(durable.including_replicas::<Convoy>("flotilla"))

@@ -383,6 +383,59 @@ async fn an_apply_stamped_with_a_root_another_home_holds_is_refused() {
     assert_manifest(&forges.get("lab").await.expect("get"), "r1");
 }
 
+// Behaviour (#3108): a definition is written at its home. Another home reads it as that home's,
+// by name and in a listing, and refuses an apply or delete of it there, naming the home, instead
+// of writing a copy of its own or finding nothing to delete; its home writes it.
+#[tokio::test]
+async fn another_homes_definition_reads_as_that_homes_and_is_written_only_there() {
+    use flotilla_resources::{ResourceError, ResourceProvenance};
+    use flotilla_store::{apply_resource_document, delete_resource_kind};
+
+    let directory = tempfile::tempdir().expect("temp dir");
+    let open = |home: &str| {
+        let mut kinds = flotilla_schema::KindRegistry::new();
+        flotilla_provisioning::stored::definition::register(&mut kinds).expect("register");
+        flotilla_provisioning::stored::manifest_root::register(&mut kinds).expect("register roots");
+        flotilla_provisioning::stored::repository::register(&mut kinds).expect("register repositories");
+        flotilla_provisioning::stored::project::register(&mut kinds).expect("register projects");
+        let service = Arc::new(Service::open(&directory.path().join(format!("{home}.sqlite")), home, kinds).expect("store"));
+        let backend = ResourceBackend::new(InMemoryBackend::default());
+        backend.install_engine_records(Arc::new(
+            EngineDefinitions::open(Arc::clone(&service), Arc::new(SystemClock) as Arc<dyn Clock>).expect("open"),
+        ));
+        (service, backend)
+    };
+    let (alpha, alpha_backend) = open("alpha");
+    let (beta, beta_backend) = open("beta");
+    let document = |repository: &str| {
+        serde_json::json!({
+            "kind": "WorkflowTemplate",
+            "metadata": {"name": "homed"},
+            "spec": {"vessels": [], "repository_refs": [repository]},
+        })
+    };
+    apply_resource_document(&beta_backend, NS, document("first")).await.expect("declared at its home");
+    flotilla_provisioning_testkit::replicate_home(&beta, "beta", &alpha);
+
+    let beta_root = flotilla_protocol::NodeId::new("beta");
+    let read = alpha_backend.including_replicas::<WorkflowTemplate>(NS).get("homed").await.expect("read here");
+    assert!(matches!(&read.provenance, ResourceProvenance::Replica { origin_root, .. } if *origin_root == beta_root), "{read:?}");
+    let listed = alpha_backend.including_replicas::<WorkflowTemplate>(NS).list().await.expect("list here");
+    let homed = listed.items.iter().find(|item| item.object.metadata.name == "homed").expect("listed");
+    assert!(matches!(&homed.provenance, ResourceProvenance::Replica { origin_root, .. } if *origin_root == beta_root));
+
+    let refused = apply_resource_document(&alpha_backend, NS, document("second")).await.expect_err("not this home's to write");
+    assert!(refused.to_string().contains("WorkflowTemplate homed is homed at `beta`; write it there"), "{refused}");
+    let refused = delete_resource_kind(&alpha_backend, NS, "workflowtemplates", "homed").await.expect_err("not this home's to delete");
+    assert!(refused.to_string().contains("WorkflowTemplate homed is homed at `beta`; delete it there"), "{refused}");
+    assert!(matches!(alpha_backend.using::<WorkflowTemplate>(NS).get("homed").await, Err(ResourceError::NotFound { .. })));
+
+    apply_resource_document(&beta_backend, NS, document("second")).await.expect("its home edits it");
+    let edited = beta_backend.definitions::<WorkflowTemplate>(NS).get("homed").await.expect("home's copy");
+    assert_eq!(edited.spec.repository_refs, Some(vec![flotilla_resources::RepositoryKey("second".into())]));
+    delete_resource_kind(&beta_backend, NS, "workflowtemplates", "homed").await.expect("its home deletes it");
+}
+
 // Behaviour (#3108 item B): every watcher of the definitions on a daemon is woken by one shared
 // follower. Each watcher gets the tick for a write after it subscribed, and once every watcher has
 // gone a new one is still woken.

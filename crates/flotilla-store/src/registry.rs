@@ -1295,8 +1295,12 @@ async fn apply_typed<T: Resource>(
     let spec = serde_json::from_value::<T::Spec>(spec)
         .map_err(|error| ResourceError::decode(format!("decode {} spec: {error}", T::API_PATHS.kind)))?;
     if T::REPLICATION_CLASS == crate::ReplicationClass::Definitions {
-        let meta = match backend.definitions::<T>(namespace).get(&metadata.name).await {
-            Ok(existing) => metadata.input_meta_for_update(&existing.metadata),
+        let meta = match backend.including_replicas::<T>(namespace).get(&metadata.name).await {
+            Ok(existing) if matches!(existing.provenance, ResourceProvenance::Local) => {
+                metadata.input_meta_for_update(&existing.object.metadata)
+            }
+            // A definition another home holds is that home's to write, not a new record here.
+            Ok(_) => return Err(backend.using::<T>(namespace).not_held_here(&metadata.name, "write").await?),
             Err(ResourceError::NotFound { .. }) => metadata.input_meta_for_create(),
             Err(error) => return Err(error),
         };

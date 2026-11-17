@@ -119,6 +119,15 @@ impl OtherHome {
         KindRecords::<R>::apply(&definitions, name, &Default::default(), annotations, spec).await.expect("write definition at its home");
     }
 
+    /// Deletes definition `name` of kind `R` here, as this home's operator would.
+    pub async fn delete_definition<R: Resource>(&self, name: &str)
+    where
+        EngineDefinitions: KindRecords<R>,
+    {
+        let definitions = EngineDefinitions::open(Arc::clone(&self.service), Arc::new(SystemClock)).expect("other home definitions");
+        KindRecords::<R>::delete(&definitions, name).await.expect("delete definition at its home");
+    }
+
     /// Sends everything this home holds to `target`, heard now.
     pub fn replicate_to(&self, target: &Service) {
         self.replicate_to_at(target, Utc::now());
