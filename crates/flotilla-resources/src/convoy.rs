@@ -2616,9 +2616,6 @@ impl StatusPatch<ConvoyStatus> for ConvoyStatusPatch {
                 });
             }
             Self::HandoffCrewWork { vessel, sender_role, target_role, handed_off_at, message } => {
-                if status.crew_work.get(vessel).is_some_and(|crew| crew.contains_key(target_role)) {
-                    promises::handoff(status, vessel, sender_role, target_role);
-                }
                 if let Some(work) = status.work.get_mut(vessel) {
                     work.completion_authority = WorkCompletionAuthority::CrewRollup;
                 }

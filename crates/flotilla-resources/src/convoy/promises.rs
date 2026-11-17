@@ -344,58 +344,9 @@ pub fn apply(status: &mut ConvoyStatus, vessel: &str, role: &str, operation: &Pr
     }
 }
 
-/// Open obligations follow the work. Finished history stays with its owner.
-pub fn handoff(status: &mut ConvoyStatus, vessel: &str, sender: &str, target: &str) {
-    if sender == target {
-        return;
-    }
-    let Some(crew) = status.promises.get_mut(vessel) else {
-        return;
-    };
-    let Some(promises) = crew.get_mut(sender) else {
-        return;
-    };
-    let mut moving = Vec::new();
-    promises.retain(|promise| {
-        if promise.state.terminal() {
-            true
-        } else {
-            moving.push(promise.clone());
-            false
-        }
-    });
-    let target_promises = crew.entry(target.into()).or_default();
-    for mut promise in moving {
-        if promise.kind == PromiseKind::DecisionLedger {
-            for submission in &mut promise.submissions {
-                submission.metadata.entry("producer".into()).or_insert_with(|| sender.into());
-            }
-        }
-        if target_promises.iter().any(|p| p.id == promise.id) {
-            let original = promise.id.clone();
-            let mut sequence = 1;
-            loop {
-                promise.id = handoff_id(sender, &original, sequence);
-                if !target_promises.iter().any(|p| p.id == promise.id) {
-                    break;
-                }
-                sequence += 1;
-            }
-        }
-        promise.role = target.into();
-        target_promises.push(promise);
-    }
-}
-
-/// Handoff renames an ID that collides at the target to
-/// `handoff/{sender}/{original}/{sequence}`. [`handoff_origin`] is its inverse;
-/// keep the two together.
-fn handoff_id(sender: &str, original: &str, sequence: u32) -> String {
-    format!("handoff/{sender}/{original}/{sequence}")
-}
-
-/// The ID a handoff rename wrapped, one level deep. Role names contain no `/`,
-/// so the sender is the first segment and the sequence the last.
+/// The ID an old-store handoff's rename (`handoff/{sender}/{original}/{sequence}`) wrapped, one
+/// level deep, as statuses stored before the engine's Reassign still hold. Role names contain no
+/// `/`, so the sender is the first segment and the sequence the last.
 fn handoff_origin(id: &str) -> Option<&str> {
     let (_sender, rest) = id.strip_prefix("handoff/")?.split_once('/')?;
     rest.rsplit_once('/').map(|(original, _sequence)| original)
@@ -1337,26 +1288,6 @@ mod tests {
         apply(&mut status, "work", "coder", &enriched);
         assert!(owned(&status, "work", "coder")[0].submissions[0].verdict.as_ref().unwrap().accepted);
     }
-    // ADR 0061: handoff carries unfinished obligations without losing source,
-    // attempts or completed history, including colliding role-local identifiers.
-    #[test]
-    fn handoff_moves_open_promises_and_retains_history() {
-        let mut status = ConvoyStatus::default();
-        apply(&mut status, "work", "coder", &submit("feature", 1));
-        apply(&mut status, "work", "reviewer", &submit("feature", 2));
-        apply(&mut status, "work", "reviewer", &submit("handoff/coder/feature/1", 4));
-        apply(&mut status, "work", "coder", &submit("finished", 3));
-        apply(&mut status, "work", "coder", &verdict("finished", 3, true));
-        handoff(&mut status, "work", "coder", "reviewer");
-        assert_eq!(owned(&status, "work", "coder").len(), 1);
-        assert_eq!(owned(&status, "work", "coder")[0].state, PromiseState::Kept);
-        let moved = &owned(&status, "work", "reviewer")[2];
-        assert_eq!(moved.id, "handoff/coder/feature/2");
-        assert_eq!(moved.role, "reviewer");
-        assert_eq!(moved.state, PromiseState::Submitted);
-        assert_eq!(moved.submissions.len(), 1);
-        assert_ne!(moved.id, "feature");
-    }
     // ADR 0021: settled history cannot propose patches that terminal status
     // ignores, including previous-generation records with unpromised subjects.
     #[test]
@@ -1799,7 +1730,8 @@ mod tests {
             ]
         );
         assert!(admitted_declarations(&dispatch, &status, false).is_empty());
-        // A colliding handoff renames the moved promise; it is still seeded.
+        // An old-store handoff renamed a moved promise that collided at its target, as statuses
+        // stored before the engine's Reassign hold; it is still seeded.
         let mut collided = status.clone();
         apply(
             &mut collided,
@@ -1807,7 +1739,11 @@ mod tests {
             "reviewer",
             &PromiseOperation::Declare { id: "api-split".into(), kind: PromiseKind::Pr, source: PromiseSource::Crew },
         );
-        handoff(&mut collided, "work", "coder", "reviewer");
+        let crew = collided.promises.get_mut("work").unwrap();
+        let coder = crew.get_mut("coder").unwrap();
+        let mut moved = coder.remove(coder.iter().position(|p| p.id == "api-split").unwrap());
+        (moved.id, moved.role) = ("handoff/coder/api-split/1".into(), "reviewer".into());
+        crew.get_mut("reviewer").unwrap().push(moved);
         assert!(owned(&collided, "work", "reviewer")
             .iter()
             .any(|p| p.id == "handoff/coder/api-split/1" && p.source == PromiseSource::Dispatch));

@@ -243,23 +243,45 @@ async fn repeated_roles_get_seats_and_template_labels_by_seat() {
     assert_eq!(old_promise(&convoy, "b", "coder", "template/pr").state, PromiseState::Submitted);
 }
 
-// Behaviour: handoff reassigns the sender's open promises to the target's seat, adding a seat
-// under the sender for a crew the convoy has none for; the old status shows them under the target.
+// Behaviour: a crew keeps its own promises through a handoff (#3574 decision 3) except those the
+// handoff names: the coder's open deliverable stays the coder's when it hands work to the reviewer,
+// a follow-up the reviewer declares and names moves to the coder, and a name that is not the
+// sender's, or not open, refuses the handoff by that name and moves nothing. A handoff to a crew
+// the convoy has no seat for adds that seat under the sender without moving anything.
 #[tokio::test]
-async fn handoff_reassigns_open_promises() {
+async fn handoff_moves_only_the_promises_it_names() {
     let fixture = fixture();
     let convoy = admitted(&fixture, "c", bootstrapped(vec![("work", vec![crew("coder", true), crew("reviewer", false)])])).await;
-    fixture.engine.reassign(&convoy, "work", "coder", "reviewer").await.expect("reassigned");
+    let (coder, reviewer) = (("work", "coder"), ("work", "reviewer"));
+    fixture.engine.reassign(&convoy, coder, reviewer, &[]).await.expect("handed off");
     let convoy = reread(&fixture, "c").await;
-    assert_eq!(old_promise(&convoy, "work", "reviewer", "template/pr").state, PromiseState::Open);
-    fixture.engine.reassign(&convoy, "work", "reviewer", "fixer").await.expect("reassigned to a new seat");
+    assert_eq!(old_promise(&convoy, "work", "coder", "template/pr").state, PromiseState::Open);
+
+    let declare = PromiseOperation::Declare { id: "follow-up".into(), kind: PromiseKind::Pr, source: OldSource::Crew };
+    fixture.engine.promise(&convoy, "work", "reviewer", &declare, Actor::Crew).await.expect("declared");
+    let refused = fixture.engine.reassign(&convoy, coder, reviewer, &["template/pr".into(), "follow-up".into()]).await;
+    assert!(refused.expect_err("not the coder's").contains("`follow-up`"));
+    let declare = PromiseOperation::Declare { id: "dropped".into(), kind: PromiseKind::Pr, source: OldSource::Crew };
+    fixture.engine.promise(&convoy, "work", "reviewer", &declare, Actor::Crew).await.expect("declared");
+    let retract = PromiseOperation::Retract { id: "dropped".into(), reason: "not needed".into() };
+    fixture.engine.promise(&convoy, "work", "reviewer", &retract, Actor::Crew).await.expect("retracted");
+    let refused = fixture.engine.reassign(&convoy, reviewer, coder, &["follow-up".into(), "dropped".into()]).await;
+    assert!(refused.expect_err("not open").contains("`dropped`"));
+    let convoy = reread(&fixture, "c").await;
+    assert_eq!(old_promise(&convoy, "work", "coder", "template/pr").state, PromiseState::Open, "a refusal moves nothing");
+    assert_eq!(old_promise(&convoy, "work", "reviewer", "follow-up").state, PromiseState::Open, "a refusal moves nothing");
+
+    fixture.engine.reassign(&convoy, reviewer, coder, &["follow-up".into()]).await.expect("reassigned");
+    let convoy = reread(&fixture, "c").await;
+    assert_eq!(old_promise(&convoy, "work", "coder", "follow-up").state, PromiseState::Open);
+    assert!(promises::owned(convoy.status.as_ref().expect("status"), "work", "reviewer").iter().all(|p| p.id != "follow-up"));
+
+    fixture.engine.reassign(&convoy, coder, ("work", "fixer"), &[]).await.expect("handed off to a new seat");
     let engine = fixture.convoys.get("c").expect("held");
     let (_, fixer) = engine.spec().seat(&SeatName::new("fixer", "work")).expect("fan-out seat");
-    assert_eq!(fixer.parent, Some(SeatName::new("reviewer", "")));
+    assert_eq!(fixer.parent, Some(SeatName::new("coder", "")));
     let promise = &engine.spec().promises.iter().next().expect("promise").record;
-    assert_eq!(promise.owner, SeatName::new("fixer", "work"));
-    // A label names the deliverable, so reassignment never changes it.
-    assert_eq!(promise.label, "template/coder/pr");
+    assert_eq!((promise.owner.clone(), promise.label.as_str()), (SeatName::new("coder", ""), "template/coder/pr"));
 }
 
 // Behaviour: an operator keeps a crew's open promises by verdict (the old `--force`), or keeps or

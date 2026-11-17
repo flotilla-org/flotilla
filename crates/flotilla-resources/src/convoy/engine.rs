@@ -73,8 +73,16 @@ pub trait EngineConvoys: Send + Sync {
         actor: Actor,
     ) -> Result<(), String>;
 
-    /// Handoff: every open promise of `from` moves to `to` in the same vessel.
-    async fn reassign(&self, convoy: &ResourceObject<Convoy>, vessel: &str, from: &str, to: &str) -> Result<(), String>;
+    /// Handoff from crew `from` to crew `to`, each `(vessel, role)`: the open promises of `from`
+    /// named by their ids in `promises` move to `to`, and no other. A named promise that is not
+    /// `from`'s, or not open, refuses the whole reassignment.
+    async fn reassign(
+        &self,
+        convoy: &ResourceObject<Convoy>,
+        from: (&str, &str),
+        to: (&str, &str),
+        promises: &[String],
+    ) -> Result<(), String>;
 
     /// An operator keeps every open promise in `scope` by verdict, with a
     /// reason; returns the labels kept.
@@ -381,7 +389,7 @@ mod tests {
         async fn promise(&self, _: &ResourceObject<Convoy>, _: &str, _: &str, _: &PromiseOperation, _: Actor) -> Result<(), String> {
             Ok(())
         }
-        async fn reassign(&self, _: &ResourceObject<Convoy>, _: &str, _: &str, _: &str) -> Result<(), String> {
+        async fn reassign(&self, _: &ResourceObject<Convoy>, _: (&str, &str), _: (&str, &str), _: &[String]) -> Result<(), String> {
             Ok(())
         }
         async fn keep_by_verdict(&self, _: &ResourceObject<Convoy>, _: &VerdictScope, _: &str, _: &str) -> Result<Vec<String>, String> {

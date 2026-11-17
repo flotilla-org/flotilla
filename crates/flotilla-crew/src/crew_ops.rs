@@ -1799,15 +1799,19 @@ impl CrewService {
     }
 
     pub async fn handoff(&self, requested: &CrewCommandContext, target: &str, message: &str) -> Result<(), String> {
-        self.handoff_with_carries(requested, target, message, Vec::new()).await
+        self.handoff_with(requested, target, message, Vec::new(), &[]).await
     }
 
-    pub async fn handoff_with_carries(
+    /// Hand work to `target` with `message`, referring to `carries`. The sender keeps its own
+    /// promises (#3574 decision 3) except those it names in `reassign`, each its own and open,
+    /// which move to the target.
+    pub async fn handoff_with(
         &self,
         requested: &CrewCommandContext,
         target: &str,
         message: &str,
         carries: Vec<flotilla_address::Reference>,
+        reassign: &[String],
     ) -> Result<(), String> {
         let carries =
             carries.into_iter().map(|carry| flotilla_messaging::IntentReference::new(carry.address, carry.revision)).collect::<Vec<_>>();
@@ -1819,6 +1823,23 @@ impl CrewService {
         }
         if message.trim().is_empty() {
             return Err("crew handoff requires a non-empty message".into());
+        }
+        // Refuse a reassignment the engine would refuse before any turn is admitted; the engine's
+        // `Reassign` checks again when it moves them.
+        if !reassign.is_empty() {
+            let not_held = || format!("convoy `{}` is not held at this home", context.convoy);
+            let engine = flotilla_resources::convoy::engine::deciding(&self.convoy_engine, &convoy).ok_or_else(not_held)?;
+            let held = engine.promises(&convoy, None)?.ok_or_else(not_held)?;
+            let owned = held.get(&context.vessel).and_then(|crew| crew.get(&context.caller_role)).map(Vec::as_slice).unwrap_or_default();
+            for id in reassign {
+                match owned.iter().find(|promise| promise.id == *id) {
+                    None => return Err(format!("promise `{id}` is not {}'s to reassign", context.caller_role)),
+                    Some(promise) if promise.state.terminal() => {
+                        return Err(format!("promise `{id}` is {:?}, not open, and cannot be reassigned", promise.state))
+                    }
+                    Some(_) => {}
+                }
+            }
         }
         let project = convoy.spec.project_ref.as_deref().unwrap_or(&context.namespace);
         let receiver = flotilla_resources::qualify_message_address(
@@ -1863,6 +1884,11 @@ impl CrewService {
                 holder.object.status.as_ref().is_some_and(|status| status.phase == ResourceTerminalSessionPhase::Failed)
             }) {
                 return Err(format!("crew target `{receiver}` failed provisioning and cannot be revived"));
+            }
+            if !reassign.is_empty() {
+                let engine = flotilla_resources::convoy::engine::deciding(&self.convoy_engine, &convoy)
+                    .ok_or_else(|| format!("convoy `{}` is not held at this home", context.convoy))?;
+                engine.reassign(&convoy, (&context.vessel, &context.caller_role), (target_vessel, target_role), reassign).await?;
             }
             self.deliver_turn(
                 &CrewTurnIntent::builder()
@@ -1981,9 +2007,10 @@ impl CrewService {
         let previous_status = convoy.status.clone().ok_or_else(|| format!("convoy `{}` has no status", context.convoy))?;
         let engine = flotilla_resources::convoy::engine::deciding(&self.convoy_engine, &convoy)
             .ok_or_else(|| format!("convoy `{}` is not held at this home", context.convoy))?;
-        // Handoff is the engine's `Reassign` of the sender's open promises (#3574 decision 3). An
-        // engine edge is not undone, so it is taken once the target's credentials are staged.
-        let reassign = || engine.reassign(&convoy, &context.vessel, &context.caller_role, target);
+        // Handoff is the engine's `Reassign` of the promises the sender names (#3574 decision 3); it
+        // also seats a target the convoy has none for. An engine edge is not undone, so it is taken
+        // once the target's credentials are staged.
+        let move_named = || engine.reassign(&convoy, (&context.vessel, &context.caller_role), (&context.vessel, target), reassign);
         // Admit the turn before reopening its recipient: the reopened crew's
         // derived Done waits on that turn's delivery (#3894).
         let admitted = self.publish_message_intent(&context.namespace, &message_name, &intent).await?;
@@ -2010,7 +2037,7 @@ impl CrewService {
                 return Err(format!("convoy `{}` became terminal during crew handoff", context.convoy));
             }
             if target_origin.is_some() {
-                if let Err(error) = reassign().await {
+                if let Err(error) = move_named().await {
                     return Err(self.restore_crew_work_after_delivery_failure(&context.convoy, &previous_status, error).await);
                 }
                 return match send().await {
@@ -2019,7 +2046,7 @@ impl CrewService {
                 };
             }
             self.reconcile_or_restore_crew_work(&context.namespace, &environment_ref, &context.convoy, previous_status.clone()).await?;
-            if let Err(error) = reassign().await {
+            if let Err(error) = move_named().await {
                 return Err(self.restore_crew_work_after_delivery_failure(&context.convoy, &previous_status, error).await);
             }
             let handoff_result: Result<(), String> = async {

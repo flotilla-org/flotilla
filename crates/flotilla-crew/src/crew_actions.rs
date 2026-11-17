@@ -56,9 +56,9 @@ impl CrewActions<'_> {
     }
 
     pub async fn execute_action_crew_handoff(&self, id: u64, command: &Command) -> Result<u64, String> {
-        if let CommandAction::CrewHandoff { context, target, message, carries } = &command.action {
+        if let CommandAction::CrewHandoff { context, target, message, carries, reassign } = &command.action {
             let empty_identity = self.events.start(id, command.description().to_string());
-            let result = match Box::pin(self.crew.handoff_with_carries(context, target, message, carries.clone())).await {
+            let result = match Box::pin(self.crew.handoff_with(context, target, message, carries.clone(), reassign)).await {
                 Ok(()) => CommandValue::Ok,
                 Err(message) => CommandValue::Error { message },
             };

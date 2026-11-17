@@ -84,7 +84,7 @@ pub(super) fn authorize(request: &mut Request, crew: &CallerCrew) -> Result<(), 
                 | CommandAction::QueryCrewList { context }
                 | CommandAction::QueryMessageContacts { context } => authorize_context(context, crew),
                 CommandAction::CrewHandoff { context, target, .. } => {
-                    // Short forms are qualified using the caller's convoy by handoff_with_carries,
+                    // Short forms are qualified using the caller's convoy by handoff_with,
                     // which independently rejects a resolved foreign convoy.
                     let parts = target.split('/').collect::<Vec<_>>();
                     if parts.iter().any(|part| part.is_empty())
@@ -341,6 +341,7 @@ mod tests {
                         target: "flotilla/foreign/work/coder".into(),
                         message: "handoff".into(),
                         carries: Vec::new(),
+                        reassign: Vec::new(),
                     })
                     .build(),
             },
@@ -363,6 +364,7 @@ mod tests {
                         target: target.into(),
                         message: "handoff".into(),
                         carries: Vec::new(),
+                        reassign: Vec::new(),
                     })
                     .build(),
             };
@@ -376,6 +378,7 @@ mod tests {
                         target: target.into(),
                         message: "handoff".into(),
                         carries: Vec::new(),
+                        reassign: Vec::new(),
                     })
                     .build(),
             };

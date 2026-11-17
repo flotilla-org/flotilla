@@ -264,6 +264,7 @@ pub(super) async fn crew_provisioning_recovery_scenario() {
             Command::builder()
                 .action(CommandAction::CrewHandoff {
                     carries: Vec::new(),
+                    reassign: Vec::new(),
                     context: crew_context.clone(),
                     target: "reviewer".to_string(),
                     message: "Review commit abc123".to_string(),
@@ -310,8 +311,8 @@ pub(super) async fn crew_provisioning_recovery_scenario() {
     .await;
 
     pool.set_captured_screen(&reviewer.metadata.name, "• Working (1s • esc to interrupt)\n› Ask Codex to do anything").await;
-    // A follow-up carries a new obligation so the reopened coder remains live
-    // across the daemon restart; previously it waited for a completion claim.
+    // The reviewer declares a follow-up obligation and reassigns it with the hand-back, so the
+    // reopened coder owes it and remains live across the daemon restart.
     promise(
         &daemon,
         CrewCommandContext { crew_id: Some(reviewer_id.clone()), ..Default::default() },
@@ -324,6 +325,7 @@ pub(super) async fn crew_provisioning_recovery_scenario() {
             Command::builder()
                 .action(CommandAction::CrewHandoff {
                     carries: Vec::new(),
+                    reassign: vec!["recovery-work".into()],
                     context: CrewCommandContext { crew_id: Some(reviewer_id.clone()), ..Default::default() },
                     target: "coder".to_string(),
                     message: "Address the review findings".to_string(),
@@ -384,7 +386,9 @@ pub(super) async fn crew_provisioning_recovery_scenario() {
     .await;
     let reopened = convoys.get(&crew_record).await.expect("reopened convoy").status.expect("reopened status");
     assert_eq!(reopened.crew_work["implement"]["coder"].phase, flotilla_resources::CrewWorkPhase::Working);
-    assert_eq!(reopened.crew_work["implement"]["reviewer"].phase, flotilla_resources::CrewWorkPhase::HandedBack);
+    // The hand-back moved only `recovery-work`: the reviewer still owes its own ledger, so it is
+    // still working.
+    assert_eq!(reopened.crew_work["implement"]["reviewer"].phase, flotilla_resources::CrewWorkPhase::Working);
 
     for handle in controller_handles {
         handle.abort();
@@ -514,6 +518,7 @@ pub(super) async fn crew_provisioning_recovery_scenario() {
             Command::builder()
                 .action(CommandAction::CrewHandoff {
                     carries: Vec::new(),
+                    reassign: Vec::new(),
                     context: CrewCommandContext { crew_id: Some(revived_coder_id), ..Default::default() },
                     target: "reviewer".to_string(),
                     message: "Please verify the fixes".to_string(),
@@ -549,8 +554,8 @@ pub(super) async fn crew_provisioning_recovery_scenario() {
             .expect("record observed absence of a change request");
     }
     record_successful_empty_branch_scan(&daemon, &crew_record).await;
-    // This recovery fixture's reviewer has no promises, so only the operator's forced completion
-    // ends its part.
+    // This recovery fixture's reviewer never publishes the ledger it owes, so only the operator's
+    // forced completion ends its part.
     assert_eq!(
         daemon
             .crew_complete_as_principal_internal(

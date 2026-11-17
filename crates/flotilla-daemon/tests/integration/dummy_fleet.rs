@@ -126,6 +126,64 @@ async fn a_reviewed_coder_lands_after_its_reviewer_answers() {
     assert_no_old_messages(&fleet).await;
 }
 
+// Behaviour: a crew keeps its own role's promises through a handoff (#3574 decision 3). A
+// co-located coder and reviewer, with change requests merged at once, each settle their own
+// promises after the review exchange: none is refused, each delivers its two turns, and every
+// convoy lands. Many convoys at once give the merge many chances to come before the handoff.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn co_located_reviewed_coders_settle_their_own_promises() {
+    use flotilla_resources::promises::{PromiseKind, PromiseState};
+
+    const CONVOYS: usize = 24;
+    let fleet = TestDaemon::builder().start().await;
+    let mut names = Vec::new();
+    for _ in 0..CONVOYS {
+        names.push(fleet.dispatch(CrewMix::CoderReviewer, DUMMY_FULFILMENT_KIND).await);
+    }
+    for name in &names {
+        fleet.wait("Landed", in_phase(name, ConvoyPhase::Landed)).await;
+        // Each role's promises are its own and kept: the change request stays with the coder.
+        for (role, holds_pr) in [("coder", true), ("reviewer", false)] {
+            let held = promises(&fleet, name, "coder", role).await;
+            assert!(held.iter().all(|promise| promise.state == PromiseState::Kept), "{name} {role}: {held:?}");
+            assert!(held.iter().any(|promise| promise.kind == PromiseKind::DecisionLedger), "{name} {role}: {held:?}");
+            assert_eq!(held.iter().any(|promise| promise.kind == PromiseKind::Pr), holds_pr, "{name} {role}: {held:?}");
+        }
+    }
+    let snapshot = fleet.counts();
+    assert_eq!(snapshot.command_errors, 0, "{snapshot:?}");
+    assert_eq!((snapshot.crews_completed, snapshot.turns_received), (2 * CONVOYS as u64, 2 * CONVOYS as u64), "{snapshot:?}");
+}
+
+// Behaviour: a handoff reassigns only promises its sender names, each its own and open; naming one
+// that is not the sender's refuses the handoff, naming the promise.
+#[tokio::test(start_paused = true)]
+async fn a_handoff_refuses_to_reassign_a_promise_not_the_senders() {
+    let fleet = TestDaemon::builder().agent("turn_delay_ms = 600000").start().await;
+    let name = fleet.dispatch(CrewMix::CoderReviewer, DUMMY_FULFILMENT_KIND).await;
+    let session = fleet.wait("the coder's session", |session: &ResourceObject<TerminalSession>| session.spec.role == "coder").await;
+    let flotilla_resources::TerminalSessionSource::Agent { context: session_context, .. } = session.spec.source else { panic!("agent") };
+    let context = flotilla_protocol::query::CrewCommandContext {
+        namespace: Some(NAMESPACE.into()),
+        convoy: Some(name.clone()),
+        vessel_ref: Some(session_context.vessel_ref),
+        role: Some("coder".into()),
+        ..Default::default()
+    };
+    let refused = fleet
+        .execute(CommandAction::CrewHandoff {
+            context,
+            target: "reviewer".into(),
+            message: "Review this.".into(),
+            carries: Vec::new(),
+            reassign: vec!["template/pr".into(), "the-reviewers".into()],
+        })
+        .await;
+    let CommandValue::Error { message } = refused else { panic!("refused: {refused:?}") };
+    assert!(message.contains("`the-reviewers`"), "{message}");
+    assert_eq!(fleet.counts().turns_received, 0, "a refused handoff delivers nothing");
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_long_runner_exchanges_its_turns_before_landing() {
     let fleet = TestDaemon::builder().start().await;
@@ -227,6 +285,7 @@ async fn a_finished_long_runner_handles_a_late_handoff_and_lands() {
             target: "governor".into(),
             message: "Done.".into(),
             carries: Vec::new(),
+            reassign: Vec::new(),
         })
         .await;
     assert_eq!(handed_off, CommandValue::Ok);

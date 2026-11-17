@@ -213,7 +213,16 @@ impl EngineHome {
             CrewWorkPhase::Interrupted => self.engine.terminals.lost(&started, "pool lost the session"),
             CrewWorkPhase::Done => self.keep(backend, launch, work, role).await,
             CrewWorkPhase::Failed => engine.fail_seat(&convoy, work, role, "supervisor", "failed").await.expect("fail the seat"),
-            CrewWorkPhase::HandedBack => engine.reassign(&convoy, work, role, "successor").await.expect("hand the work back"),
+            CrewWorkPhase::HandedBack => {
+                // A seat is handed back once it has handed every open promise on.
+                let status = convoy.status.as_ref().expect("status");
+                let open: Vec<String> = flotilla_resources::promises::owned(status, work, role)
+                    .iter()
+                    .filter(|promise| !promise.state.terminal())
+                    .map(|promise| promise.id.clone())
+                    .collect();
+                engine.reassign(&convoy, (work, role), (work, "successor"), &open).await.expect("hand the work back")
+            }
             other => panic!("no facts make a {other:?} seat"),
         }
         let read = self.view(backend, launch).await.status.expect("status").crew_work[work][role].phase;

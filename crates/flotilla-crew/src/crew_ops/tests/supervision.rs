@@ -106,9 +106,7 @@ async fn cross_vessel_handoff_case(remote: bool, publication_fails: bool, receiv
     if publication_fails {
         let before = held.convoy(&backend).await.status;
         for _ in 0..repeats {
-            crew.handoff_with_carries(&context, &short, "review this", vec![carried.clone()])
-                .await
-                .expect_err("receiver publication fails");
+            crew.handoff_with(&context, &short, "review this", vec![carried.clone()], &[]).await.expect_err("receiver publication fails");
             assert_eq!(held.convoy(&backend).await.status, before);
             assert!(home.messages.views().await.expect("inbox").is_empty());
         }
@@ -116,7 +114,7 @@ async fn cross_vessel_handoff_case(remote: bool, publication_fails: bool, receiv
     }
     for index in 0..repeats {
         let target = if index % 2 == 0 { short.as_str() } else { reviewer.as_str() };
-        crew.handoff_with_carries(&context, target, "review this", vec![carried.clone()]).await.expect("handoff");
+        crew.handoff_with(&context, target, "review this", vec![carried.clone()], &[]).await.expect("handoff");
         // The handoff delivers the reviewer its task: it is wanted running, and its vessel starts it.
         assert!(held.convoy(&backend).await.status.expect("status").crew_work["review"]["reviewer"].task_assigned);
         // The crew's view of a local Message spells its receiver by the vessel that holds it.

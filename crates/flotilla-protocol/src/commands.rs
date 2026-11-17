@@ -1046,6 +1046,9 @@ pub enum CommandAction {
         /// What the handoff refers to, each at its revision.
         #[serde(default)]
         carries: Vec<flotilla_address::Reference>,
+        /// The ids of open promises the sender owns, each moved to the target with the work.
+        #[serde(default)]
+        reassign: Vec<String>,
     },
     CrewPromise {
         context: CrewCommandContext,
@@ -1863,6 +1866,7 @@ mod tests {
             Command::builder()
                 .action(CommandAction::CrewHandoff {
                     carries: Vec::new(),
+                    reassign: Vec::new(),
                     context: CrewCommandContext { crew_id: Some("crew-123".into()), ..Default::default() },
                     target: "reviewer".into(),
                     message: "review this".into(),

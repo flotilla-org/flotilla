@@ -78,6 +78,9 @@ pub enum CrewVerb {
         /// A reference as `<address>@<revision>`; repeat for each thing carried.
         #[arg(long = "carry", value_parser = parse_carry)]
         carries: Vec<flotilla_address::Reference>,
+        /// The id of an open promise you own, moved to the target with the work; repeat for each.
+        #[arg(long = "reassign")]
+        reassign: Vec<String>,
     },
     /// Resume stalled crew work, or send mid-turn guidance to working crew as an operator
     Resume {
@@ -281,8 +284,8 @@ impl CrewNoun {
             (_, _, Some(_)) if self.force => {
                 return Err("--force is only valid with `flotilla crew complete` or `flotilla crew fail`".to_string())
             }
-            (_, _, Some(CrewVerb::Handoff { message, carries })) => {
-                CommandAction::CrewHandoff { context, target: subject.value, message, carries }
+            (_, _, Some(CrewVerb::Handoff { message, carries, reassign })) => {
+                CommandAction::CrewHandoff { context, target: subject.value, message, carries, reassign }
             }
             (_, _, Some(_)) => return Err("resume, fail, and escalate require `flotilla crew supervise`".to_string()),
             (_, _, None) => return Err("crew target requires a verb (for example: handoff)".to_string()),
@@ -345,9 +348,12 @@ impl std::fmt::Display for CrewNoun {
                 CrewVerb::Escalate { message } => ("escalate", message),
             };
             write!(f, " {name} --message {}", quote_value(message))?;
-            if let CrewVerb::Handoff { carries, .. } = verb {
+            if let CrewVerb::Handoff { carries, reassign, .. } = verb {
                 for carry in carries {
                     write!(f, " --carry {}", quote_value(&carry.to_string()))?;
+                }
+                for promise in reassign {
+                    write!(f, " --reassign {}", quote_value(promise))?;
                 }
             }
         }
@@ -501,6 +507,7 @@ mod tests {
             action(noun, Some("crew-123")),
             CommandAction::CrewHandoff {
                 carries: Vec::new(),
+                reassign: Vec::new(),
                 context: CrewCommandContext { crew_id: Some("crew-123".into()), ..Default::default() },
                 target: "reviewer".into(),
                 message: "Review commit abc123".into(),
@@ -517,6 +524,7 @@ mod tests {
                 action(noun, Some("crew-123")),
                 CommandAction::CrewHandoff {
                     carries: Vec::new(),
+                    reassign: Vec::new(),
                     context: CrewCommandContext { crew_id: Some("crew-123".into()), ..Default::default() },
                     target: role.into(),
                     message: "continue".into(),
@@ -542,6 +550,7 @@ mod tests {
             action(noun, Some("crew-123")),
             CommandAction::CrewHandoff {
                 carries: Vec::new(),
+                reassign: Vec::new(),
                 context: CrewCommandContext { crew_id: Some("crew-123".into()), ..Default::default() },
                 target: "@reviewer".into(),
                 message: "continue".into(),
@@ -677,6 +686,16 @@ mod tests {
         assert_round_trip::<CrewNoun>(&args);
         CrewNoun::try_parse_from(["crew", "reviewer", "handoff", "--message", "review", "--carry", "scratch.log"])
             .expect_err("untyped paths are not Message references");
+    }
+
+    // Glue: each `--reassign` names one promise the handoff moves, in order, and round-trips.
+    #[test]
+    fn handoff_names_the_promises_it_reassigns() {
+        let args = ["crew", "coder", "handoff", "--message", "fix it", "--reassign", "recovery-work", "--reassign", "template/pr"];
+        let noun = CrewNoun::try_parse_from(args).expect("reassign");
+        let CommandAction::CrewHandoff { reassign, .. } = action(noun, Some("crew-123")) else { panic!("handoff action") };
+        assert_eq!(reassign, ["recovery-work", "template/pr"]);
+        assert_round_trip::<CrewNoun>(&args);
     }
 
     #[test]

@@ -71,7 +71,7 @@ impl EngineConvoys for Recording {
         self.promises.lock().expect("promises").push((vessel.into(), role.into(), operation.clone(), actor));
         Ok(())
     }
-    async fn reassign(&self, _: &ResourceObject<Convoy>, _: &str, _: &str, _: &str) -> Result<(), String> {
+    async fn reassign(&self, _: &ResourceObject<Convoy>, _: (&str, &str), _: (&str, &str), _: &[String]) -> Result<(), String> {
         Ok(())
     }
     async fn keep_by_verdict(&self, _: &ResourceObject<Convoy>, _: &VerdictScope, _: &str, _: &str) -> Result<Vec<String>, String> {

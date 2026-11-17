@@ -321,10 +321,17 @@ impl EngineConvoys for ConvoyEngine {
         .await
     }
 
-    async fn reassign(&self, convoy: &ResourceObject<OldConvoy>, vessel: &str, from: &str, to: &str) -> Result<(), String> {
+    async fn reassign(
+        &self,
+        convoy: &ResourceObject<OldConvoy>,
+        from: (&str, &str),
+        to: (&str, &str),
+        promises: &[String],
+    ) -> Result<(), String> {
         let crews = crews(convoy);
-        let (from, to) = (crews.seat(vessel, from), crews.seat(vessel, to));
+        let (from, to) = (crews.seat(from.0, from.1), crews.seat(to.0, to.1));
         let name = map::engine_name(convoy)?;
+        let promises = promises.to_vec();
         self.edit(convoy, move |current, world| {
             let mut edges: Vec<ConvoyEdge> = Vec::new();
             if from == to {
@@ -346,15 +353,21 @@ impl EngineConvoys for ConvoyEngine {
                     .into(),
                 );
             }
-            edges.extend(
-                current
+            // A crew keeps its own promises (#3574 decision 3): the handoff moves only those the
+            // sender names, each its own and open.
+            for id in &promises {
+                let promise = current
                     .spec()
                     .promises
                     .iter()
                     .map(|row| &row.record)
-                    .filter(|promise| promise.owner == from && open(promise))
-                    .map(|promise| Reassign { promise: promise.id, to: to.clone(), by: from.clone(), authority: Authority::Owner }.into()),
-            );
+                    .find(|promise| promise.owner == from && map::old_id(promise) == *id)
+                    .ok_or_else(|| format!("promise `{id}` is not {}'s to reassign", from.role))?;
+                if !open(promise) {
+                    return Err(format!("promise `{id}` is {:?}, not open, and cannot be reassigned", promise.progress.value));
+                }
+                edges.push(Reassign { promise: promise.id, to: to.clone(), by: from.clone(), authority: Authority::Owner }.into());
+            }
             Ok((edges, ()))
         })
         .await

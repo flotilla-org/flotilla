@@ -415,7 +415,10 @@ fn delivery_failures_are_durable_and_log_once() {
                 if kind == 4 {
                     // The reviewer hands its work to the coder: the coder is crewed.
                     let convoy = convoys.get(launch).await.expect("delivery retry fixture");
-                    home.engine().reassign(&convoy, "work", "reviewer", "coder").await.expect("hand the work to the coder");
+                    home.engine()
+                        .reassign(&convoy, ("work", "reviewer"), ("work", "coder"), &[])
+                        .await
+                        .expect("hand the work to the coder");
                     let status = home.note(&backend, launch, retry_at(Utc::now())).await.status.expect("delivery retry fixture");
                     assert_eq!(status.phase, ConvoyPhase::Landing);
                     assert!(status.crew_work["work"].contains_key("coder"), "the coder is crewed");
