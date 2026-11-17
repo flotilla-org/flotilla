@@ -46,7 +46,10 @@ use std::{
 use async_trait::async_trait;
 use flotilla_engine_store::follow::Followed;
 use flotilla_resources::Clock;
-use flotilla_schema::{reads::carry, Identity, KindCode, Timestamp};
+use flotilla_schema::{
+    reads::{carry, inherit},
+    Identity, KindCode, Timestamp,
+};
 use flotilla_schema_sqlite::{stream::Service, Read, StoreError};
 use flotilla_state_machines::{
     machines::lifecycle::{Lifecycle, LifecycleKind, LifecycleState, VanishCause},
@@ -595,10 +598,10 @@ where
             }
             Action::Hold => {
                 self.holding.insert(owned.clone());
-                self.flights.spawn(async move {
+                self.flights.spawn(inherit(async move {
                     let done = Done::Held(actuator.holdings(&owned, &request).await);
                     (owned, done)
-                });
+                }));
             }
             Action::Observe => {
                 // A holding kind's observation reads what it holds too, so that one adopted at
@@ -607,24 +610,24 @@ where
                 if holds {
                     self.holding.insert(owned.clone());
                 }
-                self.flights.spawn(async move {
+                self.flights.spawn(inherit(async move {
                     let holdings = if holds { actuator.holdings(&owned, &request).await.ok() } else { None };
                     let done = Done::Observed(actuator.observe(&owned, &request).await, holdings);
                     (owned, done)
-                });
+                }));
             }
             Action::Realise => {
-                self.flights.spawn(async move {
+                self.flights.spawn(inherit(async move {
                     let done = Done::Realised(actuator.realise(&owned, &request).await);
                     (owned, done)
-                });
+                }));
             }
             Action::Release { identity } => {
                 self.releasing.insert(owned.clone());
-                self.flights.spawn(async move {
+                self.flights.spawn(inherit(async move {
                     let done = Done::Released(actuator.release(&owned, &request, identity.as_deref()).await);
                     (owned, done)
-                });
+                }));
             }
         }
         self.in_flight.insert(name.to_owned());
@@ -654,10 +657,10 @@ where
                         let actuator = Arc::clone(&self.actuator);
                         let owned = name.to_owned();
                         self.in_flight.insert(owned.clone());
-                        self.flights.spawn(async move {
+                        self.flights.spawn(inherit(async move {
                             let done = Done::Released(actuator.release(&owned, &request, Some(&identity)).await);
                             (owned, done)
-                        });
+                        }));
                     }
                 }
             }

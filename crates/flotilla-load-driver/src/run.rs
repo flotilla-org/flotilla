@@ -7,7 +7,7 @@ use std::{
 };
 
 use flotilla_dummy_fleet::catalog::CrewMix;
-use flotilla_store::load_metrics::LatencyHistogram;
+use flotilla_store::load_metrics::{attributed, caller, LatencyHistogram};
 use futures::{future::BoxFuture, stream::FuturesUnordered, FutureExt, StreamExt};
 use tokio::time::Instant;
 
@@ -239,8 +239,13 @@ impl Progress {
     }
 }
 
-/// Run warm-up, a measurement window, then stop admissions and drain.
+/// Run warm-up, a measurement window, then stop admissions and drain. What the driver reads of an
+/// in-process target counts for it, apart from the daemon's own work.
 pub async fn run(target: &dyn FleetTarget, plan: &LoadPlan) -> Result<LoadReport, String> {
+    attributed(caller("load driver"), drive(target, plan)).await
+}
+
+async fn drive(target: &dyn FleetTarget, plan: &LoadPlan) -> Result<LoadReport, String> {
     if plan.running == 0
         || plan.dispatch_concurrency == 0
         || !plan.ramp_per_second.is_finite()

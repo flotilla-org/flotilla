@@ -9,6 +9,9 @@ use flotilla_resources::{
     lifecycle_reads::LifecycleReads, terminal_records::TerminalRecords, TerminalAttention, TerminalAttentionSource, TerminalAttentionState,
 };
 
+/// The caller harness hooks' reads count for.
+pub(crate) const AGENT_HOOKS: &str = "agent hooks";
+
 /// Records a hook's attention on session `session_name`'s newest launch here, when it adds to
 /// what is held. A native Codex hook also records that the harness reports native hooks. A tool
 /// call is progress the daemon keeps in memory, not attention (#3108).
@@ -44,10 +47,10 @@ pub(crate) async fn record_agent_activity(
     // observation never creates an orphan record for a session with no launch here.
     let session = session_name.to_owned();
     // A store read: off the async workers.
-    let launch = tokio::task::spawn_blocking(move || {
+    let launch = tokio::task::spawn_blocking(flotilla_schema::reads::carry(move || {
         let terminals = reads.terminals()?;
         terminals.get(&session, Some(terminals.home()))
-    })
+    }))
     .await
     .map_err(|error| error.to_string())??
     .ok_or_else(|| format!("terminal session {session_name} has no launch here"))?;
@@ -57,7 +60,7 @@ pub(crate) async fn record_agent_activity(
     let sessions = Arc::clone(primitives.sessions());
     let cause = cause.to_owned();
     let now = flotilla_schema::Timestamp::from_datetime(&chrono::Utc::now());
-    tokio::task::spawn_blocking(move || sessions.observe(&launch.name, activity, cause, now))
+    tokio::task::spawn_blocking(flotilla_schema::reads::carry(move || sessions.observe(&launch.name, activity, cause, now)))
         .await
         .map_err(|error| error.to_string())??;
     Ok(())

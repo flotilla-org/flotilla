@@ -310,7 +310,7 @@ impl InProcessDaemon {
         let mut discovered = self.discovered_checkouts.changes();
         let mut namespace_changes = self.checkout_namespace_changes.subscribe();
         let weak = self.self_weak.clone();
-        tokio::spawn(async move {
+        tokio::spawn(flotilla_schema::reads::attributed(flotilla_schema::reads::caller("checkout provider lifetimes"), async move {
             loop {
                 let Some(daemon) = weak.upgrade() else { return };
                 if let Err(error) = daemon.retire_checkout_providers().await {
@@ -329,7 +329,7 @@ impl InProcessDaemon {
                     }
                 }
             }
-        });
+        }));
         Ok(())
     }
 }

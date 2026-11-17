@@ -73,7 +73,7 @@ use flotilla_schema::{Cause, CodeEnum, KindCode, KindSpec};
 use flotilla_schema_sqlite::stream::{Frame, Service};
 use flotilla_state_machines::machines::{agent_session::AgentSessionEdgeKind, message::MessageSpec};
 use flotilla_store::{
-    load_metrics::{callers, LatencyHistogram, ReplicationLoadMetrics},
+    load_metrics::{attributed, caller, callers, inherit, LatencyHistogram, ReplicationLoadMetrics},
     ResourceBackend,
 };
 use flotilla_store_sqlite::SqliteBackend;
@@ -217,10 +217,14 @@ async fn start_home(root: &std::path::Path, index: usize, dummy_fleet: &str, opt
     let runtime = DaemonRuntime::start_with_options(Arc::clone(&daemon), config, None, options).await.expect("runtime");
     let backend = daemon.resource_backend();
     let port = DaemonCommandPort::new(&(Arc::clone(&daemon) as Arc<dyn DaemonHandle>));
-    seed(&backend, &port, fleet.config()).await;
     let view = Arc::new(HomeView::default());
-    watch_convoys(&backend, Arc::clone(&view), admissions).await;
-    watch_messages(&backend, Arc::clone(&view)).await;
+    // What the harness reads to seed and observe the fleet counts for it, apart from the fleet's own work.
+    attributed(caller("load harness"), async {
+        seed(&backend, &port, fleet.config()).await;
+        watch_convoys(&backend, Arc::clone(&view), admissions).await;
+        watch_messages(&backend, Arc::clone(&view)).await;
+    })
+    .await;
     let primitives = daemon.message_primitives().expect("the Message path is composed");
     watch_engine_messages(Arc::clone(primitives.service()), Arc::clone(&view));
     Home { daemon, fleet, runtime, store, database, port, replication: Arc::default(), view }
@@ -262,7 +266,7 @@ async fn seed(backend: &ResourceBackend, port: &DaemonCommandPort, config: &flot
 /// Track the driver's local convoys, and time replicas arriving from other homes.
 async fn watch_convoys(backend: &ResourceBackend, view: Arc<HomeView>, admissions: Admissions) {
     let mut events = backend.including_replicas::<Convoy>(NAMESPACE).watch().await.expect("convoy watch");
-    tokio::spawn(async move {
+    tokio::spawn(inherit(async move {
         let mut replicated = HashSet::new();
         while let Some(event) = events.next().await {
             let Ok(ReadWatchEvent::Added(source) | ReadWatchEvent::Modified(source)) = event else { continue };
@@ -319,13 +323,13 @@ async fn watch_convoys(backend: &ResourceBackend, view: Arc<HomeView>, admission
                 }
             }
         }
-    });
+    }));
 }
 
 /// Time each Message from creation until its receipt is recorded.
 async fn watch_messages(backend: &ResourceBackend, view: Arc<HomeView>) {
     let mut events = backend.clone().using::<Message>(NAMESPACE).watch(WatchStart::Now).await.expect("message watch");
-    tokio::spawn(async move {
+    tokio::spawn(inherit(async move {
         let mut delivered = HashSet::new();
         while let Some(event) = events.next().await {
             let Ok(WatchEvent::Added(message) | WatchEvent::Modified(message)) = event else { continue };
@@ -340,7 +344,7 @@ async fn watch_messages(backend: &ResourceBackend, view: Arc<HomeView>) {
                 }
             }
         }
-    });
+    }));
 }
 
 /// Time each engine Message from its creation entry to the
@@ -719,6 +723,9 @@ async fn load_driver_smoke() {
     };
     watchdog.outlive("assertions, then dropping the fleet and the runtime");
     eprintln!("{}", report.markdown());
+    // Every engine read the fleet made counts for the caller that made it: none is left unnamed.
+    let unattributed = callers().remove(flotilla_schema::reads::UNATTRIBUTED).unwrap_or_default();
+    assert!(unattributed.values().all(|counts| *counts == Default::default()), "reads no caller named: {unattributed:?}");
     if !report.unfinished.is_empty() {
         eprintln!("convoys unfinished after the drain:\n{}", fleet.stuck_report().await);
     }

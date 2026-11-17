@@ -334,7 +334,7 @@ pub(super) fn spawn_projection_parity_task(
     runtime_health: RuntimeHealth,
     interval: Duration,
 ) -> JoinHandle<()> {
-    spawn_periodic_task(interval, PeriodicTaskStart::AfterInterval, move || {
+    spawn_periodic_task("projection parity", interval, PeriodicTaskStart::AfterInterval, move || {
         let backend = backend.clone();
         let namespace = namespace.clone();
         let projection = projection.clone();

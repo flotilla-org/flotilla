@@ -1361,11 +1361,11 @@ impl Aggregator {
         self.change_request_refresh_started.insert(reference.clone(), refresh_at);
         let refresh_tx = self.change_request_refresh_queue.tx.clone();
         let task_reference = reference.clone();
-        let task = tokio::spawn(async move {
+        let task = tokio::spawn(flotilla_store::load_metrics::inherit(async move {
             tokio::time::sleep_until(refresh_at).await;
             let result = bounded_refresh(&*resolver, &repositories, &branch, binding.as_ref()).await;
             let _ = refresh_tx.send(ChangeRequestResolution { reference: task_reference, generation, branch, result });
-        });
+        }));
         self.change_request_refresh_tasks.insert(reference, task);
     }
 
@@ -1518,10 +1518,10 @@ impl Aggregator {
                 let refresh_tx = self.change_request_refresh_queue.tx.clone();
                 let task_reference = reference.clone();
                 let task_branch = branch.clone();
-                let task = tokio::spawn(async move {
+                let task = tokio::spawn(flotilla_store::load_metrics::inherit(async move {
                     let result = lookup.await;
                     let _ = refresh_tx.send(ChangeRequestResolution { reference: task_reference, generation, branch: task_branch, result });
-                });
+                }));
                 self.change_request_refresh_tasks.insert(reference, task);
             }
         }
@@ -2238,7 +2238,7 @@ impl Aggregator {
             let host = input.host.clone();
             let resolver = resolver.clone();
             let result_key = key.clone();
-            let task = self.attach_refresh_tasks.spawn(async move {
+            let task = self.attach_refresh_tasks.spawn(flotilla_store::load_metrics::inherit(async move {
                 let targets = [(name, host)];
                 let mut delay = Duration::from_millis(250);
                 let mut warned = false;
@@ -2259,7 +2259,7 @@ impl Aggregator {
                     tokio::time::sleep(delay).await;
                     delay = (delay * 2).min(Duration::from_secs(30));
                 }
-            });
+            }));
             self.attach_refresh_generations.insert(key, (generation, task));
         }
         self.attach_refresh_inputs = inputs;

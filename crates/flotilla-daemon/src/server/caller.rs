@@ -263,7 +263,7 @@ pub(super) async fn resolve_main_caller(
     }
     // The container is the backing a contained environment of this home was realised under.
     let reads = daemon.lifecycle_reads();
-    let live = tokio::task::spawn_blocking(move || reads.environments()?.live())
+    let live = tokio::task::spawn_blocking(flotilla_schema::reads::carry(move || reads.environments()?.live()))
         .await
         .map_err(|error| format!("CallerIdentityUnavailable: {error}"))?
         .map_err(|error| format!("CallerIdentityUnavailable: {error}"))?;

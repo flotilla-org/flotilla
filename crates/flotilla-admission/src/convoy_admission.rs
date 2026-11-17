@@ -4779,7 +4779,7 @@ async fn image_placement_cost(
                 (Some(architecture), Some(host)) => {
                     let name = crate::image_build::expected_build_name(identity, architecture, image_cache.as_ref(), &host.metadata.name);
                     let reads = Arc::clone(&lifecycle_reads);
-                    tokio::task::spawn_blocking(move || reads.image_builds()?.get(&name))
+                    tokio::task::spawn_blocking(flotilla_schema::reads::carry(move || reads.image_builds()?.get(&name)))
                         .await
                         .map_err(|error| format!("read image build: {error}"))??
                         .and_then(|build| build.digest().map(str::to_owned))

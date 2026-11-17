@@ -645,6 +645,12 @@ pub struct LiveConvoyRecord {
     pub owner_host: HostName,
 }
 
+/// The caller a command's reads count for when whoever sent it names none.
+const COMMANDS: &str = "commands";
+
+/// The caller the daemon's composition and its runtime's start read as.
+pub const DAEMON_STARTUP: &str = "daemon startup";
+
 const CONVOY_ATTACH_WAIT: Duration = Duration::from_secs(60);
 
 fn convoy_start_failure(convoy: &ResourceObject<ResourceConvoy>) -> Option<String> {
@@ -1054,6 +1060,21 @@ impl InProcessDaemon {
     /// reads them. Fails when the decided store cannot be opened or filled.
     #[allow(clippy::too_many_arguments)]
     pub async fn new_composed(
+        repo_paths: Vec<PathBuf>,
+        config: Arc<ConfigStore>,
+        discovery: DiscoveryRuntime,
+        host_name: HostName,
+        resource_backend: ResourceBackend,
+        clock: Arc<dyn Clock>,
+        peer_overlay: Arc<dyn flotilla_projections::host_registry::PeerOverlay>,
+        engine: EngineOpener,
+    ) -> Result<Arc<Self>, String> {
+        let composed = Self::compose(repo_paths, config, discovery, host_name, resource_backend, clock, peer_overlay, engine);
+        flotilla_store::load_metrics::inherit_or(DAEMON_STARTUP, composed).await
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    async fn compose(
         repo_paths: Vec<PathBuf>,
         config: Arc<ConfigStore>,
         discovery: DiscoveryRuntime,
@@ -1489,7 +1510,7 @@ impl InProcessDaemon {
 
         let weak = Arc::downgrade(&daemon);
         let mut namespace_changes = daemon.checkout_namespace_changes.subscribe();
-        tokio::spawn(async move {
+        tokio::spawn(flotilla_schema::reads::attributed(flotilla_schema::reads::caller("repository provider cache"), async move {
             let mut restarts = resubscribe::Resubscribe::default();
             while let Some(daemon) = weak.upgrade() {
                 // Mark the current namespace before listing; a change during setup stays pending
@@ -1558,7 +1579,7 @@ impl InProcessDaemon {
                     return;
                 }
             }
-        });
+        }));
 
         Ok(daemon)
     }
@@ -2377,7 +2398,7 @@ impl InProcessDaemon {
         self.change_request_observer.engine().install(Arc::clone(&failures))?;
         self.issue_observer.engine().install(failures)?;
         let (change_requests, issues) = (self.change_request_observer.clone(), self.issue_observer.clone());
-        tokio::spawn(async move {
+        tokio::spawn(flotilla_schema::reads::attributed(flotilla_schema::reads::caller("observation sweep"), async move {
             tokio::time::sleep(change_requests.stale_after()).await;
             if let Err(error) = change_requests.sweep_undemanded().await {
                 tracing::warn!(%error, "sweep undemanded change request observations");
@@ -2385,7 +2406,7 @@ impl InProcessDaemon {
             if let Err(error) = issues.sweep_undemanded().await {
                 tracing::warn!(%error, "sweep undemanded issue observations");
             }
-        });
+        }));
         Ok(())
     }
 
@@ -4874,11 +4895,11 @@ impl InProcessDaemon {
     /// The hook does not wait for it: the inspections run on their own task.
     pub fn inspect_after_turn(self: &Arc<Self>, namespace: &str, session: &str) {
         let (daemon, namespace, session) = (Arc::clone(self), namespace.to_owned(), session.to_owned());
-        tokio::spawn(async move {
+        tokio::spawn(flotilla_schema::reads::inherit(async move {
             if let Err(error) = daemon.inspect_session_checkouts(&namespace, &session).await {
                 tracing::warn!(%session, %error, "the checkouts a turn worked in were not inspected after it");
             }
-        });
+        }));
     }
 
     async fn inspect_session_checkouts(&self, namespace: &str, session: &str) -> Result<(), String> {
@@ -5391,7 +5412,9 @@ impl InProcessDaemon {
         command: Command,
         remote_executor: Arc<dyn RemoteStepExecutor>,
     ) -> Result<u64, String> {
-        self.execute_impl(command, remote_executor, true, None).await.map_err(String::from)
+        flotilla_store::load_metrics::inherit_or(COMMANDS, self.execute_impl(command, remote_executor, true, None))
+            .await
+            .map_err(String::from)
     }
 
     pub async fn execute_for_principal(&self, command: Command, principal_ref: Option<PrincipalRef>) -> Result<u64, String> {
@@ -5422,7 +5445,8 @@ impl InProcessDaemon {
         command: Command,
         caller: Option<flotilla_protocol::CommandCaller>,
     ) -> Result<u64, flotilla_protocol::DispatcherError> {
-        self.execute_impl(command, Arc::new(flotilla_executor::step::UnsupportedRemoteStepExecutor), false, caller).await
+        let execution = self.execute_impl(command, Arc::new(flotilla_executor::step::UnsupportedRemoteStepExecutor), false, caller);
+        flotilla_store::load_metrics::inherit_or(COMMANDS, execution).await
     }
 
     async fn executor_provider_data(&self, repo_identity: &RepoIdentity, _repo_root: &Path, registry: &ProviderRegistry) -> ProviderData {
@@ -6316,9 +6340,9 @@ impl ProjectOperations for InProcessDaemon {
     }
     fn spawn_convoy_start(&self, task: ConvoyStartTask) -> bool {
         if let Some(daemon) = self.self_weak.upgrade() {
-            tokio::spawn(async move {
+            tokio::spawn(flotilla_schema::reads::attributed(flotilla_schema::reads::caller("convoy start"), async move {
                 daemon.supervise_convoy_start(task).await;
-            });
+            }));
             true
         } else {
             false

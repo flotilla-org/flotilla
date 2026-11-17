@@ -153,7 +153,7 @@ impl ConvoyHolderInputs {
     ) -> Result<CloneCredentials, String> {
         let reads = Arc::clone(&self.lifecycle_reads);
         let name = environment.to_owned();
-        let record = tokio::task::spawn_blocking(move || reads.environments()?.get(&name, None))
+        let record = tokio::task::spawn_blocking(flotilla_schema::reads::carry(move || reads.environments()?.get(&name, None)))
             .await
             .map_err(|error| format!("read environment {environment}: {error}"))??;
         let Some(vessel) = record.and_then(|record| record.vessel) else { return Ok(CloneCredentials::default()) };
@@ -259,15 +259,17 @@ fn discovered_by_name(
 /// controller; false once the controller has stopped.
 async fn recheck_launches(state: &super::state::ControllerRuntimeState, path: Option<&str>) -> bool {
     let reads = state.daemon.lifecycle_reads();
-    let here =
-        match tokio::task::spawn_blocking(move || reads.checkouts()?.here()).await.map_err(|error| error.to_string()).and_then(|here| here)
-        {
-            Ok(here) => here,
-            Err(error) => {
-                warn!(%error, "checkouts here could not be read for a recheck");
-                return true;
-            }
-        };
+    let here = match tokio::task::spawn_blocking(flotilla_schema::reads::carry(move || reads.checkouts()?.here()))
+        .await
+        .map_err(|error| error.to_string())
+        .and_then(|here| here)
+    {
+        Ok(here) => here,
+        Err(error) => {
+            warn!(%error, "checkouts here could not be read for a recheck");
+            return true;
+        }
+    };
     let launches = flotilla_resources::checkout_records::latest_launches(here)
         .into_values()
         .filter(|checkout| checkout.is_ready() && path.is_none_or(|path| checkout.ready_path() == Some(path)))

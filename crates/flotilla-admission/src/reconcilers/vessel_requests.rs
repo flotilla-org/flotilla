@@ -229,7 +229,7 @@ impl VesselRequests {
             None
         } else {
             let reads = Arc::clone(&reads);
-            spawn_blocking(move || {
+            spawn_blocking(flotilla_schema::reads::carry(move || {
                 let checkouts_here = reads.checkouts()?;
                 let mut holders = BTreeSet::new();
                 for name in checkouts {
@@ -241,7 +241,7 @@ impl VesselRequests {
                     }
                 }
                 Ok(Some(holders))
-            })
+            }))
             .await?
         };
         match holders {
@@ -249,14 +249,14 @@ impl VesselRequests {
             None => convoys.extend(refused.iter().cloned()),
         }
         if !launches.is_empty() {
-            let named = spawn_blocking(move || {
+            let named = spawn_blocking(flotilla_schema::reads::carry(move || {
                 let vessels = reads.vessels()?;
                 let mut convoys = BTreeSet::new();
                 for launch in launches {
                     convoys.extend(vessels.get(&launch, None)?.map(|record| (record.convoy, record.convoy_home)));
                 }
                 Ok(convoys)
-            })
+            }))
             .await?;
             convoys.extend(named);
         }
@@ -381,7 +381,7 @@ impl VesselRequests {
         work: impl FnOnce(&dyn VesselRecords) -> Result<T, String> + Send + 'static,
     ) -> Result<T, ResourceError> {
         let reads = Arc::clone(&self.reads);
-        spawn_blocking(move || work(reads.vessels()?)).await
+        spawn_blocking(flotilla_schema::reads::carry(move || work(reads.vessels()?))).await
     }
 }
 

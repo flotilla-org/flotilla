@@ -312,6 +312,16 @@ pub fn inherit<F: Future>(work: F) -> Attributed<F> {
     Attributed { caller, waiting: Some(waiting), work: Box::pin(work) }
 }
 
+/// `work`, counted as [`inherit`] counts it where a caller is current, and for `fallback` where
+/// none is: an entry point many callers share, such as command execution, names the reads of
+/// callers that name none.
+pub fn inherit_or<F: Future>(fallback: &'static str, work: F) -> Attributed<F> {
+    let current = CURRENT.with(|current| current.borrow().clone());
+    let caller = current.unwrap_or_else(|| caller(fallback));
+    let waiting = WAITING.with(|waiting| waiting.borrow().clone());
+    Attributed { caller, waiting: Some(waiting), work: Box::pin(work) }
+}
+
 /// `work`'s output and the reads it made, counted for a caller of its own: the reads of the work
 /// it spawns through [`inherit`], and of shared work it waits on through [`Waiters`], count too.
 pub async fn measure<F: Future>(work: F) -> (F::Output, ReadCounts) {

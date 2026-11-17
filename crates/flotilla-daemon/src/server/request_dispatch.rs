@@ -7,6 +7,7 @@ use flotilla_protocol::{
     AgentHookEvent, Command, CommandAction, CommandCaller, CommandValue, DaemonEvent, DispatcherError, DispatcherErrorClass, Message,
     RepoSelector, Request, Response,
 };
+use flotilla_store::load_metrics::{attributed, caller as reads_caller, inherit_or};
 use tracing::warn;
 
 use super::{caller::missing_crew_message, client_connection::QuerySubscriptions, remote_commands::RemoteCommandRouter};
@@ -14,6 +15,9 @@ use crate::artifact::{ArtifactBody, ArtifactPutInput, ArtifactService};
 use crate::runtime::archive;
 
 const INTERACTIVE_REQUEST_DEADLINE: Duration = Duration::from_secs(5);
+
+/// The caller a client request's reads count for, unless the request names its own.
+const CLIENT_REQUESTS: &str = "client requests";
 
 fn is_interactive_request(request: &Request) -> bool {
     // SubscribeQueries registers interest before awaiting result sets, so a
@@ -107,7 +111,7 @@ impl<'a> RequestDispatcher<'a> {
     }
 
     pub(super) fn dispatch(&self, id: u64, request: Request) -> std::pin::Pin<Box<impl Future<Output = Message> + '_>> {
-        Box::pin(async move {
+        Box::pin(inherit_or(CLIENT_REQUESTS, async move {
             if is_interactive_request(&request) {
                 // Attach queries resolve a plan; terminal creation happens after
                 // the client receives that plan, so cancellation cannot leave
@@ -119,7 +123,7 @@ impl<'a> RequestDispatcher<'a> {
             } else {
                 Box::pin(self.dispatch_inner(id, request)).await
             }
-        })
+        }))
     }
 
     async fn dispatch_request_shutdown(&self, id: u64, request: Request) -> Message {
@@ -568,6 +572,16 @@ impl<'a> RequestDispatcher<'a> {
 /// Record one agent hook event: the agent state store entry and, for a managed terminal,
 /// its attention. The framed `AgentHook` request and the router's hook routes share it.
 pub(super) async fn handle_agent_hook(
+    agent_state_store: &SharedAgentStateStore,
+    hook_identity_policy: HookIdentityPolicy,
+    daemon: Option<std::sync::Arc<InProcessDaemon>>,
+    event: AgentHookEvent,
+) -> Result<(), String> {
+    let hook = agent_hook(agent_state_store, hook_identity_policy, daemon, event);
+    attributed(reads_caller(crate::agent_attention::AGENT_HOOKS), hook).await
+}
+
+async fn agent_hook(
     agent_state_store: &SharedAgentStateStore,
     hook_identity_policy: HookIdentityPolicy,
     daemon: Option<std::sync::Arc<InProcessDaemon>>,

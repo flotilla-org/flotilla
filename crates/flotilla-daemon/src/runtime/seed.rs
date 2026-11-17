@@ -101,7 +101,7 @@ pub(super) async fn ensure_host_direct_environment_exists(
         }),
         docker: None,
     };
-    tokio::task::spawn_blocking(move || reads.environments()?.request(&name, &spec, None).map(drop))
+    tokio::task::spawn_blocking(flotilla_schema::reads::carry(move || reads.environments()?.request(&name, &spec, None).map(drop)))
         .await
         .map_err(|error| format!("request environment: {error}"))?
 }
@@ -151,9 +151,11 @@ pub(super) async fn discover_local_clones(
         // The engine's request says the clone was found here, not cloned. A clone already held
         // is served as it is; one held for another repository or environment is left alone.
         let reads = daemon.lifecycle_reads();
-        let requested = tokio::task::spawn_blocking(move || reads.clones()?.request(&repository_spec, &expected_spec, true))
-            .await
-            .map_err(|error| format!("request discovered clone: {error}"))?;
+        let requested = tokio::task::spawn_blocking(flotilla_schema::reads::carry(move || {
+            reads.clones()?.request(&repository_spec, &expected_spec, true)
+        }))
+        .await
+        .map_err(|error| format!("request discovered clone: {error}"))?;
         if let Err(error) = requested {
             warn!(%error, path = %repo_path.display(), "leaving discovered clone as the engine holds it");
         }

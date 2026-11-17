@@ -39,7 +39,7 @@ use flotilla_resources::LANDING_EVIDENCE_TTL;
 use flotilla_resources::{host_direct_environment_name, Convoy, Forge, Host, Repository, Resource, ResourceError, Vessel};
 use flotilla_store::{
     controller::ControllerLoop,
-    load_metrics::{attributed, within, Attributed},
+    load_metrics::{attributed, caller, inherit_or, within, Attributed},
     ResourceBackend,
 };
 use tokio::{sync::watch, task::JoinHandle};
@@ -148,7 +148,8 @@ impl DaemonRuntime {
     ) -> Result<Self, String> {
         // Boxed: initialisation composes the whole daemon, and its future is too large for a
         // caller's stack (a 2 MiB test thread overflowed polling it in place).
-        result_phase("initialize_runtime", Box::pin(Self::initialize_with_options(daemon, config, daemon_socket_path, options))).await
+        let initialize = Self::initialize_with_options(daemon, config, daemon_socket_path, options);
+        result_phase("initialize_runtime", Box::pin(inherit_or(flotilla_core::in_process::DAEMON_STARTUP, initialize))).await
     }
 
     async fn initialize_with_options(
@@ -325,14 +326,20 @@ impl DaemonRuntime {
                 runtime_health.host_observations.clone(),
                 options.fulfilment_probe_interval,
             ),
-            tokio::spawn(Arc::clone(&blob_store).run_sync()),
-            tokio::spawn(run_artifact_gc(daemon.resource_backend(), options.namespace.clone(), Arc::clone(&blob_store))),
-            tokio::spawn(run_checkout_archive_gc(CheckoutArchiveSweep {
-                daemon: Arc::clone(&daemon),
-                catalog_path: config.state_dir().as_path().join("checkout-archive-roots.json"),
-                roots: archive_roots,
-                retention_days: daemon_config.checkout_archive_retention_days,
-            })),
+            tokio::spawn(attributed(caller("blob store sync"), Arc::clone(&blob_store).run_sync())),
+            tokio::spawn(attributed(
+                caller("artifact gc"),
+                run_artifact_gc(daemon.resource_backend(), options.namespace.clone(), Arc::clone(&blob_store)),
+            )),
+            tokio::spawn(attributed(
+                caller("checkout archive gc"),
+                run_checkout_archive_gc(CheckoutArchiveSweep {
+                    daemon: Arc::clone(&daemon),
+                    catalog_path: config.state_dir().as_path().join("checkout-archive-roots.json"),
+                    roots: archive_roots,
+                    retention_days: daemon_config.checkout_archive_retention_days,
+                }),
+            )),
             spawn_heartbeat_task_with_credentials(
                 Arc::clone(&daemon),
                 options.namespace.clone(),
@@ -366,7 +373,7 @@ impl DaemonRuntime {
             ),
         ]);
         if let Some((shipper, service)) = archive_shipper(&daemon, &daemon_config.blob_stores, &runtime_health)? {
-            tasks.push(tokio::spawn(shipper.run(service)));
+            tasks.push(tokio::spawn(attributed(caller("archive shipper"), shipper.run(service))));
         }
         if let Some(relay) = relay {
             tasks.push(crate::event_relay::spawn(Arc::clone(&daemon), relay, config.state_dir().as_path().to_path_buf())?);
@@ -378,33 +385,40 @@ impl DaemonRuntime {
             let ssh = ssh.clone();
             let credential_store = Arc::clone(&credential_store);
             let ssh_host_vessels = ssh_host_vessels.clone();
-            tasks.push(spawn_periodic_task(options.heartbeat_interval, PeriodicTaskStart::AfterInterval, move || {
-                let daemon = Arc::clone(&daemon);
-                let namespace = namespace.clone();
-                let ssh = ssh.clone();
-                let credential_store = Arc::clone(&credential_store);
-                let ssh_host_vessels = ssh_host_vessels.clone();
-                async move {
-                    if let Err(error) =
-                        apply_ssh_host_observation(&daemon, &namespace, &ssh, Some(&credential_store), ssh_host_vessels.as_deref()).await
-                    {
-                        warn!(host = %ssh.provisioning.host_id, %error, "failed to publish SSH host observation");
-                    }
-                    // #3792: a removed vessel's agent goes with it, including
-                    // one removed while this daemon was down.
-                    if let Some(vessels) = &ssh_host_vessels {
-                        let retired = async {
-                            let live =
-                                ssh_host_vessels::live_vessels(&daemon.resource_backend(), &namespace, ssh.environment_id.as_str()).await?;
-                            vessels.retire_absent(&ssh, &live).await
+            tasks.push(spawn_periodic_task(
+                "ssh host heartbeat",
+                options.heartbeat_interval,
+                PeriodicTaskStart::AfterInterval,
+                move || {
+                    let daemon = Arc::clone(&daemon);
+                    let namespace = namespace.clone();
+                    let ssh = ssh.clone();
+                    let credential_store = Arc::clone(&credential_store);
+                    let ssh_host_vessels = ssh_host_vessels.clone();
+                    async move {
+                        if let Err(error) =
+                            apply_ssh_host_observation(&daemon, &namespace, &ssh, Some(&credential_store), ssh_host_vessels.as_deref())
+                                .await
+                        {
+                            warn!(host = %ssh.provisioning.host_id, %error, "failed to publish SSH host observation");
                         }
-                        .await;
-                        if let Err(error) = retired {
-                            warn!(host = %ssh.provisioning.host_id, %error, "failed to retire removed vessels' agents");
+                        // #3792: a removed vessel's agent goes with it, including
+                        // one removed while this daemon was down.
+                        if let Some(vessels) = &ssh_host_vessels {
+                            let retired = async {
+                                let live =
+                                    ssh_host_vessels::live_vessels(&daemon.resource_backend(), &namespace, ssh.environment_id.as_str())
+                                        .await?;
+                                vessels.retire_absent(&ssh, &live).await
+                            }
+                            .await;
+                            if let Err(error) = retired {
+                                warn!(host = %ssh.provisioning.host_id, %error, "failed to retire removed vessels' agents");
+                            }
                         }
                     }
-                }
-            }));
+                },
+            ));
         }
         let desired_manifest_root = manifests
             .as_ref()
@@ -421,7 +435,7 @@ impl DaemonRuntime {
             }
         }
         let charter_daemon = Arc::clone(&daemon);
-        tasks.push(spawn_periodic_task(MANIFEST_RECONCILE_INTERVAL, PeriodicTaskStart::Immediate, move || {
+        tasks.push(spawn_periodic_task("charter manifests", MANIFEST_RECONCILE_INTERVAL, PeriodicTaskStart::Immediate, move || {
             let daemon = Arc::clone(&charter_daemon);
             async move {
                 if let Err(error) = daemon.reconcile_bound_project_charters().await {
@@ -589,10 +603,13 @@ impl StartupRestoration {
             local_registry.environment_providers.for_legacy_input(flotilla_environment::environment::EnvironmentInput::Docker)
         {
             let reads = daemon.lifecycle_reads();
-            let live = phase("list_environments_for_credential_sweep", tokio::task::spawn_blocking(move || reads.environments()?.live()))
-                .await
-                .map_err(|error| error.to_string())
-                .and_then(|live| live);
+            let live = phase(
+                "list_environments_for_credential_sweep",
+                tokio::task::spawn_blocking(flotilla_schema::reads::carry(move || reads.environments()?.live())),
+            )
+            .await
+            .map_err(|error| error.to_string())
+            .and_then(|live| live);
             let running = phase("list_docker_backings_for_credential_sweep", provider.list()).await;
             match (live, running) {
                 (Ok(live), Ok(running)) => {
@@ -640,9 +657,9 @@ impl StartupRestoration {
         let mut controller_tasks = Vec::new();
         let observation_daemon = Arc::clone(daemon);
         let observation_namespace = options.namespace.clone();
-        controller_tasks.push(AbortOnDropHandle::new(tokio::spawn(async move {
+        controller_tasks.push(AbortOnDropHandle::new(tokio::spawn(attributed(caller("change request demands"), async move {
             observation_daemon.watch_change_request_convoy_demands(&observation_namespace).await;
-        })));
+        }))));
         let Some(state) = self.state.as_ref() else {
             return futures::future::pending::<Result<(), ResourceError>>().await;
         };
@@ -875,7 +892,7 @@ fn spawn_controller_loops(
     controllers.extend(vessel);
     if let Some(distributor) = &state.image_inventory {
         let distributor = Arc::clone(distributor);
-        controllers.push(tokio::spawn(async move {
+        controllers.push(tokio::spawn(attributed(caller("image inventory"), async move {
             let mut interval = tokio::time::interval(Duration::from_secs(30));
             loop {
                 interval.tick().await;
@@ -883,7 +900,7 @@ fn spawn_controller_loops(
                     tracing::warn!(%reason, "image availability refresh failed");
                 }
             }
-        }));
+        })));
     }
     controllers.extend(spawn_image_build_controller(&state, provisioning));
     // Message delivery is the engine path's adapter (#3317, #3108); the runtime opens that path at
@@ -984,7 +1001,9 @@ pub fn engine_opener(config: &ConfigStore) -> flotilla_core::in_process::EngineO
 pub(crate) async fn open_message_primitives(daemon: &Arc<InProcessDaemon>) -> Result<(), String> {
     result_phase("restore_message_primitives", async {
         let daemon = Arc::clone(daemon);
-        tokio::task::spawn_blocking(move || daemon.open_message_primitives()).await.map_err(|error| error.to_string())?
+        tokio::task::spawn_blocking(flotilla_schema::reads::carry(move || daemon.open_message_primitives()))
+            .await
+            .map_err(|error| error.to_string())?
     })
     .await
     .map(|_| ())
@@ -1187,7 +1206,7 @@ fn spawn_terminal_controller(
             let (rechecks, recheck_events) = tokio::sync::mpsc::channel(64);
             let probe =
                 TerminalProbe::new(provider, records, backings).with_progress(state.daemon.crew_progress()).with_briefs(briefs, rechecks);
-            tasks.push(tokio::spawn(probe.run(TERMINAL_PROBE_EVERY)));
+            tasks.push(tokio::spawn(attributed(caller("TerminalProbe"), probe.run(TERMINAL_PROBE_EVERY))));
             Some(tokio::spawn(counted(state, "engine TerminalSession", controller.run_with(backing_events, recheck_events))))
         }
         Err(error) => {
@@ -1236,14 +1255,15 @@ fn spawn_checkout_controller(
     match state.daemon.message_primitives() {
         Some(primitives) => {
             let inspector = Arc::new(checkouts::CheckoutInspector { inspection: Arc::clone(&actuator) as _ });
-            tasks.push(tokio::spawn(role_consumer::serve_role(Arc::clone(&primitives), inspector)));
+            let inspection = role_consumer::serve_role(Arc::clone(&primitives), inspector);
+            tasks.push(tokio::spawn(attributed(caller("checkout inspector"), inspection)));
             // Branch validation asks this host's forge observer to look its branch up.
             let observer = Arc::new(checkouts::ForgeObserver { daemon: Arc::clone(&state.daemon) });
-            tasks.push(tokio::spawn(role_consumer::serve_role(primitives, observer)));
+            tasks.push(tokio::spawn(attributed(caller("forge observer"), role_consumer::serve_role(primitives, observer))));
         }
         None => error!("the checkout inspector and forge observer have no Message path; requests to them here go unanswered"),
     }
-    tasks.push(tokio::spawn(checkouts::recheck_on_discovered_refresh(Arc::clone(state))));
+    tasks.push(tokio::spawn(attributed(caller("checkout rechecks"), checkouts::recheck_on_discovered_refresh(Arc::clone(state)))));
     match Controller::start(Arc::clone(&engine.checkouts), actuator, state.daemon.clock_for_scenarios(), service) {
         Ok(controller) => Some(tokio::spawn(counted(state, "engine Checkout", async move {
             // A checkout's backing is observed at a recheck, not pushed.
@@ -1290,7 +1310,8 @@ fn spawn_vessel_controller(
     };
     let backend = state.daemon.resource_backend();
     let planning = Arc::new(vessel_planning(state, &backend, &state.namespace));
-    tasks.push(tokio::spawn(
+    tasks.push(tokio::spawn(attributed(
+        caller("ConvoyVesselWake"),
         ConvoyVesselWake::new(
             &backend,
             &state.namespace,
@@ -1299,7 +1320,7 @@ fn spawn_vessel_controller(
             state.daemon.account_records(),
         )
         .recheck(state.namespace.clone(), state.vessel_rechecks.clone()),
-    ));
+    )));
     let actuator = Arc::new(VesselActuator::new(planning));
     match Controller::start(Arc::clone(&engine.vessels), actuator, state.daemon.clock_for_scenarios(), service) {
         Ok(controller) => Some(tokio::spawn(counted(state, "engine Vessel", async move {
@@ -1350,7 +1371,7 @@ async fn open_provisioning_lifecycles(
     let home = StoreLog::new(Arc::clone(&store)).home().to_owned();
     let opened = Arc::clone(&store);
     let service = daemon.decided_store()?;
-    let lifecycles = tokio::task::spawn_blocking(move || {
+    let lifecycles = tokio::task::spawn_blocking(flotilla_schema::reads::carry(move || {
         let store = opened;
         let home = StoreLog::new(Arc::clone(&store)).home().to_owned();
         let log = || StoreLog::new(Arc::clone(&store));
@@ -1391,7 +1412,7 @@ async fn open_provisioning_lifecycles(
             terminal_records,
             vessels: Arc::new(PlacementLifecycles::new(&home, open_home(log())?)?),
         })
-    })
+    }))
     .await
     .map_err(|error| error.to_string())??;
     // Every environment reader and requester goes through the engine's environments.

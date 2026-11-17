@@ -166,7 +166,11 @@ impl MessageDelivery {
         let mut watches = tokio::task::JoinSet::new();
         macro_rules! watch {
             ($kind:ty) => {
-                watches.spawn(watch_changes::<$kind>(backend.clone(), self.namespace.clone(), Arc::clone(&wake)));
+                watches.spawn(flotilla_schema::reads::inherit(watch_changes::<$kind>(
+                    backend.clone(),
+                    self.namespace.clone(),
+                    Arc::clone(&wake),
+                )));
             };
         }
         // Role routing's records (`MessageReceiverSnapshot`, the designation) and the records the
@@ -246,10 +250,10 @@ impl MessageDelivery {
         }
         // The senders' records past their deadlines with no reply present (#3587 layer 7).
         let awaiting = Arc::clone(self.primitives.awaiting());
-        let (expired, awaiting_next) = tokio::task::spawn_blocking(move || {
+        let (expired, awaiting_next) = tokio::task::spawn_blocking(flotilla_schema::reads::carry(move || {
             let expired = awaiting.expire_due(now)?;
             Ok::<_, String>((expired, awaiting.next_deadline_after(now)?))
-        })
+        }))
         .await
         .map_err(|error| error.to_string())??;
         if !expired.is_empty() {
@@ -340,8 +344,9 @@ impl MessageDelivery {
             let reads = self.state.daemon.lifecycle_reads();
             let launch = name.clone();
             // A store read: off the async workers.
-            let terminal =
-                tokio::task::spawn_blocking(move || reads.terminals()?.get(&launch, None)).await.map_err(|error| error.to_string())??;
+            let terminal = tokio::task::spawn_blocking(flotilla_schema::reads::carry(move || reads.terminals()?.get(&launch, None)))
+                .await
+                .map_err(|error| error.to_string())??;
             let reason = match terminal {
                 Some(launch) if launch.is_running() => continue,
                 // Stopped, as its view reads: released, or its process exited.
@@ -353,7 +358,9 @@ impl MessageDelivery {
             let sessions = Arc::clone(self.primitives.sessions());
             let ended = name.clone();
             // A SQLite write: off the async workers.
-            tokio::task::spawn_blocking(move || sessions.end(&ended, reason, now)).await.map_err(|error| error.to_string())??;
+            tokio::task::spawn_blocking(flotilla_schema::reads::carry(move || sessions.end(&ended, reason, now)))
+                .await
+                .map_err(|error| error.to_string())??;
             self.sessions.remove(&name);
         }
         self.sessions.extend(live);
@@ -639,7 +646,7 @@ impl MessageDelivery {
         // A finished turn wakes a pass to record its receipts.
         let finished = FinishedTurn(Arc::clone(&self.wake));
         let drafts = Arc::clone(&self.state.composer_drafts);
-        let task = tokio::spawn(
+        let task = tokio::spawn(flotilla_schema::reads::inherit(
             async move {
                 let _finished = finished;
                 // Keep every member's attempt open for the shared transport call.
@@ -654,7 +661,7 @@ impl MessageDelivery {
                 submit_and_confirm(&*pool, &drafts, adapter.as_deref(), &session, &typed).await
             }
             .instrument(primary_span),
-        );
+        ));
         deliveries.insert(holder.session_id.clone(), PendingTerminalDelivery { task, engine_turn: EngineTurn::new(stop) });
         self.inflight
             .insert(holder.session_id.clone(), InFlight { consumer: holder.consumer.clone(), members, submitted_at, confirmed: false });

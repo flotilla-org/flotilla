@@ -14,6 +14,7 @@ use flotilla_dummy_fleet::{CrewCommandPort, DaemonCommandPort, DummyFleet};
 use flotilla_protocol::{commands::CommandValue, CommandAction};
 use flotilla_provisioning::reconcilers::ForgeDefaultBranchResolver;
 use flotilla_resources::TerminalAttentionState;
+use flotilla_store::load_metrics::inherit_or;
 use tracing::warn;
 
 /// Install the configured dummy fleet's factories, if any.
@@ -61,6 +62,13 @@ impl CrewCommandPort for DaemonCrewPort {
     }
 
     async fn report_attention(&self, namespace: &str, session: &str, working: bool) -> Result<(), String> {
+        // Its reads count as a harness hook's do.
+        inherit_or(crate::agent_attention::AGENT_HOOKS, self.attention(namespace, session, working)).await
+    }
+}
+
+impl DaemonCrewPort {
+    async fn attention(&self, namespace: &str, session: &str, working: bool) -> Result<(), String> {
         use flotilla_state_machines::machines::agent_session::Activity;
         let (state, activity, cause) = if working {
             (TerminalAttentionState::Working, Activity::Working, DUMMY_WORKING_CAUSE)

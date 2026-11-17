@@ -443,7 +443,7 @@ impl ExecutorActions<'_> {
         let daemon_socket_path = self.daemon_socket_path.read().await.clone();
         let environment_lifecycle = Arc::clone(&self.environment_lifecycle);
         let vcs_resolver = self.port.vcs_resolver()?;
-        tokio::spawn(async move {
+        tokio::spawn(flotilla_store::load_metrics::inherit(async move {
             let resolver_registry = Arc::clone(&registry);
             let resolver_providers_data = Arc::clone(&providers_data);
             let resolver_runner = Arc::clone(&runner);
@@ -509,7 +509,7 @@ impl ExecutorActions<'_> {
                     });
                 }
             }
-        });
+        }));
 
         Ok(id)
     }

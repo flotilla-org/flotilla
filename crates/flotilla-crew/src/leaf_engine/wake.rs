@@ -1056,12 +1056,12 @@ impl ReconcilerWake {
                 continue 'desired_rows;
             }
             let subscriptions = self.subscriptions.clone();
-            let task = tokio::spawn(async move {
+            let task = tokio::spawn(flotilla_store::load_metrics::inherit(async move {
                 if let Err(error) = subscriptions.watch_row(row).await {
                     tracing::warn!(subscription_id = %id, %error, "reconciler leaf subscription watch ended");
                     subscriptions.finish(id).await;
                 }
-            });
+            }));
             self.subscriptions.inner.tasks.lock().await.insert(id, task);
         }
         Ok(())

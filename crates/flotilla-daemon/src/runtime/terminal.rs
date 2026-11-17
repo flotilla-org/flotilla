@@ -175,7 +175,7 @@ impl TerminalControllerRuntime {
         let sessions = Arc::clone(primitives.sessions());
         let name = record.to_owned();
         let now = flotilla_schema::Timestamp::from_datetime(&now);
-        match tokio::task::spawn_blocking(move || sessions.observe_screen(&name, activity, now)).await {
+        match tokio::task::spawn_blocking(flotilla_schema::reads::carry(move || sessions.observe_screen(&name, activity, now))).await {
             Ok(Ok(_)) => {}
             Ok(Err(error)) => warn!(session = %record, %error, "failed to record agent session activity from its screen"),
             Err(error) => warn!(session = %record, %error, "agent session screen observation did not finish"),

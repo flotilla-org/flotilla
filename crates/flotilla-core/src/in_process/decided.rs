@@ -39,10 +39,10 @@ pub fn opener_with(state_dir: impl Into<PathBuf>, before: BeforeOpen) -> EngineO
     let state_dir = state_dir.into();
     Box::new(move |identity: EngineIdentity| {
         Box::pin(async move {
-            tokio::task::spawn_blocking(move || {
+            tokio::task::spawn_blocking(flotilla_schema::reads::carry(move || {
                 before(&state_dir, identity.node_id.as_str(), &identity.host_id.to_string())?;
                 open(&state_dir, identity)
-            })
+            }))
             .await
             .map_err(|error| error.to_string())?
         }) as futures::future::BoxFuture<'static, _>

@@ -43,7 +43,8 @@ impl PrincipalRoles {
                     .entry(namespace.to_owned())
                     .or_insert_with(|| {
                         let (requests, received) = mpsc::unbounded_channel();
-                        tokio::spawn(follow(backend.downgrade(), namespace.to_owned(), received));
+                        let followed = follow(backend.downgrade(), namespace.to_owned(), received);
+                        tokio::spawn(flotilla_schema::reads::attributed(flotilla_schema::reads::caller("principal roles"), followed));
                         requests
                     })
                     .clone()

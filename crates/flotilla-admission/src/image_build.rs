@@ -283,7 +283,7 @@ pub async fn demand_planned_builds(reads: Arc<dyn LifecycleReads>, planned: &[Pl
         return Ok(Vec::new());
     }
     let planned = planned.to_vec();
-    tokio::task::spawn_blocking(move || {
+    tokio::task::spawn_blocking(flotilla_schema::reads::carry(move || {
         let builds = reads.image_builds()?;
         let mut demanded = Vec::new();
         for build in &planned {
@@ -307,7 +307,7 @@ pub async fn demand_planned_builds(reads: Arc<dyn LifecycleReads>, planned: &[Pl
             }
         }
         Ok(demanded)
-    })
+    }))
     .await
     .map_err(|error| format!("demand image builds: {error}"))?
 }
@@ -318,7 +318,9 @@ pub async fn withdraw_demanded_builds(reads: Arc<dyn LifecycleReads>, demanded: 
         return;
     }
     let demanded = demanded.to_vec();
-    let withdrawn = tokio::task::spawn_blocking(move || reads.image_builds().map(|builds| withdraw(builds, &demanded))).await;
+    let withdrawn =
+        tokio::task::spawn_blocking(flotilla_schema::reads::carry(move || reads.image_builds().map(|builds| withdraw(builds, &demanded))))
+            .await;
     if let Err(error) = withdrawn.map_err(|error| error.to_string()).and_then(|withdrawn| withdrawn) {
         tracing::warn!(%error, "could not withdraw an abandoned admission's image build demands");
     }

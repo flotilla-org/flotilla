@@ -467,9 +467,10 @@ pub(super) async fn mark_unavailable_environment(
     // The checkouts launched in this environment, at any home, keep its work.
     let reads = state.daemon.lifecycle_reads();
     let environment = env_id.as_str().to_owned();
-    let launches = tokio::task::spawn_blocking(move || reads.checkouts()?.in_environment(&environment, None))
-        .await
-        .map_err(|error| error.to_string())??;
+    let launches =
+        tokio::task::spawn_blocking(flotilla_schema::reads::carry(move || reads.checkouts()?.in_environment(&environment, None)))
+            .await
+            .map_err(|error| error.to_string())??;
     let mut retained_paths: Vec<String> = flotilla_resources::checkout_records::latest_launches(launches)
         .into_values()
         .filter_map(|checkout| checkout.path().map(str::to_owned))

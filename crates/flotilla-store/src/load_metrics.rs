@@ -20,8 +20,8 @@ use std::{
 };
 
 pub use flotilla_schema::reads::{
-    attributed, caller, callers, carry, counts_since, inherit, measure, measure_now, within, Attributed, CallerReads, KindReadCounts,
-    ReadCounts,
+    attributed, caller, callers, carry, counts_since, inherit, inherit_or, measure, measure_now, within, Attributed, CallerReads,
+    KindReadCounts, ReadCounts,
 };
 use serde::Serialize;
 

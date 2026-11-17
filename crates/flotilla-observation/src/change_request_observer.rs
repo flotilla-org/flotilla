@@ -15,11 +15,16 @@ use flotilla_resources::{
     ChangeRequestStatus, Convoy, Forge, ForgeSpec, InputMeta, ObservedChangeRequestState, ObservedChecks, ResourceError, ResourceObject,
     ResourceProvenance,
 };
-use flotilla_store::{watch_resource_kind_including_replicas, ResourceBackend, StoreQuery};
+use flotilla_store::{
+    load_metrics::{attributed, caller},
+    watch_resource_kind_including_replicas, ResourceBackend, StoreQuery,
+};
 
 use crate::engine_observers::EngineObservers;
 
 const KIND: &str = "ChangeRequest";
+/// The caller a subject's refresh loop reads as.
+const REFRESHER: &str = "change request refresh";
 #[cfg(test)]
 use flotilla_store_http::HttpBackend;
 #[cfg(test)]
@@ -133,7 +138,10 @@ impl ChangeRequestRefresher {
     /// Installs the forge lookup the branch probes use, once the daemon that serves it is composed.
     pub fn install_branch_probe(&self, probe: Arc<dyn BranchProbe>) -> Result<(), String> {
         self.inner.branch_probe.set(probe).map_err(|_| "the branch probe is already installed".to_owned())?;
-        let scheduler = tokio::spawn(run_branch_probes(Arc::downgrade(&self.inner), Arc::clone(&self.inner.branch_wake)));
+        let scheduler = tokio::spawn(attributed(
+            caller("branch probes"),
+            run_branch_probes(Arc::downgrade(&self.inner), Arc::clone(&self.inner.branch_wake)),
+        ));
         let _ = self.inner.branch_scheduler.set(tokio_util::task::AbortOnDropHandle::new(scheduler));
         Ok(())
     }
@@ -577,7 +585,7 @@ impl ChangeRequestRefresher {
         }
         let this = self.clone();
         let task_subject = subject.clone();
-        let task = tokio::spawn(async move { this.refresh_loop(task_subject).await });
+        let task = tokio::spawn(attributed(caller(REFRESHER), async move { this.refresh_loop(task_subject).await }));
         active.insert(
             subject,
             ActiveRefresh {
@@ -761,7 +769,7 @@ impl ChangeRequestRefresher {
         }
         let this = self.clone();
         let task_subject = subject.clone();
-        let task = tokio::spawn(async move { this.refresh_loop(task_subject).await });
+        let task = tokio::spawn(attributed(caller(REFRESHER), async move { this.refresh_loop(task_subject).await }));
         active.insert(
             subject,
             ActiveRefresh {

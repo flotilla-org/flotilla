@@ -13,6 +13,7 @@ use std::{
 };
 
 use flotilla_protocol::{DispatchBoardRepository, IssueSource};
+use flotilla_store::load_metrics::{attributed, caller};
 use futures::{future::BoxFuture, FutureExt};
 use tokio::sync::{watch, Mutex};
 use tracing::Instrument;
@@ -109,9 +110,8 @@ impl DispatchBoardCache {
         if !state.scheduled {
             state.scheduled = true;
             state.refreshing = true;
-            tokio::spawn(
-                refresh(Arc::downgrade(&self.shared), source.clone(), entry.clone()).instrument(tracing::info_span!("dispatch_board")),
-            );
+            let refreshed = refresh(Arc::downgrade(&self.shared), source.clone(), entry.clone());
+            tokio::spawn(attributed(caller("dispatch board"), refreshed.instrument(tracing::info_span!("dispatch_board"))));
         }
         let Some(board) = state.board.clone() else {
             return Err(format!(

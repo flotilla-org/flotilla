@@ -148,7 +148,7 @@ impl ControllerRuntimeState {
     pub(super) async fn environment(&self, name: &str) -> Result<Option<EnvironmentRecord>, String> {
         let reads = self.daemon.lifecycle_reads();
         let name = name.to_owned();
-        tokio::task::spawn_blocking(move || reads.environments()?.find(&name))
+        tokio::task::spawn_blocking(flotilla_schema::reads::carry(move || reads.environments()?.find(&name)))
             .await
             .map_err(|error| format!("read environment: {error}"))?
     }
@@ -156,7 +156,9 @@ impl ControllerRuntimeState {
     /// This home's environments that have not ended.
     pub(super) async fn live_environments(&self) -> Result<Vec<EnvironmentRecord>, String> {
         let reads = self.daemon.lifecycle_reads();
-        tokio::task::spawn_blocking(move || reads.environments()?.live()).await.map_err(|error| format!("read environments: {error}"))?
+        tokio::task::spawn_blocking(flotilla_schema::reads::carry(move || reads.environments()?.live()))
+            .await
+            .map_err(|error| format!("read environments: {error}"))?
     }
 
     /// Tells the Environment controller what a probe observed of `name`'s backing.
@@ -521,7 +523,7 @@ impl StandingConvoyBackingInspector for ControllerRuntimeState {
             .unwrap_or_default();
         let convoy_name = convoy.metadata.name.clone();
         let reads = self.daemon.lifecycle_reads();
-        let (launched, environments) = tokio::task::spawn_blocking(move || {
+        let (launched, environments) = tokio::task::spawn_blocking(flotilla_schema::reads::carry(move || {
             let environments = reads.environments()?;
             let vessels = reads.vessels()?.of_convoy(&convoy_name)?;
             let mut launched = false;
@@ -531,7 +533,7 @@ impl StandingConvoyBackingInspector for ControllerRuntimeState {
                 held.extend(environments.held(vessel)?.into_iter().filter(|environment| !environment.ended()));
             }
             Ok::<_, String>((launched, held))
-        })
+        }))
         .await
         .map_err(|error| format!("could not inspect backing environments: {error}"))?
         .map_err(|error| format!("could not inspect backing environments: {error}"))?;

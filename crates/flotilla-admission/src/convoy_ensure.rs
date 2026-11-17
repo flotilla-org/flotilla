@@ -107,7 +107,7 @@ impl StandingConvoyBackingInspector for ResourceStandingConvoyBackingInspector {
             .unwrap_or_default();
         let convoy_name = convoy.metadata.name.clone();
         let reads = Arc::clone(&self.lifecycle_reads);
-        let (launched, environments) = tokio::task::spawn_blocking(move || {
+        let (launched, environments) = tokio::task::spawn_blocking(flotilla_schema::reads::carry(move || {
             let environments = reads.environments()?;
             let vessels = reads.vessels()?.of_convoy(&convoy_name)?;
             let mut launched = false;
@@ -117,7 +117,7 @@ impl StandingConvoyBackingInspector for ResourceStandingConvoyBackingInspector {
                 held.extend(environments.held(vessel)?);
             }
             Ok::<_, String>((launched, held))
-        })
+        }))
         .await
         .map_err(|error| format!("could not inspect backing environments: {error}"))?
         .map_err(|error| format!("could not inspect backing environments: {error}"))?;

@@ -61,7 +61,9 @@ impl flotilla_admission::reconcilers::vessel_requests::VesselReleaseGate for Dae
         let held = match flotilla_resources::convoy::engine::checkout_holder(convoy) {
             Some(holder) => {
                 let reads = self.daemon.lifecycle_reads();
-                tokio::task::spawn_blocking(move || reads.checkouts()?.held(&holder)).await.map_err(|error| error.to_string())??
+                tokio::task::spawn_blocking(flotilla_schema::reads::carry(move || reads.checkouts()?.held(&holder)))
+                    .await
+                    .map_err(|error| error.to_string())??
             }
             None => Vec::new(),
         };
@@ -116,7 +118,7 @@ impl OperatorReconciler for RuntimeOperatorReconciler {
                 // waits on changes, so there is nothing to wake.
                 let reads = self.state.daemon.lifecycle_reads();
                 let clone = flotilla_resources::clone_records::launched(name).to_owned();
-                let renewal = tokio::task::spawn_blocking(move || reads.clones()?.renew(&clone))
+                let renewal = tokio::task::spawn_blocking(flotilla_schema::reads::carry(move || reads.clones()?.renew(&clone)))
                     .await
                     .map_err(|error| format!("renew clone: {error}"))??;
                 Ok(match renewal {

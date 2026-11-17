@@ -35,7 +35,7 @@ use flotilla_resources::{
     CredentialGrant, CredentialSpec, FulfilmentGrant, FulfilmentKind, Project, ReadWatchEvent, Repository, RepositoryKey, RepositoryTrust,
     TerminalSession, TerminalSessionPhase, WatchEvent,
 };
-use flotilla_store::load_metrics::ControllerLoadMetrics;
+use flotilla_store::load_metrics::{inherit, ControllerLoadMetrics};
 use futures::StreamExt;
 use tokio::sync::{mpsc, oneshot, Notify};
 use tracing::{debug, info, warn};
@@ -204,20 +204,35 @@ impl CredentialDelivery {
         };
         let mut sources = tokio::task::JoinSet::new();
         let backend = self.state.daemon.resource_backend();
-        sources.spawn(watch_sessions(backend.clone(), self.namespace.clone(), Arc::clone(&self.events)));
-        sources.spawn(watch_environments(Arc::clone(&self.state), Arc::clone(&self.events)));
-        sources.spawn(watch_named::<Project>(backend.clone(), self.namespace.clone(), Arc::clone(&self.events), |pending, name| {
-            pending.projects.insert(name.to_owned());
-        }));
-        sources.spawn(watch_named::<CredentialSpec>(backend.clone(), self.namespace.clone(), Arc::clone(&self.events), |pending, _| {
+        // Each source's reads count for delivery.
+        sources.spawn(inherit(watch_sessions(backend.clone(), self.namespace.clone(), Arc::clone(&self.events))));
+        sources.spawn(inherit(watch_environments(Arc::clone(&self.state), Arc::clone(&self.events))));
+        sources.spawn(inherit(watch_named::<Project>(
+            backend.clone(),
+            self.namespace.clone(),
+            Arc::clone(&self.events),
+            |pending, name| {
+                pending.projects.insert(name.to_owned());
+            },
+        )));
+        sources.spawn(inherit(watch_named::<CredentialSpec>(
+            backend.clone(),
+            self.namespace.clone(),
+            Arc::clone(&self.events),
+            |pending, _| {
+                pending.definitions = true;
+            },
+        )));
+        sources.spawn(inherit(watch_named::<CredentialGrant>(backend, self.namespace.clone(), Arc::clone(&self.events), |pending, _| {
             pending.definitions = true;
-        }));
-        sources.spawn(watch_named::<CredentialGrant>(backend, self.namespace.clone(), Arc::clone(&self.events), |pending, _| {
-            pending.definitions = true;
-        }));
-        sources.spawn(watch_bindings(Arc::clone(&self.state), self.namespace.clone(), Arc::clone(&self.events)));
-        sources.spawn(watch_fulfilment_kinds(self.state.daemon.resource_backend(), self.namespace.clone(), Arc::clone(&self.events)));
-        sources.spawn(watch_image_builds(Arc::clone(&self.state), Arc::clone(&self.events)));
+        })));
+        sources.spawn(inherit(watch_bindings(Arc::clone(&self.state), self.namespace.clone(), Arc::clone(&self.events))));
+        sources.spawn(inherit(watch_fulfilment_kinds(
+            self.state.daemon.resource_backend(),
+            self.namespace.clone(),
+            Arc::clone(&self.events),
+        )));
+        sources.spawn(inherit(watch_image_builds(Arc::clone(&self.state), Arc::clone(&self.events))));
         loop {
             let deadline = self.next_deadline().await;
             tokio::select! {
@@ -450,7 +465,7 @@ impl CredentialDelivery {
         let reads = self.state.daemon.lifecycle_reads();
         let named = environments.cloned();
         let EnvironmentVessels { vessels, without_convoy } =
-            tokio::task::spawn_blocking(move || environment_vessels(reads.as_ref(), named.as_ref()))
+            tokio::task::spawn_blocking(flotilla_schema::reads::carry(move || environment_vessels(reads.as_ref(), named.as_ref())))
                 .await
                 .map_err(|error| format!("read credential vessels: {error}"))?
                 .map_err(|error| format!("read credential vessels: {error}"))?;
@@ -719,7 +734,7 @@ async fn watch_image_builds(state: Arc<ControllerRuntimeState>, events: Arc<Cred
         match changes.recv().await {
             Ok(ImageBuildChange::Changed(name)) => {
                 let (reads, read) = (Arc::clone(&reads), name.clone());
-                let read = tokio::task::spawn_blocking(move || reads.image_builds()?.get(&read))
+                let read = tokio::task::spawn_blocking(flotilla_schema::reads::carry(move || reads.image_builds()?.get(&read)))
                     .await
                     .unwrap_or_else(|error| Err(format!("image build read: {error}")));
                 let now = match read {

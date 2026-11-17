@@ -173,7 +173,10 @@ pub(super) async fn run_checkout_archive_gc(archive_sweep: CheckoutArchiveSweep)
                 Err(error) => warn!(%error, "checkout archive sweep could not load archive roots"),
             }
             let reads = archive_sweep.daemon.lifecycle_reads();
-            match tokio::task::spawn_blocking(move || reads.clones()?.here()).await.map_err(|error| error.to_string()).and_then(|here| here)
+            match tokio::task::spawn_blocking(flotilla_schema::reads::carry(move || reads.clones()?.here()))
+                .await
+                .map_err(|error| error.to_string())
+                .and_then(|here| here)
             {
                 Ok(clones) => {
                     for clone in clones {
@@ -185,7 +188,7 @@ pub(super) async fn run_checkout_archive_gc(archive_sweep: CheckoutArchiveSweep)
                 Err(error) => warn!(%error, "checkout archive sweep could not list clones"),
             }
             let reads = archive_sweep.daemon.lifecycle_reads();
-            match tokio::task::spawn_blocking(move || reads.checkouts()?.here())
+            match tokio::task::spawn_blocking(flotilla_schema::reads::carry(move || reads.checkouts()?.here()))
                 .await
                 .map_err(|error| error.to_string())
                 .and_then(|here| here)
@@ -269,7 +272,8 @@ pub(super) async fn supervise_controller<F, Fut>(
 {
     loop {
         let result = supervise(name, supervision.clone(), || {
-            let run = make_run();
+            // Its engine reads count for it, unless it names a caller of its own.
+            let run = attributed(caller(name), make_run());
             let health = runtime_health.clone();
             // Use the supervisor's same healthy duration for alarm recovery.
             // A run failing before this window leaves the exhaustion alarm set.
@@ -366,7 +370,7 @@ pub(super) fn spawn_local_fulfilment_probe_task(
     observations: HostObservations,
     interval: Duration,
 ) -> JoinHandle<()> {
-    spawn_periodic_task(interval, PeriodicTaskStart::Immediate, move || {
+    spawn_periodic_task("local fulfilment probe", interval, PeriodicTaskStart::Immediate, move || {
         let daemon = Arc::clone(&daemon);
         let namespace = namespace.clone();
         let profile = profile.clone();
@@ -449,7 +453,7 @@ pub(super) fn spawn_ssh_fulfilment_probe_task(daemon: Arc<InProcessDaemon>, name
     // Compose the remote detection endpoint once, then retain that exact
     // provider instance across observation passes.
     let providers = Arc::new(command_provider_registry(&[EnvironmentInput::HostDirect], Arc::clone(&ssh.runner)));
-    spawn_periodic_task(FULFILMENT_CHANGE_CHECK_INTERVAL, PeriodicTaskStart::Immediate, move || {
+    spawn_periodic_task("ssh fulfilment probe", FULFILMENT_CHANGE_CHECK_INTERVAL, PeriodicTaskStart::Immediate, move || {
         let daemon = Arc::clone(&daemon);
         let namespace = namespace.clone();
         let ssh = ssh.clone();
@@ -550,7 +554,7 @@ pub(super) fn spawn_heartbeat_task_with_credentials(
 ) -> JoinHandle<()> {
     // Each tick publishes, and so does a condition that must not wait for one (a remote a clone
     // could not reach).
-    tokio::spawn(async move {
+    tokio::spawn(attributed(caller("host heartbeat"), async move {
         let mut ticker = tokio::time::interval(interval);
         ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
         loop {
@@ -565,7 +569,7 @@ pub(super) fn spawn_heartbeat_task_with_credentials(
                 warn!(%err, "failed to publish host heartbeat");
             }
         }
-    })
+    }))
 }
 
 #[cfg(test)]
@@ -583,7 +587,7 @@ pub(super) fn spawn_host_description_projection_task(
     namespace: String,
     interval: Duration,
 ) -> JoinHandle<()> {
-    tokio::spawn(async move {
+    tokio::spawn(attributed(caller("host description projection"), async move {
         let mut resync = tokio::time::interval(interval);
         resync.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
         loop {
@@ -619,7 +623,7 @@ pub(super) fn spawn_host_description_projection_task(
             }
             resync.tick().await;
         }
-    })
+    }))
 }
 
 /// Reconcile durable supervisor turns on resource changes, with periodic recovery.
@@ -733,7 +737,7 @@ pub(super) fn spawn_provisioned_environment_reconciliation_task(
     namespace: String,
     interval: Duration,
 ) -> JoinHandle<()> {
-    spawn_periodic_task(interval, PeriodicTaskStart::AfterInterval, move || {
+    spawn_periodic_task("provisioned environments", interval, PeriodicTaskStart::AfterInterval, move || {
         let state = Arc::clone(&state);
         let namespace = namespace.clone();
         async move {
@@ -752,7 +756,7 @@ pub(super) fn spawn_environment_orphan_sweep_task(state: Arc<ControllerRuntimeSt
     let mut sweep = EnvironmentOrphanSweep::default();
     sweep.mark_ready();
     let sweep = Arc::new(Mutex::new(sweep));
-    spawn_periodic_task(ORPHAN_SWEEP_INTERVAL, PeriodicTaskStart::AfterInterval, move || {
+    spawn_periodic_task("environment orphan sweep", ORPHAN_SWEEP_INTERVAL, PeriodicTaskStart::AfterInterval, move || {
         let state = Arc::clone(&state);
         let sweep = Arc::clone(&sweep);
         async move {
@@ -784,7 +788,7 @@ pub(super) fn spawn_dispatch_reconciler_task(daemon: Arc<InProcessDaemon>, names
     let issues = Arc::new(DaemonDispatchIssueSource::new(Arc::clone(&daemon))) as Arc<dyn DispatchIssueSource>;
     let backend = daemon.resource_backend();
     let reconciler = DispatchReconciler::new(backend.clone(), namespace.clone(), issues);
-    tokio::spawn(async move {
+    tokio::spawn(attributed(caller("DispatchReconciler"), async move {
         let mut boards = daemon.dispatch_board_changes();
         let mut enrol = true;
         let mut pass_failures = 0_u32;
@@ -870,7 +874,7 @@ pub(super) fn spawn_dispatch_reconciler_task(daemon: Arc<InProcessDaemon>, names
             watch_failures = watch_failures.saturating_add(1);
             tokio::time::sleep(DISPATCH_RETRY.delay(watch_failures)).await;
         }
-    })
+    }))
 }
 
 pub(super) async fn convoy_ensure_dependency_watches(
@@ -960,7 +964,7 @@ pub(super) fn spawn_convoy_ensure_reconciler_task(
     overrun_after: Duration,
     runtime_health: RuntimeHealth,
 ) -> JoinHandle<()> {
-    tokio::spawn(async move {
+    tokio::spawn(attributed(caller("ConvoyEnsure"), async move {
         let backend = state.daemon.resource_backend();
         let dependencies = || async {
             let mut events = convoy_ensure_dependency_watches(&backend, &namespace, &state.daemon.lifecycle_reads()).await;
@@ -1055,7 +1059,7 @@ pub(super) fn spawn_convoy_ensure_reconciler_task(
                 watch_failures = 0;
             }
         }
-    })
+    }))
 }
 
 #[derive(Clone, Copy)]
@@ -1065,6 +1069,7 @@ pub(super) enum PeriodicTaskStart {
 }
 
 pub(super) fn spawn_periodic_task<Operation, OperationFuture>(
+    name: &'static str,
     interval: Duration,
     start: PeriodicTaskStart,
     mut operation: Operation,
@@ -1073,7 +1078,8 @@ where
     Operation: FnMut() -> OperationFuture + Send + 'static,
     OperationFuture: Future<Output = ()> + Send + 'static,
 {
-    tokio::spawn(async move {
+    // Its engine reads count for `name`.
+    tokio::spawn(attributed(caller(name), async move {
         let start = match start {
             PeriodicTaskStart::Immediate => tokio::time::Instant::now(),
             PeriodicTaskStart::AfterInterval => tokio::time::Instant::now() + interval,
@@ -1084,7 +1090,7 @@ where
             ticker.tick().await;
             operation().await;
         }
-    })
+    }))
 }
 
 /// Runs `operation` to completion, calling `on_timeout` once it is still running after `timeout`.

@@ -82,7 +82,7 @@ impl RemoteReachability for RemoteProbe {
 
 /// Probes each unreached remote every `interval`, through this host's own Git.
 pub(super) fn spawn_remote_probe_task(state: Arc<ControllerRuntimeState>, interval: Duration) -> JoinHandle<()> {
-    super::tasks::spawn_periodic_task(interval, super::tasks::PeriodicTaskStart::AfterInterval, move || {
+    super::tasks::spawn_periodic_task("remote probe", interval, super::tasks::PeriodicTaskStart::AfterInterval, move || {
         let state = Arc::clone(&state);
         async move {
             let unreached = state.remote_reachability.unreached();
