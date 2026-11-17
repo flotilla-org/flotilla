@@ -13,15 +13,23 @@
 //! inbox at this home, a local input ([`AwaitingReplies::landed`]), and
 //! expired once the deadline passes with no reply present
 //! ([`AwaitingReplies::expire_due`]). A stall is an open record of kind
-//! [`STALL`] about the stalled seat or convoy; "stalled" is the indexed read of open
-//! stall records by subject ([`AwaitingReplies::open_about`]).
+//! [`STALL`] about the stalled seat or convoy; "stalled" is a read of the open
+//! records about it ([`OpenAwaiting::stalled`]).
+//!
+//! Every home's open records are held once per store, in [`OpenAwaiting`]: the
+//! store's writes keep it inside their transactions, this home's and other
+//! homes' applied alike, so the readers of open records and stalls read no
+//! store, and this home's writer edges the records it holds.
 
-use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
+use std::{
+    collections::{BTreeMap, BTreeSet},
+    sync::{Arc, Mutex, MutexGuard, PoisonError},
+};
 
 use flotilla_address::Address;
 use flotilla_engine_store::StoreLog;
 use flotilla_schema::Timestamp;
-use flotilla_schema_sqlite::stream::Service;
+use flotilla_schema_sqlite::{stream::Service, Observed, Observer, Staged};
 use flotilla_state_machines::{
     machines::{
         awaiting_reply::{
@@ -35,15 +43,160 @@ use flotilla_state_machines::{
 /// The record kind of a stall: a Reply-expectation message about a seat or convoy.
 pub const STALL: &str = flotilla_resources::STALL_KIND;
 
-/// The most records one indexed read returns.
-const PAGE: u32 = 256;
+/// A record, by `(home, name)`.
+type Key = (String, String);
 
-/// This home's AwaitingReply records. Only the open ones are held in memory:
-/// a record that ends is evicted, and an ended record is read on demand from
-/// the store, so memory and restart time follow the open records, not every
-/// send ever made. Each gate's world is built for its one edge from what the
-/// caller observed (the reply that landed, the sender's authority) and
-/// dropped after it, so nothing accumulates with traffic.
+/// Every home's open AwaitingReply records as this store holds them (#3108 open-stall set), by
+/// home and name and by the subject each is about. The store's writes keep it inside each write's
+/// transaction ([`flotilla_schema_sqlite::Store::observe`]): this home's own, another home's
+/// applied and a snapshot's restored alike, so it moves with the store's commits, and no read of
+/// it reads the store. A record that ends leaves it, so memory follows the open records, not
+/// every send ever made.
+///
+/// Known cost: opening it scans every home's AwaitingReply records, ended ones too, once per
+/// start. It goes when snapshots land: in the approved storage design a writer-maintained
+/// projection such as this is restored from a snapshot, not rebuilt from history.
+#[derive(Default)]
+pub struct OpenAwaiting {
+    held: Mutex<OpenHeld>,
+}
+
+#[derive(Default)]
+struct OpenHeld {
+    records: BTreeMap<Key, Resource<AwaitingReply>>,
+    about: BTreeMap<Address, BTreeSet<Key>>,
+}
+
+/// What a write did to the open records.
+enum OpenChange {
+    /// Record `key` holds `record` now: none once it ended or is gone.
+    Set(Key, Option<Box<Resource<AwaitingReply>>>),
+    /// Every record homed at this home was dropped, to be restored from a snapshot.
+    Reset(String),
+}
+
+impl OpenHeld {
+    fn set(&mut self, key: Key, record: Option<Resource<AwaitingReply>>) {
+        if let Some(held) = self.records.remove(&key) {
+            if let Some(subject) = held.spec().subject.as_ref() {
+                if let Some(keys) = self.about.get_mut(subject) {
+                    keys.remove(&key);
+                    if keys.is_empty() {
+                        self.about.remove(subject);
+                    }
+                }
+            }
+        }
+        if let Some(record) = record.filter(|record| record.label() == AwaitingReplyLabel::Open) {
+            if let Some(subject) = record.spec().subject.clone() {
+                self.about.entry(subject).or_default().insert(key.clone());
+            }
+            self.records.insert(key, record);
+        }
+    }
+
+    fn change(&mut self, change: OpenChange) {
+        match change {
+            OpenChange::Set(key, record) => self.set(key, record.map(|record| *record)),
+            OpenChange::Reset(home) => {
+                let keys: Vec<Key> = self.at(&home).map(|(key, _)| key.clone()).collect();
+                for key in keys {
+                    self.set(key, None);
+                }
+            }
+        }
+    }
+
+    /// The open records homed at `home`.
+    fn at<'a>(&'a self, home: &str) -> impl Iterator<Item = (&'a Key, &'a Resource<AwaitingReply>)> + 'a {
+        let home = home.to_owned();
+        self.records.range((home.clone(), String::new())..).take_while(move |((held, _), _)| *held == home)
+    }
+}
+
+impl OpenAwaiting {
+    /// The open records `service` holds, kept from now on by its writes: the store observes them
+    /// and is scanned under one hold of its lock, so no write between the two is missed.
+    pub fn open(service: &Arc<Service>) -> Result<Arc<Self>, String> {
+        let open = Arc::new(Self::default());
+        let kept = Arc::downgrade(&open);
+        // A set dropped lapses: its observer stages nothing more.
+        let observer: Arc<Observer<Resource<AwaitingReply>>> = Arc::new(move |observed: Observed<'_, Resource<AwaitingReply>>| {
+            let open = kept.upgrade()?;
+            let change = match observed {
+                Observed::Written { name, home, value } => {
+                    OpenChange::Set((home.to_owned(), name.to_owned()), value.cloned().map(Box::new))
+                }
+                Observed::Reset { home } => OpenChange::Reset(home.to_owned()),
+            };
+            let staged: Staged = Box::new(move || open.locked().change(change));
+            Some(staged)
+        });
+        service
+            .with_store(|store| {
+                store.observe(observer);
+                let mut read = store.read()?;
+                let mut held = open.locked();
+                for home in service.homes() {
+                    let mut after = None;
+                    loop {
+                        let page = read.scan::<Resource<AwaitingReply>>(&home, after, 64)?;
+                        for id in page.ids {
+                            if let Some(loaded) = read.load::<Resource<AwaitingReply>>(id)? {
+                                held.set((loaded.home, loaded.name), Some(loaded.value));
+                            }
+                        }
+                        after = page.next;
+                        if after.is_none() {
+                            break;
+                        }
+                    }
+                }
+                Ok(())
+            })
+            .map_err(|error| error.to_string())?;
+        Ok(open)
+    }
+
+    fn locked(&self) -> MutexGuard<'_, OpenHeld> {
+        locked(&self.held)
+    }
+
+    /// Open record `name` homed at `home`.
+    pub fn get(&self, home: &str, name: &str) -> Option<Resource<AwaitingReply>> {
+        self.locked().records.get(&(home.to_owned(), name.to_owned())).cloned()
+    }
+
+    /// The open records about `subject`, every home's.
+    pub fn about(&self, subject: &Address) -> Vec<Resource<AwaitingReply>> {
+        let held = self.locked();
+        let keys = held.about.get(subject).into_iter().flatten();
+        keys.filter_map(|key| held.records.get(key).cloned()).collect()
+    }
+
+    /// Whether `subject` is stalled: an open stall record, of any home, is about it.
+    pub fn stalled(&self, subject: &Address) -> bool {
+        let held = self.locked();
+        let keys = held.about.get(subject).into_iter().flatten();
+        keys.filter_map(|key| held.records.get(key)).any(|record| record.spec().kind == STALL)
+    }
+
+    /// The open records `sender` holds, every home's.
+    pub fn from(&self, sender: &Address) -> Vec<Resource<AwaitingReply>> {
+        self.locked().records.values().filter(|record| record.spec().sender == *sender).cloned().collect()
+    }
+
+    /// The open records homed at `home` that `keep` selects.
+    fn at(&self, home: &str, keep: impl Fn(&Resource<AwaitingReply>) -> bool) -> Vec<Resource<AwaitingReply>> {
+        self.locked().at(home).map(|(_, record)| record).filter(|record| keep(record)).cloned().collect()
+    }
+}
+
+/// This home's AwaitingReply writer. The records it edges are this home's open ones in
+/// [`OpenAwaiting`], each placed in its machine home for one edge and taken out after, so the
+/// open set is held once; an ended record is read on demand from the store. Each gate's world is
+/// built for its one edge from what the caller observed (the reply that landed, the sender's
+/// authority) and dropped after it, so nothing accumulates with traffic.
 ///
 /// Poisoning: a panic while the lock is held poisons it; an applied edge
 /// leaves the home as its log took it, so the lock is recovered.
@@ -51,6 +204,7 @@ pub struct AwaitingReplies {
     home_name: String,
     service: Arc<Service>,
     home: Mutex<Home<AwaitingReply, StoreLog>>,
+    open: Arc<OpenAwaiting>,
 }
 
 fn locked<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
@@ -63,35 +217,22 @@ pub fn record_name(message: &MessageRef) -> String {
 }
 
 impl AwaitingReplies {
-    /// Opens the records homed at `home` over `service`, restoring each so a
-    /// restart keeps their versions.
+    /// Opens the records homed at `home` over `service`, with every home's open records held in
+    /// an [`OpenAwaiting`] of its own.
     pub fn open(home: &str, service: &Arc<Service>) -> Result<Self, String> {
-        let mut records = Home::with_log(home, StoreLog::new(service.store())).map_err(|error| format!("AwaitingReply home: {error:?}"))?;
-        let stored = service
-            .with_store(|store| {
-                let mut read = store.read()?;
-                let mut stored = Vec::new();
-                let mut after = None;
-                loop {
-                    let page = read.scan::<Resource<AwaitingReply>>(home, after, 64)?;
-                    for id in page.ids {
-                        if let Some(loaded) = read.load::<Resource<AwaitingReply>>(id)? {
-                            if loaded.value.label() == AwaitingReplyLabel::Open {
-                                stored.push(loaded.value);
-                            }
-                        }
-                    }
-                    after = page.next;
-                    if after.is_none() {
-                        return Ok(stored);
-                    }
-                }
-            })
-            .map_err(|error| error.to_string())?;
-        for record in stored {
-            records.restore(record).map_err(|error| format!("{error:?}"))?;
-        }
-        Ok(Self { home_name: home.to_owned(), service: Arc::clone(service), home: Mutex::new(records) })
+        Self::over(home, service, OpenAwaiting::open(service)?)
+    }
+
+    /// The records homed at `home` over `service`, keeping `open`: the store's open records,
+    /// opened over the same `service`.
+    pub fn over(home: &str, service: &Arc<Service>, open: Arc<OpenAwaiting>) -> Result<Self, String> {
+        let records = Home::with_log(home, StoreLog::new(service.store())).map_err(|error| format!("AwaitingReply home: {error:?}"))?;
+        Ok(Self { home_name: home.to_owned(), service: Arc::clone(service), home: Mutex::new(records), open })
+    }
+
+    /// Every home's open records, which this writer keeps: what stall readers read.
+    pub fn open_records(&self) -> &Arc<OpenAwaiting> {
+        &self.open
     }
 
     /// Writes the sender's record for a send expecting a reply or an outcome;
@@ -101,8 +242,8 @@ impl AwaitingReplies {
     pub fn record(&self, spec: AwaitingReplySpec, now: Timestamp) -> Result<bool, String> {
         let name = record_name(&spec.message);
         let mut home = locked(&self.home);
-        let existing = match home.get(&name) {
-            Some(open) => Some(open.clone()),
+        let existing = match self.open.get(&self.home_name, &name) {
+            Some(open) => Some(open),
             None => self.stored(&name)?,
         };
         let created = if let Some(existing) = existing {
@@ -111,13 +252,14 @@ impl AwaitingReplies {
             }
             false
         } else {
-            home.create(&name, spec, &MemoryAwaitingReplyWorld::default(), now)
-                .map_err(|error| format!("AwaitingReply `{name}`: {error:?}"))?;
+            let created = home.create(&name, spec, &MemoryAwaitingReplyWorld::default(), now).map(|_| ());
+            home.evict(&name);
+            created.map_err(|error| format!("AwaitingReply `{name}`: {error:?}"))?;
             true
         };
         // Replication may have delivered the drop before the send's record was
         // written. Repeats retry this read and withdrawal after a store failure.
-        if let Some(record) = home.get(&name) {
+        if let Some(record) = self.open.get(&self.home_name, &name) {
             let awaited = record.spec().message.clone();
             let message = self
                 .service
@@ -130,7 +272,7 @@ impl AwaitingReplies {
                 })
                 .map_err(|error| error.to_string())?;
             if let Some(message) = message {
-                Self::withdraw_dropped(&mut home, &awaited.home, &message, now)?;
+                self.withdraw_dropped(&mut home, &awaited.home, &message, now)?;
             }
         }
         Ok(created)
@@ -142,10 +284,11 @@ impl AwaitingReplies {
         if message.state().drop_reason().is_none() {
             return Ok(());
         }
-        Self::withdraw_dropped(&mut locked(&self.home), message_home, message, now)
+        self.withdraw_dropped(&mut locked(&self.home), message_home, message, now)
     }
 
     fn withdraw_dropped(
+        &self,
         home: &mut Home<AwaitingReply, StoreLog>,
         message_home: &str,
         message: &Resource<Message>,
@@ -155,25 +298,24 @@ impl AwaitingReplies {
             return Ok(());
         }
         let name = record_name(&MessageRef::new(message.name(), message_home));
-        let Some(record) = home.get(&name) else { return Ok(()) };
+        let Some(record) = self.open.get(&self.home_name, &name) else { return Ok(()) };
         if record.spec().sender != message.spec().sender {
             return Ok(());
         }
         let sender = record.spec().sender.clone();
-        Self::withdraw_open(home, &name, &sender, "awaited message dropped", now)
+        self.withdraw_open(home, &name, &sender, "awaited message dropped", now)
     }
 
     /// Whether the sender still awaits this message, without loading ended history.
     pub(super) fn has_open_record(&self, message: &MessageRef) -> bool {
-        locked(&self.home).get(&record_name(message)).is_some()
+        self.open.get(&self.home_name, &record_name(message)).is_some()
     }
 
     /// The record awaiting `message`, if it is homed here: open in memory, or
     /// ended in the store.
     pub fn get(&self, message: &MessageRef) -> Option<Resource<AwaitingReply>> {
         let name = record_name(message);
-        let open = locked(&self.home).get(&name).cloned();
-        open.or_else(|| self.stored(&name).ok().flatten())
+        self.open.get(&self.home_name, &name).or_else(|| self.stored(&name).ok().flatten())
     }
 
     /// A record homed here as the store holds it: one keyed read.
@@ -189,19 +331,21 @@ impl AwaitingReplies {
             .map_err(|error| error.to_string())
     }
 
-    /// Applies `edge` to the open record `name` and evicts it once it ends.
+    /// Applies `edge` to the open record `name`, placed in `home` for it and taken out after.
     fn end(
+        &self,
         home: &mut Home<AwaitingReply, StoreLog>,
         name: &str,
         edge: impl Into<flotilla_state_machines::machines::awaiting_reply::AwaitingReplyEdge>,
         world: &MemoryAwaitingReplyWorld,
         now: Timestamp,
     ) -> Result<(), WriteError<AwaitingReply>> {
-        home.apply(name, edge, world, now)?;
-        if home.get(name).is_some_and(|record| record.label() != AwaitingReplyLabel::Open) {
-            home.evict(name);
-        }
-        Ok(())
+        let record = self.open.get(&self.home_name, name).ok_or_else(|| WriteError::Unknown(name.to_owned()))?;
+        home.evict(name);
+        home.restore(record)?;
+        let applied = home.apply(name, edge, world, now).map(|_| ());
+        home.evict(name);
+        applied
     }
 
     /// A message landed in `inbox` at this home. When it replies to a message
@@ -218,15 +362,15 @@ impl AwaitingReplies {
         let Some(awaited) = in_reply_to else { return Ok(None) };
         let name = record_name(awaited);
         let mut home = locked(&self.home);
-        let Some(record) = home.get(&name) else { return Ok(None) };
-        if record.label() != AwaitingReplyLabel::Open || record.spec().sender != *inbox {
+        let Some(record) = self.open.get(&self.home_name, &name) else { return Ok(None) };
+        if record.spec().sender != *inbox {
             return Ok(None);
         }
         // The gate's evidence: this reply, landed in this inbox, answering this message.
         let mut world = MemoryAwaitingReplyWorld::default();
         world.land(reply, inbox, Some(awaited));
-        match Self::end(&mut home, &name, Answer { reply: reply.clone() }, &world, now) {
-            Ok(_) => Ok(Some(name)),
+        match self.end(&mut home, &name, Answer { reply: reply.clone() }, &world, now) {
+            Ok(()) => Ok(Some(name)),
             Err(WriteError::Refused(AwaitingReplyRefusal::NotOpen)) => Ok(None),
             Err(error) => Err(format!("AwaitingReply `{name}`: {error:?}")),
         }
@@ -238,13 +382,14 @@ impl AwaitingReplies {
     pub fn withdraw(&self, message: &MessageRef, by: &Address, reason: &str, now: Timestamp) -> Result<bool, String> {
         let name = record_name(message);
         let mut home = locked(&self.home);
-        if home.get(&name).is_none_or(|record| record.label() != AwaitingReplyLabel::Open) {
+        if self.open.get(&self.home_name, &name).is_none() {
             return Ok(false);
         }
-        Self::withdraw_open(&mut home, &name, by, reason, now).map(|_| true)
+        self.withdraw_open(&mut home, &name, by, reason, now).map(|_| true)
     }
 
     fn withdraw_open(
+        &self,
         home: &mut Home<AwaitingReply, StoreLog>,
         name: &str,
         by: &Address,
@@ -258,13 +403,13 @@ impl AwaitingReplies {
         let mut world = MemoryAwaitingReplyWorld::default();
         world.authority.put(&Ref::new(authority.as_str()), true);
         let withdraw = Withdraw { by: by.clone(), reason: reason.to_owned(), authority: Ref::new(authority) };
-        Self::end(home, name, withdraw, &world, now).map_err(|error| format!("AwaitingReply `{name}`: {error:?}"))
+        self.end(home, name, withdraw, &world, now).map_err(|error| format!("AwaitingReply `{name}`: {error:?}"))
     }
 
     /// Whether any stall record homed here is open: what lets a caller skip
     /// [`Self::end_stalls`] without reading anything.
     pub fn any_open_stall(&self) -> bool {
-        locked(&self.home).resources().any(|record| record.spec().kind == STALL && record.label() == AwaitingReplyLabel::Open)
+        !self.open.at(&self.home_name, |record| record.spec().kind == STALL).is_empty()
     }
 
     /// Withdraws the open stall records homed here about any of `subjects`,
@@ -274,17 +419,20 @@ impl AwaitingReplies {
     /// withdrawn; one that fails does not stop the others.
     pub fn end_stalls(&self, subjects: &[Address], keep: Option<&str>, reason: &str, now: Timestamp) -> Result<Vec<String>, String> {
         let mut home = locked(&self.home);
-        let ended: Vec<(String, Address)> = home
-            .resources()
-            .filter(|record| record.spec().kind == STALL && record.label() == AwaitingReplyLabel::Open)
-            .filter(|record| record.spec().subject.as_ref().is_some_and(|subject| subjects.contains(subject)))
-            .filter(|record| Some(record.name()) != keep)
+        let ended: Vec<(String, Address)> = self
+            .open
+            .at(&self.home_name, |record| {
+                record.spec().kind == STALL
+                    && record.spec().subject.as_ref().is_some_and(|subject| subjects.contains(subject))
+                    && Some(record.name()) != keep
+            })
+            .into_iter()
             .map(|record| (record.name().to_owned(), record.spec().sender.clone()))
             .collect();
         let mut withdrawn = Vec::new();
         let mut failures = Vec::new();
         for (name, sender) in ended {
-            match Self::withdraw_open(&mut home, &name, &sender, reason, now) {
+            match self.withdraw_open(&mut home, &name, &sender, reason, now) {
                 Ok(()) => withdrawn.push(name),
                 Err(error) => failures.push(error),
             }
@@ -297,51 +445,20 @@ impl AwaitingReplies {
     }
 
     /// Expires every open record homed here whose deadline has passed with no
-    /// reply present: one read of the deadline index, in deadline order.
-    ///
-    /// The scan stops at the first record not yet due. That relies on the
-    /// index's declaration: `order(deadline)` with `when(state in [Open],
-    /// deadline is_some)`, so it holds only open records with a deadline, in
-    /// deadline order. It holds every home's replicated records too (a
-    /// home is the record's identity, not an indexed column); those are read
-    /// and passed over, and only this home's are expired. A reply that landed
-    /// before the sweep has answered its record, so it is no longer Open; a
-    /// reply landing after expiry finds the record Expired and answers nothing.
+    /// reply present, in deadline order. A reply that landed before the sweep
+    /// has answered its record, so it is no longer open; a reply landing after
+    /// expiry finds the record Expired and answers nothing.
     pub fn expire_due(&self, now: Timestamp) -> Result<Vec<String>, String> {
-        let due: Vec<String> = self
-            .service
-            .with_store(|store| {
-                let mut read = store.read()?;
-                let mut due = Vec::new();
-                let mut after = None;
-                loop {
-                    let page = read.page(&AwaitingReplySpec::deadline(), after.as_ref(), PAGE)?;
-                    for id in page.ids {
-                        let Some(loaded) = read.load::<Resource<AwaitingReply>>(id)? else { continue };
-                        match loaded.value.spec().deadline {
-                            Some(deadline) if deadline < now => {
-                                if loaded.home == self.home_name {
-                                    due.push(loaded.name);
-                                }
-                            }
-                            _ => return Ok(due),
-                        }
-                    }
-                    after = page.next;
-                    if after.is_none() {
-                        return Ok(due);
-                    }
-                }
-            })
-            .map_err(|error| error.to_string())?;
-        let mut expired = Vec::new();
         let mut home = locked(&self.home);
+        let mut due = self.open.at(&self.home_name, |record| record.spec().deadline.is_some_and(|deadline| deadline < now));
+        due.sort_by_key(|record| record.spec().deadline);
+        let mut expired = Vec::new();
         let world = MemoryAwaitingReplyWorld::default();
-        for name in due {
-            match Self::end(&mut home, &name, Expire, &world, now) {
-                Ok(_) => expired.push(name),
-                // An ended record stays as it is. One that ended (and was
-                // evicted) between the index read and the lock is unknown here.
+        for record in due {
+            let name = record.name().to_owned();
+            match self.end(&mut home, &name, Expire, &world, now) {
+                Ok(()) => expired.push(name),
+                // An ended record stays as it is.
                 Err(WriteError::Refused(_) | WriteError::Unknown(_)) => {}
                 Err(error) => return Err(format!("AwaitingReply `{name}`: {error:?}")),
             }
@@ -350,74 +467,24 @@ impl AwaitingReplies {
     }
 
     /// The earliest deadline after `now` of an open record homed here: when
-    /// [`AwaitingReplies::expire_due`] next has work. One read of the deadline
-    /// index from its start, past the records already due.
+    /// [`AwaitingReplies::expire_due`] next has work.
     pub fn next_deadline_after(&self, now: Timestamp) -> Result<Option<Timestamp>, String> {
-        self.service
-            .with_store(|store| {
-                let mut read = store.read()?;
-                let mut after = None;
-                loop {
-                    let page = read.page(&AwaitingReplySpec::deadline(), after.as_ref(), PAGE)?;
-                    for id in page.ids {
-                        let Some(loaded) = read.load::<Resource<AwaitingReply>>(id)? else { continue };
-                        match loaded.value.spec().deadline {
-                            Some(deadline) if deadline > now && loaded.home == self.home_name => return Ok(Some(deadline)),
-                            _ => {}
-                        }
-                    }
-                    after = page.next;
-                    if after.is_none() {
-                        return Ok(None);
-                    }
-                }
-            })
-            .map_err(|error| error.to_string())
+        let open = self.open.at(&self.home_name, |record| record.spec().deadline.is_some_and(|deadline| deadline > now));
+        Ok(open.iter().filter_map(|record| record.spec().deadline).min())
     }
 
-    /// The open records about `subject` in this home's replica, every home's:
-    /// one read of the `open_by_subject` index.
+    /// The open records about `subject` in this home's replica, every home's.
     pub fn open_about(&self, subject: &Address) -> Result<Vec<Resource<AwaitingReply>>, String> {
-        self.indexed(|read, after| read.page(&AwaitingReplySpec::open_by_subject(subject), after, PAGE))
+        Ok(self.open.about(subject))
     }
 
-    /// Whether `seat` is stalled: it has an open stall record (#3574 ruling
-    /// 2), read through the `open_by_subject` index.
+    /// Whether `seat` is stalled: it has an open stall record (#3574 ruling 2).
     pub fn stalled(&self, seat: &Address) -> Result<bool, String> {
-        Ok(self.open_about(seat)?.iter().any(|record| record.spec().kind == STALL))
+        Ok(self.open.stalled(seat))
     }
 
-    /// The open records `sender` holds, in this home's replica: one read of
-    /// the `open_by_sender` index.
+    /// The open records `sender` holds, in this home's replica.
     pub fn open_from(&self, sender: &Address) -> Result<Vec<Resource<AwaitingReply>>, String> {
-        self.indexed(|read, after| read.page(&AwaitingReplySpec::open_by_sender(sender), after, PAGE))
-    }
-
-    fn indexed(
-        &self,
-        page: impl Fn(
-            &mut flotilla_schema_sqlite::Read<'_>,
-            Option<&flotilla_schema_sqlite::Cursor>,
-        ) -> Result<flotilla_schema_sqlite::Page, flotilla_schema_sqlite::StoreError>,
-    ) -> Result<Vec<Resource<AwaitingReply>>, String> {
-        self.service
-            .with_store(|store| {
-                let mut read = store.read()?;
-                let mut out = Vec::new();
-                let mut after = None;
-                loop {
-                    let found = page(&mut read, after.as_ref())?;
-                    for id in found.ids {
-                        if let Some(loaded) = read.load::<Resource<AwaitingReply>>(id)? {
-                            out.push(loaded.value);
-                        }
-                    }
-                    after = found.next;
-                    if after.is_none() {
-                        return Ok(out);
-                    }
-                }
-            })
-            .map_err(|error| error.to_string())
+        Ok(self.open.from(sender))
     }
 }

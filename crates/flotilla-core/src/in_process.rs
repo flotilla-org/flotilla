@@ -779,6 +779,9 @@ pub struct InProcessDaemon {
     engine_convoys: std::sync::OnceLock<Arc<Convoys>>,
     /// The engine's convoys as their readers read them, once the Convoy path is installed.
     convoy_records: std::sync::OnceLock<Arc<EngineConvoyRecords>>,
+    /// The decided store's open AwaitingReply records, once the Convoy path is installed: one
+    /// set, which the convoys' readers and the Message path's writer share.
+    open_awaiting: std::sync::OnceLock<Arc<flotilla_engine_messages::awaiting::OpenAwaiting>>,
     message_receivers: projection_ports::MessageReceivers,
     brief_artifact_writer: Arc<RwLock<Option<Arc<dyn BriefArtifactWriter>>>>,
     /// Unique identity for this daemon instance, generated at startup.
@@ -1434,6 +1437,7 @@ impl InProcessDaemon {
             convoy_engine_path,
             engine_convoys: std::sync::OnceLock::new(),
             convoy_records: Default::default(),
+            open_awaiting: Default::default(),
             brief_artifact_writer: Arc::clone(&brief_artifact_writer),
             session_id: uuid::Uuid::new_v4(),
             agent_state_store,
@@ -2410,11 +2414,13 @@ impl InProcessDaemon {
     pub fn open_message_primitives(&self) -> Result<Arc<flotilla_engine_messages::MessagePrimitives>, String> {
         let service =
             self.decided_store().map_err(|error| format!("[primitives] needs the decided store composed with the daemon: {error}"))?;
-        let primitives = Arc::new(flotilla_engine_messages::MessagePrimitives::open(
+        let open = self.open_awaiting.get().cloned().ok_or("the Convoy path is not installed with the decided store")?;
+        let primitives = Arc::new(flotilla_engine_messages::MessagePrimitives::open_over(
             self.node_id().as_str(),
             service,
             self.resource_backend(),
             self.clock_for_scenarios(),
+            open,
         )?);
         self.install_message_primitives(Arc::clone(&primitives))?;
         Ok(primitives)
@@ -2452,9 +2458,13 @@ impl InProcessDaemon {
         }
         let convoys = Arc::new(Convoys::open(home, service)?);
         self.engine_convoys.set(Arc::clone(&convoys)).map_err(|_| "the Convoy path is already installed".to_owned())?;
+        // The store's open AwaitingReply records, held once: the convoys' readers read their
+        // seats' stalls from them, and the Message path's writer keeps them.
+        let open = flotilla_engine_messages::awaiting::OpenAwaiting::open(service)?;
+        self.open_awaiting.set(Arc::clone(&open)).map_err(|_| "the Convoy path is already installed".to_owned())?;
         // Every convoy reader reads the engine's launches, with this home's notes on them; its
         // readers hear their changes from the store's log, on the runtime composing this daemon.
-        let records = Arc::new(EngineConvoyRecords::new(home, Arc::clone(service), Arc::clone(convoys.memory())));
+        let records = Arc::new(EngineConvoyRecords::new(home, Arc::clone(service), Arc::clone(convoys.memory()), open));
         if tokio::runtime::Handle::try_current().is_ok() {
             drop(records.follow()?);
         }

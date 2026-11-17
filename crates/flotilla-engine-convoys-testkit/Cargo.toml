@@ -9,6 +9,7 @@ description = "Dev-only: the engine Convoy path at a home over a decided store, 
 [dependencies]
 flotilla-engine-convoys = { path = "../flotilla-engine-convoys" }
 flotilla-engine-store = { path = "../flotilla-engine-store" }
+flotilla-engine-messages = { path = "../flotilla-engine-messages" }
 flotilla-engine-messages-testkit = { path = "../flotilla-engine-messages-testkit" }
 flotilla-provisioning-testkit = { path = "../flotilla-provisioning-testkit" }
 flotilla-protocol = { path = "../flotilla-protocol" }

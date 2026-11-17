@@ -753,13 +753,7 @@ async fn a_first_fill_reads_each_joined_row_once() {
                 "no environment's facts by key: {reads:#?}"
             );
         }
-        // The open stall records are still read by subject, per convoy (#3108 first-fill, open).
-        let calls = |reads| {
-            let mut calls = read_calls(reads);
-            calls.remove("AwaitingReply");
-            calls
-        };
-        assert_eq!(calls(&large), calls(&small), "the fill's read calls do not grow with the convoys held");
+        assert_eq!(read_calls(&large), read_calls(&small), "the fill's read calls do not grow with the convoys held");
     }
 }
 

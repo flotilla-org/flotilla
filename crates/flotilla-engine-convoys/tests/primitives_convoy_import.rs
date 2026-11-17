@@ -469,7 +469,8 @@ fn an_imported_convoy_reads_its_old_creation_timestamp_at_home_and_on_replicas()
         ("event replica", "home-c", replica("home-c", Some(0))),
     ];
     for (which, at, service) in readers {
-        let records = EngineConvoyRecords::new(at, service, Arc::default());
+        let stalls = flotilla_engine_messages::awaiting::OpenAwaiting::open(&service).expect("open records");
+        let records = EngineConvoyRecords::new(at, service, Arc::default(), stalls);
         let record = records.get(written.name(), Some(HOME)).expect("read").expect("held");
         assert_eq!(record.admitted_at, old.metadata.creation_timestamp, "{which}: the old stamp exactly");
         let works = BTreeMap::new();

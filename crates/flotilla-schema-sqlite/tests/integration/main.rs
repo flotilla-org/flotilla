@@ -16,6 +16,7 @@ mod history;
 mod homes;
 mod interning;
 mod log;
+mod observers;
 mod ownership;
 mod plans;
 mod queries;

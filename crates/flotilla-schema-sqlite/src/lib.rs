@@ -58,8 +58,8 @@ pub use handle::{Hold, HoldTimer, StoreGuard, StoreHandle};
 pub use query::{Cursor, Page, MAX_PAGE};
 pub use shared::{schema_ddl, SORTED_STATEMENTS};
 pub use store::{
-    AboutCursor, AboutPage, Applied, ChangeId, InChange, Loaded, Read, ResourceId, Snapshot, Stamp, Store, StoreOptions, Write,
-    MAX_CHANGES_PAGE_BYTES,
+    AboutCursor, AboutPage, Applied, ChangeId, InChange, Loaded, Observed, Observer, Read, ResourceId, Snapshot, Staged, Stamp, Store,
+    StoreOptions, Write, MAX_CHANGES_PAGE_BYTES,
 };
 
 mod table_read;

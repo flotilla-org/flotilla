@@ -5,7 +5,7 @@ use std::{collections::BTreeMap, sync::Arc};
 
 use chrono::{TimeZone, Utc};
 use flotilla_engine_convoys::{convoy_records::EngineConvoyRecords, convoys::Convoys};
-use flotilla_engine_messages::awaiting::{AwaitingReplies, STALL};
+use flotilla_engine_messages::awaiting::{AwaitingReplies, OpenAwaiting, STALL};
 use flotilla_protocol::{PrincipalRef, Relationship};
 use flotilla_resources::{
     address::{stored_change_request_address, subject_for},
@@ -117,7 +117,7 @@ fn a_launch_reads_its_seats_links_stalls_and_end() {
     let dir = tempfile::tempdir().expect("tempdir");
     let service = service(&dir);
     let convoys = Convoys::open(HOME, &service).expect("open");
-    let records = EngineConvoyRecords::new(HOME, Arc::clone(&service), Arc::default());
+    let records = EngineConvoyRecords::new(HOME, Arc::clone(&service), Arc::default(), OpenAwaiting::open(&service).expect("open records"));
     convoys.world(|world| world.projects.put(&Ref::new(project().as_str()), ()));
     let reserved = convoys.reserve("fix-it", Timestamp(1_000_000)).expect("reserved");
     convoys.create_reserved(&reserved, request(), Timestamp(1_000_000)).expect("admitted");
@@ -194,7 +194,7 @@ fn an_undecodable_launch_is_listed_as_unreadable_beside_the_others() {
     let dir = tempfile::tempdir().expect("tempdir");
     let service = service(&dir);
     let convoys = Convoys::open(HOME, &service).expect("open");
-    let records = EngineConvoyRecords::new(HOME, Arc::clone(&service), Arc::default());
+    let records = EngineConvoyRecords::new(HOME, Arc::clone(&service), Arc::default(), OpenAwaiting::open(&service).expect("open records"));
     convoys.world(|world| world.projects.put(&Ref::new(project().as_str()), ()));
     let reserved = convoys.reserve("fix-it", Timestamp(1_000_000)).expect("reserved");
     convoys.create_reserved(&reserved, request(), Timestamp(1_000_000)).expect("admitted");
@@ -229,7 +229,7 @@ fn a_handoff_reads_as_handed_back() {
     let dir = tempfile::tempdir().expect("tempdir");
     let service = service(&dir);
     let convoys = Convoys::open(HOME, &service).expect("open");
-    let records = EngineConvoyRecords::new(HOME, Arc::clone(&service), Arc::default());
+    let records = EngineConvoyRecords::new(HOME, Arc::clone(&service), Arc::default(), OpenAwaiting::open(&service).expect("open records"));
     convoys.world(|world| world.projects.put(&Ref::new(project().as_str()), ()));
     let reserved = convoys.reserve("fix-it", Timestamp(1_000_000)).expect("reserved");
     convoys.create_reserved(&reserved, request(), Timestamp(1_000_000)).expect("admitted");

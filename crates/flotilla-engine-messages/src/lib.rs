@@ -429,6 +429,19 @@ impl MessagePrimitives {
         backend: ResourceBackend,
         clock: Arc<dyn flotilla_resources::Clock>,
     ) -> Result<Self, String> {
+        let open = awaiting::OpenAwaiting::open(&service)?;
+        Self::open_over(home, service, backend, clock, open)
+    }
+
+    /// [`Self::open`], its AwaitingReply writer keeping `open`, the store's one set of open
+    /// records, which the daemon's other readers share.
+    pub fn open_over(
+        home: &str,
+        service: Arc<Service>,
+        backend: ResourceBackend,
+        clock: Arc<dyn flotilla_resources::Clock>,
+        open: Arc<awaiting::OpenAwaiting>,
+    ) -> Result<Self, String> {
         let store = service.store();
         let log = flotilla_engine_store::MessageLog::new(store);
         let receipts = log.consumers();
@@ -453,7 +466,7 @@ impl MessagePrimitives {
         for record in stored::<ServiceMachine>(&service, home)? {
             services.home.lock().expect("service home").restore(record).map_err(|error| format!("{error:?}"))?;
         }
-        let awaiting = Arc::new(awaiting::AwaitingReplies::open(home, &service)?);
+        let awaiting = Arc::new(awaiting::AwaitingReplies::over(home, &service, open)?);
         // Attentions homed elsewhere arrive with their homes' entries; their readers read again then.
         let attention_changes = tokio::sync::broadcast::channel(16).0;
         let replicated = attention_changes.clone();

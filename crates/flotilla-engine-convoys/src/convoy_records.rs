@@ -4,8 +4,8 @@
 //! Each launch is read keyed, by index or by scan at its home, and mapped into a
 //! [`ConvoyRecord`]: its seats and promises under their old crews `(work, role)` by the one
 //! mapping in [`super::convoy_map`], its admission time and its links' times from the log, and
-//! each seat's stall from the open stall records about it. This home's launches and other
-//! homes' replicas read the same way.
+//! each seat's stall from the open stall records about it, as the store's [`OpenAwaiting`] holds
+//! them. This home's launches and other homes' replicas read the same way.
 
 use std::{collections::BTreeMap, sync::Arc};
 
@@ -32,7 +32,7 @@ use flotilla_state_machines::{
 };
 
 use super::convoy_map as map;
-use flotilla_engine_messages::awaiting::STALL;
+use flotilla_engine_messages::awaiting::{OpenAwaiting, STALL};
 
 /// How many changes a slow follower may fall behind by; one that lags rereads everything.
 const CHANGES: usize = 256;
@@ -45,6 +45,8 @@ pub struct EngineConvoyRecords {
     home: String,
     service: Arc<Service>,
     memory: Arc<ConvoyMemory>,
+    /// Every home's open AwaitingReply records, which say which seats are stalled.
+    stalls: Arc<OpenAwaiting>,
     changes: tokio::sync::broadcast::Sender<ConvoyChange>,
 }
 
@@ -55,9 +57,10 @@ fn followed_kinds() -> [KindCode; 2] {
 }
 
 impl EngineConvoyRecords {
-    /// The port at `home` over `service`, with the home's notes in `memory`, which its writers share.
-    pub fn new(home: &str, service: Arc<Service>, memory: Arc<ConvoyMemory>) -> Self {
-        Self { home: home.to_owned(), service, memory, changes: tokio::sync::broadcast::channel(CHANGES).0 }
+    /// The port at `home` over `service`, with the home's notes in `memory`, which its writers
+    /// share, and the store's open AwaitingReply records in `stalls`.
+    pub fn new(home: &str, service: Arc<Service>, memory: Arc<ConvoyMemory>, stalls: Arc<OpenAwaiting>) -> Self {
+        Self { home: home.to_owned(), service, memory, stalls, changes: tokio::sync::broadcast::channel(CHANGES).0 }
     }
 
     /// Follows the convoys' records and the stall records about their seats in the store's log,
@@ -82,14 +85,14 @@ impl EngineConvoyRecords {
 
     /// Every launch at `home`. One whose record cannot be read is listed as unreadable, so it
     /// neither hides the others nor reads as absent.
-    fn scan(read: &mut Read<'_>, home: &str) -> Result<ConvoyListing, StoreError> {
+    fn scan(read: &mut Read<'_>, stalls: &OpenAwaiting, home: &str) -> Result<ConvoyListing, StoreError> {
         let mut listing = ConvoyListing::default();
         let mut after = None;
         loop {
             let page = read.scan::<Resource<Convoy>>(home, after, PAGE)?;
             for id in page.ids {
                 if let Some(loaded) = read.load::<Resource<Convoy>>(id)? {
-                    match entry(read, loaded)? {
+                    match entry(read, stalls, loaded)? {
                         Ok(record) => listing.records.push(record),
                         Err(unreadable) => listing.unreadable.push(unreadable),
                     }
@@ -117,7 +120,7 @@ impl ConvoyRecords for EngineConvoyRecords {
         self.read(&format!("{name} at {home}"), |read| {
             let Some(id) = read.resolve(<Resource<Convoy> as Kind>::CODE, name, &home)? else { return Ok(None) };
             let Some(loaded) = read.load::<Resource<Convoy>>(id)? else { return Ok(None) };
-            record(read, loaded).map(Some)
+            record(read, &self.stalls, loaded).map(Some)
         })
     }
 
@@ -128,12 +131,12 @@ impl ConvoyRecords for EngineConvoyRecords {
             let query = ConvoySpec::by_launch(&project, &of.to_owned());
             let Some((id, _)) = read.integer_index_keys_before(&query, &home, i64::MAX, 1)?.first().copied() else { return Ok(None) };
             let Some(loaded) = read.load::<Resource<Convoy>>(id)? else { return Ok(None) };
-            record(read, loaded).map(Some)
+            record(read, &self.stalls, loaded).map(Some)
         })
     }
 
     fn at(&self, home: &str) -> Result<ConvoyListing, String> {
-        self.read(&format!("at {home}"), |read| Self::scan(read, home))
+        self.read(&format!("at {home}"), |read| Self::scan(read, &self.stalls, home))
     }
 
     fn every(&self) -> Result<ConvoyListing, String> {
@@ -141,7 +144,7 @@ impl ConvoyRecords for EngineConvoyRecords {
         self.read("at every home", |read| {
             let mut listing = ConvoyListing::default();
             for home in &homes {
-                listing.extend(Self::scan(read, home)?);
+                listing.extend(Self::scan(read, &self.stalls, home)?);
             }
             Ok(listing)
         })
@@ -256,32 +259,19 @@ fn written_at(
     Ok(read.change(home, event.change)?.map(|change| change.at))
 }
 
-/// Whether an open stall record is about `subject`: one read of the `open_by_subject` index.
-fn stalled(read: &mut Read<'_>, subject: &Address) -> Result<bool, StoreError> {
-    let mut after = None;
-    loop {
-        let page = read.page(&AwaitingReplySpec::open_by_subject(subject), after.as_ref(), PAGE)?;
-        for id in page.ids {
-            if read.load::<Resource<AwaitingReply>>(id)?.is_some_and(|loaded| loaded.value.spec().kind == STALL) {
-                return Ok(true);
-            }
-        }
-        after = page.next;
-        if after.is_none() {
-            return Ok(false);
-        }
-    }
-}
-
 /// `convoy`, held at `home` at `version`, as its readers take it; one that cannot be read is an
 /// error naming why.
-fn record(read: &mut Read<'_>, loaded: Loaded<Resource<Convoy>>) -> Result<ConvoyRecord, StoreError> {
-    entry(read, loaded)?.map_err(|unreadable| StoreError::Stream(unreadable.reason))
+fn record(read: &mut Read<'_>, stalls: &OpenAwaiting, loaded: Loaded<Resource<Convoy>>) -> Result<ConvoyRecord, StoreError> {
+    entry(read, stalls, loaded)?.map_err(|unreadable| StoreError::Stream(unreadable.reason))
 }
 
 /// The launch `loaded` as its readers take it, or as unreadable where what it holds does not
-/// read; the store's own failures are errors.
-fn entry(read: &mut Read<'_>, loaded: Loaded<Resource<Convoy>>) -> Result<Result<ConvoyRecord, UnreadableLaunch>, StoreError> {
+/// read; the store's own failures are errors. Each seat's stall is read from `stalls`.
+fn entry(
+    read: &mut Read<'_>,
+    stalls: &OpenAwaiting,
+    loaded: Loaded<Resource<Convoy>>,
+) -> Result<Result<ConvoyRecord, UnreadableLaunch>, StoreError> {
     let Loaded { id, home, version, value: convoy, .. } = loaded;
     let home = home.as_str();
     let spec = convoy.spec();
@@ -334,7 +324,7 @@ fn entry(read: &mut Read<'_>, loaded: Loaded<Resource<Convoy>>) -> Result<Result
             .filter(|promise| promise.owner == name && promise.progress.value == Progress::Kept)
             .map(|promise| time(promise.progress.since))
             .max();
-        let record = SeatRecord { failed: seat.failed.clone(), handed_back, stalled: stalled(read, &subject)?, kept_at };
+        let record = SeatRecord { failed: seat.failed.clone(), handed_back, stalled: stalls.stalled(&subject), kept_at };
         seats.entry(work).or_default().insert(role, record);
     }
 

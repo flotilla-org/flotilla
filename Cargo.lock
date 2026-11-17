@@ -2845,6 +2845,7 @@ version = "0.1.0"
 dependencies = [
  "chrono",
  "flotilla-engine-convoys",
+ "flotilla-engine-messages",
  "flotilla-engine-messages-testkit",
  "flotilla-engine-store",
  "flotilla-protocol",

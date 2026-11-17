@@ -45,7 +45,8 @@ impl EngineConvoysHome {
     ) -> Self {
         let home = service.home().to_owned();
         let convoys = Arc::new(Convoys::open(&home, service).expect("engine Convoy home"));
-        let records = EngineConvoyRecords::new(&home, Arc::clone(service), Arc::clone(convoys.memory()));
+        let stalls = flotilla_engine_messages::awaiting::OpenAwaiting::open(service).expect("the open AwaitingReply records");
+        let records = EngineConvoyRecords::new(&home, Arc::clone(service), Arc::clone(convoys.memory()), stalls);
         // The views hear their changes from the store's log, on the test's runtime.
         drop(records.follow().expect("follow the convoy log"));
         let meter = Arc::new(Meter::default());

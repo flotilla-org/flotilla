@@ -171,9 +171,63 @@ struct Runtime {
     strings: TwoGen<StringKey, i64>,
     identities: TwoGen<Identity, ResourceId>,
     ids: TwoGen<ResourceId, Identity>,
+    /// Told of each write to their kind inside its transaction: see [`Store::observe`].
+    observers: Vec<std::sync::Arc<dyn Observing>>,
+}
+
+/// What a write did to a resource of the kind an observer watches, told inside the write's
+/// transaction.
+pub enum Observed<'a, K> {
+    /// Resource `name` homed at `home` was written here, by this home or applied or restored from
+    /// its home: `value` is what it holds now; none once it is deleted.
+    Written { name: &'a str, home: &'a str, value: Option<&'a K> },
+    /// Every resource homed at `home` was dropped here, to be restored from its snapshot.
+    Reset { home: &'a str },
+}
+
+/// What an observer makes of a write: run once the write's transaction commits, still under the
+/// store's lock and before any commit listener is told; dropped when the write is rewound or the
+/// transaction is not committed.
+pub type Staged = Box<dyn FnOnce() + Send>;
+
+/// An observer of one kind's writes: see [`Store::observe`]. It must not block, and reads nothing
+/// but what it is told.
+pub type Observer<K> = dyn Fn(Observed<'_, K>) -> Option<Staged> + Send + Sync;
+
+/// An [`Observer`] of some kind, as the store holds it.
+trait Observing: Send + Sync {
+    fn code(&self) -> KindCode;
+    fn written(&self, ctx: &mut Ctx<'_>, id: ResourceId) -> Result<Option<Staged>, StoreError>;
+    fn reset(&self, home: &str) -> Option<Staged>;
+}
+
+struct Typed<K>(std::sync::Arc<Observer<K>>);
+
+impl<K: Kind + 'static> Observing for Typed<K> {
+    fn code(&self) -> KindCode {
+        K::CODE
+    }
+
+    fn written(&self, ctx: &mut Ctx<'_>, id: ResourceId) -> Result<Option<Staged>, StoreError> {
+        let Some(identity) = ctx.identity_of(id)? else { return Ok(None) };
+        // The write's own value, decoded once more for its observers: no read counted.
+        let loaded = ctx.load::<K>(id)?;
+        Ok((self.0)(Observed::Written { name: &identity.name, home: &identity.home, value: loaded.as_ref().map(|loaded| &loaded.value) }))
+    }
+
+    fn reset(&self, home: &str) -> Option<Staged> {
+        (self.0)(Observed::Reset { home })
+    }
 }
 
 impl Store {
+    /// Tells `observer` of every write to a resource of kind `K` from now on: this home's own,
+    /// another home's applied, and a snapshot's restored, each inside its transaction. What it
+    /// stages runs as the transaction commits, so a projection it keeps moves with the store's
+    /// commits and is never ahead of or behind them for a reader holding the store's lock.
+    pub fn observe<K: Kind + 'static>(&mut self, observer: std::sync::Arc<Observer<K>>) {
+        self.runtime.observers.push(std::sync::Arc::new(Typed(observer)));
+    }
     /// Read one described table with `filter` applied in SQLite. The filter is checked against the
     /// table's readable description ([`flotilla_schema::Table::filterable`]). Natural identities
     /// replace owner ids; interned strings and object bytes are resolved in the query.
@@ -265,6 +319,7 @@ impl Store {
             identities: TwoGen::new(options.identity_cache),
             ids: TwoGen::new(options.identity_cache),
             change_page_bytes: options.change_page_bytes,
+            observers: Vec::new(),
         };
         Ok(Store { conn, runtime, wrote: false })
     }
@@ -588,6 +643,8 @@ struct Pending {
     strings: HashMap<StringKey, i64>,
     identities: HashMap<Identity, ResourceId>,
     ids: HashMap<ResourceId, Identity>,
+    /// What observers staged, run in order once the transaction commits.
+    staged: Vec<Staged>,
     journal: Vec<Journal>,
 }
 
@@ -598,6 +655,7 @@ enum Journal {
     Kind(KindCode),
     Moved(String),
     Rescan,
+    Staged,
 }
 
 impl Pending {
@@ -626,6 +684,7 @@ impl Pending {
                     self.moved.remove(&home);
                 }
                 Journal::Rescan => self.rescan = false,
+                Journal::Staged => drop(self.staged.pop()),
             }
         }
     }
@@ -707,6 +766,12 @@ impl Write<'_> {
             }
             ctx.remember_watermark(home.to_owned(), crate::stream::Watermark::ZERO);
             ctx.note_rescan();
+            let observers = ctx.runtime.observers.clone();
+            for observer in observers {
+                if let Some(staged) = observer.reset(home) {
+                    ctx.stage(staged);
+                }
+            }
             Ok(())
         })
     }
@@ -1024,7 +1089,11 @@ impl Write<'_> {
 
     pub fn commit(self) -> Result<(), StoreError> {
         self.tx.commit()?;
-        let Pending { strings, identities, ids, watermarks, applied, kinds, moved, rescan, .. } = self.pending;
+        let Pending { strings, identities, ids, watermarks, applied, kinds, moved, rescan, staged, .. } = self.pending;
+        // First, still under the store's lock: what any listener or later read sees follows them.
+        for staged in staged {
+            staged();
+        }
         let heard: BTreeSet<String> = watermarks.keys().cloned().collect();
         self.runtime.watermarks.write().unwrap_or_else(std::sync::PoisonError::into_inner).extend(watermarks);
         if !applied.is_empty() {
@@ -1828,7 +1897,28 @@ impl Ctx<'_> {
         }
         self.append_log(code, home, Some(id), header, prev_seq, sequence, bytes)?;
         self.set_identity_seq(id, sequence)?;
+        self.observe_written(code, id)?;
         Ok(true)
+    }
+
+    /// Tells each observer of `code` that resource `id` was written, inside this transaction, and
+    /// stages what each makes of it for the commit.
+    fn observe_written(&mut self, code: KindCode, id: ResourceId) -> Result<(), StoreError> {
+        let observers: Vec<_> = self.runtime.observers.iter().filter(|observer| observer.code() == code).cloned().collect();
+        for observer in observers {
+            if let Some(staged) = observer.written(self, id)? {
+                self.stage(staged);
+            }
+        }
+        Ok(())
+    }
+
+    /// Stages `staged` for this transaction's commit; a write rewound drops it.
+    fn stage(&mut self, staged: Staged) {
+        if let Some(pending) = &mut self.pending {
+            pending.staged.push(staged);
+            pending.journal.push(Journal::Staged);
+        }
     }
 
     /// Applies an event homed elsewhere: see [`Write::apply`].
@@ -1997,6 +2087,7 @@ impl Ctx<'_> {
         self.note_written(snapshot.kind, &snapshot.home);
         let home = self.intern(HOME_DOMAIN, &snapshot.home)?;
         self.conn.prepare_cached(SEQUENCE_RAISE)?.execute(params![home, sequence])?;
+        self.observe_written(snapshot.kind, id)?;
         Ok(Stamp { id, version: snapshot.version })
     }
 
