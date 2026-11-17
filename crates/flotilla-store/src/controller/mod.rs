@@ -346,6 +346,16 @@ impl WorkQueueSender {
         progress.parked.len()
     }
 
+    /// When outstanding work without loop progress reaches `bound`, unless the loop progresses
+    /// first; none while the queue is idle.
+    pub fn stall_due(&self, bound: Duration) -> Option<DateTime<Utc>> {
+        let progress = self.progress.lock().expect("controller work queue lock poisoned");
+        if progress.queued.is_empty() && progress.processing.is_none() {
+            return None;
+        }
+        Some(progress.last_progress? + chrono::Duration::from_std(bound).expect("controller bound fits"))
+    }
+
     /// Queue age alone is not a failure: a busy loop making progress is able.
     /// An idle loop owes nothing. Only outstanding work without loop progress
     /// for the bound is evidence that the owning controller is stuck.

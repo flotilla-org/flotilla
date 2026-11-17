@@ -153,6 +153,7 @@ fn turn_inactivity_tracks_meaningful_evidence(tc: hegel::TestCase) {
             stale: false,
         },
         current: true,
+        stale_at: None,
         progress: Some(CrewProgress {
             watched_from,
             tool_at: tool.then_some(evidence),

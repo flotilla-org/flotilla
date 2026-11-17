@@ -13,6 +13,15 @@ pub enum MessageResolution {
     Unknown(String),
 }
 
+/// What a change to the messages wrote to.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum InboxChange {
+    /// Messages in these inboxes were written.
+    Touched(std::collections::BTreeSet<flotilla_address::Address>),
+    /// A home's messages must be read again whole: a snapshot cut or a replica reset.
+    Rescanned,
+}
+
 /// What a stalled seat's supervision send is about (#3108): the stalled crew role or canonical
 /// convoy address, and the stall's evidence, which its stall record carries to every home. The
 /// evidence is none for an inferred stall, where no crew declared anything.
@@ -164,6 +173,10 @@ pub trait EngineMessages: Send + Sync {
     /// A tick for each change to the messages after this call, local or replicated, heard from
     /// the store's commits: nothing is listed to hear it.
     fn changes(&self) -> Result<futures::stream::BoxStream<'static, ()>, flotilla_resources::ResourceError>;
+    /// The inboxes each change to the messages after this call wrote to, local or replicated,
+    /// read from the store's log: a reader holding some inboxes' messages reads only those
+    /// again.
+    fn inbox_changes(&self) -> Result<futures::stream::BoxStream<'static, InboxChange>, flotilla_resources::ResourceError>;
     /// Where charter notifications are admitted on this path.
     fn charter_notices(self: std::sync::Arc<Self>, namespace: &str) -> Box<dyn crate::CharterNotices>;
 }

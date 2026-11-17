@@ -138,6 +138,35 @@ async fn active_idle_crew_stalls_and_working_crew_clears() {
     watch.abort();
 }
 
+// The stall judge hears an agent's activity from its AgentSession's writes (#3108): an idle crew
+// working again clears its stall though nothing else about its session changed.
+#[tokio::test]
+async fn an_agent_working_again_clears_its_stall_from_its_session_alone() {
+    let (daemon, backend, _temp, watch, engine) = stall_test_daemon().await;
+    let mut snapshot = stall_workflow_snapshot(vec![claim_crew("coder")]);
+    snapshot.exit = Some(flotilla_resources::ExitDeclaration::standard_table());
+    snapshot.stall_nudges.insert(
+        "work/coder".into(),
+        flotilla_resources::StallNudgePolicy { max_per_episode: 2, max_refusals: None, idle_grace_seconds: Some(0) },
+    );
+    let idle_crew = admit_snapshot(&daemon, "idle-crew", ConvoySpec::builder().workflow_ref("test".into()).build(), snapshot).await;
+    let idle_at = Utc::now() - chrono::Duration::seconds(6);
+    let launch = stall_test_session(
+        &engine,
+        &idle_crew,
+        "idle-session",
+        "coder",
+        TerminalAttention { state: TerminalAttentionState::Idle, as_of: idle_at, source: TerminalAttentionSource::Screen },
+    )
+    .await;
+    let agents = agent_sessions(&daemon);
+    agents.observe_screen(&launch, Activity::Idle, engine_at(idle_at)).expect("idle activity");
+    assert!(wait_for_stall(&backend, &idle_crew, true).await.stalled.is_some());
+    agents.observe_screen(&launch, Activity::Working, engine_at(Utc::now())).expect("working activity");
+    assert!(wait_for_stall(&backend, &idle_crew, false).await.stalled.is_none());
+    watch.abort();
+}
+
 #[tokio::test]
 async fn stale_working_attention_does_not_stall_crew() {
     let (daemon, backend, _temp, watch, engine) = stall_test_daemon().await;

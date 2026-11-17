@@ -3661,6 +3661,7 @@ dependencies = [
  "flotilla-store",
  "flotilla-store-memory",
  "flotilla-vcs",
+ "futures",
  "reqwest 0.13.2",
  "rusqlite",
  "serde_json",

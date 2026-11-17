@@ -18,6 +18,7 @@ use flotilla_resources::{
 };
 use flotilla_store::{load_metrics::carry, off_frame};
 
+use super::schedule::{Pass, SeatQuery, StallSchedule, Waits, RETRY_AFTER};
 use super::sources::freshest_change_request_refs;
 use super::wake::{ConvoyRead, ReconcilerWake};
 use super::{CrewTurnIntent, LeafSubscriptionRow, LeafWatcher, Party, UnableEvidenceKey};
@@ -90,11 +91,12 @@ impl flotilla_resources::StatusPatch<ConvoyStatus> for LaunchAttention<'_> {
 impl ReconcilerWake {
     async fn observe_launch_progress(
         &self,
+        tick: StallTick<'_>,
         convoy: &ResourceObject<Convoy>,
         vessels: &BTreeMap<String, ResourceObject<flotilla_resources::Vessel>>,
         sessions: &BTreeMap<String, ResourceObject<TerminalSession>>,
-        now: DateTime<Utc>,
     ) -> Result<(), String> {
+        let StallTick { now, .. } = tick;
         let Some(status) = &convoy.status else { return Ok(()) };
         let mut pending = self.subscriptions.inner.pending_launches.lock().await;
         let stages = pending.convoys.entry((convoy.metadata.namespace.clone(), convoy.metadata.name.clone())).or_default();
@@ -151,6 +153,7 @@ impl ReconcilerWake {
                     if stage.signature != signature {
                         *stage = LaunchProgress { signature, since: now.max(anchor) };
                     }
+                    tick.due(stage.since + LAUNCH_PROGRESS_BOUND);
                     if now.signed_duration_since(stage.since) >= LAUNCH_PROGRESS_BOUND {
                         diagnostics.push(format!(
                             "launch progress stalled for {key}: Pending since {began}; no lifecycle progress since {}; vessel {:?}, session {:?}; retry evidence {:?}; inspect the launcher and retry or resume the crew after repair",
@@ -247,13 +250,22 @@ pub(super) const TURN_INACTIVITY_BOUND: chrono::Duration = chrono::Duration::min
 // supervision; queue residence while other reconciliations progress is not.
 const CONVOY_CONTROLLER_PROGRESS_BOUND: std::time::Duration = std::time::Duration::from_secs(60);
 
-pub(super) fn turn_inactivity_reason(agent: &AgentActivityView, obligation: &NudgeObligation, now: DateTime<Utc>) -> Option<String> {
+/// When a working turn's silence exceeds the turn inactivity bound unless it shows activity first:
+/// its last tool or output activity, or its obligation's latest reply, plus the bound.
+pub(super) fn turn_inactivity_deadline(agent: &AgentActivityView, obligation: &NudgeObligation) -> Option<DateTime<Utc>> {
     let since = agent.working_since()?;
     // Another home's progress is not seen here, so its turns are not bounded here.
     let progress = agent.progress?;
     let last_activity = [Some(progress.latest()), obligation.reply_after].into_iter().flatten().fold(since, std::cmp::max);
-    let quiet = now.signed_duration_since(last_activity);
-    (quiet >= TURN_INACTIVITY_BOUND).then(|| format!(
+    Some(last_activity + TURN_INACTIVITY_BOUND)
+}
+
+pub(super) fn turn_inactivity_reason(agent: &AgentActivityView, obligation: &NudgeObligation, now: DateTime<Utc>) -> Option<String> {
+    let since = agent.working_since()?;
+    let progress = agent.progress?;
+    let deadline = turn_inactivity_deadline(agent, obligation)?;
+    let quiet = now.signed_duration_since(deadline - TURN_INACTIVITY_BOUND);
+    (now >= deadline).then(|| format!(
         "turn inactivity bound exceeded: turn began {since}, last tool {:?}, last output {:?}, last prompt {:?}, watched from {}; no tool or output activity for {} seconds; automatic interrupt deferred to supervisor",
         progress.tool_at, progress.output_at, progress.prompt_submit_at, progress.watched_from, quiet.num_seconds()
     ))
@@ -262,11 +274,12 @@ pub(super) fn turn_inactivity_reason(agent: &AgentActivityView, obligation: &Nud
 // A long first turn may be legitimate; missing hooks are advisory, never a stall.
 pub(super) const FIRST_HOOK_GRACE: chrono::Duration = chrono::Duration::minutes(15);
 
-pub(super) fn missing_turn_hook(
-    session: &ResourceObject<TerminalSession>,
+/// A running crew session that has delivered no hook since it started: its harness, its vessel
+/// and its start.
+fn unhooked_session<'a>(
+    session: &'a ResourceObject<TerminalSession>,
     agent: Option<&AgentActivityView>,
-    now: DateTime<Utc>,
-) -> Option<String> {
+) -> Option<(&'a str, &'a str, DateTime<Utc>)> {
     if !matches!(session.spec.source, TerminalSessionSource::Agent { .. }) {
         return None;
     }
@@ -277,10 +290,26 @@ pub(super) fn missing_turn_hook(
     }
     let started = status.started_at?;
     let vessel = session.metadata.labels.get(VESSEL_LABEL)?;
-    let hook_seen = agent.is_some_and(|agent| agent.hook_seen_since(started));
-    (!hook_seen && now.signed_duration_since(started) >= FIRST_HOOK_GRACE).then(|| {
-        format!("{} crew {}@{} has delivered no hook since session {} started at {}; check turn hook wiring (Codex notify / Claude managed settings)",
-            crew.adapter, session.spec.role, vessel, session.metadata.name, started)
+    (!agent.is_some_and(|agent| agent.hook_seen_since(started))).then_some((crew.adapter.as_str(), vessel.as_str(), started))
+}
+
+/// When a crew session still without a hook is reported as missing it.
+pub(super) fn missing_turn_hook_deadline(
+    session: &ResourceObject<TerminalSession>,
+    agent: Option<&AgentActivityView>,
+) -> Option<DateTime<Utc>> {
+    unhooked_session(session, agent).map(|(_, _, started)| started + FIRST_HOOK_GRACE)
+}
+
+pub(super) fn missing_turn_hook(
+    session: &ResourceObject<TerminalSession>,
+    agent: Option<&AgentActivityView>,
+    now: DateTime<Utc>,
+) -> Option<String> {
+    let (adapter, vessel, started) = unhooked_session(session, agent)?;
+    (now.signed_duration_since(started) >= FIRST_HOOK_GRACE).then(|| {
+        format!("{adapter} crew {}@{vessel} has delivered no hook since session {} started at {started}; check turn hook wiring (Codex notify / Claude managed settings)",
+            session.spec.role, session.metadata.name)
     })
 }
 
@@ -379,6 +408,15 @@ pub(super) fn stall_supervision_brief(convoy: &ResourceObject<Convoy>, condition
 
 pub(super) const DEFAULT_IDLE_GRACE_SECONDS: u32 = 180;
 
+/// How long after the last of `delivered` nudges the next is due: the initial grace is 1x, and the
+/// intervals after delivered nudges are 1x, 2x, 4x, ...
+fn nudge_backoff(grace_seconds: u32, delivered: usize) -> chrono::Duration {
+    chrono::Duration::seconds(i64::from(grace_seconds.max(1)).saturating_mul(1_i64 << delivered.saturating_sub(1).min(20)))
+}
+
+/// How long a resumed crew's turn holds off supervision while its brief is unconfirmed.
+const RESUMED_TURN_GRACE: chrono::Duration = chrono::Duration::minutes(2);
+
 pub(super) fn nudge_policy<'a>(status: &'a ConvoyStatus, vessel: &str, role: &str) -> Option<&'a flotilla_resources::StallNudgePolicy> {
     status.workflow_snapshot.as_ref()?.stall_nudges.get(&format!("{vessel}/{role}"))
 }
@@ -466,7 +504,8 @@ impl StallInputs {
     }
 }
 
-/// What every step of one judging tick reads.
+/// What every step of one judging pass reads, and where a convoy's judgement records what it
+/// waits on.
 #[derive(Clone, Copy)]
 struct StallTick<'a> {
     namespace: &'a str,
@@ -475,6 +514,28 @@ struct StallTick<'a> {
     progress_observations: &'a HashMap<&'a str, &'a ResourceObject<flotilla_resources::ChangeRequest>>,
     rows: &'a [LeafSubscriptionRow],
     controller_queue: Option<&'a flotilla_store::controller::WorkQueueSender>,
+    waits: &'a std::sync::Mutex<Waits>,
+    /// The convoy is judged for the first time since the judge began.
+    first: bool,
+}
+
+impl StallTick<'_> {
+    /// Judges again at `at`, an instant the judgement turns on, once it is later than now.
+    fn due(&self, at: DateTime<Utc>) {
+        if at > self.now {
+            self.waits.lock().unwrap_or_else(|poisoned| poisoned.into_inner()).due(at);
+        }
+    }
+
+    /// Judges again after a failed write or withdrawal.
+    fn retry(&self) {
+        self.due(self.now + RETRY_AFTER);
+    }
+
+    /// Judges again when home `origin`, silent now, is heard from.
+    fn unheard(&self, origin: &str) {
+        self.waits.lock().unwrap_or_else(|poisoned| poisoned.into_inner()).unheard.insert(origin.to_owned());
+    }
 }
 
 /// A convoy's crew sessions and vessels, by name.
@@ -576,30 +637,43 @@ fn stall_causes<'a>(
 impl ReconcilerWake {
     /// A crew session's AgentSession, named by the launch its view shows, at the home its record
     /// came from; none when it cannot be read, which judges nothing.
-    fn agent_view(&self, session: &ResourceObject<TerminalSession>) -> Option<AgentActivityView> {
+    fn agent_view(&self, tick: StallTick<'_>, session: &ResourceObject<TerminalSession>) -> Option<AgentActivityView> {
         self.agent_view_at(
+            tick,
             flotilla_resources::terminal_records::launch_of(session)?,
             session.metadata.annotations.get(flotilla_resources::ORIGIN_ROOT_ANNOTATION).map(String::as_str),
         )
     }
 
-    fn agent_view_at(&self, name: &str, origin: Option<&str>) -> Option<AgentActivityView> {
-        match self.subscriptions.inner.lifecycle_reads.agent_sessions().and_then(|reads| reads.read(name, origin)) {
+    /// The AgentSession `name` homed at `origin`. Another home's reading is judged again when it
+    /// stops being current, or, once it has, when that home is heard from.
+    fn agent_view_at(&self, tick: StallTick<'_>, name: &str, origin: Option<&str>) -> Option<AgentActivityView> {
+        let view = match self.subscriptions.inner.lifecycle_reads.agent_sessions().and_then(|reads| reads.read(name, origin)) {
             Ok(view) => view,
             Err(error) => {
                 tracing::debug!(session = name, %error, "stall judgement has no AgentSession");
                 None
             }
+        };
+        if let (Some(view), Some(origin)) = (&view, origin) {
+            match view.stale_at {
+                Some(stale_at) => tick.due(stale_at),
+                None if !view.current => tick.unheard(origin),
+                None => {}
+            }
         }
+        view
     }
 
-    /// Withdraws records about the convoy or its roles once none of `stalls` names that subject.
-    /// Failed withdrawals retry next pass.
-    async fn end_settled_stalls(&self, namespace: &str, convoy: &ResourceObject<Convoy>, status: &ConvoyStatus, stalls: &Stalls) {
+    /// Withdraws records about the convoy or its roles once none of `stalls` names that subject;
+    /// a failed withdrawal is judged again after a while.
+    async fn end_settled_stalls(&self, tick: StallTick<'_>, convoy: &ResourceObject<Convoy>, status: &ConvoyStatus, stalls: &Stalls) {
+        let StallTick { namespace, .. } = tick;
         let primitives = match self.subscriptions.message_primitives() {
             Ok(primitives) => primitives,
             Err(error) => {
                 tracing::warn!(namespace, convoy = %convoy.metadata.name, %error, "ending settled stall records failed");
+                tick.retry();
                 return;
             }
         };
@@ -620,7 +694,10 @@ impl ReconcilerWake {
         match primitives.end_stalls(namespace, &seats, &stalled, "the seat's stall ended").await {
             Ok(ended) if !ended.is_empty() => tracing::debug!(namespace, convoy = %convoy.metadata.name, ?ended, "stall records ended"),
             Ok(_) => {}
-            Err(error) => tracing::warn!(namespace, convoy = %convoy.metadata.name, %error, "ending settled stall records failed"),
+            Err(error) => {
+                tracing::warn!(namespace, convoy = %convoy.metadata.name, %error, "ending settled stall records failed");
+                tick.retry();
+            }
         }
     }
 
@@ -631,20 +708,39 @@ impl ReconcilerWake {
         self.judge_stalls_at(namespace, convoys, self.subscriptions.inner.clock.now()).await
     }
 
-    /// Judges each convoy in named steps, each run off its caller's frame: a debug build's poll
-    /// frame holds every local of its function, and turn delivery routes deep (#3108).
+    /// Judges every convoy of `convoys` at `now`, reading each one's seats' messages.
     pub(super) async fn judge_stalls_at(
         &self,
         namespace: &str,
         convoys: &HashMap<String, impl ConvoyRead>,
         now: DateTime<Utc>,
     ) -> Result<(), String> {
-        let primitives = self.subscriptions.message_primitives().map_err(|error| error.to_string())?;
-        if let Some(wait) = primitives.delivery_wait(namespace).await? {
-            tracing::debug!(namespace, %wait, "stall judging waits");
+        self.judge_scheduled(namespace, convoys, now, &mut StallSchedule::default()).await
+    }
+
+    /// Judges the convoys of `convoys` that `schedule` holds changed or due at `now`, recording
+    /// when each is next due. Each convoy is judged in named steps, each run off its caller's
+    /// frame: a debug build's poll frame holds every local of its function, and turn delivery
+    /// routes deep (#3108).
+    pub(super) async fn judge_scheduled(
+        &self,
+        namespace: &str,
+        convoys: &HashMap<String, impl ConvoyRead>,
+        now: DateTime<Utc>,
+        schedule: &mut StallSchedule,
+    ) -> Result<(), String> {
+        let pass = schedule.take(&convoys.keys().collect(), now);
+        if pass.is_empty() {
             return Ok(());
         }
-        let inputs = off_frame(|| self.read_stall_inputs(namespace)).await?;
+        let primitives = self.subscriptions.message_primitives().map_err(|error| error.to_string())?;
+        if let Some(wait) = primitives.delivery_wait(namespace).await? {
+            // The designation's change judges them.
+            tracing::debug!(namespace, %wait, "stall judging waits");
+            schedule.put_back(pass);
+            return Ok(());
+        }
+        let inputs = off_frame(|| self.read_stall_inputs(namespace, convoys, &pass, schedule)).await?;
         let available_convoys = &inputs.available_convoys;
         let rows = self.subscriptions.rows().await;
         self.subscriptions.inner.supervisor_context.lock().await.retain(|(ns, name, _), _| ns != namespace || convoys.contains_key(name));
@@ -664,6 +760,8 @@ impl ReconcilerWake {
             .convoys
             .retain(|(ns, name), _| ns != namespace || convoys.contains_key(name));
         let progress_observations = freshest_change_request_refs(&inputs.observation_list.items);
+        // The namespace's own steps wait here: a retry after one fails.
+        let namespace_waits = std::sync::Mutex::new(Waits::default());
         let tick = StallTick {
             namespace,
             now,
@@ -671,6 +769,8 @@ impl ReconcilerWake {
             progress_observations: &progress_observations,
             rows: &rows,
             controller_queue: controller_queue.as_ref(),
+            waits: &namespace_waits,
+            first: false,
         };
         let reseeded = self.reseed_operator_stalls(tick, convoys).await;
         // A launch no longer judged here has ended: its seat holds no stall.
@@ -679,10 +779,11 @@ impl ReconcilerWake {
             .map(|(_, name)| name.clone())
             .collect();
         for name in gone {
-            self.settle_operator_attention(namespace, &name, &Stalls::default()).await;
+            self.settle_operator_attention(tick, &name, &Stalls::default()).await;
         }
-        for convoy in convoys.values().map(ConvoyRead::convoy) {
-            // A stall noted again from its attention is judged from the next tick's snapshot.
+        for convoy in convoys.values().map(ConvoyRead::convoy).filter(|convoy| pass.judged.contains(&convoy.metadata.name)) {
+            // A stall noted again from its attention is judged from the snapshot its note
+            // changes.
             if reseeded.contains(&convoy.metadata.name) {
                 continue;
             }
@@ -702,14 +803,71 @@ impl ReconcilerWake {
                 );
                 continue;
             }
-            self.judge_convoy_stall(tick, convoy).await?;
+            let waits = std::sync::Mutex::new(Waits::default());
+            let first = pass.first.contains(&convoy.metadata.name);
+            self.judge_convoy_stall(StallTick { waits: &waits, first, ..tick }, convoy).await?;
+            schedule.waits(&convoy.metadata.name, waits.into_inner().unwrap_or_else(|poisoned| poisoned.into_inner()));
         }
+        schedule.namespace_waits(namespace_waits.into_inner().unwrap_or_else(|poisoned| poisoned.into_inner()));
         Ok(())
     }
 
-    /// One tick's request snapshot of the watched kinds, after reconciling charter notifications
-    /// against it.
-    async fn read_stall_inputs(&self, namespace: &str) -> Result<StallInputs, String> {
+    /// The judged convoys' seats' messages: those `schedule` holds, read again for each convoy
+    /// whose seats' messages changed, or whose seats or named turns differ from the last read's.
+    async fn seat_messages(
+        &self,
+        namespace: &str,
+        convoys: &HashMap<String, impl ConvoyRead>,
+        pass: &Pass,
+        schedule: &mut StallSchedule,
+    ) -> Result<Vec<flotilla_messaging::SeatMessage>, String> {
+        // The judge reads only the messages to the convoys' crew members, and the turns their
+        // statuses name, each held by the convoy whose seat it is.
+        let mut unread = Vec::new();
+        for convoy in pass.judged.iter().filter_map(|name| convoys.get(name)).map(ConvoyRead::convoy) {
+            let query: SeatQuery =
+                (flotilla_resources::convoy_crew_seats(namespace, convoy), flotilla_resources::convoy_seat_turns(namespace, convoy));
+            if schedule.unread(&convoy.metadata.name, &query) {
+                unread.push((&convoy.metadata.name, query));
+            }
+        }
+        let mut seat_of = HashMap::new();
+        let (mut seats, mut named) = (Vec::new(), Vec::new());
+        for (name, (convoy_seats, convoy_named)) in &unread {
+            for seat in convoy_seats {
+                seat_of.insert(seat.clone(), *name);
+                seats.push(seat.clone());
+            }
+            for (seat, record) in convoy_named {
+                seat_of.insert(seat.clone(), *name);
+                named.push((seat.clone(), record.clone()));
+            }
+        }
+        let mut read: HashMap<&String, Vec<_>> = HashMap::new();
+        if !seats.is_empty() || !named.is_empty() {
+            let primitives = self.subscriptions.message_primitives().map_err(|error| error.to_string())?;
+            for message in primitives.seat_standings(namespace, &seats, &named).await.map_err(|error| error.to_string())? {
+                if let Some(convoy) = seat_of.get(&message.seat) {
+                    read.entry(*convoy).or_default().push(message);
+                }
+            }
+        }
+        for (name, query) in unread {
+            let messages = read.remove(name).unwrap_or_default();
+            schedule.read(name, query, messages);
+        }
+        Ok(schedule.standings(pass.judged.iter()))
+    }
+
+    /// One pass's request snapshot of the watched kinds, after reconciling charter notifications
+    /// against it when the pass is to.
+    async fn read_stall_inputs(
+        &self,
+        namespace: &str,
+        convoys: &HashMap<String, impl ConvoyRead>,
+        pass: &Pass,
+        schedule: &mut StallSchedule,
+    ) -> Result<StallInputs, String> {
         let backend = &self.subscriptions.inner.backend;
         let cell = self.views(namespace).await?;
         let views = cell.get().expect("initialized views");
@@ -722,20 +880,7 @@ impl ReconcilerWake {
         let forges =
             views.forges.definitions().await.map_err(|error| error.to_string())?.into_iter().map(|forge| forge.spec).collect::<Vec<_>>();
         let vessels_list = views.vessels.shared_list().await.map_err(|error| error.to_string())?;
-        let primitives = self.subscriptions.message_primitives().map_err(|error| error.to_string())?;
-        // The judge reads only the messages to the convoys' crew members, and the turns their
-        // statuses name.
-        let seats = available_convoys
-            .items
-            .iter()
-            .flat_map(|convoy| flotilla_resources::convoy_crew_seats(namespace, &convoy.object))
-            .collect::<Vec<_>>();
-        let named = available_convoys
-            .items
-            .iter()
-            .flat_map(|convoy| flotilla_resources::convoy_seat_turns(namespace, &convoy.object))
-            .collect::<Vec<_>>();
-        let messages = primitives.seat_standings(namespace, &seats, &named).await.map_err(|error| error.to_string())?;
+        let messages = self.seat_messages(namespace, convoys, pass, schedule).await?;
         // Routing helpers retain their public Store-based interface, but all
         // their reads come from the same request snapshot of the watched kinds.
         views.defaults.insert_snapshot(namespace, &mut snapshot).await.map_err(|error| error.to_string())?;
@@ -749,16 +894,19 @@ impl ReconcilerWake {
         )
         .await
         .map_err(|error| error.to_string())?;
-        let notices = primitives.charter_notices(namespace);
-        flotilla_messaging::reconcile_charter_notifications_with_receivers(
-            notices.as_ref(),
-            self.subscriptions.inner.charter_brief_renderer.as_ref(),
-            &read_backend,
-            &receivers,
-            &projects,
-        )
-        .await
-        .map_err(|error| error.to_string())?;
+        // Charter notifications follow the projects, the receivers and the designation.
+        if pass.charter {
+            let notices = self.subscriptions.message_primitives().map_err(|error| error.to_string())?.charter_notices(namespace);
+            flotilla_messaging::reconcile_charter_notifications_with_receivers(
+                notices.as_ref(),
+                self.subscriptions.inner.charter_brief_renderer.as_ref(),
+                &read_backend,
+                &receivers,
+                &projects,
+            )
+            .await
+            .map_err(|error| error.to_string())?;
+        }
         let declarations = flotilla_store::CascadeDeclarations::load(&read_backend, namespace).await.map_err(|error| error.to_string())?;
         Ok(StallInputs {
             projects,
@@ -775,11 +923,10 @@ impl ReconcilerWake {
 
     /// Judges one locally authored convoy and writes its stall status.
     async fn judge_convoy_stall(&self, tick: StallTick<'_>, convoy: &ResourceObject<Convoy>) -> Result<(), String> {
-        let StallTick { namespace, .. } = tick;
         let projects = &tick.inputs.projects;
         let Some(status) = &convoy.status else { return Ok(()) };
-        // A new turn or the launch's end may have closed a told stall since the last tick.
-        self.settle_operator_attention(namespace, &convoy.metadata.name, &status.stalls).await;
+        // A new turn or the launch's end may have closed a told stall since it was last judged.
+        self.settle_operator_attention(tick, &convoy.metadata.name, &status.stalls).await;
         let Some(crew) = self.observe_convoy_crew(tick, convoy, status).await? else { return Ok(()) };
         let ConvoyCrew { sessions: selected_sessions, vessels: selected_vessels, mut obligations, holding } = crew;
         let verdict = self.judge_convoy_rows(tick, convoy, status, &selected_sessions, &selected_vessels, &mut obligations).await?;
@@ -819,19 +966,18 @@ impl ReconcilerWake {
                 next.set(held.clone());
             }
         }
-        self.write_stall_status(namespace, convoy, status, obligations, next).await
+        self.write_stall_status(tick, convoy, status, obligations, next).await
     }
 
     /// The convoy's crew sessions and vessels, with its turn-hook health and a working stall
-    /// source observed; none once the convoy has nothing left to judge. It runs for every convoy
-    /// each tick, so its steps are awaited in place rather than boxed.
+    /// source observed; none once the convoy has nothing left to judge. It runs for every judged
+    /// convoy, so its steps are awaited in place rather than boxed.
     async fn observe_convoy_crew(
         &self,
         tick: StallTick<'_>,
         convoy: &ResourceObject<Convoy>,
         status: &ConvoyStatus,
     ) -> Result<Option<ConvoyCrew>, String> {
-        let StallTick { namespace, .. } = tick;
         let (selected_sessions, selected_vessels) = self.observe_crew_progress(tick, convoy).await?;
         let mut obligations = status.nudge_obligations.clone();
         let holding = launch_underway(status.phase) || status.phase == ConvoyPhase::Landing;
@@ -841,8 +987,10 @@ impl ReconcilerWake {
         if self.clear_working_source_stall(tick, convoy, status, &selected_sessions, &mut obligations).await? {
             return Ok(None);
         }
+        // An ended launch's records are settled on the change that ended it; it is judged on
+        // nothing else.
         if !holding && status.stalls.is_empty() {
-            self.end_settled_stalls(namespace, convoy, status, &Stalls::default()).await;
+            self.end_settled_stalls(tick, convoy, status, &Stalls::default()).await;
             return Ok(None);
         }
         Ok(Some(ConvoyCrew { sessions: selected_sessions, vessels: selected_vessels, obligations, holding }))
@@ -858,7 +1006,7 @@ impl ReconcilerWake {
         let selected_sessions = select_convoy_children(convoy, sessions);
         self.observe_queued_turns_from_messages(namespace, convoy, &selected_sessions, messages, now).await?;
         let selected_vessels = select_convoy_children(convoy, vessels);
-        self.observe_launch_progress(convoy, &selected_vessels, &selected_sessions, now).await?;
+        self.observe_launch_progress(tick, convoy, &selected_vessels, &selected_sessions).await?;
         Ok((selected_sessions, selected_vessels))
     }
 
@@ -872,10 +1020,14 @@ impl ReconcilerWake {
     ) -> Result<(), String> {
         let StallTick { namespace, now, .. } = tick;
         let backend = &self.subscriptions.inner.backend;
-        let mut missing_hooks = selected_sessions
-            .values()
-            .filter_map(|session| missing_turn_hook(session, self.agent_view(session).as_ref(), now))
-            .collect::<Vec<_>>();
+        let mut missing_hooks = Vec::new();
+        for session in selected_sessions.values() {
+            let agent = self.agent_view(tick, session);
+            if let Some(deadline) = missing_turn_hook_deadline(session, agent.as_ref()) {
+                tick.due(deadline);
+            }
+            missing_hooks.extend(missing_turn_hook(session, agent.as_ref(), now));
+        }
         missing_hooks.sort();
         let reason = (!missing_hooks.is_empty()).then(|| missing_hooks.join("\n"));
         let prior = status.attention.as_ref().filter(|attention| attention.source == ConvoyAttention::MISSING_TURN_HOOK_SOURCE);
@@ -916,7 +1068,7 @@ impl ReconcilerWake {
                 selected_sessions.values().any(|session| {
                     session.metadata.labels.get(VESSEL_LABEL).is_some_and(|name| name == vessel)
                         && session.metadata.labels.get(ROLE_LABEL).is_some_and(|name| name == role)
-                        && self.agent_view(session).is_some_and(|agent| actor_is_working(&agent, obligations, vessel, role, now))
+                        && self.agent_view(tick, session).is_some_and(|agent| actor_is_working(&agent, obligations, vessel, role, now))
                 })
             })
             .collect::<Vec<_>>();
@@ -945,7 +1097,7 @@ impl ReconcilerWake {
         }
         let mut remaining = status.stalls.clone();
         remaining.retain(|stalled| stalled.seat().is_none_or(|seat| !working.contains(&seat)));
-        self.end_settled_stalls(namespace, convoy, status, &remaining).await;
+        self.end_settled_stalls(tick, convoy, status, &remaining).await;
         Ok(true)
     }
 
@@ -1032,11 +1184,17 @@ impl ReconcilerWake {
                 LeafMaker::Controller { resource_kind, name, retry, ceiling } => {
                     let controller_queue = tick.controller_queue;
                     let reason = if resource_kind == "Convoy" {
+                        if let Some(due) = controller_queue.and_then(|queue| queue.stall_due(CONVOY_CONTROLLER_PROGRESS_BOUND)) {
+                            tick.due(due);
+                        }
                         controller_queue
                             .as_ref()
                             .and_then(|queue| queue.stall_reason(now, CONVOY_CONTROLLER_PROGRESS_BOUND))
                             .map(|reason| format!("Convoy controller for {}: {reason}", name.as_deref().unwrap_or("unknown")))
                     } else {
+                        if let Some(due) = retry.stall_due(*ceiling) {
+                            tick.due(due);
+                        }
                         retry.stall_reason(now, *ceiling)
                     };
                     match reason {
@@ -1180,7 +1338,7 @@ impl ReconcilerWake {
                 obligation.message_id = message_id.clone();
                 obligation.delivered_message_id = delivered_id;
             }
-            let agent = session.and_then(|session| self.agent_view(session));
+            let agent = session.and_then(|session| self.agent_view(tick, session));
             let pending_message = messages.iter().any(|message| message.seat == receiver_address && message.phase.is_waiting());
             // The agent's own record says when it went idle (#3108). A delivered message's reply
             // is consumed once the agent goes idle after it; until then the quiet clock counts
@@ -1196,6 +1354,9 @@ impl ReconcilerWake {
                 Some(after) => quiet.max(after),
                 None => quiet,
             });
+            if let Some(deadline) = agent.as_ref().and_then(|agent| turn_inactivity_deadline(agent, obligation)) {
+                tick.due(deadline);
+            }
             let turn_inactivity = agent.as_ref().and_then(|agent| turn_inactivity_reason(agent, obligation, now));
             let idle_grace = chrono::Duration::seconds(i64::from(idle_grace_seconds(status, vessel, role)));
             let lost_reason = session
@@ -1266,22 +1427,22 @@ impl ReconcilerWake {
                             } else {
                                 TerminalAttention::DEBOUNCE_FOR
                             };
-                            if self
-                                .maker_debouncing(
-                                    row.id,
-                                    UnableEvidenceKey::Attention { state: activity_state(activity), source },
-                                    since,
-                                    debounce,
-                                    now,
-                                )
-                                .await
-                            {
+                            let key = UnableEvidenceKey::Attention { state: activity_state(activity), source };
+                            if let Some(until) = self.maker_debouncing(row.id, key, since, debounce, now).await {
+                                tick.due(until);
                                 return Ok(RowJudgement::Unknown);
                             }
                             Err(("NeedsInput".into(), evidence_source))
                         } else {
-                            if pending_message || quiet_since.is_none_or(|since| now.signed_duration_since(since) < idle_grace) {
-                                return Ok(RowJudgement::Unknown);
+                            // A pending message's delivery judges the seat again.
+                            match quiet_since {
+                                _ if pending_message => return Ok(RowJudgement::Unknown),
+                                None => return Ok(RowJudgement::Unknown),
+                                Some(since) if now.signed_duration_since(since) < idle_grace => {
+                                    tick.due(since + idle_grace);
+                                    return Ok(RowJudgement::Unknown);
+                                }
+                                Some(_) => {}
                             }
                             Err(("idle".into(), evidence_source))
                         }
@@ -1293,7 +1454,10 @@ impl ReconcilerWake {
                             self.subscriptions.inner.unable_since.lock().await.remove(&row.id);
                             return Ok(RowJudgement::Unknown);
                         }
-                        if self.maker_debouncing(row.id, UnableEvidenceKey::Absent, now, TerminalAttention::DEBOUNCE_FOR, now).await {
+                        if let Some(until) =
+                            self.maker_debouncing(row.id, UnableEvidenceKey::Absent, now, TerminalAttention::DEBOUNCE_FOR, now).await
+                        {
+                            tick.due(until);
                             return Ok(RowJudgement::Unknown);
                         }
                         Err(("session dead or absent".into(), StallEvidenceSource::Session))
@@ -1330,7 +1494,7 @@ impl ReconcilerWake {
                     flotilla_resources::ResourceProvenance::Local => None,
                     flotilla_resources::ResourceProvenance::Replica { origin_root, .. } => Some(origin_root.as_str()),
                 };
-                self.agent_view_at(flotilla_resources::terminal_records::launch_of(&source.object)?, origin)
+                self.agent_view_at(tick, flotilla_resources::terminal_records::launch_of(&source.object)?, origin)
             });
             match agent.as_ref().map(|agent| (agent, agent.live_activity())) {
                 Some((agent, _)) if !agent.current => {
@@ -1344,16 +1508,9 @@ impl ReconcilerWake {
                 }
                 Some((agent, Some(activity @ (AgentActivity::Idle | AgentActivity::Interrupted)))) => {
                     self.subscriptions.inner.stale_attention_reported.lock().await.remove(&row.id);
-                    if self
-                        .maker_debouncing(
-                            row.id,
-                            UnableEvidenceKey::Attention { state: activity_state(activity), source: activity_source(agent) },
-                            row.created_at,
-                            TerminalAttention::DEBOUNCE_FOR,
-                            now,
-                        )
-                        .await
-                    {
+                    let key = UnableEvidenceKey::Attention { state: activity_state(activity), source: activity_source(agent) };
+                    if let Some(until) = self.maker_debouncing(row.id, key, row.created_at, TerminalAttention::DEBOUNCE_FOR, now).await {
+                        tick.due(until);
                         return RowJudgement::Unknown;
                     }
                     Err(("supervisor idle".into(), StallEvidenceSource::Session))
@@ -1369,8 +1526,10 @@ impl ReconcilerWake {
                     return RowJudgement::Unknown;
                 }
                 None => {
-                    if self.maker_debouncing(row.id, UnableEvidenceKey::Absent, row.created_at, TerminalAttention::DEBOUNCE_FOR, now).await
+                    if let Some(until) =
+                        self.maker_debouncing(row.id, UnableEvidenceKey::Absent, row.created_at, TerminalAttention::DEBOUNCE_FOR, now).await
                     {
+                        tick.due(until);
                         return RowJudgement::Unknown;
                     }
                     Err(("supervisor session dead or absent".into(), StallEvidenceSource::Session))
@@ -1408,22 +1567,26 @@ impl ReconcilerWake {
                     let merged = observation
                         .is_some_and(|status| status.state.value == Some(flotilla_resources::ObservedChangeRequestState::Merged));
                     let final_settlement = merged;
-                    let fresh = final_settlement
-                        || (has_value
-                            && observation.is_some_and(|status| {
-                                let at = match leaf.field_path.as_str() {
-                                    ".ready" => status.state.observed_at.min(status.checks.observed_at),
-                                    ".head-sha" => status.head_sha.observed_at,
-                                    ".checks" => status.checks.observed_at,
-                                    ".review.actionable-at-head" => status.review.actionable_at_head.observed_at,
-                                    ".mergeable" => status.mergeable.observed_at,
-                                    _ => status.state.observed_at,
-                                };
-                                row.freshness_demand.is_none_or(|demand| at >= demand)
-                                    && now.signed_duration_since(at)
-                                        < chrono::Duration::from_std(self.subscriptions.change_request_stale_after())
-                                            .expect("duration fits")
-                            }));
+                    // Until when the observation answers the row's demand: it goes stale then.
+                    let fresh_until = observation.filter(|_| has_value).and_then(|status| {
+                        let at = match leaf.field_path.as_str() {
+                            ".ready" => status.state.observed_at.min(status.checks.observed_at),
+                            ".head-sha" => status.head_sha.observed_at,
+                            ".checks" => status.checks.observed_at,
+                            ".review.actionable-at-head" => status.review.actionable_at_head.observed_at,
+                            ".mergeable" => status.mergeable.observed_at,
+                            _ => status.state.observed_at,
+                        };
+                        let stale_after =
+                            chrono::Duration::from_std(self.subscriptions.change_request_stale_after()).expect("duration fits");
+                        row.freshness_demand.is_none_or(|demand| at >= demand).then_some(at + stale_after)
+                    });
+                    if !final_settlement {
+                        if let Some(until) = fresh_until {
+                            tick.due(until);
+                        }
+                    }
+                    let fresh = final_settlement || fresh_until.is_some_and(|until| now < until);
                     if !fresh {
                         let subject = address.and_then(|address| ChangeRequestKey::new(namespace, address));
                         let refresh_error = match &subject {
@@ -1467,7 +1630,8 @@ impl ReconcilerWake {
                             self.subscriptions.inner.observer_grace.lock().await.retain(|(id, _), _| *id != row.id);
                             None
                         };
-                        if deadline.is_some_and(|deadline| now < deadline) {
+                        if let Some(deadline) = deadline.filter(|deadline| now < *deadline) {
+                            tick.due(deadline);
                             return RowJudgement::Unknown;
                         }
                         // The deadline is stable evidence of observer lag. Do not
@@ -1565,7 +1729,7 @@ impl ReconcilerWake {
             });
             let idle_at = session
                 .filter(|session| matches!(session.spec.source, TerminalSessionSource::Agent { .. }))
-                .and_then(|session| self.agent_view(session))
+                .and_then(|session| self.agent_view(tick, session))
                 .filter(|agent| matches!(agent.live_activity(), Some(AgentActivity::Idle | AgentActivity::Interrupted)))
                 .and_then(|agent| agent.reading.activity_since);
             // A crew that declared a stall has answered its resumed turn: a seat reads Working on
@@ -1579,9 +1743,10 @@ impl ReconcilerWake {
                 .is_some_and(|(resumed_at, brief_id)| {
                     // A missing or recreated session must not suppress
                     // supervision indefinitely while its brief is unconfirmed.
-                    if now.signed_duration_since(resumed_at) >= chrono::Duration::minutes(2) {
+                    if now.signed_duration_since(resumed_at) >= RESUMED_TURN_GRACE {
                         return false;
                     }
+                    tick.due(resumed_at + RESUMED_TURN_GRACE);
                     let operator_brief_delivered =
                         messages.iter().any(|message| message.name == brief_id && message.phase.has_delivery_evidence());
                     !operator_brief_delivered || idle_at.is_none_or(|idle_at| idle_at <= resumed_at)
@@ -1590,10 +1755,7 @@ impl ReconcilerWake {
             if idle_at.is_some() && declared.is_none() && !resume_grace {
                 let limit = nudge_policy(status, vessel, role).map_or(2, |policy| policy.max_per_episode) as usize;
                 let grace_seconds = idle_grace_seconds(status, vessel, role);
-                // Initial grace is 1x; intervals after delivered nudges are 1x, 2x, 4x, ...
-                let backoff = chrono::Duration::seconds(
-                    i64::from(grace_seconds.max(1)).saturating_mul(1_i64 << condition.nudge_history.len().saturating_sub(1).min(20)),
-                );
+                let backoff = nudge_backoff(grace_seconds, condition.nudge_history.len());
                 let due = condition.nudge_history.last().is_none_or(|nudge| now.signed_duration_since(nudge.at) >= backoff);
                 if prior
                     .is_some_and(|stalled| stalled.rung == StallRung::Operator && stalled.evidence.starts_with("nudge delivery failed:"))
@@ -1626,6 +1788,10 @@ impl ReconcilerWake {
                     }
                 } else if !due {
                     condition.rung = StallRung::Nudge;
+                }
+                // The next nudge, or the rung past the last one, is due a backoff after it.
+                if let Some(last) = condition.nudge_history.last().filter(|_| condition.rung == StallRung::Nudge) {
+                    tick.due(last.at + nudge_backoff(grace_seconds, condition.nudge_history.len()));
                 }
             }
         }
@@ -1914,7 +2080,8 @@ impl ReconcilerWake {
         let open = match backend.attentions().open(namespace, Some(Sender::StallJudge), None).await {
             Ok(open) => open,
             Err(error) => {
-                tracing::warn!(namespace, %error, "told stalls could not be read; reading them again next tick");
+                tracing::warn!(namespace, %error, "told stalls could not be read; reading them again after a while");
+                tick.retry();
                 return reseeded;
             }
         };
@@ -1995,15 +2162,17 @@ impl ReconcilerWake {
 
     /// Writes the convoy's nudge obligations and stalls to its home's notes; the engine's stall
     /// records follow them. Only the seats whose stall changed are written, so a stall noted
-    /// meanwhile about another seat (a crew's declaration) stays.
+    /// meanwhile about another seat (a crew's declaration) stays. The records are settled on the
+    /// change that settles a stall, and once on a convoy's first judgement.
     async fn write_stall_status(
         &self,
-        namespace: &str,
+        tick: StallTick<'_>,
         convoy: &ResourceObject<Convoy>,
         status: &ConvoyStatus,
         obligations: Vec<NudgeObligation>,
         next: Stalls,
     ) -> Result<(), String> {
+        let StallTick { namespace, .. } = tick;
         let backend = &self.subscriptions.inner.backend;
         if status.nudge_obligations != obligations {
             flotilla_store::note_convoy(
@@ -2035,20 +2204,24 @@ impl ReconcilerWake {
             .await;
             if let Err(error) = written {
                 tracing::warn!(namespace, convoy = %convoy.metadata.name, %error, "write stalled condition failed");
+                tick.retry();
                 return Ok(());
             }
         }
         if status.stalls != next {
-            self.settle_operator_attention(namespace, &convoy.metadata.name, &next).await;
+            self.settle_operator_attention(tick, &convoy.metadata.name, &next).await;
         }
-        self.end_settled_stalls(namespace, convoy, status, &next).await;
+        if status.stalls != next || tick.first {
+            self.end_settled_stalls(tick, convoy, status, &next).await;
+        }
         Ok(())
     }
 
     /// Withdraws each attention [`Self::tell_operator`] raised for launch `name`'s seats once
     /// `current` no longer holds that seat at the operator: the stall closed, a supervisor took
-    /// it, or the launch ended. One that could not be withdrawn is tried again next tick.
-    async fn settle_operator_attention(&self, namespace: &str, name: &str, current: &Stalls) {
+    /// it, or the launch ended. One that could not be withdrawn is tried again after a while.
+    async fn settle_operator_attention(&self, tick: StallTick<'_>, name: &str, current: &Stalls) {
+        let StallTick { namespace, .. } = tick;
         let key = (namespace.to_owned(), name.to_owned());
         let settled: Vec<String> = match self.subscriptions.inner.operator_told.lock().await.seats.get(&key) {
             Some(roles) => {
@@ -2068,7 +2241,10 @@ impl ReconcilerWake {
                         }
                     }
                 }
-                Err(error) => tracing::warn!(convoy = %name, %role, %error, "a closed stall's attention could not be withdrawn"),
+                Err(error) => {
+                    tracing::warn!(convoy = %name, %role, %error, "a closed stall's attention could not be withdrawn");
+                    tick.retry();
+                }
             }
         }
     }

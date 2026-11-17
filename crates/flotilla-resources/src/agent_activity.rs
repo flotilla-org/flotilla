@@ -43,6 +43,9 @@ pub struct AgentActivityView {
     /// Whether its home has been heard from recently enough to trust the reading; always true
     /// for this home's own sessions.
     pub current: bool,
+    /// When a current reading from another home stops being current unless that home is heard
+    /// from again; `None` for this home's own sessions and for a reading that is not current.
+    pub stale_at: Option<DateTime<Utc>>,
     /// What this home's daemon has seen of the session beside its activity; `None` for another
     /// home's session, whose progress only its own daemon sees.
     pub progress: Option<CrewProgress>,
@@ -269,6 +272,21 @@ pub trait AgentSessionReads: Send + Sync {
     /// The AgentSession named `name` (its crew's launch name) homed at `origin` (a
     /// replica's origin root; `None` for this home), or `None` when none is held.
     fn read(&self, name: &str, origin: Option<&str>) -> Result<Option<AgentActivityView>, String>;
+    /// Each AgentSession written after this call, and each other home heard from, as the store
+    /// commits them: a reader judging some sessions reads only those again.
+    fn changes(&self) -> Result<futures::stream::BoxStream<'static, AgentSessionChange>, String>;
+}
+
+/// What a write of AgentSessions, or hearing from another home, tells their readers.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum AgentSessionChange {
+    /// The AgentSession named `name` homed at `origin` (a replica's origin root; `None` for this
+    /// home) was written.
+    Changed { name: String, origin: Option<String> },
+    /// Home `origin` was heard from: its readings may be current again.
+    Heard { origin: String },
+    /// A home's AgentSessions must be read again whole.
+    Rescanned,
 }
 
 /// Live monitoring state for a crew session: delivery holds first, then what the terminal
@@ -318,6 +336,7 @@ mod tests {
                 stale: false,
             },
             current,
+            stale_at: None,
             progress: None,
         }
     }

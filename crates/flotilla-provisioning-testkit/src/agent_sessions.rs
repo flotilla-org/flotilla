@@ -9,19 +9,30 @@ use std::{
 
 use chrono::{DateTime, Utc};
 use flotilla_protocol::{AgentActivity, AgentSessionEnd, AgentSessionReading};
-use flotilla_resources::agent_activity::{AgentActivityView, AgentSessionReads, ProgressFacts};
+use flotilla_resources::agent_activity::{AgentActivityView, AgentSessionChange, AgentSessionReads, ProgressFacts};
+use futures::StreamExt;
+use tokio::sync::broadcast;
 
 /// This home's AgentSessions and its crews' progress.
 pub struct AgentSessionsFixture {
     sessions: Mutex<HashMap<String, AgentSessionReading>>,
     /// What this home's daemon has seen of its sessions' progress.
     pub progress: Arc<ProgressFacts>,
+    changes: broadcast::Sender<AgentSessionChange>,
 }
 
 impl AgentSessionsFixture {
     /// No sessions, watching progress from `watched_from`.
     pub fn new(watched_from: DateTime<Utc>) -> Self {
-        Self { sessions: Mutex::default(), progress: Arc::new(ProgressFacts::new(watched_from)) }
+        Self::holding(HashMap::new(), watched_from)
+    }
+
+    fn holding(sessions: HashMap<String, AgentSessionReading>, watched_from: DateTime<Utc>) -> Self {
+        Self { sessions: Mutex::new(sessions), progress: Arc::new(ProgressFacts::new(watched_from)), changes: broadcast::channel(64).0 }
+    }
+
+    fn changed(&self, name: &str) {
+        let _ = self.changes.send(AgentSessionChange::Changed { name: name.to_owned(), origin: None });
     }
 
     /// The agent in session `name` reported `activity` at `at`, through `cause` (a harness's
@@ -40,6 +51,8 @@ impl AgentSessionsFixture {
             reading.activity = Some(activity);
             reading.activity_since = Some(at);
             reading.activity_cause = Some(cause.to_owned());
+            drop(sessions);
+            self.changed(name);
         }
     }
 
@@ -48,20 +61,19 @@ impl AgentSessionsFixture {
         if let Some(reading) = self.sessions.lock().expect("agent sessions").get_mut(name) {
             reading.ended = Some(ended);
         }
+        self.changed(name);
     }
 
     /// The same AgentSessions read by a daemon started at `watched_from`: the records survive, what
     /// the previous daemon saw of their progress does not.
     pub fn restarted(&self, watched_from: DateTime<Utc>) -> Self {
-        Self {
-            sessions: Mutex::new(self.sessions.lock().expect("agent sessions").clone()),
-            progress: Arc::new(ProgressFacts::new(watched_from)),
-        }
+        Self::holding(self.sessions.lock().expect("agent sessions").clone(), watched_from)
     }
 
     /// Forgets session `name`, as a store that never recorded it.
     pub fn forget(&self, name: &str) {
         self.sessions.lock().expect("agent sessions").remove(name);
+        self.changed(name);
     }
 }
 
@@ -71,6 +83,17 @@ impl AgentSessionReads for AgentSessionsFixture {
         let reading = self.sessions.lock().expect("agent sessions").get(name).cloned();
         // Progress is kept by session, as the daemon keeps it.
         let progress = origin.is_none().then(|| self.progress.get(flotilla_resources::terminal_records::launched(name)));
-        Ok(reading.map(|reading| AgentActivityView { reading, current: true, progress }))
+        Ok(reading.map(|reading| AgentActivityView { reading, current: true, stale_at: None, progress }))
+    }
+
+    fn changes(&self) -> Result<futures::stream::BoxStream<'static, AgentSessionChange>, String> {
+        Ok(futures::stream::unfold(self.changes.subscribe(), |mut changes| async move {
+            match changes.recv().await {
+                Ok(change) => Some((change, changes)),
+                Err(broadcast::error::RecvError::Lagged(_)) => Some((AgentSessionChange::Rescanned, changes)),
+                Err(broadcast::error::RecvError::Closed) => None,
+            }
+        })
+        .boxed())
     }
 }

@@ -273,7 +273,9 @@ mod agent_sessions {
     use flotilla_engine_store::watch::EngineWatch;
     use flotilla_projections::ports::{AgentSessionFollow, AgentSessionKey, AgentSessionUpdate};
     use flotilla_protocol::{AgentActivity, AgentSessionEnd, AgentSessionReading, NodeId};
-    use flotilla_resources::agent_activity::{home_current, AgentActivityView, AgentSessionReads, ProgressFacts};
+    use flotilla_resources::agent_activity::{
+        home_current, home_stale_at, AgentActivityView, AgentSessionChange, AgentSessionReads, ProgressFacts,
+    };
     use flotilla_schema::Kind as StoredKind;
     use flotilla_schema_sqlite::{stream::Service, Read, StoreError};
     use flotilla_state_machines::{
@@ -370,15 +372,61 @@ mod agent_sessions {
                 .service
                 .with_store(|store| load(&mut store.read()?, name, home))
                 .map_err(|error| format!("AgentSession/{name}: {error}"))?;
-            let current = home == own || {
+            let (current, stale_at) = if home == own {
+                (true, None)
+            } else {
                 let heard = self.service.watermark(home).map_err(|error| error.to_string())?.applied_through.to_datetime();
-                home_current(heard.filter(|at| *at > DateTime::<Utc>::UNIX_EPOCH), self.clock.now())
+                let heard = heard.filter(|at| *at > DateTime::<Utc>::UNIX_EPOCH);
+                let current = home_current(heard, self.clock.now());
+                (current, heard.filter(|_| current).map(home_stale_at))
             };
             // Progress is kept by session as hooks name it; a launch reads its session's, which an
             // earlier launch's can only precede.
             let progress = (home == own).then(|| self.progress.get(flotilla_resources::terminal_records::launched(name)));
-            Ok(reading.map(|reading| AgentActivityView { reading, current, progress }))
+            Ok(reading.map(|reading| AgentActivityView { reading, current, stale_at, progress }))
         }
+
+        fn changes(&self) -> Result<futures::stream::BoxStream<'static, AgentSessionChange>, String> {
+            // Woken by keepalives too: a home heard from again is a change to its readings.
+            let watch = EngineWatch::start_hearing(Arc::clone(&self.service), [CODE]).map_err(|error| error.to_string())?;
+            let heard = heard_from(&self.service);
+            let changes = futures::stream::unfold((watch, Arc::clone(&self.service), heard), |(mut watch, service, mut last)| async move {
+                loop {
+                    let own = service.home().to_owned();
+                    // A pass that fails is tried again at the next commit.
+                    let mut found = match watch.next(move |_, followed| Ok(session_changes(&own, followed))).await {
+                        Ok(found) => found,
+                        Err(error) => {
+                            tracing::warn!(%error, "the AgentSession changes could not read the log; retrying");
+                            Vec::new()
+                        }
+                    };
+                    for (home, at) in heard_from(&service) {
+                        if last.get(&home) != Some(&at) {
+                            found.push(AgentSessionChange::Heard { origin: home.as_str().to_owned() });
+                            last.insert(home, at);
+                        }
+                    }
+                    if !found.is_empty() {
+                        return Some((futures::stream::iter(found), (watch, service, last)));
+                    }
+                }
+            });
+            Ok(changes.flatten().boxed())
+        }
+    }
+
+    /// What one pass over the log tells a reader of some sessions, without reading them.
+    fn session_changes(own: &str, followed: Vec<Followed>) -> Vec<AgentSessionChange> {
+        followed
+            .into_iter()
+            .map(|followed| match followed {
+                Followed::Changed(identity) => {
+                    AgentSessionChange::Changed { origin: (identity.home != own).then_some(identity.home), name: identity.name }
+                }
+                Followed::Rescan(_) => AgentSessionChange::Rescanned,
+            })
+            .collect()
     }
 
     /// What one pass over the log found, in log order: written sessions as they are now, and

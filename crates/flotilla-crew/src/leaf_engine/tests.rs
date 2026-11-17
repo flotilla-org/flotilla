@@ -1785,6 +1785,7 @@ fn turn_subject(request: &CrewTurnIntent) -> (flotilla_address::Kind, String, St
 
 mod change_request_authority;
 mod interrupted_stalls;
+mod judge_schedule;
 mod operator_stalls;
 mod settlement;
 mod stalls_supervision;

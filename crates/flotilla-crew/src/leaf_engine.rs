@@ -392,6 +392,7 @@ impl LeafSubscriptionTable {
 }
 
 mod routing;
+mod schedule;
 mod sources;
 mod stalls;
 mod subscriptions;

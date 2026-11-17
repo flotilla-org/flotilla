@@ -198,6 +198,9 @@ impl EngineMessages for RecordingMessages {
     fn changes(&self) -> Result<futures::stream::BoxStream<'static, ()>, ResourceError> {
         Ok(Box::pin(futures::stream::pending()))
     }
+    fn inbox_changes(&self) -> Result<futures::stream::BoxStream<'static, flotilla_messaging::InboxChange>, ResourceError> {
+        Ok(Box::pin(futures::stream::pending()))
+    }
     fn charter_notices(self: Arc<Self>, namespace: &str) -> Box<dyn flotilla_messaging::CharterNotices> {
         Box::new(NoCharterNotices(namespace.to_owned()))
     }

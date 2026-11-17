@@ -101,6 +101,16 @@ impl ControllerRetry {
         }
     }
 
+    /// When a retryable sequence still within its attempts runs past the ceiling's duration.
+    pub fn stall_due(&self, ceiling: RetryCeiling) -> Option<DateTime<Utc>> {
+        match &self.disposition {
+            ControllerRetryDisposition::Retryable { .. } if self.attempts < ceiling.attempts => Some(
+                self.first_failure_at + chrono::Duration::from_std(ceiling.total_duration).expect("retry ceiling fits chrono duration"),
+            ),
+            _ => None,
+        }
+    }
+
     pub fn stall_reason(&self, now: DateTime<Utc>, ceiling: RetryCeiling) -> Option<String> {
         match &self.disposition {
             ControllerRetryDisposition::Terminal { needs } => Some(needs.clone()),

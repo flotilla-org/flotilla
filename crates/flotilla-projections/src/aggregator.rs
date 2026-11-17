@@ -1862,11 +1862,13 @@ impl Aggregator {
     /// current, another home's while that home is heard from.
     fn agent_view(&self, session: &ReadResourceObject<TerminalSession>, now: chrono::DateTime<chrono::Utc>) -> Option<AgentActivityView> {
         let home = self.agent_session_home_of(session)?;
-        let current = Some(&home) == self.agent_session_home.as_ref()
-            || agent_activity::home_current(self.agent_session_heard.get(&home).copied(), now);
+        let own = Some(&home) == self.agent_session_home.as_ref();
+        let heard = self.agent_session_heard.get(&home).copied();
+        let current = own || agent_activity::home_current(heard, now);
+        let stale_at = heard.filter(|_| current && !own).map(agent_activity::home_stale_at);
         let name = flotilla_resources::terminal_records::launch_of(&session.object)?.to_owned();
         let reading = self.agent_sessions.get(&AgentSessionKey { home, name })?.clone();
-        Some(AgentActivityView { reading, current, progress: None })
+        Some(AgentActivityView { reading, current, stale_at, progress: None })
     }
 
     /// An environment's engine record changed, or any of them may have (`None` or a rescan):

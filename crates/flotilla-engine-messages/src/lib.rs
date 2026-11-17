@@ -570,6 +570,24 @@ impl MessagePrimitives {
     pub fn changes(&self) -> Result<futures::stream::BoxStream<'static, ()>, ResourceError> {
         self.changes.subscribe().map_err(|error| ResourceError::other(format!("Message changes: {error}")))
     }
+    /// The inboxes each commit after this call that writes a Message wrote to, this home's or
+    /// another's, read from the log: a message's name is its address, under its inbox's.
+    pub fn inbox_changes(&self) -> Result<futures::stream::BoxStream<'static, flotilla_messaging::InboxChange>, ResourceError> {
+        use futures::StreamExt;
+        let watch = flotilla_engine_store::watch::EngineWatch::start(Arc::clone(&self.service), [<Resource<Message> as StoredKind>::CODE])
+            .map_err(|error| ResourceError::other(format!("Message inbox changes: {error}")))?;
+        Ok(futures::stream::unfold(watch, |mut watch| async move {
+            loop {
+                // A pass that fails is tried again at the next commit.
+                match watch.next(|_, followed| Ok(inbox_change(followed))).await {
+                    Ok(Some(change)) => return Some((change, watch)),
+                    Ok(None) => {}
+                    Err(error) => tracing::warn!(%error, "the Message inbox changes could not read the log; retrying"),
+                }
+            }
+        })
+        .boxed())
+    }
     /// The bindings port: who holds each role inbox, from today's role routing.
     pub fn bindings(&self) -> &Arc<dyn ports::RoleBindings> {
         &self.bindings
@@ -2085,6 +2103,9 @@ impl flotilla_messaging::EngineMessages for MessagePrimitives {
     fn changes(&self) -> Result<futures::stream::BoxStream<'static, ()>, ResourceError> {
         MessagePrimitives::changes(self)
     }
+    fn inbox_changes(&self) -> Result<futures::stream::BoxStream<'static, flotilla_messaging::InboxChange>, ResourceError> {
+        MessagePrimitives::inbox_changes(self)
+    }
     fn charter_notices(self: Arc<Self>, namespace: &str) -> Box<dyn flotilla_messaging::CharterNotices> {
         Box::new(EngineCharterNotices { primitives: self, namespace: namespace.to_owned() })
     }
@@ -2174,6 +2195,25 @@ impl Wanted {
         self.projects.extend(other.projects);
         self.seats.extend(other.seats);
     }
+}
+
+/// The inboxes one pass's followed Messages were written to; every inbox once a home must be
+/// read again, or a name is no message address.
+fn inbox_change(followed: Vec<flotilla_engine_store::follow::Followed>) -> Option<flotilla_messaging::InboxChange> {
+    let mut touched = BTreeSet::new();
+    for followed in followed {
+        let inbox = match followed {
+            flotilla_engine_store::follow::Followed::Changed(identity) => {
+                identity.name.parse::<Address>().ok().filter(|name| name.kind() == AddressKind::Message).and_then(|name| name.parent())
+            }
+            flotilla_engine_store::follow::Followed::Rescan(_) => None,
+        };
+        match inbox {
+            Some(inbox) => touched.insert(inbox),
+            None => return Some(flotilla_messaging::InboxChange::Rescanned),
+        };
+    }
+    (!touched.is_empty()).then_some(flotilla_messaging::InboxChange::Touched(touched))
 }
 
 /// Where a message created at `created` stands, read as in `seat`'s inbox.

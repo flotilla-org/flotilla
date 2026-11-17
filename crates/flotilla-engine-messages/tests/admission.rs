@@ -131,6 +131,20 @@ async fn a_name_admitted_again_after_its_message_is_archived_admits_nothing() {
     assert_eq!(held(primitives).await, 1, "only the successor");
 }
 
+// Behaviour (#3108): each admission is told as a change to its receiver's inbox alone, so a reader
+// of some inboxes reads again only those a message reached.
+#[tokio::test]
+async fn an_admission_is_told_as_its_receivers_inbox_change() {
+    use futures::StreamExt;
+    let home = home().await;
+    let primitives = home.primitives();
+    let mut changes = primitives.inbox_changes().expect("inbox changes");
+    primitives.admit("first", &spec(IntentExpectation::Nothing)).await.expect("admit");
+    let change = tokio::time::timeout(std::time::Duration::from_secs(10), changes.next()).await.expect("told in time").expect("a change");
+    let inbox = primitives.inbox_for(NAMESPACE, RECEIVER).await.expect("inbox");
+    assert_eq!(change, flotilla_messaging::InboxChange::Touched(std::collections::BTreeSet::from([inbox])));
+}
+
 // Behaviour (#3108): a message is admitted only from its sender's intent. One written in the old
 // shape through the generic resource verbs is refused, and nothing is admitted.
 #[tokio::test]

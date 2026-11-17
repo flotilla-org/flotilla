@@ -580,6 +580,7 @@ mod tests {
                 stale: false,
             },
             current,
+            stale_at: None,
             progress: None,
         };
         let idle = view(AgentActivity::Idle, since, "agent-turn-complete", true);

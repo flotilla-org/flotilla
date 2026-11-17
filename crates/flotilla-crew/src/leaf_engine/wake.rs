@@ -4,7 +4,6 @@ use std::{
     marker::PhantomData,
     pin::Pin,
     sync::Arc,
-    time::Duration,
 };
 
 use chrono::{DateTime, Utc};
@@ -26,8 +25,10 @@ use flotilla_store::{
     load_metrics::carry,
     ResourceBackend, StoreQuery, WatchView,
 };
+use futures::StreamExt;
 use tokio::sync::{broadcast, OnceCell};
 
+use super::schedule::StallSchedule;
 use super::sources::{change_request_sources, freshest_change_requests};
 use super::stalls::{is_active_change_request_probe, is_merged_settlement_probe, launch_underway};
 use super::{EpisodeKeyFields, LeafSubscriptionRow, LeafSubscriptionTable, LeafWatcher, UnableEvidenceKey};
@@ -240,6 +241,8 @@ impl ReconcilerWake {
         }
     }
 
+    /// Until when the evidence `key` about row `row_id`, first seen at `first_seen`, is still
+    /// debounced by `delay`; none once it has held for that long.
     pub(super) async fn maker_debouncing(
         &self,
         row_id: uuid::Uuid,
@@ -247,13 +250,13 @@ impl ReconcilerWake {
         first_seen: DateTime<Utc>,
         delay: chrono::Duration,
         now: DateTime<Utc>,
-    ) -> bool {
+    ) -> Option<DateTime<Utc>> {
         let mut episodes = self.subscriptions.inner.unable_since.lock().await;
         let episode = episodes.entry(row_id).or_insert((key, first_seen));
         if episode.0 != key {
             *episode = (key, first_seen);
         }
-        now.signed_duration_since(episode.1) < delay
+        Some(episode.1 + delay).filter(|until| now < *until)
     }
 
     #[cfg(test)]
@@ -339,14 +342,36 @@ impl ReconcilerWake {
         let mut engine_changes = self.subscriptions.inner.convoy_engine.get().map(|engine| engine.changes());
         let mut convoy_objects = views.local_convoys().await?.as_ref().clone();
         let mut wake_rx = self.subscriptions.inner.reconciler_tx.subscribe();
+        // What the stall judge reads besides the rows' inputs: every convoy, a supervisor's
+        // included; the sessions; the seats' messages and their agents' sessions; and the
+        // supervision and delivery declarations.
+        let mut every_convoy_watch = views.convoys.subscribe_keys();
+        let mut session_watch = views.sessions.subscribe_keys();
+        let mut project_watch = views.projects.subscribe();
+        let mut defaults_watch = views.defaults.subscribe();
+        let mut fleet_watch = views.fleet.subscribe();
+        let mut inbox_changes =
+            self.subscriptions.message_primitives().and_then(|messages| messages.inbox_changes()).map_err(|error| error.to_string())?;
+        let mut agent_changes = self.subscriptions.inner.lifecycle_reads.agent_sessions().ok().and_then(|reads| reads.changes().ok());
+        let clock = Arc::clone(&self.subscriptions.inner.clock);
+        let mut jumps = clock.jumps();
+        let mut schedule = StallSchedule::default();
         self.sync_rows(&namespace, &convoy_objects).await?;
-        let mut judge_tick = tokio::time::interval(Duration::from_secs(1));
 
         loop {
+            self.judge_scheduled(&namespace, &convoy_objects, clock.now(), &mut schedule).await?;
+            // Measured on the daemon's clock, again whenever that clock jumps.
+            let due_wait = schedule.next_due().map(|due| (due - clock.now()).to_std().unwrap_or_default());
             tokio::select! {
-                _ = judge_tick.tick() => {
-                    self.judge_stalls(&namespace, &convoy_objects).await?;
-                }
+                () = tokio::time::sleep(due_wait.unwrap_or_default()), if due_wait.is_some() => {}
+                jumped = async {
+                    match jumps.as_mut() {
+                        Some(jumps) => jumps.changed().await,
+                        None => std::future::pending().await,
+                    }
+                } => if jumped.is_err() {
+                    jumps = None;
+                },
                 event = convoy_watch.recv() => {
                     let selected = match event {
                         Ok(Some(name)) => {
@@ -362,6 +387,72 @@ impl ReconcilerWake {
                         Err(broadcast::error::RecvError::Closed) => return Err("convoy view stopped".into()),
                     };
                     self.sync_rows_selected(&namespace, &convoy_objects, selected.as_ref()).await?;
+                    schedule.convoys_changed(selected.as_ref());
+                }
+                event = every_convoy_watch.recv() => {
+                    if let Err(broadcast::error::RecvError::Closed) = event {
+                        return Err("convoy view stopped".into());
+                    }
+                    // Any launch, another home's included, may be a stalled seat's supervisor.
+                    schedule.changed(Some(&stalled(&convoy_objects)));
+                    schedule.charter_changed();
+                }
+                event = session_watch.recv() => {
+                    let selected = match event {
+                        Ok(Some(name)) => Some(session_convoys(views.sessions.shared_named(&name).await.map_err(|error| error.to_string())?)),
+                        Ok(None) | Err(broadcast::error::RecvError::Lagged(_)) => None,
+                        Err(broadcast::error::RecvError::Closed) => return Err("session view stopped".into()),
+                    };
+                    self.seats_changed(&mut schedule, &convoy_objects, selected).await;
+                    schedule.charter_changed();
+                }
+                change = async {
+                    match agent_changes.as_mut() {
+                        Some(changes) => changes.next().await,
+                        None => std::future::pending().await,
+                    }
+                } => match change {
+                    Some(flotilla_resources::agent_activity::AgentSessionChange::Changed { name, origin }) => {
+                        let sessions = views.sessions.shared_list().await.map_err(|error| error.to_string())?;
+                        let running = sessions.items.iter().filter(|session| {
+                            flotilla_resources::terminal_records::launch_of(&session.object) == Some(name.as_str())
+                                && session.object.metadata.annotations.get(flotilla_resources::ORIGIN_ROOT_ANNOTATION) == origin.as_ref()
+                        });
+                        let selected = running.filter_map(|session| session.object.metadata.labels.get(flotilla_resources::CONVOY_LABEL).cloned()).collect();
+                        self.seats_changed(&mut schedule, &convoy_objects, Some(selected)).await;
+                    }
+                    Some(flotilla_resources::agent_activity::AgentSessionChange::Heard { origin }) => schedule.heard(&origin),
+                    Some(flotilla_resources::agent_activity::AgentSessionChange::Rescanned) => schedule.changed(None),
+                    None => agent_changes = None,
+                },
+                change = inbox_changes.next() => match change {
+                    Some(flotilla_messaging::InboxChange::Touched(inboxes)) => {
+                        let selected = inboxes
+                            .iter()
+                            .flat_map(flotilla_resources::convoy::engine::convoy_records)
+                            .filter(|name| convoy_objects.contains_key(name))
+                            .collect();
+                        schedule.messages_changed(Some(&selected));
+                    }
+                    Some(flotilla_messaging::InboxChange::Rescanned) => schedule.messages_changed(None),
+                    None => return Err("the Message inbox changes stopped".into()),
+                },
+                changed = project_watch.changed() => {
+                    changed.map_err(|_| "project view stopped".to_string())?;
+                    // A project declares its convoys' supervision and its charter.
+                    schedule.changed(Some(&stalled(&convoy_objects)));
+                    schedule.charter_changed();
+                }
+                changed = defaults_watch.changed() => {
+                    changed.map_err(|_| "crew defaults view stopped".to_string())?;
+                    schedule.changed(Some(&stalled(&convoy_objects)));
+                    schedule.charter_changed();
+                }
+                changed = fleet_watch.changed() => {
+                    // The designation decides whether messages are delivered at all.
+                    changed.map_err(|_| "fleet designation view stopped".to_string())?;
+                    schedule.changed(None);
+                    schedule.charter_changed();
                 }
                 change = async {
                     match checkout_changes.as_mut() {
@@ -379,7 +470,7 @@ impl ReconcilerWake {
                             continue;
                         }
                     };
-                    self.sync_rows_selected(&namespace, &convoy_objects, selected.as_ref()).await?;
+                    self.rows_changed(&namespace, &convoy_objects, selected.as_ref(), &mut schedule).await?;
                 }
                 change = async {
                     match engine_changes.as_mut() {
@@ -395,19 +486,19 @@ impl ReconcilerWake {
                             continue;
                         }
                     };
-                    self.sync_rows_selected(&namespace, &convoy_objects, selected.as_ref()).await?;
+                    self.rows_changed(&namespace, &convoy_objects, selected.as_ref(), &mut schedule).await?;
                 }
                 event = change_request_watch.recv() => {
                     let selected = affected_rows(views, &views.change_requests, event).await?;
-                    self.sync_rows_selected(&namespace, &convoy_objects, selected.as_ref()).await?;
+                    self.rows_changed(&namespace, &convoy_objects, selected.as_ref(), &mut schedule).await?;
                 }
                 event = vessel_watch.recv() => {
                     let selected = affected_rows(views, &views.vessels, event).await?;
-                    self.sync_rows_selected(&namespace, &convoy_objects, selected.as_ref()).await?;
+                    self.rows_changed(&namespace, &convoy_objects, selected.as_ref(), &mut schedule).await?;
                 }
                 event = forge_watch.changed() => {
                     event.map_err(|_| "forge view stopped".to_string())?;
-                    self.sync_rows(&namespace, &convoy_objects).await?;
+                    self.rows_changed(&namespace, &convoy_objects, None, &mut schedule).await?;
                 }
                 change = async {
                     match clone_changes.as_mut() {
@@ -426,21 +517,65 @@ impl ReconcilerWake {
                             continue;
                         }
                     };
-                    self.sync_rows_selected(&namespace, &convoy_objects, selected.as_ref()).await?;
+                    self.rows_changed(&namespace, &convoy_objects, selected.as_ref(), &mut schedule).await?;
                 }
+                // A woken convoy's controller row is judged by the queue's progress.
                 wake = wake_rx.recv() => match wake {
-                    Ok(convoy) => sender.send(convoy).await.map_err(|_| "convoy controller queue closed".to_string())?,
+                    Ok(convoy) => {
+                        sender.send(convoy.clone()).await.map_err(|_| "convoy controller queue closed".to_string())?;
+                        schedule.changed(Some(&HashSet::from([convoy])));
+                    }
                     Err(broadcast::error::RecvError::Lagged(_)) => {
                         for convoy in convoy_objects.values().filter(|convoy| {
                             convoy.status.as_ref().is_some_and(|status| matches!(status.phase, ConvoyPhase::Landing))
                         }) {
                             sender.send(convoy.metadata.name.clone()).await.map_err(|_| "convoy controller queue closed".to_string())?;
                         }
+                        schedule.changed(None);
                     }
                     Err(broadcast::error::RecvError::Closed) => return Err("reconciler wake channel closed".to_string()),
                 }
             }
         }
+    }
+
+    /// Rebuilds the rows of `selected` convoys, or every convoy's for `None`, after their inputs
+    /// changed; the stall judge judges them again.
+    async fn rows_changed(
+        &self,
+        namespace: &str,
+        convoys: &HashMap<String, impl ConvoyRead>,
+        selected: Option<&HashSet<String>>,
+        schedule: &mut StallSchedule,
+    ) -> Result<(), String> {
+        self.sync_rows_selected(namespace, convoys, selected).await?;
+        schedule.changed(selected);
+        Ok(())
+    }
+
+    /// The crew sessions of `selected` convoys changed, or any convoy's for `None`: those convoys
+    /// are judged again, with each convoy one of them supervises and each stall awaiting a
+    /// supervisor.
+    async fn seats_changed(
+        &self,
+        schedule: &mut StallSchedule,
+        convoys: &HashMap<String, SharedConvoy>,
+        selected: Option<HashSet<String>>,
+    ) {
+        let Some(selected) = selected else {
+            schedule.changed(None);
+            return;
+        };
+        let supervised = self.subscriptions.rows().await.into_iter().filter_map(|row| match (&row.maker, row.watcher) {
+            (LeafMaker::Supervisor { convoy, .. }, LeafWatcher::ReconcilerWake { convoy: supervised }) if selected.contains(convoy) => {
+                Some(supervised)
+            }
+            _ => None,
+        });
+        let mut judged: HashSet<String> = supervised.collect();
+        judged.extend(stalled(convoys));
+        judged.extend(selected);
+        schedule.changed(Some(&judged));
     }
 
     pub(super) async fn sync_rows(&self, namespace: &str, convoys: &HashMap<String, impl ConvoyRead>) -> Result<(), String> {
@@ -1115,6 +1250,21 @@ fn watcher_convoy(watcher: &LeafWatcher) -> Option<&str> {
 
 // Reverse dependencies cover disappeared children too. A newly created child
 // supplies its parent label before it has ever participated in row evaluation.
+/// The convoys holding a stall: a change to any launch, session or declaration may move its
+/// supervision.
+fn stalled(convoys: &HashMap<String, SharedConvoy>) -> HashSet<String> {
+    convoys
+        .values()
+        .filter(|convoy| convoy.status.as_ref().is_some_and(|status| !status.stalls.is_empty()))
+        .map(|convoy| convoy.metadata.name.clone())
+        .collect()
+}
+
+/// The convoys sessions `named` belong to.
+fn session_convoys(named: Vec<Arc<flotilla_resources::ReadResourceObject<TerminalSession>>>) -> HashSet<String> {
+    named.iter().filter_map(|session| session.object.metadata.labels.get(flotilla_resources::CONVOY_LABEL).cloned()).collect()
+}
+
 async fn affected_rows<T: flotilla_resources::Resource>(
     views: &LeafViews,
     view: &WatchView<T>,
