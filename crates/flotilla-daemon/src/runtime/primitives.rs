@@ -404,6 +404,17 @@ impl MessageDelivery {
                     self.held.hold(turn.members.iter().cloned(), until);
                     self.held_turns.push(turn);
                 }
+                // Typed before, by a daemon that forgot it across a restart: held from when the
+                // pool first accepted it, as if this daemon had seen it typed then.
+                Ok(TerminalDeliveryOutcome::AlreadyTyped { at_unix_ms }) => {
+                    let typed_at = i64::try_from(at_unix_ms).ok().and_then(chrono::DateTime::<Utc>::from_timestamp_millis);
+                    let mut turn = turn;
+                    turn.submitted_at = typed_at.unwrap_or(turn.submitted_at);
+                    let left = (turn.submitted_at + flotilla_resources::delivery_hold::DELIVERY_HOLD_FOR) - self.state.daemon.clock().now();
+                    let until = std::time::Instant::now() + left.to_std().unwrap_or_default();
+                    self.held.hold(turn.members.iter().cloned(), until);
+                    self.held_turns.push(turn);
+                }
                 // Never typed (cleat refused it): nothing to hold; the next pass retries.
                 Ok(TerminalDeliveryOutcome::Deferred(_)) => {}
                 Err(error) => debug!(%session, %error, "engine turn delivery did not complete"),
@@ -639,6 +650,7 @@ impl MessageDelivery {
         let session = holder.session_id.clone();
         let typed = text.clone();
         let submitted_at = self.state.daemon.clock().now();
+        let identity = turn_key(&members);
         let stop = tokio_util::sync::CancellationToken::new();
         let teardown = stop.clone();
         let trace_spans: Vec<_> = members.iter().map(|message| flotilla_tracing::queued_span(message, "attempt")).collect();
@@ -658,7 +670,7 @@ impl MessageDelivery {
                 if teardown.is_cancelled() {
                     return Ok(TerminalDeliveryOutcome::Deferred("teardown stopped the turn before it was typed; no input sent"));
                 }
-                submit_and_confirm(&*pool, &drafts, adapter.as_deref(), &session, &typed).await
+                type_turn(&*pool, &drafts, adapter.as_deref(), &session, &typed, &identity, submitted_at).await
             }
             .instrument(primary_span),
         ));
@@ -667,6 +679,52 @@ impl MessageDelivery {
             .insert(holder.session_id.clone(), InFlight { consumer: holder.consumer.clone(), members, submitted_at, confirmed: false });
         Ok(())
     }
+}
+
+/// How many times one pass retypes a turn judged lost under a new key before it gives up.
+const RETYPE_LIMIT: usize = 4;
+
+/// A turn's key: the identity of the messages it carries, as a pool records it (1 to 256 bytes).
+fn turn_key(members: &[String]) -> String {
+    use sha2::Digest;
+    let mut digest = sha2::Sha256::new();
+    for message in members {
+        digest.update(message.as_bytes());
+        digest.update(b"\n");
+    }
+    format!("turn:{:x}", digest.finalize())
+}
+
+/// Types the turn `text`, keyed by its messages' `identity`, into `session` at `now`. The pool
+/// writes nothing for a key it already accepted: a turn this daemon forgot it typed, across a
+/// restart, is not typed twice. One typed so long ago that its hold has run out was judged lost;
+/// it is retyped under a key naming when it was first accepted.
+pub(super) async fn type_turn(
+    pool: &dyn flotilla_terminal::TerminalPool,
+    drafts: &flotilla_terminal::drafts::ComposerDrafts,
+    adapter: Option<&dyn flotilla_agent::adapter::AgentAdapter>,
+    session: &str,
+    text: &str,
+    identity: &str,
+    now: chrono::DateTime<Utc>,
+) -> Result<TerminalDeliveryOutcome, String> {
+    let mut key = identity.to_owned();
+    for _ in 0..RETYPE_LIMIT {
+        match submit_and_confirm(pool, drafts, adapter, session, text, &key).await? {
+            TerminalDeliveryOutcome::AlreadyTyped { at_unix_ms } if hold_ran_out(at_unix_ms, now) => {
+                key = format!("{identity}@{at_unix_ms}");
+            }
+            outcome => return Ok(outcome),
+        }
+    }
+    Err(format!("turn {identity} was judged lost {RETYPE_LIMIT} times over; it is left pending"))
+}
+
+/// Whether a turn first accepted at `at_unix_ms` has outlived its hold by `now`: it was typed,
+/// never confirmed, and judged lost.
+fn hold_ran_out(at_unix_ms: u64, now: chrono::DateTime<Utc>) -> bool {
+    let at = i64::try_from(at_unix_ms).ok().and_then(chrono::DateTime::<Utc>::from_timestamp_millis);
+    at.is_some_and(|at| at + flotilla_resources::delivery_hold::DELIVERY_HOLD_FOR <= now)
 }
 
 /// Wakes delivery when a turn's task ends, however it ends.

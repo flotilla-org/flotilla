@@ -151,8 +151,8 @@ impl TerminalPool for SharedTerminalPool {
         self.inner.deliver(session_name, text).await
     }
 
-    async fn guarded_deliver(&self, session_name: &str, text: &str) -> Result<TerminalSubmission, String> {
-        self.inner.guarded_deliver(session_name, text).await
+    async fn guarded_deliver(&self, session_name: &str, text: &str, key: &str) -> Result<TerminalSubmission, String> {
+        self.inner.guarded_deliver(session_name, text, key).await
     }
 
     async fn operator_deliver(&self, session_name: &str, text: &str) -> Result<(), String> {

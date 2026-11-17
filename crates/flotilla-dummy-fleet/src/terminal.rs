@@ -19,7 +19,7 @@ use flotilla_environment::environment::dummy::DUMMY_FLEET_ENV;
 use flotilla_paths::path_context::ExecutionEnvironmentPath;
 use flotilla_protocol::{arg::Arg, TerminalStatus};
 use flotilla_provider_runtime::CommandRunner;
-use flotilla_terminal::{ScreenActivity, TerminalEnvVars, TerminalPool, TerminalSession, TerminalSessionTag};
+use flotilla_terminal::{ScreenActivity, TerminalEnvVars, TerminalPool, TerminalSession, TerminalSessionTag, TerminalSubmission};
 use tokio::{sync::mpsc, task::JoinHandle};
 
 use crate::{
@@ -53,8 +53,17 @@ pub(crate) struct DummySession {
 /// its crew sent, in order. A crew resumed in another process runs its script again over them.
 #[derive(Default)]
 pub(crate) struct CrewRecord {
-    pub(crate) turns: Vec<String>,
+    pub(crate) turns: Vec<DeliveredTurn>,
     pub(crate) outcomes: Vec<Outcome>,
+}
+
+/// A turn delivered to a session: its text, and the key it was sent with and when it was
+/// accepted, as cleat records a keyed send.
+#[derive(Clone)]
+pub(crate) struct DeliveredTurn {
+    pub(crate) text: String,
+    pub(crate) key: Option<String>,
+    pub(crate) at_unix_ms: u64,
 }
 
 impl DummySession {
@@ -82,11 +91,16 @@ impl DummySession {
     }
 
     /// Queue a turn a previous process delivered.
-    pub(crate) fn restore_turn(&self, text: String) {
+    pub(crate) fn restore_turn(&self, turn: DeliveredTurn) {
         if let Some(turns) = &self.turns {
-            let _ = turns.send(text.clone());
+            let _ = turns.send(turn.text.clone());
         }
-        self.record().turns.push(text);
+        self.record().turns.push(turn);
+    }
+
+    /// When the session accepted a turn sent with `key`, if it did.
+    fn accepted(&self, key: &str) -> Option<u64> {
+        self.record().turns.iter().find(|turn| turn.key.as_deref() == Some(key)).map(|turn| turn.at_unix_ms)
     }
 
     /// Start the hosted crew, resuming its script over what the session has recorded.
@@ -188,7 +202,12 @@ impl DummySessions {
                 crew: session.launched.clone(),
             });
             let record = session.record();
-            events.extend(record.turns.iter().map(|text| Event::Turn { session: name.clone(), text: text.clone() }));
+            events.extend(record.turns.iter().map(|turn| Event::Turn {
+                session: name.clone(),
+                text: turn.text.clone(),
+                key: turn.key.clone(),
+                at_unix_ms: turn.at_unix_ms,
+            }));
             events.extend(record.outcomes.iter().map(|outcome| Event::Acted { session: name.clone(), outcome: outcome.clone() }));
         }
         events
@@ -307,6 +326,22 @@ impl TerminalPool for DummyTerminalPool {
     }
 
     async fn deliver(&self, session_name: &str, text: &str) -> Result<(), String> {
+        self.accept(session_name, text, None)
+    }
+
+    /// A keyed send, as cleat's (cleat#411): a key the session already accepted writes nothing
+    /// and answers when it was first accepted, across a restart of the daemon too.
+    async fn guarded_deliver(&self, session_name: &str, text: &str, key: &str) -> Result<TerminalSubmission, String> {
+        if let Some(at_unix_ms) = self.fleet.sessions.get(session_name).and_then(|session| session.accepted(key)) {
+            return Ok(TerminalSubmission::AlreadySubmitted { at_unix_ms });
+        }
+        self.accept(session_name, text, Some(key))?;
+        Ok(TerminalSubmission::Submitted { keyed: true })
+    }
+}
+
+impl DummyTerminalPool {
+    fn accept(&self, session_name: &str, text: &str, key: Option<&str>) -> Result<(), String> {
         let session = self.fleet.sessions.get(session_name).ok_or_else(|| format!("dummy session {session_name} is not running"))?;
         let turns = session.turns.as_ref().ok_or_else(|| format!("dummy session {session_name} hosts no crew"))?;
         if turns.is_closed() {
@@ -315,8 +350,18 @@ impl TerminalPool for DummyTerminalPool {
         // The crew shows working from the moment its turn is accepted, as a
         // harness does once its composer submits.
         session.set_working(true);
-        self.fleet.record(&Event::Turn { session: session_name.into(), text: text.into() });
-        session.record().turns.push(text.into());
+        let turn = DeliveredTurn {
+            text: text.into(),
+            key: key.map(str::to_owned),
+            at_unix_ms: u64::try_from(chrono::Utc::now().timestamp_millis()).unwrap_or_default(),
+        };
+        self.fleet.record(&Event::Turn {
+            session: session_name.into(),
+            text: turn.text.clone(),
+            key: turn.key.clone(),
+            at_unix_ms: turn.at_unix_ms,
+        });
+        session.record().turns.push(turn);
         turns.send(text.to_string()).map_err(|_| format!("dummy crew in {session_name} has stopped"))?;
         self.fleet.count(Counter::TurnsReceived);
         Ok(())

@@ -49,6 +49,11 @@ pub enum TerminalDeliveryOutcome {
     Deferred(&'static str),
     Confirmed,
     Unconfirmed(TerminalDeliveryFailure),
+    /// The pool had already accepted the turn's key, at `at_unix_ms` as it reports it, and wrote
+    /// nothing: the turn was typed then.
+    AlreadyTyped {
+        at_unix_ms: u64,
+    },
 }
 
 /// Why a typed turn's submission was not confirmed.
@@ -224,11 +229,18 @@ pub(super) async fn submit_and_confirm(
     adapter: Option<&dyn AgentAdapter>,
     session_id: &str,
     message: &str,
+    key: &str,
 ) -> Result<TerminalDeliveryOutcome, String> {
     // An abandoned draft is set aside in memory and typed back after the turn.
-    let submission = drafts.guarded_deliver(pool, session_id, message).await;
+    let submission = drafts.guarded_deliver(pool, session_id, message, key).await;
     match submission {
-        Ok(TerminalSubmission::Submitted) => {}
+        Ok(TerminalSubmission::Submitted { keyed: true }) => {}
+        Ok(TerminalSubmission::Submitted { keyed: false }) => {
+            debug!(%session_id, %key, "the pool could not record the turn's key: a retype of it may duplicate it");
+        }
+        Ok(TerminalSubmission::AlreadySubmitted { at_unix_ms }) => {
+            return Ok(TerminalDeliveryOutcome::AlreadyTyped { at_unix_ms });
+        }
         Ok(TerminalSubmission::Refused(reason)) => {
             debug!(%session_id, %reason, "cleat refused atomic submission; keeping delivery queued");
             // Keep the in-flight batch at the FIFO head. A refusal consumes

@@ -67,10 +67,15 @@ pub(crate) enum Event {
     SessionsDestroyed {
         environment: String,
     },
-    /// A turn delivered to a session, in delivery order.
+    /// A turn delivered to a session, in delivery order, under the key it was sent with and when
+    /// it was accepted (wall-clock milliseconds), as cleat records a keyed send.
     Turn {
         session: String,
         text: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        key: Option<String>,
+        #[serde(default)]
+        at_unix_ms: u64,
     },
     /// The outcome of a crew's command, in the order the crew sent them.
     Acted {

@@ -1,4 +1,5 @@
 use super::*;
+use crate::runtime::primitives::type_turn;
 use flotilla_terminal::drafts::ComposerDrafts;
 
 #[tokio::test]
@@ -162,9 +163,10 @@ async fn hookless_submission_needing_permission_is_confirmed_without_retry() {
         &EnvironmentBag::new().with(EnvironmentAssertion::binary("codex", "/tools/codex")),
         Arc::new(DiscoveryMockRunner::builder().build()),
     );
-    let outcome = submit_and_confirm(&pool, &ComposerDrafts::default(), adapters.get("codex").map(|a| &**a), "agent", "review wake")
-        .await
-        .expect("submit");
+    let outcome =
+        submit_and_confirm(&pool, &ComposerDrafts::default(), adapters.get("codex").map(|a| &**a), "agent", "review wake", "turn:k")
+            .await
+            .expect("submit");
     assert_eq!(outcome, TerminalDeliveryOutcome::Confirmed);
     assert_eq!(pool.inner.delivered.lock().await.len(), 1);
 }
@@ -189,7 +191,7 @@ async fn hookless_submission_waits_for_delayed_working_evidence_with_composer_vi
     let adapter = adapters.get("codex").expect("adapter").clone();
     let submit_pool = pool.clone();
     let submit = tokio::spawn(async move {
-        submit_and_confirm(&*submit_pool, &ComposerDrafts::default(), Some(&*adapter), "agent", "review wake").await
+        submit_and_confirm(&*submit_pool, &ComposerDrafts::default(), Some(&*adapter), "agent", "review wake", "turn:k").await
     });
     tokio::task::yield_now().await;
     assert_eq!(pool.inner.delivered.lock().await.len(), 1);
@@ -224,10 +226,16 @@ async fn flickering_codex_confirmation_never_resends() {
                 &EnvironmentBag::new().with(EnvironmentAssertion::binary("codex", "/tools/codex")),
                 Arc::new(DiscoveryMockRunner::builder().build()),
             );
-            let outcome =
-                submit_and_confirm(&pool, &ComposerDrafts::default(), adapters.get("codex").map(|adapter| &**adapter), "agent", "wake")
-                    .await
-                    .expect("uncertain submission");
+            let outcome = submit_and_confirm(
+                &pool,
+                &ComposerDrafts::default(),
+                adapters.get("codex").map(|adapter| &**adapter),
+                "agent",
+                "wake",
+                "turn:k",
+            )
+            .await
+            .expect("uncertain submission");
             assert_eq!(outcome, TerminalDeliveryOutcome::Unconfirmed(TerminalDeliveryFailure::SubmissionUnconfirmed));
             assert_eq!(pool.deliveries.load(Ordering::SeqCst), 1);
             assert_eq!(pool.retries.load(Ordering::SeqCst), 0);
@@ -239,11 +247,44 @@ async fn flickering_codex_confirmation_never_resends() {
 async fn accepted_but_unconfirmed_delivery_is_never_retyped() {
     let pool = DeliveryProbePool::new(vec![ScreenActivity::Stable]);
 
-    let outcome = submit_and_confirm(&pool, &ComposerDrafts::default(), None, "agent", "stuck handoff").await.expect("delivery outcome");
+    let outcome =
+        submit_and_confirm(&pool, &ComposerDrafts::default(), None, "agent", "stuck handoff", "turn:k").await.expect("delivery outcome");
 
     assert_eq!(outcome, TerminalDeliveryOutcome::Unconfirmed(TerminalDeliveryFailure::SubmissionUnconfirmed));
     assert_eq!(pool.deliveries.load(Ordering::SeqCst), 1);
     assert_eq!(pool.retries.load(Ordering::SeqCst), 0);
+}
+
+// Behaviour (cleat#411): a turn the pool already accepted under its key is not typed again, but
+// held from when it was accepted; one accepted so long ago that its hold ran out was judged lost
+// and is retyped once, under a key naming when it was first accepted.
+#[tokio::test(start_paused = true)]
+async fn a_keyed_turn_is_typed_once_unless_it_was_judged_lost() {
+    let now = chrono::Utc::now();
+    let ms = |at: chrono::DateTime<chrono::Utc>| u64::try_from(at.timestamp_millis()).expect("after the epoch");
+    let recent = ms(now - chrono::Duration::minutes(1));
+    let lapsed = ms(now - flotilla_resources::delivery_hold::DELIVERY_HOLD_FOR - chrono::Duration::minutes(1));
+    for (accepted_at, retyped) in [(recent, false), (lapsed, true)] {
+        let pool =
+            KeyedPool { inner: FakeTerminalPool::new(), accepted: std::sync::Mutex::new([("turn:k".to_string(), accepted_at)].into()) };
+        pool.inner
+            .add_sessions(vec![ProviderTerminalSession::builder()
+                .session_name("agent".into())
+                .status(TerminalStatus::Running)
+                .screen_activity(ScreenActivity::Stable)
+                .build()])
+            .await;
+        let outcome = type_turn(&pool, &ComposerDrafts::default(), None, "agent", "review", "turn:k", now).await.expect("an outcome");
+        let written = pool.inner.delivered.lock().await.len();
+        if retyped {
+            assert_eq!(written, 1, "a lapsed turn is retyped once");
+            assert!(pool.accepted.lock().unwrap().contains_key(&format!("turn:k@{lapsed}")), "under its first acceptance");
+            assert_ne!(outcome, TerminalDeliveryOutcome::AlreadyTyped { at_unix_ms: lapsed });
+        } else {
+            assert_eq!(written, 0, "a turn typed before is not typed again");
+            assert_eq!(outcome, TerminalDeliveryOutcome::AlreadyTyped { at_unix_ms: recent });
+        }
+    }
 }
 
 // Environment boundary fixture: retain the same interior runner while exposing

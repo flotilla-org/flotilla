@@ -55,7 +55,19 @@ struct DaemonInfo {
     name: String,
     runtime_root: String,
     alive: bool,
+    /// The build the daemon serves, when it reports one.
+    #[serde(default)]
+    build: Option<DaemonBuild>,
 }
+
+#[derive(Debug, Deserialize)]
+struct DaemonBuild {
+    #[serde(default)]
+    capabilities: Vec<String>,
+}
+
+/// The daemon capability of a send keyed by its caller, whose repeat writes nothing (cleat#411).
+const KEYED_SEND: &str = "keyed_send";
 
 #[derive(Debug, Deserialize)]
 #[serde(rename_all = "PascalCase")]
@@ -108,13 +120,17 @@ pub struct CleatTerminalPool {
     environment: ControlledTerminalEnvironment,
     launch_capability: tokio::sync::OnceCell<LaunchCapability>,
     attach_capability: tokio::sync::OnceCell<()>,
+    /// Whether this client's `send` takes `--key` (cleat#411).
+    send_key_capability: tokio::sync::OnceCell<bool>,
     endpoint_cache: tokio::sync::Mutex<Option<EndpointCache>>,
     last_recording_prune: tokio::sync::Mutex<Instant>,
 }
 
 struct EndpointCache {
     updated: Instant,
-    endpoints: HashMap<String, Option<CleatEndpoint>>,
+    /// Each session's physical daemon, and whether that daemon records send keys; `None` for a
+    /// session more than one daemon reports.
+    endpoints: HashMap<String, Option<(CleatEndpoint, bool)>>,
 }
 
 impl CleatTerminalPool {
@@ -126,8 +142,101 @@ impl CleatTerminalPool {
             environment,
             launch_capability: tokio::sync::OnceCell::new(),
             attach_capability: tokio::sync::OnceCell::new(),
+            send_key_capability: tokio::sync::OnceCell::new(),
             endpoint_cache: tokio::sync::Mutex::new(None),
             last_recording_prune: tokio::sync::Mutex::new(Instant::now()),
+        }
+    }
+
+    /// The physical daemon hosting `session_id`, and whether it records send keys.
+    async fn hosting(&self, session_id: &str) -> Result<Option<(CleatEndpoint, bool)>, String> {
+        // Share one physical-daemon inventory across sessions reconciled in the
+        // same burst. Expire it quickly so daemon turnover retracts stale facts.
+        let mut cache = self.endpoint_cache.lock().await;
+        if let Some(snapshot) = cache.as_ref() {
+            if snapshot.updated.elapsed() < ENDPOINT_CACHE_TTL {
+                return Ok(snapshot.endpoints.get(session_id).cloned().flatten());
+            }
+        }
+        let output = run!(self.runner, &self.binary, &["daemons", "--json"], Path::new("/"))?;
+        let daemons: Vec<DaemonInfo> = serde_json::from_str(&output).map_err(|error| format!("parse cleat daemon list: {error}"))?;
+        let mut endpoints = HashMap::new();
+        for daemon in daemons.into_iter().filter(|daemon| daemon.alive && Path::new(&daemon.runtime_root).is_absolute()) {
+            let args = ["--runtime-root", daemon.runtime_root.as_str(), "--server", daemon.name.as_str(), "list", "--json"];
+            let output = run!(self.runner, &self.binary, &args, Path::new("/"))?;
+            let sessions = Self::parse_list_output(&output)?;
+            let keyed = daemon.build.as_ref().is_some_and(|build| build.capabilities.iter().any(|capability| capability == KEYED_SEND));
+            for session in sessions {
+                let endpoint =
+                    CleatEndpoint { runtime_root: daemon.runtime_root.clone(), daemon: daemon.name.clone(), session: session.id.clone() };
+                // A duplicate session id is ambiguous even if more daemons
+                // report it later in the inventory.
+                endpoints.entry(session.id).and_modify(|existing| *existing = None).or_insert(Some((endpoint, keyed)));
+            }
+        }
+        let endpoint = endpoints.get(session_id).cloned().flatten();
+        *cache = Some(EndpointCache { updated: Instant::now(), endpoints });
+        Ok(endpoint)
+    }
+
+    /// Whether a send into `session_id` can be keyed: this client takes `--key` and the daemon
+    /// hosting the session records keys. Otherwise the send is unkeyed, and may be duplicated by
+    /// a retype; so is one whose daemon could not be read.
+    async fn keyed_send(&self, session_id: &str) -> bool {
+        let client = self
+            .send_key_capability
+            .get_or_try_init(|| async {
+                let help = run!(self.runner, &self.binary, &["send", "--help"], Path::new("/"))?;
+                Ok::<bool, String>(help.split_whitespace().any(|word| word == "--key"))
+            })
+            .await;
+        match client {
+            Ok(true) => {}
+            Ok(false) => return false,
+            Err(error) => {
+                tracing::debug!(binary = %self.binary, %error, "cleat send capability unknown; sending unkeyed, which may duplicate");
+                return false;
+            }
+        }
+        match self.hosting(session_id).await {
+            Ok(Some((_, keyed))) => keyed,
+            Ok(None) => false,
+            Err(error) => {
+                tracing::debug!(session = %session_id, %error, "cleat daemon unknown; sending unkeyed, which may duplicate");
+                false
+            }
+        }
+    }
+
+    /// One atomic guarded submission, keyed by `key` when given.
+    async fn submit(&self, session_name: &str, text: &str, key: Option<&str>) -> Result<TerminalSubmission, String> {
+        // Cleat owns paste encoding and Enter in the same daemon transaction.
+        // End option parsing before either positional argument: raw crew text
+        // can itself be an option spelling such as --help or a Markdown bullet.
+        let mut args = vec!["send", "--submit", "--if", "composer[value='']", "--controller-idle", "2s"];
+        if let Some(key) = key {
+            args.extend(["--key", key]);
+        }
+        args.extend(["--", session_name, text]);
+        let label = flotilla_provider_runtime::command_channel_label(&self.binary, &args);
+        // Inspect the raw process result. Runner/spawn errors must never be
+        // mistaken for a daemon's explicit pre-write rejection, even if their
+        // context happens to contain one of the refusal strings.
+        let output = self.runner.run_output(&self.binary, &args, Path::new("/"), &label).await?;
+        if output.success() {
+            // A repeated key writes nothing and answers `already <unix-ms>`.
+            if let Some(at) = key.and(output.stdout.trim().strip_prefix("already ")) {
+                let at_unix_ms = at.parse().map_err(|error| format!("cleat answered a repeated key with `{at}`: {error}"))?;
+                return Ok(TerminalSubmission::AlreadySubmitted { at_unix_ms });
+            }
+            return Ok(TerminalSubmission::Submitted { keyed: key.is_some() });
+        }
+        let reason = output.stderr;
+        match (output.exit_code, reason.trim().split_once(':').map(|(code, _)| code)) {
+            (Some(1), Some("not-matched" | "role-absent" | "controller-active")) | (Some(2), Some("unsupported")) => {
+                Ok(TerminalSubmission::Refused(reason))
+            }
+            _ => Err(reason),
         }
     }
 
@@ -319,32 +428,7 @@ impl TerminalPool for CleatTerminalPool {
         })
     }
     async fn cleat_endpoint(&self, session_id: &str) -> Result<Option<CleatEndpoint>, String> {
-        // Share one physical-daemon inventory across sessions reconciled in the
-        // same burst. Expire it quickly so daemon turnover retracts stale facts.
-        let mut cache = self.endpoint_cache.lock().await;
-        if let Some(snapshot) = cache.as_ref() {
-            if snapshot.updated.elapsed() < ENDPOINT_CACHE_TTL {
-                return Ok(snapshot.endpoints.get(session_id).cloned().flatten());
-            }
-        }
-        let output = run!(self.runner, &self.binary, &["daemons", "--json"], Path::new("/"))?;
-        let daemons: Vec<DaemonInfo> = serde_json::from_str(&output).map_err(|error| format!("parse cleat daemon list: {error}"))?;
-        let mut endpoints = HashMap::new();
-        for daemon in daemons.into_iter().filter(|daemon| daemon.alive && Path::new(&daemon.runtime_root).is_absolute()) {
-            let args = ["--runtime-root", daemon.runtime_root.as_str(), "--server", daemon.name.as_str(), "list", "--json"];
-            let output = run!(self.runner, &self.binary, &args, Path::new("/"))?;
-            let sessions = Self::parse_list_output(&output)?;
-            for session in sessions {
-                let endpoint =
-                    CleatEndpoint { runtime_root: daemon.runtime_root.clone(), daemon: daemon.name.clone(), session: session.id.clone() };
-                // A duplicate session id is ambiguous even if more daemons
-                // report it later in the inventory.
-                endpoints.entry(session.id).and_modify(|existing| *existing = None).or_insert(Some(endpoint));
-            }
-        }
-        let endpoint = endpoints.get(session_id).cloned().flatten();
-        *cache = Some(EndpointCache { updated: Instant::now(), endpoints });
-        Ok(endpoint)
+        Ok(self.hosting(session_id).await?.map(|(endpoint, _)| endpoint))
     }
 
     fn tracks_session_liveness(&self) -> bool {
@@ -511,32 +595,15 @@ impl TerminalPool for CleatTerminalPool {
     }
 
     async fn deliver(&self, session_name: &str, text: &str) -> Result<(), String> {
-        match self.guarded_deliver(session_name, text).await? {
-            TerminalSubmission::Submitted => Ok(()),
+        match self.submit(session_name, text, None).await? {
+            TerminalSubmission::Submitted { .. } | TerminalSubmission::AlreadySubmitted { .. } => Ok(()),
             TerminalSubmission::Refused(reason) => Err(reason),
         }
     }
 
-    async fn guarded_deliver(&self, session_name: &str, text: &str) -> Result<TerminalSubmission, String> {
-        // Cleat owns paste encoding and Enter in the same daemon transaction.
-        // End option parsing before either positional argument: raw crew text
-        // can itself be an option spelling such as --help or a Markdown bullet.
-        let args = ["send", "--submit", "--if", "composer[value='']", "--controller-idle", "2s", "--", session_name, text];
-        let label = flotilla_provider_runtime::command_channel_label(&self.binary, &args);
-        // Inspect the raw process result. Runner/spawn errors must never be
-        // mistaken for a daemon's explicit pre-write rejection, even if their
-        // context happens to contain one of the refusal strings.
-        let output = self.runner.run_output(&self.binary, &args, Path::new("/"), &label).await?;
-        if output.success() {
-            return Ok(TerminalSubmission::Submitted);
-        }
-        let reason = output.stderr;
-        match (output.exit_code, reason.trim().split_once(':').map(|(code, _)| code)) {
-            (Some(1), Some("not-matched" | "role-absent" | "controller-active")) | (Some(2), Some("unsupported")) => {
-                Ok(TerminalSubmission::Refused(reason))
-            }
-            _ => Err(reason),
-        }
+    async fn guarded_deliver(&self, session_name: &str, text: &str, key: &str) -> Result<TerminalSubmission, String> {
+        let key = self.keyed_send(session_name).await.then_some(key);
+        self.submit(session_name, text, key).await
     }
 
     async fn operator_deliver(&self, session_name: &str, text: &str) -> Result<(), String> {
@@ -569,6 +636,13 @@ mod tests {
     const LAUNCH_HELP: &str = "Usage: cleat launch [OPTIONS] [ID] [-- <PROGRAM>...]\n      --env <NAME=VALUE>\n      --env-clear\n";
 
     fn test_pool(runner: Arc<dyn CommandRunner>, binary: &str) -> CleatTerminalPool {
+        let pool = probing_pool(runner, binary);
+        // Command-layout tests send unkeyed; the keyed-send tests probe.
+        pool.send_key_capability.set(false).expect("known send capability");
+        pool
+    }
+
+    fn probing_pool(runner: Arc<dyn CommandRunner>, binary: &str) -> CleatTerminalPool {
         let pool = CleatTerminalPool::new(runner, binary, &EnvironmentBag::new());
         pool.launch_capability.set(LaunchCapability { env_clear: true, argv: true }).expect("known launch capability");
         pool
@@ -1034,6 +1108,61 @@ mod tests {
         }
     }
 
+    const SEND_HELP_WITH_KEY: &str = "Usage: cleat send [OPTIONS] <ID> <TEXT>\n      --key <KEY>  Idempotency key\n";
+    const GUARDED_SEND: [&str; 6] = ["send", "--submit", "--if", "composer[value='']", "--controller-idle", "2s"];
+
+    fn daemons(capabilities: &str) -> String {
+        format!(r#"[{{"name":"work@3","runtime_root":"/state/cleat","alive":true,"build":{{"capabilities":[{capabilities}]}}}}]"#)
+    }
+
+    const AGENT_LISTED: &str = r#"[{"id":"agent","cwd":null,"cmd":null,"status":"Detached"}]"#;
+
+    // Behaviour (cleat#411): a turn is keyed when this client takes `--key` and the daemon
+    // hosting the session lists `keyed_send`; a repeat of the key writes nothing and comes back
+    // with when cleat first accepted it.
+    #[tokio::test]
+    async fn a_keyed_turn_carries_its_key_and_a_repeat_reports_the_first_acceptance() {
+        let runner = Arc::new(MockRunner::new(vec![
+            Ok(SEND_HELP_WITH_KEY.into()),
+            Ok(daemons(r#""launch_env_clear","keyed_send""#)),
+            Ok(AGENT_LISTED.into()),
+            Ok(String::new()),
+            Ok("already 1763371622123\n".into()),
+        ]));
+        let pool = probing_pool(runner.clone(), "cleat");
+        assert_eq!(pool.guarded_deliver("agent", "turn", "turn-k").await, Ok(TerminalSubmission::Submitted { keyed: true }));
+        assert_eq!(
+            pool.guarded_deliver("agent", "turn", "turn-k").await,
+            Ok(TerminalSubmission::AlreadySubmitted { at_unix_ms: 1763371622123 })
+        );
+        let calls = logical_calls(&runner);
+        let keyed = [&GUARDED_SEND[..], &["--key", "turn-k", "--", "agent", "turn"]].concat();
+        assert_eq!(calls[3].1, keyed);
+        assert_eq!(calls[4].1, keyed, "the inventory and the client's capability are read once");
+    }
+
+    // Behaviour: without the daemon's `keyed_send`, or this client's `--key`, a turn is sent
+    // unkeyed and says so: a retype of it may duplicate.
+    #[tokio::test]
+    async fn a_turn_is_unkeyed_where_the_daemon_or_the_client_cannot_record_keys() {
+        let runner = Arc::new(MockRunner::new(vec![
+            Ok(SEND_HELP_WITH_KEY.into()),
+            Ok(daemons(r#""launch_env_clear""#)),
+            Ok(AGENT_LISTED.into()),
+            Ok(String::new()),
+        ]));
+        let pool = probing_pool(runner.clone(), "cleat");
+        assert_eq!(pool.guarded_deliver("agent", "turn", "turn-k").await, Ok(TerminalSubmission::Submitted { keyed: false }));
+        assert_eq!(logical_calls(&runner)[3].1, [&GUARDED_SEND[..], &["--", "agent", "turn"]].concat());
+
+        let runner = Arc::new(MockRunner::new(vec![Ok("Usage: cleat send [OPTIONS] <ID> <TEXT>\n".into()), Ok(String::new())]));
+        let pool = probing_pool(runner.clone(), "cleat");
+        assert_eq!(pool.guarded_deliver("agent", "turn", "turn-k").await, Ok(TerminalSubmission::Submitted { keyed: false }));
+        let calls = logical_calls(&runner);
+        assert_eq!(calls.len(), 2, "an old client reads no daemon inventory");
+        assert_eq!(calls[1].1, [&GUARDED_SEND[..], &["--", "agent", "turn"]].concat());
+    }
+
     // Glue: an explicit operator attempt uses one atomic send into the same
     // child, without controller guards, clearing the composer or restarting it.
     #[tokio::test]
@@ -1071,7 +1200,7 @@ mod tests {
             crate::scan_cache::SharedTerminalPool::new(Arc::new(test_pool(runner.clone(), "cleat")), std::time::Duration::from_secs(1));
         assert_eq!(pool.abandoned_draft("agent").await.unwrap().as_deref(), Some("draft"));
         assert!(pool.clear_draft("agent", "draft").await.unwrap());
-        assert_eq!(pool.guarded_deliver("agent", "turn").await.unwrap(), TerminalSubmission::Submitted);
+        assert_eq!(pool.guarded_deliver("agent", "turn", "turn-k").await.unwrap(), TerminalSubmission::Submitted { keyed: false });
         pool.operator_deliver("agent", "turn").await.unwrap();
         pool.type_without_submit("agent", "draft").await.unwrap();
         let verbs: Vec<_> = logical_calls(&runner).into_iter().map(|call| call.1[..2].join(" ")).collect();
@@ -1099,7 +1228,7 @@ mod tests {
                 stderr: reason.clone(),
                 exit_code: Some(captured["exit_code"].as_i64().unwrap() as i32),
             })]));
-            let result = test_pool(runner.clone(), "cleat").guarded_deliver("agent", "turn").await;
+            let result = test_pool(runner.clone(), "cleat").guarded_deliver("agent", "turn", "turn-k").await;
             assert_eq!(result, Ok(TerminalSubmission::Refused(reason)));
             assert_eq!(logical_calls(&runner).len(), 1);
         }
@@ -1117,7 +1246,10 @@ mod tests {
                 stderr: reason.clone(),
                 exit_code: Some(status),
             })]));
-            assert_eq!(test_pool(runner, "cleat").guarded_deliver("agent", "wake").await.unwrap(), TerminalSubmission::Refused(reason));
+            assert_eq!(
+                test_pool(runner, "cleat").guarded_deliver("agent", "wake", "wake-k").await.unwrap(),
+                TerminalSubmission::Refused(reason)
+            );
         }
     }
 
@@ -1192,7 +1324,10 @@ mod tests {
             Ok(CommandOutput { stdout: String::new(), stderr: "controller input is not idle".into(), exit_code: Some(2) }),
         ] {
             let runner = Arc::new(MockRunner::with_outputs(vec![response]));
-            assert_eq!(test_pool(runner, "cleat").guarded_deliver("agent", "turn").await, Err("controller input is not idle".into()));
+            assert_eq!(
+                test_pool(runner, "cleat").guarded_deliver("agent", "turn", "turn-k").await,
+                Err("controller input is not idle".into())
+            );
         }
     }
 
@@ -1214,19 +1349,22 @@ mod tests {
                 stderr: stderr.into(),
                 exit_code: Some(1),
             })]));
-            assert_eq!(test_pool(runner, "cleat").guarded_deliver("agent", "turn").await, Err(stderr.into()));
+            assert_eq!(test_pool(runner, "cleat").guarded_deliver("agent", "turn", "turn-k").await, Err(stderr.into()));
         }
         // The diagnostic is deliberately different: prose is not the contract.
         let runner =
             Arc::new(MockRunner::with_outputs(vec![Ok(CommandOutput { stdout: String::new(), stderr: known.into(), exit_code: Some(1) })]));
-        assert_eq!(test_pool(runner, "cleat").guarded_deliver("agent", "turn").await, Ok(TerminalSubmission::Refused(known.into())));
+        assert_eq!(
+            test_pool(runner, "cleat").guarded_deliver("agent", "turn", "turn-k").await,
+            Ok(TerminalSubmission::Refused(known.into()))
+        );
         for exit_code in [None, Some(2), Some(127)] {
             let runner =
                 Arc::new(MockRunner::with_outputs(vec![Ok(CommandOutput { stdout: String::new(), stderr: known.into(), exit_code })]));
-            assert_eq!(test_pool(runner, "cleat").guarded_deliver("agent", "turn").await, Err(known.into()));
+            assert_eq!(test_pool(runner, "cleat").guarded_deliver("agent", "turn", "turn-k").await, Err(known.into()));
         }
         let runner = Arc::new(MockRunner::with_outputs(vec![Err(known.into())]));
-        assert_eq!(test_pool(runner, "cleat").guarded_deliver("agent", "turn").await, Err(known.into()));
+        assert_eq!(test_pool(runner, "cleat").guarded_deliver("agent", "turn", "turn-k").await, Err(known.into()));
     }
 
     // ── attach_args tests ──────────────────────────────────────────

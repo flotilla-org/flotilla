@@ -187,8 +187,8 @@ impl DummyFleet {
                 self.sessions.lock().remove(&session);
             }
             Event::SessionsDestroyed { environment } => self.sessions.lock().retain(|_, session| session.environment != environment),
-            Event::Turn { session, text } => match self.sessions.get(&session) {
-                Some(session) => session.restore_turn(text),
+            Event::Turn { session, text, key, at_unix_ms } => match self.sessions.get(&session) {
+                Some(session) => session.restore_turn(crate::terminal::DeliveredTurn { text, key, at_unix_ms }),
                 None => tracing::warn!(%session, "dummy fleet state delivers a turn to an unknown session"),
             },
             Event::Acted { session, outcome } => {

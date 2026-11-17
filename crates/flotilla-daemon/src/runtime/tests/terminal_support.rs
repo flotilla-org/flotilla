@@ -105,14 +105,14 @@ impl TerminalPool for DeliveryProbePool {
     }
 
     // Process boundary fake: the daemon guard refuses before any PTY bytes.
-    async fn guarded_deliver(&self, session: &str, text: &str) -> Result<flotilla_terminal::TerminalSubmission, String> {
+    async fn guarded_deliver(&self, session: &str, text: &str, _key: &str) -> Result<flotilla_terminal::TerminalSubmission, String> {
         self.submission_attempts.fetch_add(1, Ordering::SeqCst);
         self.submission_attempted.notify_one();
         if self.controller_refusals.try_update(Ordering::SeqCst, Ordering::SeqCst, |left| left.checked_sub(1)).is_ok() {
             return Ok(flotilla_terminal::TerminalSubmission::Refused("controller input is not idle".into()));
         }
         self.deliver(session, text).await?;
-        Ok(flotilla_terminal::TerminalSubmission::Submitted)
+        Ok(flotilla_terminal::TerminalSubmission::Submitted { keyed: false })
     }
 
     async fn operator_deliver(&self, session: &str, text: &str) -> Result<(), String> {
@@ -141,6 +141,59 @@ impl TerminalPool for HooklessComposerPool {
         self.inner.deliver(id, text).await?;
         self.inner.set_captured_screen(id, self.submitted_screen).await;
         Ok(())
+    }
+
+    async fn ensure_session(
+        &self,
+        _: &str,
+        _: &str,
+        _: &ExecutionEnvironmentPath,
+        _: &TerminalEnvVars,
+        _: &[TerminalSessionTag],
+    ) -> Result<(), String> {
+        unreachable!("scenario starts with a running crew")
+    }
+
+    fn attach_args(
+        &self,
+        _: &str,
+        _: &str,
+        _: &ExecutionEnvironmentPath,
+        _: &TerminalEnvVars,
+    ) -> Result<Vec<flotilla_protocol::arg::Arg>, String> {
+        Ok(Vec::new())
+    }
+
+    async fn kill_session(&self, _: &str) -> Result<(), String> {
+        unreachable!("scenario never tears down its crew")
+    }
+}
+
+/// A pool that records each turn's key as cleat's keyed send does (cleat#411), holding keys a
+/// previous daemon's turns were accepted under, by when.
+pub(super) struct KeyedPool {
+    pub(super) inner: FakeTerminalPool,
+    pub(super) accepted: std::sync::Mutex<std::collections::BTreeMap<String, u64>>,
+}
+
+#[async_trait]
+impl TerminalPool for KeyedPool {
+    async fn list_sessions(&self) -> Result<Vec<ProviderTerminalSession>, String> {
+        self.inner.list_sessions().await
+    }
+
+    async fn capture_screen(&self, id: &str) -> Result<Option<String>, String> {
+        self.inner.capture_screen(id).await
+    }
+
+    async fn guarded_deliver(&self, id: &str, text: &str, key: &str) -> Result<flotilla_terminal::TerminalSubmission, String> {
+        if let Some(at_unix_ms) = self.accepted.lock().expect("keys").get(key).copied() {
+            return Ok(flotilla_terminal::TerminalSubmission::AlreadySubmitted { at_unix_ms });
+        }
+        self.inner.deliver(id, text).await?;
+        let now = u64::try_from(chrono::Utc::now().timestamp_millis()).expect("after the epoch");
+        self.accepted.lock().expect("keys").insert(key.into(), now);
+        Ok(flotilla_terminal::TerminalSubmission::Submitted { keyed: true })
     }
 
     async fn ensure_session(

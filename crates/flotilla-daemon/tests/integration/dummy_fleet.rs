@@ -718,7 +718,6 @@ async fn a_long_runner_exchange_survives_a_daemon_restart() {
 // processes surviving, acts on each turn once: one change request, one launch of each crew, and
 // the convoy lands.
 #[tokio::test(start_paused = true)]
-#[ignore = "duplicate review turn after restart: the daemon holds typed turns in memory; fixed by the keyed cleat submission"]
 async fn a_restart_mid_review_acts_on_each_turn_once_and_lands() {
     let fleet = TestDaemon::builder().agent("turn_delay_ms = 10000").settings("host_name = \"restart-proof\"\n").start().await;
     let name = fleet.dispatch(CrewMix::CoderReviewer, DUMMY_FULFILMENT_KIND).await;
@@ -731,7 +730,6 @@ async fn a_restart_mid_review_acts_on_each_turn_once_and_lands() {
 // restores the vendor's backing, the sessions and their crews, and the forge from its state file,
 // as a real host's Docker, cleat and forge outlive flotillad. The crews resume where they were.
 #[tokio::test(start_paused = true)]
-#[ignore = "duplicate review turn after restart: the daemon holds typed turns in memory; fixed by the keyed cleat submission"]
 async fn a_process_restart_mid_review_acts_on_each_turn_once_and_lands() {
     let fleet = TestDaemon::builder().agent("turn_delay_ms = 10000").settings("host_name = \"restart-proof\"\n").start().await;
     let name = fleet.dispatch(CrewMix::CoderReviewer, DUMMY_FULFILMENT_KIND).await;

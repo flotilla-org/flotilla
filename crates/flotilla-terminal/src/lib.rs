@@ -72,7 +72,12 @@ pub enum ScreenActivity {
 /// a known-unsent refusal may be rechecked without restarting the child activation.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum TerminalSubmission {
-    Submitted,
+    /// Written and submitted. `keyed`: the pool recorded the submission's key, so a repeat of
+    /// it writes nothing; an unkeyed submission may be duplicated by a later retype.
+    Submitted { keyed: bool },
+    /// The pool had already accepted this key, at `at_unix_ms` as it reports it, and wrote
+    /// nothing.
+    AlreadySubmitted { at_unix_ms: u64 },
     /// A temporary controller refusal; keep the batch queued without a receipt.
     Refused(String),
 }
@@ -220,11 +225,13 @@ pub trait TerminalPool: Send + Sync {
         Err("terminal pool does not support delivery".to_string())
     }
 
-    /// Submit with any pool-owned atomic input guards. Transport errors remain
-    /// ambiguous; only an explicit refusal establishes that no text was written.
-    async fn guarded_deliver(&self, session_name: &str, text: &str) -> Result<TerminalSubmission, String> {
+    /// Submit with any pool-owned atomic input guards, keyed by `key`: a pool that records keys
+    /// writes nothing for a key it already accepted in this session and says when it did.
+    /// Transport errors remain ambiguous; only an explicit refusal establishes that no text was
+    /// written. A pool that cannot record keys submits unkeyed, which a retype may duplicate.
+    async fn guarded_deliver(&self, session_name: &str, text: &str, _key: &str) -> Result<TerminalSubmission, String> {
         self.deliver(session_name, text).await?;
-        Ok(TerminalSubmission::Submitted)
+        Ok(TerminalSubmission::Submitted { keyed: false })
     }
 
     /// One explicitly authorized operator attempt, bypassing the controller fence.
