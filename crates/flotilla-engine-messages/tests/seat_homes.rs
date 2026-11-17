@@ -180,6 +180,10 @@ impl LifecycleReads for Counted {
     fn vessels(&self) -> Result<&dyn VesselRecords, String> {
         Ok(self)
     }
+
+    fn joins(&self) -> Result<&flotilla_resources::held_joins::HeldJoins, String> {
+        self.reads.joins()
+    }
 }
 
 impl VesselRecords for Counted {

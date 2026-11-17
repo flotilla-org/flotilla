@@ -19,7 +19,7 @@ use flotilla_protocol::{LifecycleReading, NodeId};
 use flotilla_resources::{
     engine_records::{IndexCover, KindRecords, LogPosition, Record, Since, UnloggedJournal},
     environment_records::{EnvironmentChange, EnvironmentRecord},
-    held_joins::{self, JoinChange, JoinChanges},
+    held_joins::{self, JoinChange, JoinChanges, JoinsReader},
     lifecycle_reads::{ChangeCursor, LifecycleReads},
     terminal_records::{newest_launches, TerminalHolderView, TerminalRecord, TerminalRecords},
     vessel_seats::VesselSeats,
@@ -148,6 +148,8 @@ struct Dirt {
 /// joins' journal for the session and Vessel launches, and cursors over the rest. A read port that
 /// serves no environments joins none, so follows none.
 struct Cursors {
+    /// The listing's place in the held joins' journal.
+    reader: JoinsReader,
     /// The held joins' journal sequence the listing has read through.
     joins_seen: u64,
     /// How far the held joins had read the log, at that sequence.
@@ -161,12 +163,13 @@ struct Cursors {
 
 impl Cursors {
     /// Cursors from now on, where `reads` holds a log of its sessions.
-    fn start(reads: &dyn LifecycleReads) -> Result<Option<Self>, String> {
+    fn start(reads: Arc<dyn LifecycleReads>) -> Result<Option<Self>, String> {
         let terminals = reads.terminals()?;
-        if !reads.joins()?.read(reads, |joins| joins.follows())? {
+        if !reads.joins()?.read(reads.as_ref(), |joins| joins.follows())? {
             return Ok(None);
         }
         Ok(Some(Self {
+            reader: JoinsReader::register(Arc::clone(&reads), false)?,
             joins_seen: 0,
             joins_position: 0,
             environments: reads.environments().ok().and_then(|environments| environments.cursor()),
@@ -190,20 +193,26 @@ impl Cursors {
         self.joins_position = joins.position();
     }
 
+    /// The listing has composed everything it has read of the journal: the held joins may evict
+    /// what it no longer needs.
+    fn composed(&self) {
+        self.reader.composed(self.joins_seen);
+    }
+
     /// What changed since the last pass; a change that could not be read marks everything.
-    fn pass(&mut self, reads: &dyn LifecycleReads) -> Dirt {
+    fn pass(&mut self) -> Dirt {
         let mut dirt = Dirt::default();
-        let joined = reads.joins().and_then(|joins| {
-            joins.read(reads, |joins| {
-                match joins.since(self.joins_seen) {
-                    JoinChanges::Everything => dirt.all = true,
-                    JoinChanges::Changed(changes) => changes.into_iter().for_each(|change| match change {
-                        JoinChange::Terminal { name, home, .. } => drop(dirt.terminals.insert((name.clone(), home.clone()))),
-                        JoinChange::Vessel { name, .. } => drop(dirt.vessels.insert(name.clone())),
-                    }),
-                }
-                self.joined(&joins);
-            })
+        let (seen, position) = (&mut self.joins_seen, &mut self.joins_position);
+        let joined = self.reader.read(|joins| {
+            match joins.since(*seen) {
+                JoinChanges::Everything => dirt.all = true,
+                JoinChanges::Changed(changes) => changes.into_iter().for_each(|change| match change {
+                    JoinChange::Terminal { name, home, .. } => drop(dirt.terminals.insert((name.clone(), home.clone()))),
+                    JoinChange::Vessel { name, .. } => drop(dirt.vessels.insert(name.clone())),
+                }),
+            }
+            *seen = joins.sequence();
+            *position = joins.position();
         });
         dirt.all |= joined.is_err();
         if let Some(environments) = self.environments.as_mut() {
@@ -290,10 +299,11 @@ impl TerminalViews {
     /// Takes into `listing` what changed since its last pass.
     async fn pass_listing(&self, listing: &mut Listing) -> Result<(), ResourceError> {
         let held = listing.cursors.take();
+        let reads = Arc::clone(&self.reads);
         let (cursors, dirt) = self
-            .blocking(move |reads| match held {
+            .blocking(move |_| match held {
                 Some(mut cursors) => {
-                    let dirt = cursors.pass(reads);
+                    let dirt = cursors.pass();
                     Ok((Some(cursors), dirt))
                 }
                 // Started before the full read: a change after it is read again at the next pass.
@@ -342,6 +352,9 @@ impl TerminalViews {
                 listing.cursors = None;
                 return Err(error);
             }
+        }
+        if let Some(cursors) = listing.cursors.as_ref() {
+            cursors.composed();
         }
         Ok(())
     }

@@ -7012,6 +7012,9 @@ mod tests {
         fn home(&self) -> Result<&str, String> {
             Err("scripted readings read no engine".into())
         }
+        fn joins(&self) -> Result<&flotilla_resources::held_joins::HeldJoins, String> {
+            Err("scripted readings read no engine".into())
+        }
         fn reading(
             &self,
             kind: crate::ports::ProvisioningKind,

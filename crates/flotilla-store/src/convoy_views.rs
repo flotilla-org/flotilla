@@ -30,7 +30,7 @@ use flotilla_resources::{
     convoy::view::VesselReading,
     convoy_records::{ConvoyChange, ConvoyJoins, ConvoyNotes, ConvoyRecord, ConvoyRecords, WorkFacts},
     engine_records::{IndexCover, KindRecords, LogPosition, Record, Since, UnloggedJournal},
-    held_joins::{JoinChange, JoinChanges},
+    held_joins::{JoinChange, JoinChanges, JoinsReader},
     lifecycle_reads::{ChangeCursor, LifecycleReads},
     terminal_records::{newest_launches, TerminalRecord},
     vessel_records::{interrupted_message, VesselRecord},
@@ -89,6 +89,10 @@ struct HeldViews {
     /// The launches held, by `(home, launch)`, that have not ended. One that cannot be read
     /// counts: nothing says it ended.
     open: BTreeSet<(String, String)>,
+    /// What each ended launch's works were last composed from, by `(home, launch)`: its Vessel
+    /// launches are released, and once the held joins evict them a view composed again keeps
+    /// these.
+    ended_works: BTreeMap<(String, String), BTreeMap<String, WorkFacts>>,
 }
 
 /// A launch's view and the version it is handed out at.
@@ -116,6 +120,8 @@ struct Following {
 /// launches' own cursor, and the held joins' journal for their Vessel and session launches.
 struct Cursors {
     convoys: Box<dyn ChangeCursor<ConvoyChange>>,
+    /// The views' place in the held joins' journal.
+    reader: JoinsReader,
     /// The journal's sequence the views have read through.
     joins_seen: u64,
     /// How far the held joins had read the log, at that sequence.
@@ -124,9 +130,10 @@ struct Cursors {
 
 impl Cursors {
     /// Cursors from now on, where `reads` holds a log of its convoys.
-    fn start(reads: &dyn LifecycleReads) -> Result<Option<Self>, String> {
+    fn start(reads: Arc<dyn LifecycleReads>) -> Result<Option<Self>, String> {
         let Some(convoys) = reads.convoys()?.cursor() else { return Ok(None) };
-        Ok(Some(Self { convoys, joins_seen: 0, joins_position: 0 }))
+        let reader = JoinsReader::register(reads, true)?;
+        Ok(Some(Self { convoys, reader, joins_seen: 0, joins_position: 0 }))
     }
 
     /// How far the cursors have read the log.
@@ -134,9 +141,15 @@ impl Cursors {
         self.convoys.position().saturating_add(self.joins_position)
     }
 
+    /// The views have composed every launch whose joins changed before sequence `seen`: the held
+    /// joins may evict what they no longer need.
+    fn composed(&self, seen: u64) {
+        self.reader.composed(seen);
+    }
+
     /// The launches, by `(home, name)`, whose records or joins changed since the last pass; none
     /// when anything may have.
-    fn pass(&mut self, reads: &dyn LifecycleReads) -> Result<Option<BTreeSet<(String, String)>>, String> {
+    fn pass(&mut self) -> Result<Option<BTreeSet<(String, String)>>, String> {
         let mut launches = BTreeSet::new();
         let mut rescanned = false;
         for change in self.convoys.pass()? {
@@ -146,7 +159,7 @@ impl Cursors {
             }
         }
         // The convoy launch a Vessel launch, or the Vessel launch a session, is held for.
-        let joined = reads.joins()?.read(reads, |joins| {
+        let joined = self.reader.read(|joins| {
             let touched = match joins.since(self.joins_seen) {
                 JoinChanges::Everything => None,
                 JoinChanges::Changed(changes) => Some(
@@ -254,7 +267,8 @@ impl ConvoyViews {
             // Follow before filling, so no change between the fill and the first pass is missed.
             let wakes = self.wakes()?;
             let notes = self.convoys().map_err(ResourceError::other)?.memory().subscribe();
-            let cursors = self.blocking(Cursors::start).await?;
+            let reads = Arc::clone(&self.reads);
+            let cursors = self.blocking(move |_| Cursors::start(reads)).await?;
             let cursors_read = cursors.as_ref().map_or(0, Cursors::position);
             let mut held = HeldViews {
                 views: BTreeMap::new(),
@@ -270,6 +284,7 @@ impl ConvoyViews {
                 changed: UnloggedJournal::default(),
                 index: ViewIndex::default(),
                 open: BTreeSet::new(),
+                ended_works: BTreeMap::new(),
             };
             self.refill(&mut held).await?;
             *state = Some(held);
@@ -351,22 +366,26 @@ impl ConvoyViews {
         let Some(following) = held.following.clone() else { return self.refill(held).await };
         let passing = Arc::clone(&following);
         // A failed pass still moved the cursors: the views take how far they read before failing.
-        let failed = self
-            .blocking(move |reads| {
+        let (failed, seen) = self
+            .blocking(move |_| {
                 let mut following = passing.lock().unwrap_or_else(PoisonError::into_inner);
-                let passed = following.cursors.pass(reads);
+                let passed = following.cursors.pass();
                 following.through = following.cursors.position();
-                Ok(match passed {
-                    Ok(Some(launches)) => {
-                        following.passed.extend(launches);
-                        None
-                    }
-                    Ok(None) => {
-                        following.rescanned = true;
-                        None
-                    }
-                    Err(error) => Some(error),
-                })
+                let seen = following.cursors.joins_seen;
+                Ok((
+                    match passed {
+                        Ok(Some(launches)) => {
+                            following.passed.extend(launches);
+                            None
+                        }
+                        Ok(None) => {
+                            following.rescanned = true;
+                            None
+                        }
+                        Err(error) => Some(error),
+                    },
+                    seen,
+                ))
             })
             .await?;
         let (passed, through, rescanned) = {
@@ -395,7 +414,10 @@ impl ConvoyViews {
                 Err(TryRecvError::Empty | TryRecvError::Closed) => break,
             }
         }
-        self.recompose(held).await
+        self.recompose(held).await?;
+        // Every launch whose joins changed before `seen` is composed again.
+        following.lock().unwrap_or_else(PoisonError::into_inner).cursors.composed(seen);
+        Ok(())
     }
 
     /// Composes the launches owed again from their records; one with no record leaves the views.
@@ -408,7 +430,7 @@ impl ConvoyViews {
             let (key_home, key_name) = (home.clone(), name.clone());
             let record = self.blocking(move |reads| reads.convoys()?.get(&key_name, Some(&key_home))).await?;
             let composed = match record {
-                Some(record) => Some(self.compose(vec![record]).await?.0),
+                Some(record) => Some(self.compose(vec![record], held).await?.0),
                 None => None,
             };
             let key = (home, name);
@@ -426,7 +448,7 @@ impl ConvoyViews {
     async fn refill(&self, held: &mut HeldViews) -> Result<(), ResourceError> {
         held.refill_owed = true;
         let listing = self.blocking(|reads| reads.convoys()?.every()).await?;
-        let (mut composed, joined) = self.compose(listing.records).await?;
+        let (mut composed, joined) = self.compose(listing.records, held).await?;
         // Every launch was composed from the joins as held: their journal is read through there.
         if let (Some(following), (seen, position)) = (held.following.as_ref(), joined) {
             let mut following = following.lock().unwrap_or_else(PoisonError::into_inner);
@@ -446,7 +468,7 @@ impl ConvoyViews {
                 home: launch.home.clone(),
                 view: ReadResourceObject { object: launch.read_view(&self.namespace), provenance },
                 unreadable: Some((launch.version, launch.reason.clone())),
-                ended: false,
+                ended: None,
             }
         }));
         // Each view read again keeps its version while it shows the same; the rest leave.
@@ -458,6 +480,9 @@ impl ConvoyViews {
         held.insert(composed).map_err(ResourceError::other)?;
         held.owed.clear();
         held.refill_owed = false;
+        if let Some(following) = held.following.as_ref() {
+            following.lock().unwrap_or_else(PoisonError::into_inner).cursors.composed(joined.0);
+        }
         self.convoys().map_err(ResourceError::other)?.memory().set_unreadable(held.unreadable.len() as u64);
         Ok(())
     }
@@ -465,20 +490,35 @@ impl ConvoyViews {
     /// `records` as read views, each joined with its works' Vessel launches and their sessions as
     /// the read port holds them, with the joins' journal sequence and log position they were
     /// composed at.
-    async fn compose(&self, records: Vec<ConvoyRecord>) -> Result<(Vec<Composed>, (u64, u64)), ResourceError> {
+    ///
+    /// An ended launch's Vessel launches are released, so the held joins evict them once they end:
+    /// a work whose launches are no longer held keeps what `held` last composed of it.
+    async fn compose(&self, records: Vec<ConvoyRecord>, held: &HeldViews) -> Result<(Vec<Composed>, (u64, u64)), ResourceError> {
+        let prior: Vec<_> = records
+            .iter()
+            .map(|record| record.ended.as_ref().and_then(|_| held.ended_works.get(&(record.home.clone(), record.name.clone())).cloned()))
+            .collect();
         let (records, joined, at) = self
             .blocking(move |reads| {
                 let convoys = reads.convoys()?;
                 let here = convoys.home().to_owned();
-                reads.joins()?.read(reads, |joins| {
+                reads.joins()?.read(reads, |mut joins| {
                     let joined = records
                         .iter()
-                        .map(|record| {
+                        .zip(prior)
+                        .map(|(record, prior)| {
                             let notes = (record.home == here).then(|| convoys.memory().get(&record.name));
-                            let joined = join(record, notes.as_ref(), joins.vessels_of(&record.name), |vessel| joins.sessions_of(vessel));
+                            let mut joined =
+                                join(record, notes.as_ref(), joins.vessels_of(&record.name), |vessel| joins.sessions_of(vessel));
+                            for (work, facts) in prior.unwrap_or_default() {
+                                joined.works.entry(work).or_insert(facts);
+                            }
                             (notes, joined)
                         })
                         .collect::<Vec<_>>();
+                    for record in records.iter().filter(|record| record.ended.is_some()) {
+                        joins.release(&record.name, &record.home);
+                    }
                     (records, joined, (joins.sequence(), joins.position()))
                 })
             })
@@ -501,7 +541,7 @@ impl ConvoyViews {
                     home: record.home.clone(),
                     view: ReadResourceObject { object, provenance },
                     unreadable: None,
-                    ended: record.ended.is_some(),
+                    ended: record.ended.as_ref().map(|_| joined.works),
                 }
             })
             .collect();
@@ -707,8 +747,8 @@ struct Composed {
     view: ReadResourceObject<Convoy>,
     /// For a launch that cannot be read, its version and why.
     unreadable: Option<(u64, String)>,
-    /// The launch's record says it ended.
-    ended: bool,
+    /// Where the launch's record says it ended, what its works were composed from.
+    ended: Option<BTreeMap<String, WorkFacts>>,
 }
 
 impl HeldViews {
@@ -736,10 +776,15 @@ impl HeldViews {
         let position = self.position();
         for Composed { home, view, unreadable, ended } in composed {
             let key = (home, view.object.metadata.name.clone());
-            if ended {
-                self.open.remove(&key);
-            } else {
-                self.open.insert(key.clone());
+            match ended {
+                Some(works) => {
+                    self.open.remove(&key);
+                    self.ended_works.insert(key.clone(), works);
+                }
+                None => {
+                    self.open.insert(key.clone());
+                    self.ended_works.remove(&key);
+                }
             }
             match unreadable {
                 Some((version, reason)) => {
@@ -773,6 +818,7 @@ impl HeldViews {
         }
         self.unreadable.remove(key);
         self.open.remove(key);
+        self.ended_works.remove(key);
     }
 
     /// Keeps only the views `keep` names.

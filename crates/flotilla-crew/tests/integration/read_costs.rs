@@ -579,6 +579,8 @@ struct CrewedConvoys {
     target: (String, String),
     /// The launch of the first convoy's coder's session.
     target_session: String,
+    /// Each convoy's launch, its Vessel launch and its coder's session launch, the target first.
+    launches: Vec<(String, String, String)>,
 }
 
 /// A target convoy of project "app" and `others` of project "other", each with a coder: all in
@@ -598,6 +600,7 @@ async fn crewed_convoys(others: usize, own_environments: bool) -> CrewedConvoys 
     };
     let mut target = None;
     let mut target_session = None;
+    let mut launches = Vec::new();
     for n in 0..=others {
         let project = if n == 0 { "app" } else { "other" };
         let spec = ConvoySpec::builder().workflow_ref("workflow".into()).project_ref(project.into()).build();
@@ -615,12 +618,13 @@ async fn crewed_convoys(others: usize, own_environments: bool) -> CrewedConvoys 
         };
         engine.terminals.ready(&session, &format!("pool-{n}"), &facts);
         if n == 0 {
-            target = Some((launch, engine.terminals.record(&session).session_name().to_owned()));
-            target_session = Some(session);
+            target = Some((launch.clone(), engine.terminals.record(&session).session_name().to_owned()));
+            target_session = Some(session.clone());
         }
+        launches.push((launch, vessel, session));
     }
     let (target, target_session) = (target.expect("the target convoy"), target_session.expect("the target's session"));
-    CrewedConvoys { store, engine, convoys, backend, target, target_session }
+    CrewedConvoys { store, engine, convoys, backend, target, target_session, launches }
 }
 
 /// What each of a scoped fleet listing's selecting queries read, by kind, with `others` convoys
@@ -781,4 +785,54 @@ async fn a_change_is_read_once_for_both_views() {
     assert!(exited.status.as_ref().is_some_and(|status| status.stopped_at.is_some()), "the views show the change: {exited:?}");
     let gets = crewed.convoys.keyed_gets() - before;
     assert_eq!((gets.terminals, gets.vessels), (1, 0), "the change is read once, its vessel not at all: {gets:?}");
+}
+
+// Behaviour: the held joins hold live work, not history. Once half the convoys end and their
+// Vessel and session launches are released, and both views have composed that, those launches are
+// no longer held; until the session views have read a release, its session stays listed by them
+// correctly as released. An ended convoy composed again later keeps what its works showed.
+#[tokio::test]
+async fn ended_launches_leave_the_held_joins() {
+    use flotilla_resources::{convoy::engine::set_notes, vessel_records::VesselStep, TerminalSession};
+
+    let crewed = crewed_convoys(9, false).await;
+    let convoys = crewed.backend.clone().using::<Convoy>(NAMESPACE);
+    let sessions = crewed.backend.clone().using::<TerminalSession>(NAMESPACE);
+    convoys.list().await.expect("fill the convoy views");
+    sessions.list().await.expect("fill the session views");
+    let joins = crewed.convoys.reads().joins().expect("the held joins");
+    let held = joins.held();
+    assert_eq!((held.vessels, held.terminals), (10, 10), "every launch is held: {held:?}");
+
+    let (ended, live) = crewed.launches.split_at(5);
+    let engine = crewed.convoys.path().get().cloned().expect("the Convoy path");
+    for (launch, vessel, session) in ended {
+        let view = convoys.get(launch).await.expect("the convoy");
+        engine.abandon(&view, "operator", "ended").await.expect("end the convoy");
+        crewed.engine.terminals.release(session);
+        crewed.engine.vessels.step(vessel, VesselStep::Released);
+    }
+    // The convoy views compose the ends; the session views have not read the releases yet.
+    convoys.list().await.expect("the convoy views");
+    convoys.list().await.expect("the convoy views");
+    let composed = convoys.get(&ended[0].0).await.expect("an ended convoy").status.expect("its status").work;
+    assert!(composed.get("work").is_some_and(|work| work.started_at.is_some()), "its work shows its Vessel launch: {composed:?}");
+    let listed = sessions.list().await.expect("the session views");
+    let names: BTreeSet<String> = listed.items.iter().map(|session| session.metadata.name.clone()).collect();
+    for (_, _, session) in live {
+        assert!(names.contains(crewed.engine.terminals.record(session).session_name()), "a live session is listed: {names:?}");
+    }
+    assert_eq!(names.len(), live.len(), "the released sessions are listed no more: {names:?}");
+
+    convoys.list().await.expect("the convoy views");
+    let held = joins.held();
+    assert_eq!((held.vessels, held.terminals), (5, 5), "only the live launches are held: {held:?}");
+
+    // Composed again as its notes change, an ended convoy's works show what they did.
+    let mut status = convoys.get(&ended[0].0).await.expect("an ended convoy").status.expect("its status");
+    status.branch_subject_scan_error = Some("noted after the end".into());
+    set_notes(&crewed.convoys.path(), &ended[0].0, &status).expect("note the convoy");
+    let again = convoys.get(&ended[0].0).await.expect("an ended convoy").status.expect("its status");
+    assert_eq!(again.branch_subject_scan_error.as_deref(), Some("noted after the end"), "the view is composed again");
+    assert_eq!(again.work, composed, "its works show what they did");
 }

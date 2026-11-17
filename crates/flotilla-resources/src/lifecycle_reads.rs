@@ -106,10 +106,9 @@ pub trait LifecycleReads: Send + Sync {
     }
 
     /// The Vessel and session launches the views join, held once for this port (#3108): every
-    /// view composing from them reads them here. Unavailable where no engine is installed.
-    fn joins(&self) -> Result<&crate::held_joins::HeldJoins, String> {
-        Err("held joins are not served without the engine".into())
-    }
+    /// view composing from them reads them here. Unavailable where no engine is installed. Every
+    /// adapter answers it, so a wrapper hands on its port's joins rather than dropping them.
+    fn joins(&self) -> Result<&crate::held_joins::HeldJoins, String>;
 
     /// The reading of `name` homed at `origin` (a replica's origin root; `None` for this home), or
     /// `None` when the engine holds no such resource: the switch is off, or it was written before.
@@ -165,6 +164,10 @@ impl LifecycleReads for NoLifecycleReads {
 
     fn try_reading(&self, _: ProvisioningKind, _: &str, _: Option<&str>) -> Result<Option<flotilla_protocol::LifecycleReading>, String> {
         Ok(None)
+    }
+
+    fn joins(&self) -> Result<&crate::held_joins::HeldJoins, String> {
+        Err("held joins are not served without the engine".into())
     }
 }
 
