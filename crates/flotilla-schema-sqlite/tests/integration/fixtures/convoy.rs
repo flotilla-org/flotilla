@@ -8,8 +8,8 @@ use flotilla_state_machines::{
     machines::convoy::{
         Abandon, AbandonCause, AddSeat, AdmissionBytes, Authority, Convoy, ConvoySpec, ConvoyState, ConvoyWorld, Declare, Deliver, Duty,
         DutyId, DutyScope, FailSeat, Keep, Link, LinkSource, MemoryConvoyWorld, Priority, Progress, Promise, PromiseId, PromiseKind,
-        PromiseKinds, PromiseSource, Readmit, Reassign, Reject, ReplaceSeat, Resupervise, RetireDuty, RetireSeat, Retract, Seat, SeatName,
-        SubjectLink, Submission, Submit, Terms, Unlink, VesselClass,
+        PromiseKinds, PromiseSource, Readmit, Reassign, Reject, ReplaceSeat, Resupervise, Retire, RetireDuty, RetireSeat, Retract, Seat,
+        SeatName, SubjectLink, Submission, Submit, Terms, Unlink, VesselClass,
     },
     Ref, Resource,
 };
@@ -21,7 +21,7 @@ use super::{
     name, records, stamp, stamp_flat, text, timestamp, version, Fixture, Pick, SHAPES,
 };
 
-/// Covering indexes: every shape of [`SHAPES`] in each round, and the label by round (base 3), so
+/// Covering indexes: every shape of [`SHAPES`] in each round, and the label by round (base 4), so
 /// every label meets every shape; four rounds give every code enum every code.
 pub const COVERING: usize = SHAPES * 4;
 
@@ -133,12 +133,13 @@ fn retired(tc: &TestCase, pick: Pick) -> BTreeSet<DutyId> {
 /// A state of every label in turn when covering, its collections of every size.
 pub fn state_value(tc: &TestCase, pick: Pick) -> ConvoyState {
     let (quota, retired) = (quota(tc, pick), retired(tc, pick));
-    match pick.digit(tc, 3, SHAPES) {
-        0 => ConvoyState::Open { quota, retired },
-        1 => ConvoyState::Delivered { quota, retired, disposition: text(tc) },
+    match pick.digit(tc, 4, SHAPES) {
+        0 => ConvoyState::Open { quota, retired_duties: retired },
+        1 => ConvoyState::Delivered { quota, retired_duties: retired, disposition: text(tc) },
+        3 => ConvoyState::Retired,
         _ => ConvoyState::Abandoned {
             quota,
-            retired,
+            retired_duties: retired,
             cause: code_enum(tc, pick.nth(3), &[AbandonCause::Failed, AbandonCause::Operator]),
             reason: text(tc),
         },
@@ -193,22 +194,24 @@ pub fn sample() -> Resource<Convoy> {
         seats,
         promises,
     };
-    let open = ConvoyState::Open { quota: [(VesselClass::new("standard"), 1)].into(), retired: BTreeSet::new() };
+    let open = ConvoyState::Open { quota: [(VesselClass::new("standard"), 1)].into(), retired_duties: BTreeSet::new() };
     resource(spec, State::new(open, Timestamp(0)))
 }
 
-/// A world in which every authority and every reference is authorised and durable.
+/// A world in which every authority and every reference is authorised and durable, and nothing
+/// holds the convoy.
 fn yes(authority: &str) -> Box<dyn ConvoyWorld> {
     let mut world = MemoryConvoyWorld::default();
     world.authority.put(&Ref::new(authority), true);
     world.durable.put(&Ref::new(authority), true);
+    world.holds.put(&Ref::new(authority), BTreeSet::new());
     Box::new(world)
 }
 
 /// Every edge an open convoy may take: declaring a promise, each promise edge on an open
 /// promise (by its owner, or an operator's verdict), the seat edges, linking a subject and
 /// unlinking a linked one, retiring a holding duty, delivering, abandoning, and readmitting with
-/// every count raised or kept.
+/// every count raised or kept; and the edge an ended one takes, retiring.
 pub fn candidates(tc: &TestCase, pick: Pick, convoy: &Resource<Convoy>) -> Vec<Candidate<Convoy>> {
     // One draw of each value, shared by the candidates: draws are what generation spends.
     let now = timestamp(tc);
@@ -293,6 +296,7 @@ pub fn candidates(tc: &TestCase, pick: Pick, convoy: &Resource<Convoy>) -> Vec<C
         .map(|(class, count)| (class.clone(), count.saturating_add(tc.draw(gs::integers::<u32>().max_value(2)))))
         .collect();
     candidates.push((Readmit { quota: raised, by, authority: Ref::new(authority.as_str()) }.into(), yes(&authority), now));
+    candidates.push((Retire { holds: Ref::new(authority.as_str()) }.into(), yes(&authority), now));
     candidates
 }
 

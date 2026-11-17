@@ -359,7 +359,7 @@ pub fn import_convoy(
         seats,
         promises,
     };
-    let state = StoredState::<Convoy>::new(ConvoyState::Open { quota: BTreeMap::new(), retired: BTreeSet::new() }, since);
+    let state = StoredState::<Convoy>::new(ConvoyState::Open { quota: BTreeMap::new(), retired_duties: BTreeSet::new() }, since);
     let resource = Resource::stored(launch_of, spec, state, Version(1));
     check(&resource).map_err(refuse)?;
 

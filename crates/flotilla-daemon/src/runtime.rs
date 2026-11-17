@@ -332,7 +332,15 @@ impl DaemonRuntime {
             tokio::spawn(attributed(caller("blob store sync"), Arc::clone(&blob_store).run_sync())),
             tokio::spawn(attributed(
                 caller("artifact gc"),
-                run_artifact_gc(daemon.resource_backend(), options.namespace.clone(), Arc::clone(&blob_store)),
+                run_artifact_gc(daemon.resource_backend(), options.namespace.clone(), Arc::clone(&blob_store), {
+                    let daemon = Arc::clone(&daemon);
+                    Arc::new(move |convoy: &str| {
+                        daemon
+                            .engine_convoys()
+                            .and_then(|convoys| convoys.launch(convoy))
+                            .is_some_and(|launch| launch.label() == flotilla_state_machines::machines::convoy::ConvoyLabel::Retired)
+                    })
+                }),
             )),
             tokio::spawn(attributed(
                 caller("checkout archive gc"),

@@ -94,7 +94,7 @@ fn the_enumeration_covers_every_kind_and_index() {
         "message set receiver",
         "message set state state",
         "message label state",
-        "convoy_retired insert",
+        "convoy_retired_duties insert",
         "convoy_promises last position",
         "convoy_promises_submissions last position",
         "convoy_promises set progress",

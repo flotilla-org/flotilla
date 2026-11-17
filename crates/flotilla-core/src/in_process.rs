@@ -2496,6 +2496,8 @@ impl InProcessDaemon {
         let records = Arc::new(EngineConvoyRecords::new(home, Arc::clone(service), Arc::clone(convoys.memory()), open));
         if tokio::runtime::Handle::try_current().is_ok() {
             drop(records.follow()?);
+            // This home retires its ended convoys as their holds release.
+            drop(flotilla_engine_convoys::retire::follow(Arc::clone(&convoys), self.clock_for_scenarios())?);
         }
         self.convoy_records.set(Arc::clone(&records)).map_err(|_| "the Convoy path is already installed".to_owned())?;
         let engine: Arc<dyn flotilla_resources::convoy::engine::EngineConvoys> =

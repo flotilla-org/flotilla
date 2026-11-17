@@ -93,8 +93,9 @@ impl EngineConvoyRecords {
             for id in page.ids {
                 if let Some(loaded) = read.load::<Resource<Convoy>>(id)? {
                     match entry(read, stalls, loaded)? {
-                        Ok(record) => listing.records.push(record),
-                        Err(unreadable) => listing.unreadable.push(unreadable),
+                        Some(Ok(record)) => listing.records.push(record),
+                        Some(Err(unreadable)) => listing.unreadable.push(unreadable),
+                        None => {}
                     }
                 }
             }
@@ -120,7 +121,7 @@ impl ConvoyRecords for EngineConvoyRecords {
         self.read(&format!("{name} at {home}"), |read| {
             let Some(id) = read.resolve(<Resource<Convoy> as Kind>::CODE, name, &home)? else { return Ok(None) };
             let Some(loaded) = read.load::<Resource<Convoy>>(id)? else { return Ok(None) };
-            record(read, &self.stalls, loaded).map(Some)
+            record(read, &self.stalls, loaded)
         })
     }
 
@@ -131,7 +132,7 @@ impl ConvoyRecords for EngineConvoyRecords {
             let query = ConvoySpec::by_launch(&project, &of.to_owned());
             let Some((id, _)) = read.integer_index_keys_before(&query, &home, i64::MAX, 1)?.first().copied() else { return Ok(None) };
             let Some(loaded) = read.load::<Resource<Convoy>>(id)? else { return Ok(None) };
-            record(read, &self.stalls, loaded).map(Some)
+            record(read, &self.stalls, loaded)
         })
     }
 
@@ -259,20 +260,29 @@ fn written_at(
     Ok(read.change(home, event.change)?.map(|change| change.at))
 }
 
-/// `convoy`, held at `home` at `version`, as its readers take it; one that cannot be read is an
-/// error naming why.
-fn record(read: &mut Read<'_>, stalls: &OpenAwaiting, loaded: Loaded<Resource<Convoy>>) -> Result<ConvoyRecord, StoreError> {
-    entry(read, stalls, loaded)?.map_err(|unreadable| StoreError::Stream(unreadable.reason))
+/// `convoy`, held at `home` at `version`, as its readers take it, none once it retired; one that
+/// cannot be read is an error naming why.
+fn record(read: &mut Read<'_>, stalls: &OpenAwaiting, loaded: Loaded<Resource<Convoy>>) -> Result<Option<ConvoyRecord>, StoreError> {
+    entry(read, stalls, loaded)?.transpose().map_err(|unreadable| StoreError::Stream(unreadable.reason))
 }
 
 /// The launch `loaded` as its readers take it, or as unreadable where what it holds does not
-/// read; the store's own failures are errors. Each seat's stall is read from `stalls`.
+/// read; none once it retired, since nothing reads a retired launch. The store's own failures
+/// are errors. Each seat's stall is read from `stalls`.
 fn entry(
     read: &mut Read<'_>,
     stalls: &OpenAwaiting,
     loaded: Loaded<Resource<Convoy>>,
-) -> Result<Result<ConvoyRecord, UnreadableLaunch>, StoreError> {
+) -> Result<Option<Result<ConvoyRecord, UnreadableLaunch>>, StoreError> {
     let Loaded { id, home, version, value: convoy, .. } = loaded;
+    let ended = match convoy.state() {
+        ConvoyState::Open { .. } => None,
+        ConvoyState::Delivered { disposition, .. } => Some(ConvoyEnd::Delivered { disposition: disposition.clone() }),
+        ConvoyState::Abandoned { cause: AbandonCause::Failed, reason, .. } => Some(ConvoyEnd::Failed { reason: reason.clone() }),
+        ConvoyState::Abandoned { cause: AbandonCause::Operator, reason, .. } => Some(ConvoyEnd::Abandoned { reason: reason.clone() }),
+        ConvoyState::Retired => return Ok(None),
+    }
+    .map(|end| (end, time(convoy.since())));
     let home = home.as_str();
     let spec = convoy.spec();
     let admitted_at = read.creation_time(id)?.to_datetime();
@@ -289,7 +299,7 @@ fn entry(
     };
     let admission = match AdmissionDocument::decode(convoy.name(), spec.admission.value().bytes()) {
         Ok(admission) => admission,
-        Err(error) => return Ok(Err(unreadable(format!("convoy {}'s admission: {error}", convoy.name())))),
+        Err(error) => return Ok(Some(Err(unreadable(format!("convoy {}'s admission: {error}", convoy.name()))))),
     };
 
     let status = ConvoyStatus { workflow_snapshot: Some(admission.workflow_snapshot.clone()), ..ConvoyStatus::default() };
@@ -315,7 +325,7 @@ fn entry(
         }) || spec.seats.iter().any(|row| row.record.parent.as_ref() == Some(&name));
         let subject = match seat_address(&project, convoy.name(), &seat.role) {
             Ok(subject) => subject,
-            Err(error) => return Ok(Err(unreadable(format!("convoy {}'s seat {}: {error}", convoy.name(), seat.role)))),
+            Err(error) => return Ok(Some(Err(unreadable(format!("convoy {}'s seat {}: {error}", convoy.name(), seat.role))))),
         };
         let kept_at = spec
             .promises
@@ -356,15 +366,7 @@ fn entry(
     // A relink after an unlink appends another row: the subject is linked again.
     unlinked.retain(|subject| !subjects.iter().any(|linked| linked.subject == *subject));
 
-    let ended = match convoy.state() {
-        ConvoyState::Open { .. } => None,
-        ConvoyState::Delivered { disposition, .. } => Some(ConvoyEnd::Delivered { disposition: disposition.clone() }),
-        ConvoyState::Abandoned { cause: AbandonCause::Failed, reason, .. } => Some(ConvoyEnd::Failed { reason: reason.clone() }),
-        ConvoyState::Abandoned { cause: AbandonCause::Operator, reason, .. } => Some(ConvoyEnd::Abandoned { reason: reason.clone() }),
-    }
-    .map(|end| (end, time(convoy.since())));
-
-    Ok(Ok(ConvoyRecord {
+    Ok(Some(Ok(ConvoyRecord {
         home: home.to_owned(),
         version,
         launch_of: spec.launch_of.clone(),
@@ -379,5 +381,5 @@ fn entry(
         unlinked,
         admission,
         name: convoy.name().to_owned(),
-    }))
+    })))
 }

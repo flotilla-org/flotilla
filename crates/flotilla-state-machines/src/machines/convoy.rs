@@ -389,39 +389,49 @@ pub struct ConvoySpec {
 }
 
 states! {
-    /// The spec's `State`, with its work record's state data on every label:
-    /// the quota in force and the lifetime duties retired.
+    /// The spec's `State`, with its work record's state data on every label
+    /// until it retires: the quota in force and the lifetime duties retired.
+    /// Retired carries nothing: nothing reads a retired convoy's quota,
+    /// duties or end facts, and its Deliver or Abandon event keeps the latter.
     pub enum ConvoyState => ConvoyLabel {
         Open {
             #[store(child)] quota: BTreeMap<VesselClass, u32>,
-            #[store(child)] retired: BTreeSet<DutyId>,
+            #[store(child)] retired_duties: BTreeSet<DutyId>,
         } = "op",
         Delivered {
             #[store(child)] quota: BTreeMap<VesselClass, u32>,
-            #[store(child)] retired: BTreeSet<DutyId>,
+            #[store(child)] retired_duties: BTreeSet<DutyId>,
             disposition: String,
         } = "de",
         Abandoned {
             #[store(child)] quota: BTreeMap<VesselClass, u32>,
-            #[store(child)] retired: BTreeSet<DutyId>,
+            #[store(child)] retired_duties: BTreeSet<DutyId>,
             cause: AbandonCause,
             reason: String,
         } = "ab",
+        Retired = "re",
     }
 }
 
+static NO_QUOTA: Quota = BTreeMap::new();
+static NO_DUTIES: BTreeSet<DutyId> = BTreeSet::new();
+
 impl ConvoyState {
-    /// The quota in force: the admitted one, or the last readmission's.
+    /// The quota in force: the admitted one, or the last readmission's; none once retired.
     pub fn quota(&self) -> &Quota {
         match self {
             ConvoyState::Open { quota, .. } | ConvoyState::Delivered { quota, .. } | ConvoyState::Abandoned { quota, .. } => quota,
+            ConvoyState::Retired => &NO_QUOTA,
         }
     }
 
-    /// The lifetime duties retired so far.
+    /// The lifetime duties retired so far; none once the convoy retired.
     pub fn retired(&self) -> &BTreeSet<DutyId> {
         match self {
-            ConvoyState::Open { retired, .. } | ConvoyState::Delivered { retired, .. } | ConvoyState::Abandoned { retired, .. } => retired,
+            ConvoyState::Open { retired_duties, .. }
+            | ConvoyState::Delivered { retired_duties, .. }
+            | ConvoyState::Abandoned { retired_duties, .. } => retired_duties,
+            ConvoyState::Retired => &NO_DUTIES,
         }
     }
 
@@ -682,6 +692,14 @@ pub struct Abandon {
     pub authority: Ref<Authorisation>,
 }
 
+/// An ended convoy that nothing holds any more retires: its end is the
+/// convoy's last edge, and what it carried leaves with it.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Retire {
+    /// The holds its home read, recorded with the edge.
+    pub holds: Ref<Holds>,
+}
+
 /// Readmission of the same convoy with a raised quota.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Readmit {
@@ -733,6 +751,7 @@ edges! {
         Deliver(Deliver) = "de",
         Abandon(Abandon) = "ab",
         Readmit(Readmit) = "ra",
+        Retire(Retire) = "re",
     }
 }
 
@@ -856,7 +875,7 @@ pub enum ConvoyRefusal {
     /// The spec refuses negative quota counts. Counts here are unsigned, so
     /// neither admission nor readmission produces this.
     InvalidQuota,
-    /// The convoy has ended (Delivered or Abandoned).
+    /// The convoy has ended (Delivered or Abandoned) or retired.
     NotOpen,
     UnknownPromise,
     PromiseSettled,
@@ -883,6 +902,12 @@ pub enum ConvoyRefusal {
     UnknownSubject,
     /// Admission's seats are not a tree: a seat is above itself.
     SeatCycle,
+    /// Retire on an Open convoy: only an ended one retires.
+    NotEnded,
+    /// Retire while these dependents still hold the convoy.
+    Held(BTreeSet<String>),
+    /// Retire without the holds read: absent is not "nothing holds it".
+    HoldsUnread,
 }
 
 impl From<Ended<ConvoyLabel>> for ConvoyRefusal {
@@ -892,8 +917,11 @@ impl From<Ended<ConvoyLabel>> for ConvoyRefusal {
 }
 
 impl From<WrongState<ConvoyLabel, ConvoyEdgeKind>> for ConvoyRefusal {
-    fn from(_: WrongState<ConvoyLabel, ConvoyEdgeKind>) -> Self {
-        ConvoyRefusal::NotOpen
+    fn from(wrong: WrongState<ConvoyLabel, ConvoyEdgeKind>) -> Self {
+        match wrong.edge {
+            ConvoyEdgeKind::Retire => ConvoyRefusal::NotEnded,
+            _ => ConvoyRefusal::NotOpen,
+        }
     }
 }
 
@@ -950,9 +978,18 @@ impl Kind for ConvoyLimits {
     type Value = Limits;
 }
 
+/// What still holds an ended convoy, as its home read the hold indexes: one
+/// entry per dependent record, named `kind:name`. Empty when nothing holds it;
+/// absent when the holds were not read.
+pub struct Holds;
+impl Kind for Holds {
+    const NAME: &'static str = "holds";
+    type Value = BTreeSet<String>;
+}
+
 /// What convoy admission and gates read.
-pub trait ConvoyWorld: Source<Authorisation> + Source<Durable> + Source<Project> + Source<ConvoyLimits> {}
-impl<T: Source<Authorisation> + Source<Durable> + Source<Project> + Source<ConvoyLimits> + ?Sized> ConvoyWorld for T {}
+pub trait ConvoyWorld: Source<Authorisation> + Source<Durable> + Source<Project> + Source<ConvoyLimits> + Source<Holds> {}
+impl<T: Source<Authorisation> + Source<Durable> + Source<Project> + Source<ConvoyLimits> + Source<Holds> + ?Sized> ConvoyWorld for T {}
 
 /// An in-memory convoy world, for tests, replay and conformance.
 #[derive(Default)]
@@ -961,6 +998,7 @@ pub struct MemoryConvoyWorld {
     pub durable: Table<Durable>,
     pub projects: Table<Project>,
     pub limits: Table<ConvoyLimits>,
+    pub holds: Table<Holds>,
 }
 
 impl Source<ConvoyLimits> for MemoryConvoyWorld {
@@ -996,6 +1034,12 @@ impl Source<Authorisation> for MemoryConvoyWorld {
 impl Source<Durable> for MemoryConvoyWorld {
     fn lookup(&self, reference: &Ref<Durable>) -> Option<(Version, &bool)> {
         self.durable.lookup(reference)
+    }
+}
+
+impl Source<Holds> for MemoryConvoyWorld {
+    fn lookup(&self, reference: &Ref<Holds>) -> Option<(Version, &BTreeSet<String>)> {
+        self.holds.lookup(reference)
     }
 }
 
@@ -1080,7 +1124,7 @@ impl Machine for Convoy {
                 EdgeDef::<Self, RetireDuty>::new()
                     .from([Open])
                     .to([Open])
-                    .changes(["retired"])
+                    .changes(["retired_duties"])
                     .gate("an authorised retirement of a holding lifetime duty", gate_retire_duty)
                     .effect(retire_duty),
             )
@@ -1182,8 +1226,14 @@ impl Machine for Convoy {
                     .gate("an authorised quota over the same classes, no count lower", gate_readmit)
                     .effect(readmit),
             )
-            .end(Delivered, "the convoy delivered its work")
-            .end(Abandoned, "the convoy was abandoned")
+            .edge(
+                EdgeDef::<Self, Retire>::new()
+                    .from([Delivered, Abandoned])
+                    .to([Retired])
+                    .gate("ended, and nothing holds it", gate_retire)
+                    .effect(|_, _, _| ConvoyState::Retired),
+            )
+            .end(Retired, "the convoy ended and nothing holds it")
     }
 
     /// A convoy needs an obligation: a promise or a convoy-lifetime duty.
@@ -1246,7 +1296,7 @@ impl Machine for Convoy {
             };
             spec.promises.append(0, row).expect("a request holds fewer than 2^32 promises");
         }
-        Ok((spec, ConvoyState::Open { quota: request.quota, retired: BTreeSet::new() }))
+        Ok((spec, ConvoyState::Open { quota: request.quota, retired_duties: BTreeSet::new() }))
     }
 }
 
@@ -1478,6 +1528,14 @@ fn gate_abandon(h: &mut Handle<'_, Convoy>, abandon: &Abandon) -> Result<(), Con
     }
 }
 
+fn gate_retire(h: &mut Handle<'_, Convoy>, retire: &Retire) -> Result<(), ConvoyRefusal> {
+    match h.read(&retire.holds) {
+        None => Err(ConvoyRefusal::HoldsUnread),
+        Some(holds) if !holds.is_empty() => Err(ConvoyRefusal::Held(holds.clone())),
+        Some(_) => Ok(()),
+    }
+}
+
 // Spec: the class domain is fixed and no count may fall below the quota in force.
 fn gate_readmit(h: &mut Handle<'_, Convoy>, readmit: &Readmit) -> Result<(), ConvoyRefusal> {
     if !authorised(h, &readmit.authority) {
@@ -1569,9 +1627,9 @@ fn resupervise(h: &mut Handle<'_, Convoy>, state: ConvoyState, change: &Resuperv
 
 fn retire_duty(_: &mut Handle<'_, Convoy>, state: ConvoyState, retire: &RetireDuty) -> ConvoyState {
     match state {
-        ConvoyState::Open { quota, mut retired } => {
-            retired.insert(retire.duty);
-            ConvoyState::Open { quota, retired }
+        ConvoyState::Open { quota, mut retired_duties } => {
+            retired_duties.insert(retire.duty);
+            ConvoyState::Open { quota, retired_duties }
         }
         other => other,
     }
@@ -1594,15 +1652,17 @@ fn unlink(h: &mut Handle<'_, Convoy>, state: ConvoyState, unlink: &Unlink) -> Co
 
 fn deliver(_: &mut Handle<'_, Convoy>, state: ConvoyState, deliver: &Deliver) -> ConvoyState {
     match state {
-        ConvoyState::Open { quota, retired } => ConvoyState::Delivered { quota, retired, disposition: deliver.disposition.clone() },
+        ConvoyState::Open { quota, retired_duties } => {
+            ConvoyState::Delivered { quota, retired_duties, disposition: deliver.disposition.clone() }
+        }
         other => other,
     }
 }
 
 fn abandon(_: &mut Handle<'_, Convoy>, state: ConvoyState, abandon: &Abandon) -> ConvoyState {
     match state {
-        ConvoyState::Open { quota, retired } => {
-            ConvoyState::Abandoned { quota, retired, cause: abandon.cause, reason: abandon.reason.clone() }
+        ConvoyState::Open { quota, retired_duties } => {
+            ConvoyState::Abandoned { quota, retired_duties, cause: abandon.cause, reason: abandon.reason.clone() }
         }
         other => other,
     }
@@ -1610,7 +1670,7 @@ fn abandon(_: &mut Handle<'_, Convoy>, state: ConvoyState, abandon: &Abandon) ->
 
 fn readmit(_: &mut Handle<'_, Convoy>, state: ConvoyState, readmit: &Readmit) -> ConvoyState {
     match state {
-        ConvoyState::Open { retired, .. } => ConvoyState::Open { quota: readmit.quota.clone(), retired },
+        ConvoyState::Open { retired_duties, .. } => ConvoyState::Open { quota: readmit.quota.clone(), retired_duties },
         other => other,
     }
 }

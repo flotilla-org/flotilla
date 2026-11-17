@@ -445,7 +445,7 @@ fn convoy_and_awaiting_reply_round_trip() {
     let state = State::new(
         ConvoyState::Abandoned {
             quota: [(VesselClass::new("standard"), 2)].into(),
-            retired: BTreeSet::from([DutyId(0)]),
+            retired_duties: BTreeSet::from([DutyId(0)]),
             cause: AbandonCause::Operator,
             reason: "decision".into(),
         },

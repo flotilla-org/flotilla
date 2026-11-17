@@ -310,6 +310,12 @@ impl ArtifactService<'_> {
     /// Deletes this home's unpinned artifacts past their expiry: the digests still referenced, and
     /// when the next unpinned artifact expires.
     pub async fn reap_expired(&self) -> Result<Reaped, String> {
+        self.reap(&|_| false).await
+    }
+
+    /// [`Self::reap_expired`], also deleting the unpinned artifacts of each convoy `retired` says
+    /// has retired: an artifact goes with its convoy unless it is pinned.
+    pub async fn reap(&self, retired: &(dyn Fn(&str) -> bool + Sync)) -> Result<Reaped, String> {
         let resolver = self.backend.using::<Artifact>(self.namespace);
         let now = Utc::now();
         let mut next_expiry = None;
@@ -317,7 +323,7 @@ impl ArtifactService<'_> {
             if artifact.spec.pinned {
                 continue;
             }
-            if artifact.spec.expires_at <= now {
+            if artifact.spec.expires_at <= now || retired(&artifact.spec.convoy) {
                 resolver.delete(&artifact.metadata.name).await.map_err(|error| error.to_string())?;
             } else {
                 next_expiry = next_expiry.min(Some(artifact.spec.expires_at)).or(Some(artifact.spec.expires_at));

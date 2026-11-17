@@ -186,7 +186,7 @@ CREATE TABLE "convoy" (
   "project" INTEGER NOT NULL REFERENCES "strings" ("id"),
   "priority" INTEGER NOT NULL,
   "kinds" BLOB NOT NULL REFERENCES "objects" ("hash"),
-  "state" TEXT NOT NULL CHECK ("state" IN ('ab', 'de', 'op')),
+  "state" TEXT NOT NULL CHECK ("state" IN ('ab', 'de', 'op', 're')),
   "state_since" INTEGER NOT NULL,
   "disposition" TEXT,
   "cause" TEXT CHECK ("cause" IN ('fa', 'op')),
@@ -205,6 +205,11 @@ CREATE TABLE "convoy" (
       THEN "cause" IS NOT NULL
       AND "reason" IS NOT NULL
       AND "disposition" IS NULL
+      END),
+  CHECK (CASE WHEN "state" = 're'
+      THEN "disposition" IS NULL
+      AND "cause" IS NULL
+      AND "reason" IS NULL
       END)
 ) STRICT;
 CREATE TABLE "convoy_subjects" (
@@ -288,7 +293,7 @@ CREATE TABLE "convoy_quota" (
   PRIMARY KEY ("convoy", "key"),
   FOREIGN KEY ("convoy") REFERENCES "convoy" ("id") ON DELETE CASCADE
 ) STRICT, WITHOUT ROWID;
-CREATE TABLE "convoy_retired" (
+CREATE TABLE "convoy_retired_duties" (
   "convoy" INTEGER NOT NULL,
   "value" INTEGER NOT NULL,
   PRIMARY KEY ("convoy", "value"),
@@ -302,6 +307,7 @@ INSERT INTO "codes" ("kind", "field", "code", "name") VALUES
   ('cv', 'state', 'ab', 'Abandoned'),
   ('cv', 'state', 'de', 'Delivered'),
   ('cv', 'state', 'op', 'Open'),
+  ('cv', 'state', 're', 'Retired'),
   ('cv', 'cause', 'fa', 'Failed'),
   ('cv', 'cause', 'op', 'Operator'),
   ('cv', 'subjects.source', 'br', 'Branch'),
@@ -326,6 +332,7 @@ INSERT INTO "codes" ("kind", "field", "code", "name") VALUES
   ('cv', 'log:edge', 'lk', 'Link'),
   ('cv', 'log:edge', 'ra', 'Readmit'),
   ('cv', 'log:edge', 'rd', 'RetireDuty'),
+  ('cv', 'log:edge', 're', 'Retire'),
   ('cv', 'log:edge', 'rj', 'Reject'),
   ('cv', 'log:edge', 'rp', 'ReplaceSeat'),
   ('cv', 'log:edge', 'rs', 'Reassign'),
@@ -336,7 +343,8 @@ INSERT INTO "codes" ("kind", "field", "code", "name") VALUES
   ('cv', 'log:edge', 'ul', 'Unlink'),
   ('cv', 'log:label', 'ab', 'Abandoned'),
   ('cv', 'log:label', 'de', 'Delivered'),
-  ('cv', 'log:label', 'op', 'Open');
+  ('cv', 'log:label', 'op', 'Open'),
+  ('cv', 'log:label', 're', 'Retired');
 CREATE VIEW "convoy_view" AS SELECT
   "convoy"."id",
   "convoy"."version",
@@ -416,10 +424,10 @@ CREATE VIEW "convoy_quota_view" AS SELECT
   (SELECT "s" FROM "strings" WHERE "id" = "convoy_quota"."key") AS "key",
   "convoy_quota"."value"
 FROM "convoy_quota";
-CREATE VIEW "convoy_retired_view" AS SELECT
-  "convoy_retired"."convoy",
-  "convoy_retired"."value"
-FROM "convoy_retired";
+CREATE VIEW "convoy_retired_duties_view" AS SELECT
+  "convoy_retired_duties"."convoy",
+  "convoy_retired_duties"."value"
+FROM "convoy_retired_duties";
 CREATE TABLE "dossier" (
   "id" INTEGER PRIMARY KEY REFERENCES "resource_identity" ("id"),
   "version" INTEGER NOT NULL,

@@ -791,6 +791,7 @@ fn convoy_value(resource: &Resource<Convoy>) -> Value {
             };
             variant("Abandoned", json!({ "cause": constant(cause), "reason": reason }))
         }
+        ConvoyState::Retired => constant("Retired"),
     };
     json!({ "work": work, "phase": phase })
 }

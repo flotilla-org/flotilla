@@ -13,7 +13,7 @@ async fn an_artifact_is_reaped_at_its_expiry_without_a_timer() {
     let blobs = Arc::new(TieredBlobStore::new(state.path(), Vec::new()));
     let home = EngineBackend::open_in("home", NAMESPACE);
     let backend = home.backend.clone();
-    let task = tokio::spawn(run_artifact_gc(backend.clone(), NAMESPACE.into(), Arc::clone(&blobs)));
+    let task = tokio::spawn(run_artifact_gc(backend.clone(), NAMESPACE.into(), Arc::clone(&blobs), Arc::new(|_: &str| false)));
     let artifacts = backend.using::<Artifact>(NAMESPACE);
     let digest = blobs.put(b"review notes").await.expect("put blob");
     let name = |subject: &str| {
@@ -46,4 +46,40 @@ async fn an_artifact_is_reaped_at_its_expiry_without_a_timer() {
     assert!(artifacts.get(&name("kept")).await.is_ok(), "a pinned artifact is never reaped");
     assert!(!task.is_finished());
     task.abort();
+}
+
+// Behaviour (#3108 retirement): an unpinned artifact goes with its convoy when the convoy retires,
+// long before its expiry; a pinned one outlives it, and another convoy's stays.
+#[tokio::test]
+async fn a_retired_convoys_unpinned_artifacts_go_with_it() {
+    let state = tempfile::tempdir().expect("state dir");
+    let blobs = TieredBlobStore::new(state.path(), Vec::new());
+    let backend = ResourceBackend::new(InMemoryBackend::default());
+    let artifacts = backend.using::<Artifact>(NAMESPACE);
+    let digest = blobs.put(b"decision ledger").await.expect("put blob");
+    let name = |convoy: &str, subject: &str| {
+        flotilla_resources::address::record_name(
+            &flotilla_resources::address::artifact_address(convoy, "coder", "decision-ledger", subject).expect("artifact address"),
+        )
+        .expect("record name")
+    };
+    for (convoy, subject, pinned) in [("gone", "ledger", false), ("gone", "kept", true), ("live", "ledger", false)] {
+        let spec = ArtifactSpec::builder()
+            .convoy(convoy.into())
+            .producer("coder".into())
+            .kind("decision-ledger".into())
+            .subject(subject.into())
+            .digest(digest.as_str().to_owned())
+            .size(15)
+            .media_type("text/plain".into())
+            .expires_at(Utc::now() + chrono::Duration::days(3650))
+            .pinned(pinned)
+            .build();
+        artifacts.create(&InputMeta::builder().name(name(convoy, subject)).build(), &spec).await.expect("create artifact");
+    }
+    let service = crate::artifact::ArtifactService { backend: &backend, blobs: &blobs, namespace: NAMESPACE };
+    service.reap(&|convoy| convoy == "gone").await.expect("reap");
+    assert!(artifacts.get(&name("gone", "ledger")).await.is_err(), "the retired convoy's unpinned artifact went with it");
+    assert!(artifacts.get(&name("gone", "kept")).await.is_ok(), "a pinned artifact outlives its convoy");
+    assert!(artifacts.get(&name("live", "ledger")).await.is_ok(), "another convoy's artifact stays");
 }

@@ -441,7 +441,8 @@ impl EngineConvoys for ConvoyEngine {
         let disposition = disposition.to_owned();
         self.edit(convoy, move |current, _| {
             Ok((
-                if current.label() == ConvoyLabel::Delivered {
+                // A retired convoy has nothing left to deliver.
+                if matches!(current.label(), ConvoyLabel::Delivered | ConvoyLabel::Retired) {
                     Vec::new()
                 } else {
                     vec![Deliver { disposition: disposition.clone() }.into()]

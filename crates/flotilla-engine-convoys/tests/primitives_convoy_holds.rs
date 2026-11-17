@@ -6,9 +6,14 @@ use std::{
     sync::Arc,
 };
 
-use flotilla_engine_convoys::{convoys::Convoys, holds::holds};
-use flotilla_engine_messages::awaiting::{AwaitingReplies, STALL};
-use flotilla_engine_store::StoreLog;
+use flotilla_engine_convoys::{
+    convoy_records::EngineConvoyRecords,
+    convoys::{Convoys, Retirement},
+    holds::holds,
+    retire,
+};
+use flotilla_engine_messages::awaiting::{AwaitingReplies, OpenAwaiting, STALL};
+use flotilla_engine_store::{watch::EngineWatch, StoreLog};
 use flotilla_protocol::PrincipalRef;
 use flotilla_provisioning::{
     engine::{account::binding_spec, LifecycleHome, Lifecycles, Step},
@@ -25,19 +30,20 @@ use flotilla_resources::{
     account_access::{requester_address, AccessName, AccountBindingSpec, CredentialName, EpochEntry, Selection},
     address::{stored_change_request_address, subject_for},
     convoy::{admission::AdmissionDocument, engine::seat_address},
+    convoy_records::ConvoyRecords,
     vessel_resource_name,
     workflow_template::single_agent_workflow_spec,
-    AccessDeliverySpec, WorkflowSnapshot,
+    AccessDeliverySpec, SystemClock, WorkflowSnapshot,
 };
-use flotilla_schema::{Address, Frozen, NewChange, Records, State, Timestamp};
+use flotilla_schema::{Address, Frozen, Kind, NewChange, Records, State, Timestamp};
 use flotilla_schema_sqlite::stream::Service;
 use flotilla_state_machines::{
     kinds::{stock, Catalog},
     machines::{
         awaiting_reply::{Awaited, AwaitingReplySpec},
         convoy::{
-            AdmissionBytes, AdmittedPromise, ConvoyId, ConvoyRequest, Link, LinkSource, Priority, PromiseId, PromiseSource, Seat, SeatName,
-            VesselClass,
+            Abandon, AbandonCause, AdmissionBytes, AdmittedPromise, Convoy, ConvoyId, ConvoyLabel, ConvoyRequest, Link, LinkSource,
+            Priority, PromiseId, PromiseSource, Seat, SeatName, VesselClass,
         },
         message::{Message, MessageBody, MessageRef, MessageSpec, MessageState, Relation},
         vessel::{VesselKind, VesselSpec},
@@ -124,7 +130,7 @@ fn request() -> ConvoyRequest {
 
 struct Fixture {
     service: Arc<Service>,
-    convoys: Convoys,
+    convoys: Arc<Convoys>,
     launch: String,
 }
 
@@ -132,7 +138,7 @@ impl Fixture {
     fn new(dir: &tempfile::TempDir) -> Self {
         let registry = stored::decided_registry().expect("registry");
         let service = Arc::new(Service::open(&dir.path().join("decided.sqlite"), HOME, registry).expect("store"));
-        let convoys = Convoys::open(HOME, &service).expect("open");
+        let convoys = Arc::new(Convoys::open(HOME, &service).expect("open"));
         convoys.world(|world| {
             world.projects.put(&Ref::new(project().as_str()), ());
             world.authority.put(&Ref::new("granted"), true);
@@ -318,6 +324,94 @@ fn each_unreleased_dependent_holds_the_convoy() {
     ]
     .into();
     assert_eq!(fixture.holds(), expected);
+}
+
+impl Fixture {
+    fn checkouts(&self) -> Arc<dyn Lifecycles<CheckoutKind>> {
+        Arc::new(LifecycleHome::new(HOME, Home::with_log(HOME, StoreLog::new(self.service.store())).expect("home")))
+    }
+
+    /// A worktree checkout held by the convoy.
+    fn checkout(&self, checkouts: &Arc<dyn Lifecycles<CheckoutKind>>, name: &str) -> String {
+        let request = CheckoutRequest {
+            launch_of: name.into(),
+            launch: 0,
+            repository: "repo".into(),
+            environment: flotilla_schema::Ref::new("env".to_owned(), HOME),
+            branch: "feature".into(),
+            base: None,
+            path: "/w".into(),
+            source: Source::Worktree,
+            clone: Some(flotilla_schema::Ref::new("clone", HOME)),
+            holder: Some(Holder::convoy(&self.launch)),
+        };
+        checkouts.request(name, request, Timestamp(2_000_000)).expect("requested").name().to_owned()
+    }
+
+    fn abandon(&self) {
+        let abandon = Abandon {
+            by: SeatName::new("coder", ""),
+            cause: AbandonCause::Operator,
+            reason: "stopped".into(),
+            authority: Ref::new("granted"),
+        };
+        self.convoys.apply("fix-it", abandon, Timestamp(4_000_000)).expect("abandoned");
+    }
+
+    fn label(&self) -> ConvoyLabel {
+        self.convoys.launch(&self.launch).expect("launch").label()
+    }
+}
+
+// Behaviour: an open convoy does not retire; an ended one waits for its holds, then retires, and
+// reads as absent to its readers.
+#[test]
+fn an_ended_convoy_retires_once_its_holds_release() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let fixture = Fixture::new(&dir);
+    let checkouts = fixture.checkouts();
+    let checkout = fixture.checkout(&checkouts, "ck");
+    let records =
+        EngineConvoyRecords::new(HOME, Arc::clone(&fixture.service), Arc::default(), OpenAwaiting::open(&fixture.service).expect("open"));
+
+    assert_eq!(fixture.convoys.retire(&fixture.launch, Timestamp(3_000_000)), Ok(Retirement::NotEnded));
+    fixture.abandon();
+    assert_eq!(
+        fixture.convoys.retire(&fixture.launch, Timestamp(5_000_000)),
+        Ok(Retirement::Held([format!("checkout:{checkout}")].into()))
+    );
+    assert_eq!(fixture.label(), ConvoyLabel::Abandoned);
+    assert!(records.get(&fixture.launch, None).expect("read").is_some(), "an ended, held convoy still reads");
+
+    checkouts.step(&checkout, &Step::Released, Timestamp(6_000_000)).expect("released");
+    assert_eq!(fixture.convoys.retire(&fixture.launch, Timestamp(7_000_000)), Ok(Retirement::Retired));
+    assert_eq!(fixture.label(), ConvoyLabel::Retired);
+    assert_eq!(records.get(&fixture.launch, None).expect("read"), None, "a retired convoy reads as absent");
+    assert_eq!(records.at(HOME).expect("listing").records.len(), 0);
+}
+
+// Behaviour: the convoy's home retires it on its own when its last hold releases, woken by the
+// release's write; nothing is called and nothing polls.
+#[tokio::test]
+async fn the_home_retires_a_convoy_when_its_last_hold_releases() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let fixture = Fixture::new(&dir);
+    let checkouts = fixture.checkouts();
+    let checkout = fixture.checkout(&checkouts, "ck");
+    fixture.abandon();
+    let mut convoy_writes = EngineWatch::start(Arc::clone(&fixture.service), [<Resource<Convoy> as Kind>::CODE]).expect("watch");
+    // It starts by trying the ended convoy, which its checkout holds.
+    let follower = retire::follow(Arc::clone(&fixture.convoys), Arc::new(SystemClock)).expect("follow");
+    assert_eq!(fixture.label(), ConvoyLabel::Abandoned);
+
+    checkouts.step(&checkout, &Step::Released, Timestamp(6_000_000)).expect("released");
+    let retired = async {
+        while fixture.label() != ConvoyLabel::Retired {
+            convoy_writes.next(|_, _| Ok(())).await.expect("a convoy write");
+        }
+    };
+    tokio::time::timeout(std::time::Duration::from_secs(30), retired).await.expect("retired once its checkout released");
+    follower.abort();
 }
 
 /// The one stall record's name.

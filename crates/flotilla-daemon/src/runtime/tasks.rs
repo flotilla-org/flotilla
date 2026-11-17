@@ -91,11 +91,16 @@ const GC_RETRY: RetryBackoff = RetryBackoff { initial: Duration::from_secs(60), 
 /// Consecutive failed collections retried at [`GC_RETRY`]; past it, the next Artifact change retries.
 const GC_RETRY_LIMIT: u32 = 10;
 
-/// Reaps expired artifacts and collects unreferenced blobs at once, then at each change to this
-/// home's Artifacts and at the next time an artifact expires or a blob's grace passes, never on a
-/// timer. A failed collection retries at a backoff a finite number of times.
-pub(super) async fn run_artifact_gc(backend: ResourceBackend, namespace: String, blobs: Arc<TieredBlobStore>) {
+/// Which convoys have retired, by name: their unpinned artifacts go with them.
+pub(super) type Retired = Arc<dyn Fn(&str) -> bool + Send + Sync>;
+
+/// Reaps expired artifacts and those of retired convoys, and collects unreferenced blobs at once,
+/// then at each change to this home's Artifacts or Convoys and at the next time an artifact
+/// expires or a blob's grace passes, never on a timer. A failed collection retries at a backoff a
+/// finite number of times.
+pub(super) async fn run_artifact_gc(backend: ResourceBackend, namespace: String, blobs: Arc<TieredBlobStore>, retired: Retired) {
     let mut changes = None;
+    let mut convoys = None;
     let mut failures = 0_u32;
     loop {
         if changes.is_none() {
@@ -104,8 +109,15 @@ pub(super) async fn run_artifact_gc(backend: ResourceBackend, namespace: String,
                 Err(error) => warn!(%error, "artifact retention could not watch artifacts"),
             }
         }
+        // A convoy that retires leaves the convoys watched: its artifacts are reaped then.
+        if convoys.is_none() {
+            match backend.using::<flotilla_resources::Convoy>(&namespace).watch(flotilla_resources::WatchStart::Now).await {
+                Ok(watch) => convoys = Some(watch.ready_chunks(64)),
+                Err(error) => warn!(%error, "artifact retention could not watch convoys"),
+            }
+        }
         let service = crate::artifact::ArtifactService { backend: &backend, blobs: blobs.as_ref(), namespace: &namespace };
-        let collected = match service.reap_expired().await {
+        let collected = match service.reap(retired.as_ref()).await {
             Ok(reaped) => {
                 if !reaped.unreadable.is_empty() {
                     warn!(skipped = reaped.unreadable.len(), "artifact retention skipped artifacts naming no blob");
@@ -136,11 +148,23 @@ pub(super) async fn run_artifact_gc(backend: ResourceBackend, namespace: String,
                 None => std::future::pending().await,
             }
         };
+        let convoy_changed = async {
+            match convoys.as_mut() {
+                Some(convoys) => convoys.next().await,
+                None => std::future::pending().await,
+            }
+        };
         tokio::select! {
             batch = changed => {
                 if !batch.is_some_and(|events| events.iter().all(Result::is_ok)) {
                     warn!("artifact watch ended; reopening it");
                     changes = None;
+                }
+            }
+            batch = convoy_changed => {
+                if !batch.is_some_and(|events| events.iter().all(Result::is_ok)) {
+                    warn!("convoy watch ended; reopening it");
+                    convoys = None;
                 }
             }
             () = async {

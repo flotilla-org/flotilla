@@ -261,6 +261,9 @@ fn refusal_of(refusal: ConvoyRefusal) -> Value {
         ConvoyRefusal::SubjectLinked => "SubjectLinked",
         ConvoyRefusal::UnknownSubject => "UnknownSubject",
         ConvoyRefusal::SeatCycle => "SeatCycle",
+        ConvoyRefusal::NotEnded => "NotEnded",
+        ConvoyRefusal::Held(holds) => return variant("Held", set_of(holds.iter().map(|hold| json!(hold)))),
+        ConvoyRefusal::HoldsUnread => "HoldsUnread",
     };
     bare(name)
 }
@@ -468,6 +471,7 @@ impl Conformance for ConvoyConformance {
             ConvoyState::Abandoned { cause, reason, .. } => {
                 variant("Abandoned", json!({ "cause": bare(cause_name(*cause)), "reason": reason }))
             }
+            ConvoyState::Retired => bare("Retired"),
         };
         json!({ "work": work(c.spec(), c.state()), "phase": phase })
     }

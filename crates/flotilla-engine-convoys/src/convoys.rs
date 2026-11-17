@@ -7,7 +7,10 @@
 //! the world before it applies the edge, the way the Message gates read
 //! [`flotilla_engine_messages::GateWorld`].
 
-use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
+use std::{
+    collections::BTreeSet,
+    sync::{Arc, Mutex, MutexGuard, PoisonError},
+};
 
 use flotilla_address::Address;
 use flotilla_engine_store::StoreLog;
@@ -16,9 +19,11 @@ use flotilla_schema::Timestamp;
 use flotilla_schema_sqlite::stream::Service;
 use flotilla_state_machines::{
     launch_name,
-    machines::convoy::{Convoy, ConvoyEdge, ConvoyRefusal, ConvoyRequest, ConvoySpec, MemoryConvoyWorld},
-    Edge as _, Home, Resource, Version, WriteError,
+    machines::convoy::{Convoy, ConvoyEdge, ConvoyLabel, ConvoyRefusal, ConvoyRequest, ConvoySpec, MemoryConvoyWorld, Retire},
+    Edge as _, Home, Ref, Resource, Version, WriteError,
 };
+
+use super::holds::holds;
 
 /// This home's Convoy records and the world their gates read.
 ///
@@ -83,6 +88,11 @@ impl Convoys {
         &self.home_name
     }
 
+    /// The decided store these records are written to.
+    pub fn service(&self) -> Arc<Service> {
+        Arc::clone(&self.service)
+    }
+
     /// This home's notes on its launches, which their readers and writers share.
     pub fn memory(&self) -> &Arc<ConvoyMemory> {
         &self.memory
@@ -115,9 +125,9 @@ impl Convoys {
 
     /// Edit the world the gates read; the next admission or edge reads the
     /// result. Projects stay (one entry per project admission named). The
-    /// `durable` and `authority` tables are scoped to one edge: put them here
-    /// for an [`Convoys::apply`] that follows, or inside an edit's plan. Any
-    /// [`Convoys::edit`] clears both when it ends, so an input put here before
+    /// `durable`, `authority` and `holds` tables are scoped to one edge: put them
+    /// here for an [`Convoys::apply`] that follows, or inside an edit's plan. Any
+    /// [`Convoys::edit`] clears them when it ends, so an input put here before
     /// an unrelated edit is gone after it.
     pub fn world<T>(&self, edit: impl FnOnce(&mut MemoryConvoyWorld) -> T) -> T {
         edit(&mut locked(&self.world))
@@ -190,8 +200,47 @@ impl Convoys {
         });
         world.durable = Default::default();
         world.authority = Default::default();
+        world.holds = Default::default();
         result
     }
+
+    /// Retires launch `name` homed here once it has ended and nothing holds it: its holds are
+    /// read from the store ([`holds`]), then Retire applies under the writer lock with what was
+    /// read, so the log records why it retired. A hold that appears after the read finds the
+    /// convoy retired, and its dependent takes it as gone.
+    pub fn retire(&self, name: &str, now: Timestamp) -> Result<Retirement, String> {
+        let current = self.launch(name).ok_or_else(|| format!("convoy `{name}` is not on the engine at this home"))?;
+        match current.label() {
+            ConvoyLabel::Open => return Ok(Retirement::NotEnded),
+            ConvoyLabel::Retired => return Ok(Retirement::Retired),
+            ConvoyLabel::Delivered | ConvoyLabel::Abandoned => {}
+        }
+        let held = self
+            .service
+            .with_store(|store| holds(&mut store.read()?, &current, &self.home_name))
+            .map_err(|error| format!("convoy `{name}`'s holds: {error}"))?;
+        if !held.is_empty() {
+            return Ok(Retirement::Held(held));
+        }
+        let reference = format!("{name}/holds");
+        self.edit(name, now, move |_, world| {
+            world.holds.put(&Ref::new(reference.as_str()), held);
+            Ok((vec![Retire { holds: Ref::new(reference) }.into()], ()))
+        })
+        .map_err(|error| error.to_string())?;
+        Ok(Retirement::Retired)
+    }
+}
+
+/// What [`Convoys::retire`] found.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Retirement {
+    /// The convoy is open.
+    NotEnded,
+    /// It ended, and these dependents still hold it.
+    Held(BTreeSet<String>),
+    /// It is retired.
+    Retired,
 }
 
 /// The launch `name` names at `home`: itself when it is a launch held there, else the newest

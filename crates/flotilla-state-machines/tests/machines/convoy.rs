@@ -7,8 +7,8 @@ use flotilla_state_machines::{
     machines::convoy::{
         Abandon, AbandonCause, AddSeat, AdmittedPromise, Authority, Convoy, ConvoyEdgeKind, ConvoyLabel, ConvoyRefusal, ConvoyRequest,
         ConvoyState, Declare, Deliver, Duty, DutyId, DutyScope, FailSeat, Keep, Link, LinkSource, MemoryConvoyWorld, Priority, Progress,
-        PromiseId, PromiseKinds, PromiseSource, Quota, Readmit, Reassign, Reject, Resupervise, RetireDuty, Retract, Seat, SeatName, Submit,
-        Terms, Unlink, VesselClass,
+        PromiseId, PromiseKinds, PromiseSource, Quota, Readmit, Reassign, Reject, Resupervise, Retire, RetireDuty, Retract, Seat, SeatName,
+        Submit, Terms, Unlink, VesselClass,
     },
     Coded, Diagram, Home, InputRead, Machine, Ref, StateValue, Version, WriteError,
 };
@@ -129,16 +129,18 @@ fn the_declaration_is_valid() {
 }
 
 // State and edge codes are stable: renames never change them. Every label
-// carries the quota in force and the retired duties; Delivered also carries
-// its disposition, and Abandoned its cause and reason. Codes kept from the earlier machine stay (`ke`, `rt`, `de`,
+// until Retired carries the quota in force and the retired duties; Delivered
+// also carries its disposition, and Abandoned its cause and reason. Retired
+// carries nothing. Codes kept from the earlier machine stay (`ke`, `rt`, `de`,
 // `ab`, `ra`).
 #[test]
 fn codes_are_pinned() {
     let labels: Vec<_> = ConvoyLabel::ALL.iter().map(|s| (s.name(), s.code(), ConvoyState::fields(*s))).collect();
-    let expected: [(&str, Code, &[&str]); 3] = [
-        ("Open", Code::new("op"), &["quota", "retired"]),
-        ("Delivered", Code::new("de"), &["quota", "retired", "disposition"]),
-        ("Abandoned", Code::new("ab"), &["quota", "retired", "cause", "reason"]),
+    let expected: [(&str, Code, &[&str]); 4] = [
+        ("Open", Code::new("op"), &["quota", "retired_duties"]),
+        ("Delivered", Code::new("de"), &["quota", "retired_duties", "disposition"]),
+        ("Abandoned", Code::new("ab"), &["quota", "retired_duties", "cause", "reason"]),
+        ("Retired", Code::new("re"), &[]),
     ];
     assert_eq!(labels, expected);
     let edges: Vec<_> = ConvoyEdgeKind::ALL.iter().map(|k| (k.name(), k.code().as_str().to_owned())).collect();
@@ -160,19 +162,20 @@ fn codes_are_pinned() {
         ("deliver", "de"),
         ("abandon", "ab"),
         ("readmit", "ra"),
+        ("retire", "re"),
     ];
     assert_eq!(edges, expected.map(|(name, code)| (name, code.to_owned())));
 }
 
 // The diagram is drawn from the declaration: every edge with the data it
-// changes and the records it writes, and both ends.
+// changes and the records it writes, and its end.
 #[test]
 fn the_diagram_is_pinned() {
     let full = Convoy::definition().mermaid(Diagram::Full);
     for line in [
         "  Open --> Open: declare writes promises\n",
         "  Open --> Open: submit writes promises\n",
-        "  Open --> Open: retire_duty [retired]\n",
+        "  Open --> Open: retire_duty [retired_duties]\n",
         "  Open --> Open: add_seat writes seats\n",
         "  Open --> Open: resupervise writes seats\n",
         "  Open --> Open: fail_seat writes seats\n",
@@ -181,7 +184,9 @@ fn the_diagram_is_pinned() {
         "  Open --> Delivered: deliver [disposition]\n",
         "  Open --> Abandoned: abandon [cause, reason]\n",
         "  Open --> Open: readmit [quota]\n",
-        "  note right of Delivered: the convoy delivered its work\n",
+        "  Delivered --> Retired: retire\n",
+        "  Abandoned --> Retired: retire\n",
+        "  note right of Retired: the convoy ended and nothing holds it\n",
     ] {
         assert!(full.contains(line), "missing {line:?} in\n{full}");
     }
@@ -200,7 +205,7 @@ fn admission_requires_an_obligation() {
     assert_eq!(home.create("b", empty.clone(), &world(), Timestamp(0)).err(), Some(WriteError::Refused(ConvoyRefusal::NoObligations)));
     empty.duties = [(DutyId(0), lifetime("coder"))].into();
     let created = home.create("c", empty, &world(), Timestamp(0)).expect("a lifetime duty is an obligation");
-    assert_eq!(created.resource.state(), &ConvoyState::Open { quota: quota(&[("standard", 1)]), retired: BTreeSet::new() });
+    assert_eq!(created.resource.state(), &ConvoyState::Open { quota: quota(&[("standard", 1)]), retired_duties: BTreeSet::new() });
 }
 
 // #3392 G1: the project is read by address at admission, and the create
@@ -405,7 +410,8 @@ fn deliver_waits_for_promises_then_duties() {
     assert_eq!(apply(&mut home, retire(0, YES)), refused(ConvoyRefusal::UnknownDuty), "already retired");
     apply(&mut home, merged()).expect("delivered");
     let state = home.newest_launch("c", None).expect("exists").state().clone();
-    let delivered = ConvoyState::Delivered { quota: quota(&[("standard", 1)]), retired: [DutyId(0)].into(), disposition: "merged".into() };
+    let delivered =
+        ConvoyState::Delivered { quota: quota(&[("standard", 1)]), retired_duties: [DutyId(0)].into(), disposition: "merged".into() };
     assert_eq!(state, delivered);
     assert_eq!(apply(&mut home, submit(0, "coder", YES)), refused(ConvoyRefusal::NotOpen));
 }
@@ -427,6 +433,30 @@ fn abandon_is_an_authorised_decision() {
     assert_eq!((state.cause(), state.reason()), (Some(AbandonCause::Failed), Some("vessel failed")));
 }
 
+// Only an ended convoy retires, and only once its home read that nothing
+// holds it: unread holds are not "none". Retired is the end; it carries
+// nothing, and no edge leaves it.
+#[test]
+fn an_ended_convoy_retires_once_nothing_holds_it() {
+    let mut home = convoy(request(&[(0, PromiseSource::Template)]));
+    let mut world = world();
+    world.holds.put(&Ref::new("held"), ["message:m1".to_owned()].into());
+    world.holds.put(&Ref::new("free"), BTreeSet::new());
+    let retire = |home: &mut Home<Convoy>, holds: &str| {
+        let launch = home.newest_launch("c", None).expect("admitted").name().to_owned();
+        home.apply(&launch, Retire { holds: Ref::new(holds) }, &world, at()).map(drop)
+    };
+    assert_eq!(retire(&mut home, "free"), refused(ConvoyRefusal::NotEnded));
+    apply(&mut home, verdict(0, Authority::Operator)).expect("kept");
+    apply(&mut home, merged()).expect("delivered");
+    assert_eq!(retire(&mut home, "unread"), refused(ConvoyRefusal::HoldsUnread));
+    assert_eq!(retire(&mut home, "held"), refused(ConvoyRefusal::Held(["message:m1".to_owned()].into())));
+    retire(&mut home, "free").expect("retired");
+    assert_eq!(home.newest_launch("c", None).expect("exists").state(), &ConvoyState::Retired);
+    assert_eq!(retire(&mut home, "free"), refused(ConvoyRefusal::NotOpen));
+    assert_eq!(apply(&mut home, merged()), refused(ConvoyRefusal::NotOpen));
+}
+
 // A Fail verdict is authorised, has a reason, names a known seat and is
 // final for the seat; it records the reason and changes nothing else.
 #[test]
@@ -446,7 +476,7 @@ fn a_seat_fails_once_with_a_reason() {
     let convoy = home.newest_launch("c", None).expect("exists");
     let (_, coder) = convoy.spec().seat(&seat("coder")).expect("seat");
     assert_eq!(coder.failed.as_deref(), Some("crashed"));
-    assert_eq!(convoy.state(), &ConvoyState::Open { quota: quota(&[("standard", 1)]), retired: BTreeSet::new() });
+    assert_eq!(convoy.state(), &ConvoyState::Open { quota: quota(&[("standard", 1)]), retired_duties: BTreeSet::new() });
     assert_eq!(progress(&home, 0), Progress::Pending, "the verdict settles none of the seat's promises");
 }
 

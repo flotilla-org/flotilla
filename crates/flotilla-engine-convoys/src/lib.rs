@@ -7,3 +7,4 @@ pub mod convoy_map;
 pub mod convoy_records;
 pub mod convoys;
 pub mod holds;
+pub mod retire;
