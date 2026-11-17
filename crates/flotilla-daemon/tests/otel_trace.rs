@@ -2,6 +2,7 @@
 //! router and blocking inbox workers use the same in-memory exporter.
 use flotilla_config::ConfigStore;
 use flotilla_core::in_process::InProcessDaemon;
+use flotilla_daemon_testkit::server::HomedDaemon;
 use flotilla_protocol::HostName;
 use flotilla_tracing::{QueueIdGenerator, SdkTracerProvider, TracerProvider as _};
 #[path = "../../../tests/support/span_exporter.rs"]
@@ -16,18 +17,20 @@ use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt};
 #[path = "request_session_pair/message_homes.rs"]
 mod message_homes;
 
-/// A daemon whose Message path [`message_homes::engine`] opens once its mesh is up.
-async fn message_home_daemon(name: &str) -> Arc<InProcessDaemon> {
-    let dir = tempfile::tempdir().expect("config").keep();
-    std::fs::write(dir.join("daemon.toml"), "machine_id = 'test-machine'\n").expect("config");
-    InProcessDaemon::new(
+/// A daemon whose Message path [`message_homes::engine`] opens once its mesh is up, in a
+/// temporary home removed when the daemon's harness drops it.
+async fn message_home_daemon(name: &str) -> HomedDaemon {
+    let home = tempfile::tempdir().expect("config");
+    std::fs::write(home.path().join("daemon.toml"), "machine_id = 'test-machine'\n").expect("config");
+    let daemon = InProcessDaemon::new(
         vec![],
-        Arc::new(ConfigStore::with_base(dir)),
+        Arc::new(ConfigStore::with_base(home.path().to_path_buf())),
         flotilla_discovery_testkit::fake_discovery(false),
         HostName::new(name),
         Arc::new(flotilla_discovery_testkit::HostPeerOverlay::default()),
     )
-    .await
+    .await;
+    HomedDaemon::new(daemon, home)
 }
 
 #[derive(Clone, Default)]

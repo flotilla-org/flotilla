@@ -60,6 +60,35 @@ pub struct InMemoryRequestTopology {
     /// The homes whose change streams the follower holds back.
     pub follower_stream_holds: StreamHolds,
     _tasks: Vec<tokio::task::JoinHandle<()>>,
+    /// The daemons' temporary homes, removed after everything above drops.
+    _homes: Vec<tempfile::TempDir>,
+}
+
+/// A harness daemon and the temporary home it was made in, which goes when this does, or when
+/// the topology it joins does. A daemon made elsewhere comes with no home to remove.
+pub struct HomedDaemon {
+    pub daemon: Arc<InProcessDaemon>,
+    pub home: Option<tempfile::TempDir>,
+}
+
+impl HomedDaemon {
+    pub fn new(daemon: Arc<InProcessDaemon>, home: tempfile::TempDir) -> Self {
+        Self { daemon, home: Some(home) }
+    }
+}
+
+impl std::ops::Deref for HomedDaemon {
+    type Target = Arc<InProcessDaemon>;
+
+    fn deref(&self) -> &Arc<InProcessDaemon> {
+        &self.daemon
+    }
+}
+
+impl From<Arc<InProcessDaemon>> for HomedDaemon {
+    fn from(daemon: Arc<InProcessDaemon>) -> Self {
+        Self { daemon, home: None }
+    }
 }
 
 impl InMemoryRequestTopology {
@@ -97,6 +126,8 @@ pub struct InMemoryRequestMesh {
     pub clients: Vec<Arc<SocketDaemon>>,
     pub shutdown_txs: Vec<watch::Sender<bool>>,
     _tasks: Vec<tokio::task::JoinHandle<()>>,
+    /// The hosts' temporary homes, removed after everything above drops.
+    _homes: Vec<tempfile::TempDir>,
 }
 
 impl Drop for InMemoryRequestMesh {
@@ -107,36 +138,57 @@ impl Drop for InMemoryRequestMesh {
     }
 }
 
-pub async fn spawn_in_memory_request_mesh(hosts: Vec<Arc<InProcessDaemon>>) -> Result<InMemoryRequestMesh, String> {
+/// `hosts`' daemons, and their homes for the mesh to hold.
+fn homed(hosts: Vec<impl Into<HomedDaemon>>) -> (Vec<Arc<InProcessDaemon>>, Vec<tempfile::TempDir>) {
+    let (mut daemons, mut homes) = (Vec::new(), Vec::new());
+    for host in hosts {
+        let HomedDaemon { daemon, home } = host.into();
+        daemons.push(daemon);
+        homes.extend(home);
+    }
+    (daemons, homes)
+}
+
+impl InMemoryRequestMesh {
+    fn holding(mut self, homes: Vec<tempfile::TempDir>) -> Self {
+        self._homes = homes;
+        self
+    }
+}
+
+pub async fn spawn_in_memory_request_mesh(hosts: Vec<impl Into<HomedDaemon>>) -> Result<InMemoryRequestMesh, String> {
     spawn_in_memory_request_mesh_with_filter(hosts, Arc::new(Some)).await
 }
 
 /// A network-boundary fault injector for replication scenarios. Returning None
 /// drops one envelope; changing a request can simulate a failed stream round.
 pub async fn spawn_in_memory_request_mesh_with_filter(
-    hosts: Vec<Arc<InProcessDaemon>>,
+    hosts: Vec<impl Into<HomedDaemon>>,
     filter: EnvelopeFilter,
 ) -> Result<InMemoryRequestMesh, String> {
-    spawn_request_mesh(hosts, filter).await
+    let (hosts, homes) = homed(hosts);
+    Ok(spawn_request_mesh(hosts, filter).await?.holding(homes))
 }
 
 /// A full mesh whose hosts record replication into the given metrics, one per
 /// host in order, for load measurement (#3206).
 pub async fn spawn_in_memory_request_mesh_with_replication_metrics(
-    hosts: Vec<Arc<InProcessDaemon>>,
+    hosts: Vec<impl Into<HomedDaemon>>,
     replication_metrics: Vec<Arc<flotilla_store::load_metrics::ReplicationLoadMetrics>>,
 ) -> Result<InMemoryRequestMesh, String> {
+    let (hosts, homes) = homed(hosts);
     if replication_metrics.len() != hosts.len() {
         return Err("replication metrics must name one entry per host".into());
     }
-    spawn_request_graph(hosts, Arc::new(Some), replication_metrics, |_, _| true).await
+    Ok(spawn_request_graph(hosts, Arc::new(Some), replication_metrics, |_, _| true).await?.holding(homes))
 }
 
 /// Hosts linked in a line, each only to the next: the first and last are not directly connected,
 /// so what crosses between them is passed on by the hosts between.
-pub async fn spawn_in_memory_request_line(hosts: Vec<Arc<InProcessDaemon>>) -> Result<InMemoryRequestMesh, String> {
+pub async fn spawn_in_memory_request_line(hosts: Vec<impl Into<HomedDaemon>>) -> Result<InMemoryRequestMesh, String> {
+    let (hosts, homes) = homed(hosts);
     let replication_metrics = hosts.iter().map(|_| Arc::default()).collect();
-    spawn_request_graph(hosts, Arc::new(Some), replication_metrics, |left, right| right == left + 1).await
+    Ok(spawn_request_graph(hosts, Arc::new(Some), replication_metrics, |left, right| right == left + 1).await?.holding(homes))
 }
 
 async fn spawn_request_mesh(hosts: Vec<Arc<InProcessDaemon>>, filter: EnvelopeFilter) -> Result<InMemoryRequestMesh, String> {
@@ -251,12 +303,12 @@ async fn spawn_request_graph(
     .await
     .map_err(|_| "timed out waiting for in-memory request mesh to connect".to_string())??;
 
-    Ok(InMemoryRequestMesh { hosts, clients, shutdown_txs, _tasks: tasks })
+    Ok(InMemoryRequestMesh { hosts, clients, shutdown_txs, _tasks: tasks, _homes: Vec::new() })
 }
 
 pub async fn spawn_in_memory_request_topology(
-    leader: Arc<InProcessDaemon>,
-    follower: Arc<InProcessDaemon>,
+    leader: impl Into<HomedDaemon>,
+    follower: impl Into<HomedDaemon>,
 ) -> Result<InMemoryRequestTopology, String> {
     spawn_in_memory_request_topology_stateful(leader, follower).await
 }
@@ -264,8 +316,8 @@ pub async fn spawn_in_memory_request_topology(
 /// Like [`spawn_in_memory_request_topology`] but performs a Hello handshake so
 /// the client gets a server-assigned `session_id` for cursor ownership.
 pub async fn spawn_in_memory_request_topology_stateful(
-    leader: Arc<InProcessDaemon>,
-    follower: Arc<InProcessDaemon>,
+    leader: impl Into<HomedDaemon>,
+    follower: impl Into<HomedDaemon>,
 ) -> Result<InMemoryRequestTopology, String> {
     spawn_in_memory_request_topology_stateful_with_options(leader, follower, None, None, None).await
 }
@@ -273,16 +325,16 @@ pub async fn spawn_in_memory_request_topology_stateful(
 /// Stateful in-memory topology whose client declares an explicit attention
 /// character during the Hello handshake.
 pub async fn spawn_in_memory_request_topology_stateful_with_surface(
-    leader: Arc<InProcessDaemon>,
-    follower: Arc<InProcessDaemon>,
+    leader: impl Into<HomedDaemon>,
+    follower: impl Into<HomedDaemon>,
     surface: SurfaceDeclaration,
 ) -> Result<InMemoryRequestTopology, String> {
     spawn_in_memory_request_topology_stateful_with_options(leader, follower, Some(surface), None, None).await
 }
 
 pub async fn spawn_in_memory_request_topology_stateful_with_caller(
-    leader: Arc<InProcessDaemon>,
-    follower: Arc<InProcessDaemon>,
+    leader: impl Into<HomedDaemon>,
+    follower: impl Into<HomedDaemon>,
     surface: SurfaceDeclaration,
     caller: CommandCaller,
 ) -> Result<InMemoryRequestTopology, String> {
@@ -290,8 +342,8 @@ pub async fn spawn_in_memory_request_topology_stateful_with_caller(
 }
 
 pub async fn spawn_in_memory_request_topology_stateful_with_caller_and_blob_store(
-    leader: Arc<InProcessDaemon>,
-    follower: Arc<InProcessDaemon>,
+    leader: impl Into<HomedDaemon>,
+    follower: impl Into<HomedDaemon>,
     surface: SurfaceDeclaration,
     caller: CommandCaller,
     blob_store: Arc<TieredBlobStore>,
@@ -300,12 +352,14 @@ pub async fn spawn_in_memory_request_topology_stateful_with_caller_and_blob_stor
 }
 
 async fn spawn_in_memory_request_topology_stateful_with_options(
-    leader: Arc<InProcessDaemon>,
-    follower: Arc<InProcessDaemon>,
+    leader: impl Into<HomedDaemon>,
+    follower: impl Into<HomedDaemon>,
     surface: Option<SurfaceDeclaration>,
     caller: Option<CommandCaller>,
     blob_store: Option<Arc<TieredBlobStore>>,
 ) -> Result<InMemoryRequestTopology, String> {
+    let HomedDaemon { daemon: leader, home: leader_home } = leader.into();
+    let HomedDaemon { daemon: follower, home: follower_home } = follower.into();
     let leader_host = leader.host_name().clone();
     let follower_host = follower.host_name().clone();
 
@@ -429,6 +483,7 @@ async fn spawn_in_memory_request_topology_stateful_with_options(
         leader_stream_holds,
         follower_stream_holds,
         _tasks: vec![leader_runtime_handle, follower_runtime_handle, client_session_handle],
+        _homes: leader_home.into_iter().chain(follower_home).collect(),
     })
 }
 

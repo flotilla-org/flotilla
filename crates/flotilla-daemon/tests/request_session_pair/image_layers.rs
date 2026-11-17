@@ -43,13 +43,17 @@ async fn composed_image_routing_row(issuer: usize, satisfiable: bool) {
     let source = IssueSource { service: "https://github.com".into(), scope: "flotilla-org/flotilla".into() };
     let reference = IssueRef { source: source.clone(), id: "3397".into() };
     let mut hosts = Vec::new();
+    // The daemons' homes, removed when the scenario ends.
+    let mut config_dirs = Vec::new();
     for name in ["image-home", "image-issuer"] {
         let provider = Arc::new(flotilla_discovery_testkit::FakeIssueProvider::new());
         let mut issue = TestIssue::new("Triage label").id("3397").with_labels(vec!["needs:multi-host".into()]).build();
         issue.reference = reference.clone();
         provider.add_issues(vec![(reference.id.clone(), issue)]).await;
         let discovery = fake_discovery_with_provider_set(FakeDiscoveryProviders::new().with_issue_tracker(provider));
-        let config = test_config_store(tempfile::tempdir().unwrap().keep());
+        let config_dir = tempfile::tempdir().unwrap();
+        let config = test_config_store(config_dir.path().to_path_buf());
+        config_dirs.push(config_dir);
         let daemon = InProcessDaemon::new(
             vec![],
             config,

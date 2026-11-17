@@ -27,6 +27,7 @@ use flotilla_daemon_testkit::server::spawn_in_memory_request_topology_stateful;
 use flotilla_daemon_testkit::server::spawn_in_memory_request_topology_stateful_with_caller;
 use flotilla_daemon_testkit::server::spawn_in_memory_request_topology_stateful_with_caller_and_blob_store;
 use flotilla_daemon_testkit::server::spawn_in_memory_request_topology_stateful_with_surface;
+use flotilla_daemon_testkit::server::HomedDaemon;
 use flotilla_daemon_testkit::server::InMemoryRequestMesh;
 use flotilla_daemon_testkit::server::InMemoryRequestTopology;
 use flotilla_discovery_api::EnvironmentBag;
@@ -144,11 +145,11 @@ fn crew_facts(adapter: &str, stance: &str) -> TerminalLaunchFacts {
     TerminalLaunchFacts { agent: Some(AgentLaunch { adapter: adapter.into(), model: None, stance: stance.into() }), ..Default::default() }
 }
 
-async fn empty_daemon_named(host_name: &str) -> Arc<InProcessDaemon> {
+async fn empty_daemon_named(host_name: &str) -> HomedDaemon {
     empty_daemon_named_with_floor(host_name, None).await
 }
 
-async fn empty_daemon_named_with_floor(host_name: &str, free_space_floor_gib: Option<u64>) -> Arc<InProcessDaemon> {
+async fn empty_daemon_named_with_floor(host_name: &str, free_space_floor_gib: Option<u64>) -> HomedDaemon {
     let daemon = message_home_daemon_with_floor(host_name, free_space_floor_gib).await;
     // Its Message path, over the designated fleet's roles, as the runtime composes it.
     message_homes::seed_fleet(&daemon.resource_backend()).await;
@@ -158,11 +159,11 @@ async fn empty_daemon_named_with_floor(host_name: &str, free_space_floor_gib: Op
 
 /// A daemon composed with its engine, whose Message path [`message_homes::engine`] opens once
 /// its mesh is up.
-async fn message_home_daemon(host_name: &str) -> Arc<InProcessDaemon> {
+async fn message_home_daemon(host_name: &str) -> HomedDaemon {
     message_home_daemon_with_floor(host_name, None).await
 }
 
-async fn message_home_daemon_with_floor(host_name: &str, free_space_floor_gib: Option<u64>) -> Arc<InProcessDaemon> {
+async fn message_home_daemon_with_floor(host_name: &str, free_space_floor_gib: Option<u64>) -> HomedDaemon {
     let daemon = daemon_named_without_engine(host_name, free_space_floor_gib).await;
     // Composed with its engine, as the runtime composes a daemon.
     flotilla_daemon_testkit::engine::engine(&daemon);
@@ -170,13 +171,14 @@ async fn message_home_daemon_with_floor(host_name: &str, free_space_floor_gib: O
 }
 
 /// A daemon a [`DaemonRuntime`] will start, which composes its engine itself.
-async fn runtime_daemon_named(host_name: &str) -> Arc<InProcessDaemon> {
+async fn runtime_daemon_named(host_name: &str) -> HomedDaemon {
     daemon_named_without_engine(host_name, None).await
 }
 
-async fn daemon_named_without_engine(host_name: &str, free_space_floor_gib: Option<u64>) -> Arc<InProcessDaemon> {
-    let tmp = tempfile::tempdir().expect("tempdir");
-    let config = test_config_store_with_floor(tmp.keep(), free_space_floor_gib);
+/// A daemon in a temporary home, removed when the daemon's harness drops it.
+async fn daemon_named_without_engine(host_name: &str, free_space_floor_gib: Option<u64>) -> HomedDaemon {
+    let home = tempfile::tempdir().expect("tempdir");
+    let config = test_config_store_with_floor(home.path().to_path_buf(), free_space_floor_gib);
     let daemon = InProcessDaemon::new(
         vec![],
         config,
@@ -196,7 +198,7 @@ async fn daemon_named_without_engine(host_name: &str, free_space_floor_gib: Opti
                 .build(),
         ))
         .await;
-    daemon
+    HomedDaemon::new(daemon, home)
 }
 
 fn compatible_codex_facts() -> flotilla_resources::FulfilmentFacts {
@@ -625,7 +627,9 @@ fn partition_heal_and_request_runtime_restart_keep_deleted_resource_absent() {
     runtime.block_on(async {
         // Dropping the mesh cuts peer sessions; rebuilding sub-meshes models a
         // stable network partition and a fresh request runtime, not packet loss.
-        let hosts = vec![empty_daemon_named("home").await, empty_daemon_named("peer-b").await, empty_daemon_named("peer-c").await];
+        // Held to the end: the hosts outlive each mesh made over them.
+        let homed = [empty_daemon_named("home").await, empty_daemon_named("peer-b").await, empty_daemon_named("peer-c").await];
+        let hosts: Vec<_> = homed.iter().map(|host| Arc::clone(host)).collect();
         let mesh = spawn_in_memory_request_mesh(hosts.clone()).await.expect("full mesh");
         let name = "deleted-during-partition";
         create_sample(&hosts[0], name).await.expect("create home resource");
@@ -679,11 +683,10 @@ fn generated_partition_heal_restart_preserves_tombstones(tc: hegel::TestCase) {
     let transitions = (0..step_count).map(|_| tc.draw(gs::booleans())).collect::<Vec<_>>();
     let runtime = tokio::runtime::Builder::new_current_thread().enable_all().start_paused(true).build().expect("paused runtime");
     runtime.block_on(async {
-        let hosts = vec![
-            empty_daemon_named("transition-a").await,
-            empty_daemon_named("transition-b").await,
-            empty_daemon_named("transition-c").await,
-        ];
+        // Held to the end: the hosts outlive each mesh made over them.
+        let homed =
+            [empty_daemon_named("transition-a").await, empty_daemon_named("transition-b").await, empty_daemon_named("transition-c").await];
+        let hosts: Vec<_> = homed.iter().map(|host| Arc::clone(host)).collect();
         let mut mesh = spawn_tombstone_mesh(hosts.clone()).await.expect("initial mesh");
         let name = "transition-tombstone";
         create_sample(&hosts[home_index], name).await.expect("create at home");
@@ -4171,14 +4174,14 @@ async fn repository_identity_operations_scenario(alias: bool, observed: bool) {
         ))];
         let daemon = InProcessDaemon::new(
             Vec::new(),
-            test_config_store_with_floor(tmp.keep(), None),
+            test_config_store_with_floor(tmp.path().to_path_buf(), None),
             discovery,
             HostName::new("leader"),
             std::sync::Arc::new(flotilla_discovery_testkit::HostPeerOverlay::default()),
         )
         .await;
         flotilla_daemon_testkit::engine::engine(&daemon);
-        daemon
+        HomedDaemon::new(daemon, tmp)
     } else {
         empty_daemon_named("leader").await
     };
