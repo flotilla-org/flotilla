@@ -20,7 +20,7 @@ use std::{
 use async_trait::async_trait;
 use flotilla_address::{Address, Condition, Kind};
 use flotilla_resources::{
-    Convoy, ConvoyEnsure, ReadResourceObject, ResourceObject, ResourceProvenance, TerminalSession, TerminalSessionPhase,
+    crew_role_address, Convoy, ConvoyEnsure, ReadResourceObject, ResourceObject, ResourceProvenance, TerminalSession, TerminalSessionPhase,
     TerminalSessionSource, ThreeValue, CONVOY_LABEL, ENSURED_FROM_ANNOTATION, ROLE_ADDRESS_ANNOTATION, ROLE_LABEL, VESSEL_LABEL,
 };
 use flotilla_store::{ResourceBackend, WeakResourceBackend};
@@ -146,7 +146,8 @@ impl RoleBindings for RoleRouting {
             let labels = &terminal.metadata.labels;
             let mut addresses = Vec::new();
             if let (Some(convoy), Some(vessel), Some(role)) = (labels.get(CONVOY_LABEL), labels.get(VESSEL_LABEL), labels.get(ROLE_LABEL)) {
-                addresses.push(format!("{project}/{convoy}/{vessel}/{role}"));
+                // A standing generation's record name holds `/`; the address escapes it.
+                addresses.push(crew_role_address(&project, convoy, vessel, role));
                 if let Some((_, home)) = observed.convoy(keyed, namespace, convoy).await? {
                     observed.seat(keyed, namespace, convoy, &home, vessel, role).await?;
                 }
