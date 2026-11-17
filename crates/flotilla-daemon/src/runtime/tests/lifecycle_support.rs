@@ -35,6 +35,15 @@ impl Stage4aGitRunner {
         local[remote_index] = self.upstream.to_string_lossy().into_owned();
         Some(local)
     }
+
+    /// Git naming a remote URL this runner does not route locally would reach the network.
+    fn refuse_network(cmd: &str, args: &[&str]) -> Result<(), String> {
+        let remote = |arg: &&&str| ["https://", "http://", "ssh://", "git://", "git@"].iter().any(|scheme| arg.starts_with(scheme));
+        match args.iter().find(remote) {
+            Some(url) if cmd == "git" => Err(format!("test git runner refuses to reach {url}: git {}", args.join(" "))),
+            _ => Ok(()),
+        }
+    }
 }
 
 // Git transport boundary: retain the declared GitHub identity, but enforce
@@ -44,13 +53,19 @@ impl CommandRunner for Stage4aGitRunner {
     async fn run(&self, cmd: &str, args: &[&str], cwd: &Path, label: &ChannelLabel) -> Result<String, String> {
         match self.local_transport_args(cmd, args) {
             Some(local) => ProcessCommandRunner.run(cmd, &local.iter().map(String::as_str).collect::<Vec<_>>(), cwd, label).await,
-            None => self.inner.run(cmd, args, cwd, label).await,
+            None => {
+                Self::refuse_network(cmd, args)?;
+                self.inner.run(cmd, args, cwd, label).await
+            }
         }
     }
     async fn run_output(&self, cmd: &str, args: &[&str], cwd: &Path, label: &ChannelLabel) -> Result<CommandOutput, String> {
         match self.local_transport_args(cmd, args) {
             Some(local) => ProcessCommandRunner.run_output(cmd, &local.iter().map(String::as_str).collect::<Vec<_>>(), cwd, label).await,
-            None => self.inner.run_output(cmd, args, cwd, label).await,
+            None => {
+                Self::refuse_network(cmd, args)?;
+                self.inner.run_output(cmd, args, cwd, label).await
+            }
         }
     }
     async fn exists(&self, cmd: &str, args: &[&str]) -> bool {
