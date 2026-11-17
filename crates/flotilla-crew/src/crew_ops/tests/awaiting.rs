@@ -26,7 +26,7 @@ struct RecordingMessages {
     admitted: Mutex<BTreeMap<String, (Intent, DateTime<Utc>)>>,
     failures: AtomicUsize,
     records: Mutex<Vec<(String, String)>>,
-    ended: Mutex<Vec<(Vec<String>, Option<String>)>>,
+    ended: Mutex<Vec<(Vec<String>, Vec<String>)>>,
 }
 
 impl RecordingMessages {
@@ -185,8 +185,8 @@ impl EngineMessages for RecordingMessages {
         records.push(record);
         Ok(true)
     }
-    async fn end_stalls(&self, _namespace: &str, seats: &[String], stalled: Option<&str>, _reason: &str) -> Result<Vec<String>, String> {
-        self.ended.lock().expect("ended").push((seats.to_vec(), stalled.map(str::to_owned)));
+    async fn end_stalls(&self, _namespace: &str, seats: &[String], stalled: &[String], _reason: &str) -> Result<Vec<String>, String> {
+        self.ended.lock().expect("ended").push((seats.to_vec(), stalled.to_vec()));
         Ok(Vec::new())
     }
     async fn delivery_held_until(&self, _namespace: &str, _receiver: &str) -> Result<Option<chrono::DateTime<chrono::Utc>>, String> {
@@ -280,5 +280,5 @@ async fn the_stall_reconciler_ends_records_of_subjects_not_stalled() {
     crew.reconcile_crew_stalls_once("flotilla").await.expect("one pass");
     let project = flotilla_address::Address::project("flotilla").expect("project address");
     let convoy = flotilla_resources::convoy::engine::launch_address(&project, &held.launch).expect("launch address");
-    assert_eq!(messages.ended.lock().expect("ended").as_slice(), &[(vec![held.receiver("work", "coder"), convoy.to_string()], None)]);
+    assert_eq!(messages.ended.lock().expect("ended").as_slice(), &[(vec![held.receiver("work", "coder"), convoy.to_string()], vec![])]);
 }

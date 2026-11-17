@@ -14,10 +14,13 @@ pub(super) struct SupervisionRoutes<'a> {
     pub(super) receivers: &'a MessageReceiverSnapshot,
 }
 
+/// The supervision ladder of a stall about `seat` in `convoy`: routed from the seat, or from the
+/// convoy's role for none.
 pub(super) fn supervision_policy(
     routes: SupervisionRoutes<'_>,
     convoy: &ResourceObject<Convoy>,
     projects: &[impl Borrow<ReadResourceObject<Project>>],
+    seat: Option<(&str, &str)>,
 ) -> Result<Vec<SupervisionTarget>, String> {
     let status = convoy.status.as_ref().ok_or("convoy has no status")?;
     let project_policy = convoy.spec.project_ref.as_ref().and_then(|project| {
@@ -35,10 +38,7 @@ pub(super) fn supervision_policy(
             ]
         });
     if let Some(project) = convoy.spec.project_ref.as_deref() {
-        let sender = status
-            .stalled
-            .as_ref()
-            .and_then(stalled_source_actor)
+        let sender = seat
             .map(|(vessel, role)| crew_role_address(project, &convoy.metadata.name, vessel, role))
             .unwrap_or_else(|| format!("{project}/{}", convoy.spec.role));
         let path = flotilla_messaging::supervision_path(routes.declarations, routes.receivers, project, &sender)
@@ -168,8 +168,17 @@ impl super::LeafSubscriptionTable {
         let convoys = backend.including_replicas::<Convoy>(namespace).list().await.map_err(|error| error.to_string())?.items;
         let declarations = CascadeDeclarations::load(backend, namespace).await.map_err(|error| error.to_string())?;
         let receivers = MessageReceiverSnapshot::load(backend, namespace).await.map_err(|error| error.to_string())?;
-        let policy = supervision_policy(SupervisionRoutes { declarations: &declarations, receivers: &receivers }, convoy, &projects)?;
-        let stalled = convoy.status.as_ref().and_then(|status| status.stalled.as_ref()).ok_or("crew is not stalled")?;
+        let stalled = convoy
+            .status
+            .as_ref()
+            .and_then(|status| status.stalls.naming(source_vessel, source_role))
+            .ok_or_else(|| format!("crew `{source_vessel}/{source_role}` is not stalled"))?;
+        let policy = supervision_policy(
+            SupervisionRoutes { declarations: &declarations, receivers: &receivers },
+            convoy,
+            &projects,
+            stalled.seat(),
+        )?;
         let mut condition = stalled.clone();
         let mut start = stalled.supervision_index.map_or(0, |index| index.saturating_add(1));
         // Old records may have an owner without a cursor. Live subscription
@@ -232,7 +241,7 @@ impl super::LeafSubscriptionTable {
                 .receiver(addressed)
                 .namespace(namespace.to_string())
                 .convoy(target_convoy.clone())
-                .source(super::stalls::supervision_message_source(&convoy.metadata.name, index))
+                .source(super::stalls::supervision_message_source(&convoy.metadata.name, stalled.seat(), index))
                 .vessel(vessel.clone())
                 .role(role.clone())
                 .brief(format!("Escalated by {sender}: {message}\n\n{}", super::stalls::stall_supervision_brief(convoy, stalled)))

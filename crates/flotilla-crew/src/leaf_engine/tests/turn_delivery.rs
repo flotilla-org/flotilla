@@ -40,7 +40,7 @@ async fn queued_turn_case(rung: TurnDeliveryRung, state: usize, age: i64) {
     let mut status = case.status().await;
     assert_eq!(status.phase, ConvoyPhase::Interrupted);
     status.attention = None;
-    status.stalled = None;
+    status.stalls.clear();
     status.turn_deliveries.insert("review".into(), queued_turn(rung, start, start, "turn"));
     // Episodes, including their original age, survive the status's wire form.
     let status: ConvoyStatus = serde_json::from_value(serde_json::to_value(status).unwrap()).unwrap();
@@ -108,7 +108,7 @@ async fn queued_turn_observations_write_once_per_convoy() {
     interrupt(&case);
     let convoy = case
         .note(|status| {
-            status.stalled = None;
+            status.stalls.clear();
             status.attention = None;
             for source in ["review", "checks"] {
                 let queued = queued_turn(TurnDeliveryRung::WarmSession, now, now - chrono::Duration::seconds(301), source);

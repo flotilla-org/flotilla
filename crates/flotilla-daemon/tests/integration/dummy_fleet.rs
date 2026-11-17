@@ -669,7 +669,7 @@ async fn the_standing_governor_resumes_a_stalled_coder() {
     fleet.wait("the governor Active", in_phase(&governor, ConvoyPhase::Active)).await;
     let name = create_through_admission(&fleet, &role, CrewMix::Coder.workflow_name()).await;
     let governed = |status: &ConvoyStatus| {
-        status.stalled.as_ref().and_then(|stall| stall.supervisor.as_ref()).is_some_and(|supervisor| supervisor.convoy == governor)
+        status.stalls.iter().filter_map(|stall| stall.supervisor.as_ref()).any(|supervisor| supervisor.convoy == governor)
     };
     fleet.wait("a stall the governor supervises", convoy(&name, governed)).await;
     fleet.wait("Landed", in_phase(&name, ConvoyPhase::Landed)).await;

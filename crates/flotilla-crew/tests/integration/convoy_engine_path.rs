@@ -441,7 +441,7 @@ async fn a_capacity_wait_is_a_note() {
     let outcome = reconciler.reconcile(&convoy, &prepared, chrono::Utc::now());
     assert!(outcome.patch.is_none());
     assert_eq!(outcome.requeue_after, None, "no timer: a change wakes it");
-    let stall = engine.memory.get("c").stall.expect("a capacity stall is noted");
+    let stall = engine.memory.get("c").stalls.about(None).cloned().expect("a capacity stall is noted");
     assert_eq!(stall.cause, Some(StallCause::Capacity));
     assert!(stall.evidence.contains("no free vessel slots"), "{}", stall.evidence);
     assert!(engine.promises.lock().expect("promises").is_empty(), "a waiting convoy observes nothing yet");
@@ -458,7 +458,7 @@ async fn a_capacity_wait_is_a_note() {
     hosts.update_status("feta", &host.metadata.resource_version, &slots(1)).await.expect("free");
     let prepared = reconciler.prepare(&convoy).await.expect("prepare free");
     assert_eq!(reconciler.reconcile(&convoy, &prepared, chrono::Utc::now()).requeue_after, None);
-    assert_eq!(engine.memory.get("c").stall, None, "the capacity stall is cleared");
+    assert_eq!(engine.memory.get("c").stalls.about(None), None, "the capacity stall is cleared");
 }
 
 // Behaviour: a change of what convoys wait on wakes the convoys their home notes as waiting on
@@ -490,7 +490,7 @@ async fn a_change_wakes_only_the_convoys_noted_as_waiting() {
         proposed_disposition: None,
         nudge_history: Vec::new(),
     };
-    engine.memory.update("waits-for-capacity", |notes| notes.stall = Some(stall));
+    engine.memory.update("waits-for-capacity", |notes| notes.stalls.set(stall));
     engine.memory.update("holds-delivery", |notes| notes.delivery_held_until = Some(chrono::Utc::now()));
     engine.memory.update("neither", |notes| notes.branch_subject_scan_error = Some("noted".into()));
     let path: EngineConvoyPath = Arc::new(OnceLock::new());
@@ -1373,7 +1373,7 @@ impl flotilla_messaging::EngineMessages for Turns {
     ) -> Result<bool, String> {
         unreachable!("the convoy reconciler records no replies")
     }
-    async fn end_stalls(&self, _: &str, _: &[String], _: Option<&str>, _: &str) -> Result<Vec<String>, String> {
+    async fn end_stalls(&self, _: &str, _: &[String], _: &[String], _: &str) -> Result<Vec<String>, String> {
         unreachable!("the convoy reconciler ends no stalls")
     }
     async fn delivery_held_until(&self, namespace: &str, receiver: &str) -> Result<Option<chrono::DateTime<chrono::Utc>>, String> {

@@ -460,7 +460,7 @@ async fn a_cleared_stall_withdraws_its_subjects_records() {
         let dir = tempfile::tempdir().expect("tempdir");
         let primitives = primitives(&dir).await;
         let seat: flotilla_address::Address = canonical.parse().expect("subject");
-        assert!(primitives.end_stalls(NAMESPACE, &[subject.to_owned()], None, "cleared").await.expect("nothing open").is_empty());
+        assert!(primitives.end_stalls(NAMESPACE, &[subject.to_owned()], &[], "cleared").await.expect("nothing open").is_empty());
         let mut stall = intent("system:stall-judge", "fleet/governor");
         stall.relation = MessageRelation::Supervisor;
         stall.expectation = IntentExpectation::Reply;
@@ -469,9 +469,9 @@ async fn a_cleared_stall_withdraws_its_subjects_records() {
         primitives.await_reply(NAMESPACE, &name, &stall, "home-a", "stall", Some(subject)).await.expect("recorded");
         // Another vessel's seat of the same role shares the record's subject: it keeps the records.
         let twin = "flotilla/demo/other/coder";
-        assert!(primitives.end_stalls(NAMESPACE, &[twin.to_owned()], Some(subject), "cleared").await.expect("kept").is_empty());
+        assert!(primitives.end_stalls(NAMESPACE, &[twin.to_owned()], &[subject.to_owned()], "cleared").await.expect("kept").is_empty());
         assert!(primitives.awaiting().stalled(&seat).expect("read"));
-        assert_eq!(primitives.end_stalls(NAMESPACE, &[subject.to_owned()], None, "cleared").await.expect("ended").len(), 1);
+        assert_eq!(primitives.end_stalls(NAMESPACE, &[subject.to_owned()], &[], "cleared").await.expect("ended").len(), 1);
         assert!(!primitives.awaiting().stalled(&seat).expect("read"), "the cleared stall is not open");
         let sender = "fleet:lab/role:stall-judge".parse().expect("sender");
         assert!(

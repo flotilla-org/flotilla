@@ -183,10 +183,11 @@ pub struct ConvoyNotes {
     /// Turn delivery's failures and episodes, by source.
     pub turn_deliveries: BTreeMap<String, TurnDeliveryStatus>,
     pub nudge_obligations: Vec<NudgeObligation>,
-    /// The stall the home judged, with its supervision's progress. A seat's stall is replicated
-    /// as the open stall AwaitingReply about it ([`SeatRecord::stalled`]); what the judge saw
-    /// and how far it has escalated is the home's own.
-    pub stall: Option<StalledCondition>,
+    /// The stalls the home judged, one about each stalled seat and one about no seat, each with
+    /// its supervision's progress. A seat's stall is replicated as the open stall AwaitingReply
+    /// about it ([`SeatRecord::stalled`]); what the judge saw and how far it has escalated is the
+    /// home's own.
+    pub stalls: crate::Stalls,
     /// When the home last scanned the convoy's branches for subjects, which paces the next scan.
     pub branch_subject_scan_at: Option<DateTime<Utc>>,
     pub branch_subject_scan_error: Option<String>,
@@ -203,7 +204,7 @@ pub struct ConvoyNotes {
 impl ConvoyNotes {
     /// The launch waits for capacity on a host its placement chose.
     pub fn waits_for_capacity(&self) -> bool {
-        self.stall.as_ref().is_some_and(|stall| stall.cause == Some(crate::StallCause::Capacity))
+        self.stalls.about(None).is_some_and(|stall| stall.cause == Some(crate::StallCause::Capacity))
     }
 
     /// The launch's delivery is held on a crew turn not yet delivered.
@@ -227,7 +228,8 @@ impl ConvoyNotes {
         status.attention.clone_from(&self.attention);
         status.turn_deliveries.clone_from(&self.turn_deliveries);
         status.nudge_obligations.clone_from(&self.nudge_obligations);
-        status.stalled.clone_from(&self.stall);
+        status.stalls.clone_from(&self.stalls);
+        status.stalled = self.stalls.oldest().cloned();
         status.branch_subject_scan_at = self.branch_subject_scan_at;
         status.branch_subject_scan_error.clone_from(&self.branch_subject_scan_error);
         status.target_mismatches.clone_from(&self.target_mismatches);
@@ -250,7 +252,7 @@ impl ConvoyNotes {
         self.attention.clone_from(&status.attention);
         self.turn_deliveries.clone_from(&status.turn_deliveries);
         self.nudge_obligations.clone_from(&status.nudge_obligations);
-        self.stall.clone_from(&status.stalled);
+        self.stalls.clone_from(&status.stalls);
         self.branch_subject_scan_at = status.branch_subject_scan_at;
         self.branch_subject_scan_error.clone_from(&status.branch_subject_scan_error);
         self.target_mismatches.clone_from(&status.target_mismatches);
@@ -372,7 +374,7 @@ impl ConvoyRecord {
                 reading.stalled = seat.stalled;
             }
         }
-        if let Some((work, role)) = notes.and_then(|notes| notes.stall.as_ref()).and_then(StalledCondition::seat) {
+        for (work, role) in notes.into_iter().flat_map(|notes| &notes.stalls).filter_map(StalledCondition::seat) {
             readings.entry(work.to_owned()).or_default().entry(role.to_owned()).or_default().stalled = true;
         }
         for (work, role) in working {
@@ -485,7 +487,8 @@ impl ConvoyRecord {
             branch_subject_scan_at: notes.branch_subject_scan_at,
             branch_subject_scan_error: notes.branch_subject_scan_error.clone(),
             unlinked_subjects: self.unlinked.clone(),
-            stalled: notes.stall.clone().filter(|_| !derived.phase.is_terminal()),
+            stalled: notes.stalls.oldest().cloned().filter(|_| !derived.phase.is_terminal()),
+            stalls: if derived.phase.is_terminal() { crate::Stalls::default() } else { notes.stalls.clone() },
             nudge_obligations: notes.nudge_obligations.clone(),
             placement_decision: self.admission.placement_decision.clone(),
             workflow_snapshot: Some(snapshot.clone()),

@@ -72,7 +72,7 @@ async fn landing_transition_clears_stall_without_another_judge() {
         let mut status = prior.clone();
         flotilla_resources::ConvoyStatusPatch::RollUpPhase { phase, started_at: None, finished_at: Some(Utc::now()) }.apply(&mut status);
         assert!(status.stalled.is_none());
-        flotilla_resources::ConvoyStatusPatch::SetStalled { condition: prior.stalled.clone() }.apply(&mut status);
+        flotilla_resources::ConvoyStatusPatch::SetStall { condition: prior.stalled.clone().expect("the prior stall") }.apply(&mut status);
         assert!(status.stalled.is_none());
     }
 }
@@ -533,7 +533,7 @@ fn pending_stall(cause: Option<flotilla_resources::StallCause>) -> flotilla_reso
 /// A launch admitted with nothing started, its home noting `stall` on it: one waiting for capacity.
 async fn waiting_launch(backend: &ResourceBackend, home: &EngineHome, stall: flotilla_resources::StalledCondition) -> String {
     let launch = create_convoy(home, "waiting", single_agent("coder")).await;
-    home.note(backend, &launch, |status| status.stalled = Some(stall)).await;
+    home.note(backend, &launch, |status| status.stalls.set(stall)).await;
     launch
 }
 

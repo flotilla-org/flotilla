@@ -1216,9 +1216,11 @@ impl CrewService {
         let convoys = self.resource_backend.clone().using::<ResourceConvoy>(namespace);
         let convoy = convoys.get(convoy_name).await.map_err(|error| error.to_string())?;
         let status = convoy.status.as_ref().ok_or_else(|| "convoy has no status".to_string())?;
-        if let Some(principal) = principal
-            .filter(|_| status.stalled.is_none() && actor_crew_id.is_none() && action == flotilla_protocol::CrewSupervisionAction::Resume)
-        {
+        if let Some(principal) = principal.filter(|_| {
+            status.stalls.naming(vessel, role).is_none()
+                && actor_crew_id.is_none()
+                && action == flotilla_protocol::CrewSupervisionAction::Resume
+        }) {
             off_frame(|| {
                 self.convoy_resume_with_sender_internal(
                     namespace,
@@ -1232,14 +1234,7 @@ impl CrewService {
             .await?;
             return Ok(CommandValue::Ok);
         }
-        let stalled = status.stalled.as_ref().ok_or_else(|| "crew is not stalled".to_string())?;
-        if !stalled.leaves.iter().any(|leaf| {
-            matches!(&leaf.address,
-            flotilla_protocol::LeafAddress::Work { work, .. } if work == vessel)
-                && leaf.field_path == format!(".crew.{role}.phase")
-        }) {
-            return Err(format!("crew `{vessel}/{role}` is not the stalled obligation"));
-        }
+        let stalled = status.stalls.naming(vessel, role).ok_or_else(|| format!("crew `{vessel}/{role}` is not stalled"))?;
         off_frame(|| self.authorize_supervision(namespace, stalled, actor_crew_id, principal)).await?;
         if action == flotilla_protocol::CrewSupervisionAction::Escalate && stalled.rung == flotilla_resources::StallRung::Operator {
             return Ok(CommandValue::CrewEscalationRefused {
@@ -1397,7 +1392,10 @@ impl CrewService {
         let name = flotilla_resources::message_record_name(
             parties.from.as_str(),
             parties.to.as_str(),
-            &turn_message_producer_key(&supervision_message_source(convoy_name, index), &stalled.began_at.timestamp_micros().to_string()),
+            &turn_message_producer_key(
+                &supervision_message_source(convoy_name, stalled.seat(), index),
+                &stalled.began_at.timestamp_micros().to_string(),
+            ),
         );
         Ok(self.reply_link(parties, &name).await)
     }
@@ -1433,20 +1431,6 @@ impl CrewService {
     ) -> Result<CommandValue, String> {
         let current = convoys.get(convoy_name).await.map_err(|error| error.to_string())?;
         let updated = current.status.clone().ok_or("convoy has no status")?;
-        // Local supervisor activation legitimately changes this convoy
-        // and clears its stall. Accept only the activation proved by the
-        // admitted Message, while preserving every other current field.
-        let local_activation = updated.stalled.is_none()
-            && condition.supervisor.as_ref().is_some_and(|supervisor| {
-                supervisor.convoy == convoy_name
-                    && updated.crew_work.get(&supervisor.vessel).and_then(|crew| crew.get(&supervisor.role)).is_some_and(|work| {
-                        work.phase == CrewWorkPhase::Working
-                            && condition
-                                .supervision_message
-                                .as_ref()
-                                .is_some_and(|message| work.resume_brief_id.as_deref() == Some(message.name.as_str()))
-                    })
-            });
         /// The seat without what its convoy's stall derives: a Stalled phase reads Working, and the
         /// stall report goes. The stall is compared separately, so clearing it does not also
         /// change the seat; a per-seat stall record would replace this.
@@ -1461,17 +1445,16 @@ impl CrewService {
         }
         let obligation_unchanged = without_stall(updated.crew_work.get(vessel).and_then(|crew| crew.get(role)))
             == without_stall(status.crew_work.get(vessel).and_then(|crew| crew.get(role)));
-        if updated.phase.is_terminal() || !obligation_unchanged || (updated.stalled != status.stalled && !local_activation) {
+        // Only this seat's stall is compared: a local supervisor's activation, or another seat's
+        // stall, leaves it as it was.
+        if updated.phase.is_terminal() || !obligation_unchanged || updated.stalls.naming(vessel, role) != status.stalls.naming(vessel, role)
+        {
             return Err(
                 "stall changed during escalation; the current ruling was preserved; the next receiver may already have been notified"
                     .into(),
             );
         }
-        flotilla_resources::convoy::engine::note(
-            &self.convoy_engine,
-            &current,
-            &ConvoyStatusPatch::SetStalled { condition: Some(*condition) },
-        )?;
+        flotilla_resources::convoy::engine::note(&self.convoy_engine, &current, &ConvoyStatusPatch::SetStall { condition: *condition })?;
         Ok(CommandValue::CrewEscalated { receiver })
     }
 

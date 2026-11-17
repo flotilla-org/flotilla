@@ -2686,6 +2686,7 @@ impl Aggregator {
         }
         let phase = status.map(|status| status.phase).unwrap_or_default();
         let checkouts = self.held_checkouts(convoy);
+        let no_stalls = flotilla_resources::Stalls::default();
         let mut vessels: Vec<VesselRow> = status
             .and_then(|status| status.workflow_snapshot.as_ref())
             .map(|snapshot| {
@@ -2697,7 +2698,7 @@ impl Aggregator {
                             resource,
                             definition,
                             status.and_then(|status| status.work.get(&definition.name)),
-                            status.and_then(|status| status.stalled.as_ref()),
+                            status.map_or(&no_stalls, |status| &status.stalls),
                             status.and_then(|status| status.crew_work.get(&definition.name)),
                             &checkouts,
                         )
@@ -2761,8 +2762,8 @@ impl Aggregator {
             SurfaceState::NeedsYou
         } else if phase.is_terminal() {
             SurfaceState::Available
-        } else if let Some(stalled) = status.and_then(|status| status.stalled.as_ref()) {
-            stalled_surface_state(stalled)
+        } else if let Some(state) = stalls_surface_state(status.into_iter().flat_map(|status| &status.stalls)) {
+            state
         } else if vessels.iter().all(|vessel| vessel.surface_state == SurfaceState::Available) && !vessels.is_empty() {
             SurfaceState::Available
         } else {
@@ -2777,12 +2778,15 @@ impl Aggregator {
             .promise_counts(promise_counts)
             .admission_blockers(
                 status
-                    .and_then(|status| status.stalled.as_ref())
+                    .into_iter()
+                    .flat_map(|status| &status.stalls)
                     .filter(|stalled| matches!(stalled.maker, Some(flotilla_resources::LeafMaker::Controller { .. })))
-                    .map(|stalled| {
-                        vec![ReadinessBlocker { resource: resource.clone(), phase: "Admission".into(), reason: stalled.evidence.clone() }]
+                    .map(|stalled| ReadinessBlocker {
+                        resource: resource.clone(),
+                        phase: "Admission".into(),
+                        reason: stalled.evidence.clone(),
                     })
-                    .unwrap_or_default(),
+                    .collect(),
             )
             .resource(resource.clone())
             .maybe_address_role(convoy.metadata.labels.get(ROLE_LABEL).cloned())
@@ -2902,7 +2906,7 @@ impl Aggregator {
         convoy_ref: &ResourceRef,
         definition: &VesselRequirement,
         state: Option<&WorkState>,
-        stalled: Option<&StalledCondition>,
+        stalls: &flotilla_resources::Stalls,
         crew_work: Option<&BTreeMap<String, flotilla_resources::CrewWorkState>>,
         checkouts: &HeldCheckouts,
     ) -> VesselRow {
@@ -3007,14 +3011,14 @@ impl Aggregator {
             .min();
         let surface_state = if credential_attention.is_some() || obstruction.is_some() {
             SurfaceState::NeedsYou
-        } else if let Some(stalled) = stalled.filter(|stalled| {
+        } else if let Some(state) = stalls_surface_state(stalls.iter().filter(|stalled| {
             matches!(&stalled.maker, Some(flotilla_resources::LeafMaker::Actor { vessel, .. }) if vessel == &definition.name)
                 || stalled
                     .leaves
                     .iter()
                     .any(|leaf| matches!(&leaf.address, flotilla_protocol::LeafAddress::Work { work, .. } if work == &definition.name))
-        }) {
-            stalled_surface_state(stalled)
+        })) {
+            state
         } else {
             matching_sessions()
                 .filter(|session| session.object.status.as_ref().is_some_and(|status| status.phase == TerminalSessionPhase::Running))
@@ -3029,7 +3033,8 @@ impl Aggregator {
         };
         let (mut readiness, loss_reason) = self.vessel_readiness(convoy_ref, definition, state, crew_work, &vessel_host, checkouts);
         if readiness.state == ReadinessState::Provisioning {
-            if let Some(stalled) = stalled.filter(|stalled| matches!(stalled.maker, Some(flotilla_resources::LeafMaker::Controller { .. })))
+            if let Some(stalled) =
+                stalls.iter().find(|stalled| matches!(stalled.maker, Some(flotilla_resources::LeafMaker::Controller { .. })))
             {
                 readiness.state = ReadinessState::Blocked;
                 readiness.blockers.push(ReadinessBlocker {
@@ -3203,6 +3208,11 @@ fn agent_surface_state(activity: flotilla_protocol::AgentActivity) -> SurfaceSta
     }
 }
 
+/// The surface of several stalls: one needing a person outranks those a rung handles.
+fn stalls_surface_state<'a>(stalls: impl Iterator<Item = &'a StalledCondition>) -> Option<SurfaceState> {
+    stalls.map(stalled_surface_state).max_by_key(|state| *state == SurfaceState::NeedsYou)
+}
+
 fn stalled_surface_state(stalled: &StalledCondition) -> SurfaceState {
     if stalled.maker.is_none() {
         return SurfaceState::NeedsYou;
@@ -3371,7 +3381,7 @@ mod tests {
         for name in ["governor-a", "governor-b", "governor-c", "crew", "orphan"] {
             let mut convoy = convoy_with_vessel(name).await;
             if name == "crew" || name == "orphan" {
-                convoy.status.as_mut().expect("status").stalled = Some(StalledCondition {
+                convoy.status.as_mut().expect("status").stalls.set(StalledCondition {
                     leaves: Vec::new(),
                     maker: (name == "crew")
                         .then(|| flotilla_resources::LeafMaker::Actor { vessel: "implement".into(), role: "coder".into() }),
@@ -3759,7 +3769,7 @@ mod tests {
             .vessels
             .push(VesselRequirement::builder().name("review".to_string()).crew(Vec::new()).build());
         status.work.insert("review".into(), WorkState::builder().phase(ResourceWorkPhase::Ready).build());
-        status.stalled = Some(StalledCondition {
+        status.stalls.set(StalledCondition {
             leaves: Vec::new(),
             maker: Some(flotilla_resources::LeafMaker::Actor { vessel: "implement".into(), role: "coder".into() }),
             evidence: "idle at turn end".into(),
@@ -6698,7 +6708,14 @@ mod tests {
             let status = convoy.status.as_ref().expect("status");
             let definition = &status.workflow_snapshot.as_ref().expect("snapshot").vessels[0];
             let row = |aggregator: &Aggregator| {
-                aggregator.summarize_vessel(&reference, definition, status.work.get("implement"), None, None, &Ok(BTreeMap::new()))
+                aggregator.summarize_vessel(
+                    &reference,
+                    definition,
+                    status.work.get("implement"),
+                    &status.stalls,
+                    None,
+                    &Ok(BTreeMap::new()),
+                )
             };
             assert_eq!(row(&aggregator).environment_kind, None, "{context}");
             let source = ReadResourceObject {
@@ -6830,7 +6847,7 @@ mod tests {
                     &reference,
                     definition,
                     status.work.get("implement"),
-                    None,
+                    &status.stalls,
                     status.crew_work.get("implement"),
                     &Ok(BTreeMap::new()),
                 );
@@ -7632,7 +7649,7 @@ mod tests {
                     Some(ConfiguredResourceLimits { cpus: None, cpu_shares: None, build_jobs: Some(2), linker_threads: None });
                 aggregator.replace_replica_sessions(vec![ReadResourceObject { object: session, provenance }]).await;
                 let resource = ResourceRef::new("flotilla/v1", "Convoy", "flotilla", &convoy.metadata.name).on_host(HostName::new("kiwi"));
-                let row = aggregator.summarize_vessel(&resource, &definition, Some(work), None, None, &Ok(BTreeMap::new()));
+                let row = aggregator.summarize_vessel(&resource, &definition, Some(work), &Default::default(), None, &Ok(BTreeMap::new()));
                 assert_eq!(row.crew[0].adapter.as_deref(), Some("codex"));
                 assert_eq!(row.crew[0].model, model);
                 assert_eq!(
@@ -7749,7 +7766,7 @@ mod tests {
                 &aggregator.convoy_ref("flotilla", &convoy.metadata.name),
                 &status.workflow_snapshot.as_ref().expect("workflow snapshot").vessels[0],
                 status.work.get("implement"),
-                None,
+                &status.stalls,
                 status.crew_work.get("implement"),
                 &Ok(BTreeMap::new()),
             );

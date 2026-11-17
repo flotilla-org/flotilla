@@ -6,6 +6,7 @@ use flotilla_resources::convoy::engine::Actor;
 use flotilla_resources::promises::{PromiseKind, PromiseOperation, PromiseSource, PromiseState, Submission, SubmissionVerdict};
 use flotilla_resources::terminal_records::{AgentLaunch, TerminalLaunchFacts, TerminalLaunchRequest, TerminalLaunchSource};
 use flotilla_resources::ResumeIntent;
+use std::collections::BTreeSet;
 
 use super::*;
 
@@ -36,7 +37,7 @@ async fn coder_session_started(case: &Case) -> DateTime<Utc> {
 /// with `workflow`, its actor rows cleared.
 async fn working_coder(workflow: WorkflowSnapshot) -> Case {
     let case = supervised_case(workflow, &[]).await;
-    case.note(|status| status.stalled = None).await;
+    case.note(|status| status.stalls.clear()).await;
     case.wake.subscriptions.inner.rows.lock().await.clear();
     case
 }
@@ -196,7 +197,7 @@ fn missing_turn_hook_is_visible_and_recovers(tc: hegel::TestCase) {
 
 async fn missing_turn_hook_case(age: i64, claude: bool, other_attention: bool) {
     let case = project_supervision_case(&[]).await;
-    case.note(|status| status.stalled = None).await;
+    case.note(|status| status.stalls.clear()).await;
     resume_coder_under(&case, if claude { "claude-code" } else { "codex" });
     let start = coder_session_started(&case).await;
     let now = start + chrono::Duration::seconds(age);
@@ -296,7 +297,7 @@ async fn declared_stall_waits_on_supervision_while_working_crew_is_nudged() {
     for declared in [false, true] {
         let case = project_supervision_case(&[]).await;
         if !declared {
-            case.note(|status| status.stalled = None).await;
+            case.note(|status| status.stalls.clear()).await;
         }
         resume_coder(&case);
         let start = Utc::now();
@@ -448,7 +449,7 @@ async fn observed_commit_resets_budget_but_refresh_does_not() {
     let mut workflow = supervised_workflow();
     workflow.vessels[0].repository_refs = Some(vec![repo.clone()]);
     let case = supervised_case(workflow, &[]).await;
-    case.note(|status| status.stalled = None).await;
+    case.note(|status| status.stalls.clear()).await;
     resume_coder(&case);
     let checkouts = &case.home.engine.checkouts;
     let launch = checkouts.put_ready(
@@ -603,10 +604,11 @@ async fn unavailable_governor_preserves_consumed_bosun_rung() {
     // Same transition as crew supervise ... escalate: clear ownership,
     // preserve the consumed index, and restore the original actor as maker.
     case.note(|status| {
-        let condition = status.stalled.as_mut().expect("stall");
+        let mut condition = status.stalls.oldest().cloned().expect("stall");
         condition.supervisor = None;
         condition.maker = Some(LeafMaker::Actor { vessel: "work".into(), role: "coder".into() });
         condition.rung = StallRung::Operator;
+        status.stalls.set(condition);
     })
     .await;
     delivery.unavailable.store(true, Ordering::SeqCst);
@@ -632,6 +634,98 @@ async fn unavailable_governor_preserves_consumed_bosun_rung() {
     assert_eq!(requests[1].role, "governor");
 }
 
+// Two crews that declare before the judge runs each climb their own ladder: each gets its own
+// supervision message from the latent bosun, and each escalates to the governor once its own
+// bosun row times out. Neither seat's stall replaces or restarts the other's.
+#[tokio::test]
+async fn two_declared_seats_climb_their_own_ladders() {
+    let mut workflow = supervised_workflow();
+    workflow.vessels[0].crew.push(flotilla_engine_convoys_testkit::agent("reviewer"));
+    // The bosun owes nothing, so no row of its own holds the judge while it is silent.
+    let mut bosun = flotilla_engine_convoys_testkit::agent("bosun");
+    bosun.promises.clear();
+    bosun.completion_conditions.clear();
+    bosun.promise_exclusions = vec![PromiseKind::DecisionLedger];
+    workflow.vessels[0].crew.push(bosun);
+    let case = supervised_case(workflow, &[("governor", 1, ConvoyPhase::Active)]).await;
+    let now = Utc::now();
+    let work = case.work.clone();
+    case.note(|status| {
+        let reason = flotilla_resources::StallReason::Scope;
+        external_patches::mark_crew_stalled(work, "work".into(), "reviewer".into(), now, reason, None, "needs scope".into()).apply(status)
+    })
+    .await;
+    let stall = |status: &ConvoyStatus, role: &str| status.stalls.about(Some(("work", role))).cloned().expect("the seat's stall");
+    // Each seat's stall, as the deliveries to `role` name it; each delivery is its own message.
+    let delivered_to = |role: &str| {
+        let requests = case.delivery.requests.lock().expect("deliveries");
+        let requests = requests.iter().filter(|request| request.role == role).collect::<Vec<_>>();
+        let sources = requests.iter().map(|request| request.source.as_str()).collect::<BTreeSet<_>>();
+        assert_eq!(sources.len(), requests.len(), "one message source per seat: {sources:?}");
+        requests.iter().map(|request| request.stall_of.clone()).collect::<BTreeSet<_>>()
+    };
+    let seats =
+        BTreeSet::from([Some(format!("wheelhouse/{}/work/coder", case.work)), Some(format!("wheelhouse/{}/work/reviewer", case.work))]);
+    sync_work_rows(&case).await;
+    case.judge(&case.wake, now).await;
+    let first = case.status().await;
+    for role in ["coder", "reviewer"] {
+        assert_eq!(stall(&first, role).rung, StallRung::Bosun, "{role}");
+    }
+    let messages = |status: &ConvoyStatus| ["coder", "reviewer"].map(|role| stall(status, role).supervision_message.expect("its message"));
+    let [coder, reviewer] = messages(&first);
+    assert_ne!(coder, reviewer, "each seat has its own supervision message");
+    assert_eq!(delivered_to("bosun"), seats);
+    assert_eq!(case.delivery.requests.lock().expect("deliveries").len(), 2);
+
+    // Before the bosun rows time out, both stalls wait on the bosun.
+    sync_work_rows(&case).await;
+    case.judge(&case.wake, now + chrono::Duration::seconds(3)).await;
+    assert_eq!(case.status().await.stalls, first.stalls);
+    assert_eq!(case.delivery.requests.lock().expect("deliveries").len(), 2);
+
+    // Each seat's bosun row times out: each climbs to the governor with its own message.
+    case.judge(&case.wake, now + chrono::Duration::seconds(6)).await;
+    let second = case.status().await;
+    for role in ["coder", "reviewer"] {
+        let climbed = stall(&second, role);
+        assert_eq!(climbed.rung, StallRung::Governor, "{role}");
+        assert_eq!(climbed.began_at, stall(&first, role).began_at, "{role} keeps its episode");
+        assert_eq!(climbed.supervisor.expect("its governor").convoy, case.governor("governor"));
+    }
+    let [coder, reviewer] = messages(&second);
+    assert_ne!(coder, reviewer);
+    assert_eq!(delivered_to("governor"), seats);
+    assert_eq!(case.delivery.requests.lock().expect("deliveries").len(), 4);
+}
+
+// Two unable rows at once, about two seats, stall both: each seat's stall is judged from its own
+// row and evidence, and a later tick replaces neither.
+#[tokio::test]
+async fn two_unable_rows_stall_both_seats() {
+    let now = Utc::now();
+    let case = coder_beside_governor(false, Some(TerminalAttentionState::NeedsInput), now).await;
+    observe_actor_source(&case, &case.wake, TerminalAttentionState::NeedsInput, TerminalAttentionSource::Hook, now).await;
+    let status = case.status().await;
+    let coder = status.stalls.about(Some(("work", "coder"))).cloned().expect("the coder's stall");
+    let governor = status.stalls.about(Some(("supervise", "governor"))).cloned().expect("the governor's stall");
+    assert_eq!(coder.source, StallEvidenceSource::Hook);
+    assert_eq!(governor.source, StallEvidenceSource::Hook);
+    assert_eq!(coder.evidence, "NeedsInput");
+    assert_eq!(governor.evidence, "NeedsInput");
+    // The coder's stall goes up to its supervisor, who is stalled on its own ladder.
+    let supervisor = coder.supervisor.as_ref().expect("the coder's supervisor");
+    assert_eq!((supervisor.vessel.as_str(), supervisor.role.as_str()), ("supervise", "governor"));
+    assert_eq!(status.stalls.iter().count(), 2, "{:?}", status.stalls);
+    let delivered = case.delivery.requests.lock().expect("deliveries").len();
+    sync_work_rows(&case).await;
+    case.judge(&case.wake, now + chrono::Duration::seconds(1)).await;
+    assert_eq!(case.delivery.requests.lock().expect("deliveries").len(), delivered, "neither stall is escalated again");
+    let later = case.status().await;
+    assert_eq!(later.stalls.about(Some(("work", "coder"))).map(|stall| stall.began_at), Some(coder.began_at));
+    assert_eq!(later.stalls.about(Some(("supervise", "governor"))).map(|stall| stall.began_at), Some(governor.began_at));
+}
+
 // Explicit escalation by the last governor consumes the whole policy.
 // Legacy cursor recovery must not send the stall back to that governor.
 #[tokio::test]
@@ -639,10 +733,11 @@ async fn governor_escalation_exhausts_default_policy_once() {
     let case = project_supervision_case(&[("governor", 1, ConvoyPhase::Active)]).await;
     case.judge(&case.wake, Utc::now()).await;
     case.note(|status| {
-        let condition = status.stalled.as_mut().expect("stall");
+        let mut condition = status.stalls.oldest().cloned().expect("stall");
         condition.supervisor = None;
         condition.maker = Some(LeafMaker::Actor { vessel: "work".into(), role: "coder".into() });
         condition.rung = StallRung::Operator;
+        status.stalls.set(condition);
     })
     .await;
     for _ in 0..2 {

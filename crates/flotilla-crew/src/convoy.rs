@@ -323,13 +323,13 @@ impl ConvoyReconciler {
     /// Notes `wait` as the convoy's capacity stall, or clears a capacity stall that has passed. The
     /// stall is the home's note; its count is the convoys-waiting-for-capacity gauge.
     fn note_capacity(&self, obj: &ResourceObject<Convoy>, wait: Option<&String>, now: DateTime<Utc>) -> Result<(), String> {
-        let prior = obj.status.as_ref().and_then(|status| status.stalled.as_ref());
+        let prior = obj.status.as_ref().and_then(|status| status.stalls.about(None));
         let patch = match wait {
             Some(evidence) if prior.is_some_and(|stalled| stalled.cause == Some(StallCause::Capacity) && stalled.evidence == *evidence) => {
                 return Ok(());
             }
-            Some(evidence) => ConvoyStatusPatch::SetStalled {
-                condition: Some(StalledCondition {
+            Some(evidence) => ConvoyStatusPatch::SetStall {
+                condition: StalledCondition {
                     leaves: Vec::new(),
                     maker: Some(LeafMaker::Controller {
                         resource_kind: "Convoy".to_string(),
@@ -349,11 +349,9 @@ impl ConvoyReconciler {
                     reason: None,
                     proposed_disposition: None,
                     nudge_history: Vec::new(),
-                }),
+                },
             },
-            None if prior.is_some_and(|stalled| stalled.cause == Some(StallCause::Capacity)) => {
-                ConvoyStatusPatch::SetStalled { condition: None }
-            }
+            None if prior.is_some_and(|stalled| stalled.cause == Some(StallCause::Capacity)) => ConvoyStatusPatch::EndStall { seat: None },
             None => return Ok(()),
         };
         note(&self.engine, obj, &patch).map(drop)

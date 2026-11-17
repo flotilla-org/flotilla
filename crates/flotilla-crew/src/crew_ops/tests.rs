@@ -158,7 +158,9 @@ impl Held {
                     ),
                     status,
                 );
-                change(status.stalled.as_mut().expect("the coder's stall"));
+                let mut stall = status.stalls.about(Some(("work", "coder"))).cloned().expect("the coder's stall");
+                change(&mut stall);
+                status.stalls.set(stall);
             })
             .await
     }

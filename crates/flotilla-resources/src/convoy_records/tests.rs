@@ -229,15 +229,17 @@ fn a_stall_note_stalls_its_seat_at_any_rung() {
         "needs decision".into(),
     );
     notes.apply(&view(&notes), &declare);
-    notes.stall.as_mut().expect("the stall note").evidence.push_str("; supervisor delivery failed: gone");
+    let mut stall = notes.stalls.about(Some(("work", "coder"))).cloned().expect("the stall note");
+    stall.evidence.push_str("; supervisor delivery failed: gone");
+    notes.stalls.set(stall);
 
     let status = view(&notes);
     let coder = &status.crew_work["work"]["coder"];
-    assert_eq!(notes.stall.as_ref().map(|stall| stall.rung), Some(crate::StallRung::Operator));
+    assert_eq!(notes.stalls.about(Some(("work", "coder"))).map(|stall| stall.rung), Some(crate::StallRung::Operator));
     assert_eq!((coder.phase, coder.message.as_deref()), (CrewWorkPhase::Stalled, Some("needs decision")));
     assert_eq!(status.work["work"].phase, WorkPhase::Stalled);
 
-    notes.apply(&status, &crate::ConvoyStatusPatch::SetStalled { condition: None });
+    notes.apply(&status, &crate::ConvoyStatusPatch::EndStall { seat: Some(("work".into(), "coder".into())) });
     let status = view(&notes);
     assert_eq!(status.crew_work["work"]["coder"].phase, CrewWorkPhase::Working, "the cleared note stalls nothing");
     assert_eq!(status.crew_work["work"]["coder"].message, None);

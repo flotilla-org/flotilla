@@ -1151,8 +1151,13 @@ pub struct ConvoyStatus {
     pub branch_subject_scan_error: Option<String>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub unlinked_subjects: Vec<Subject>,
+    /// The oldest of [`Self::stalls`], for a reader asking whether the launch is stalled at all.
+    /// Derived: each patch sets it from `stalls` once applied, so a stall is written there.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub stalled: Option<StalledCondition>,
+    /// Every open stall, one about each stalled seat and one about no seat.
+    #[serde(default, skip_serializing_if = "Stalls::is_empty")]
+    pub stalls: Stalls,
     /// Actor obligation budgets outlive transient attention and visible stalls.
     /// Remove the decoder default one fleet roll after this field lands (ADR 0047).
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
@@ -1404,12 +1409,97 @@ pub struct StalledCondition {
 }
 
 impl StalledCondition {
-    /// The seat `(work, role)` the stall is about: its first leaf's crew phase.
+    /// The seat `(work, role)` the stall is about: the first crew phase among its leaves.
     pub fn seat(&self) -> Option<(&str, &str)> {
-        let leaf = self.leaves.first()?;
+        leaves_seat(&self.leaves)
+    }
+
+    /// Whether any of its leaves is seat `(work, role)`'s crew phase.
+    pub fn names_seat(&self, work: &str, role: &str) -> bool {
+        self.leaves.iter().any(|leaf| {
+            matches!(&leaf.address, LeafAddress::Work { work: named, .. } if named == work)
+                && leaf.field_path.strip_prefix(".crew.").and_then(|path| path.strip_suffix(".phase")) == Some(role)
+        })
+    }
+}
+
+/// The seat `(work, role)` a stall judged from `leaves` is about: the first crew phase among
+/// them. Inferred leaves, such as a work's own phase, may come before it.
+pub fn leaves_seat(leaves: &[Leaf]) -> Option<(&str, &str)> {
+    leaves.iter().find_map(|leaf| {
         let LeafAddress::Work { work, .. } = &leaf.address else { return None };
         let role = leaf.field_path.strip_prefix(".crew.")?.strip_suffix(".phase")?;
-        Some((work, role))
+        Some((work.as_str(), role))
+    })
+}
+
+/// A launch's open stalls: at most one about each seat, and one about no seat (a cause no crew
+/// owns, such as capacity or an unable observer). Each climbs its own supervision ladder, so one
+/// seat's stall never replaces another's.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(transparent)]
+pub struct Stalls(Vec<StalledCondition>);
+
+impl Stalls {
+    pub fn is_empty(&self) -> bool {
+        self.0.is_empty()
+    }
+
+    pub fn iter(&self) -> std::slice::Iter<'_, StalledCondition> {
+        self.0.iter()
+    }
+
+    /// The stall about `seat`; about no seat for `None`.
+    pub fn about(&self, seat: Option<(&str, &str)>) -> Option<&StalledCondition> {
+        self.0.iter().find(|stall| stall.seat() == seat)
+    }
+
+    /// The stall naming seat `(work, role)` among its leaves.
+    pub fn naming(&self, work: &str, role: &str) -> Option<&StalledCondition> {
+        self.0.iter().find(|stall| stall.names_seat(work, role))
+    }
+
+    /// Notes `condition` in place of the stall about its seat.
+    pub fn set(&mut self, condition: StalledCondition) {
+        self.0.retain(|stall| stall.seat() != condition.seat());
+        self.0.push(condition);
+        self.0.sort_by(|left, right| left.seat().cmp(&right.seat()));
+    }
+
+    /// Ends the stall about `seat`.
+    pub fn end(&mut self, seat: Option<(&str, &str)>) {
+        self.0.retain(|stall| stall.seat() != seat);
+    }
+
+    pub fn retain(&mut self, keep: impl FnMut(&StalledCondition) -> bool) {
+        self.0.retain(keep);
+    }
+
+    pub fn clear(&mut self) {
+        self.0.clear();
+    }
+
+    /// The oldest: what a reader asking whether the launch is stalled at all reads.
+    pub fn oldest(&self) -> Option<&StalledCondition> {
+        self.0.iter().min_by_key(|stall| stall.began_at)
+    }
+}
+
+impl FromIterator<StalledCondition> for Stalls {
+    fn from_iter<I: IntoIterator<Item = StalledCondition>>(conditions: I) -> Self {
+        let mut stalls = Self::default();
+        for condition in conditions {
+            stalls.set(condition);
+        }
+        stalls
+    }
+}
+
+impl<'a> IntoIterator for &'a Stalls {
+    type Item = &'a StalledCondition;
+    type IntoIter = std::slice::Iter<'a, StalledCondition>;
+    fn into_iter(self) -> Self::IntoIter {
+        self.0.iter()
     }
 }
 
@@ -1524,7 +1614,7 @@ fn is_same_crew_stall(
         .get(vessel)
         .and_then(|crew| crew.get(role))
         .is_some_and(|state| state.phase == CrewWorkPhase::Stalled && state.message.as_deref() == Some(message))
-        && status.stalled.as_ref().is_some_and(|stall| {
+        && status.stalls.iter().any(|stall| {
             stall.source == StallEvidenceSource::Crew
                 && stall.reason == Some(reason)
                 && stall.proposed_disposition == proposed_disposition
@@ -1546,15 +1636,7 @@ fn clear_nudge_budget(status: &mut ConvoyStatus, vessel: &str, role: &str) {
 }
 
 fn clear_stall_for_crew(status: &mut ConvoyStatus, vessel: &str, role: &str) {
-    let field_path = format!(".crew.{role}.phase");
-    if status.stalled.as_ref().is_some_and(|stalled| {
-        stalled
-            .leaves
-            .iter()
-            .any(|leaf| matches!(&leaf.address, LeafAddress::Work { work, .. } if work == vessel) && leaf.field_path == field_path)
-    }) {
-        status.stalled = None;
-    }
+    status.stalls.retain(|stall| !stall.names_seat(vessel, role));
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, bon::Builder)]
@@ -1886,8 +1968,13 @@ pub enum ConvoyStatusPatch {
     UnlinkSubject {
         subject: Subject,
     },
-    SetStalled {
-        condition: Option<StalledCondition>,
+    /// Notes `condition` in place of the stall about its seat.
+    SetStall {
+        condition: StalledCondition,
+    },
+    /// Ends the stall about `seat`, `(work, role)`; about no seat for `None`.
+    EndStall {
+        seat: Option<(String, String)>,
     },
     SetNudgeObligations {
         obligations: Vec<NudgeObligation>,
@@ -2103,9 +2190,9 @@ impl ConvoyStatus {
     }
 }
 
-impl StatusPatch<ConvoyStatus> for ConvoyStatusPatch {
-    fn diagnostic_name(&self) -> Option<&'static str> {
-        Some(match self {
+impl ConvoyStatusPatch {
+    fn name(&self) -> &'static str {
+        match self {
             Self::Promise { .. } => "Promise",
             Self::ObservePromise { .. } => "ObservePromise",
             Self::HandPromisesToEngine { .. } => "HandPromisesToEngine",
@@ -2116,7 +2203,8 @@ impl StatusPatch<ConvoyStatus> for ConvoyStatusPatch {
             Self::RecordBranchSubjectScan { .. } => "RecordBranchSubjectScan",
             Self::RecordBranchSubjectScanFailure { .. } => "RecordBranchSubjectScanFailure",
             Self::UnlinkSubject { .. } => "UnlinkSubject",
-            Self::SetStalled { .. } => "SetStalled",
+            Self::SetStall { .. } => "SetStall",
+            Self::EndStall { .. } => "EndStall",
             Self::SetNudgeObligations { .. } => "SetNudgeObligations",
             Self::SetTeardownWait { .. } => "SetTeardownWait",
             Self::SetPlacementDecision { .. } => "SetPlacementDecision",
@@ -2150,20 +2238,21 @@ impl StatusPatch<ConvoyStatus> for ConvoyStatusPatch {
             Self::FailTurnDelivery { .. } => "FailTurnDelivery",
             Self::RefuseTurnDelivery { .. } => "RefuseTurnDelivery",
             Self::RollUpWork { .. } => "RollUpWork",
-        })
+        }
     }
 
-    fn apply(&self, status: &mut ConvoyStatus) {
+    fn change(&self, status: &mut ConvoyStatus) {
         // Optimistic retry can reapply a patch computed from an older phase.
         // Terminal outcomes reject stale and duplicate patches. An explicit
         // abandon may override a terminal outcome only when its caller saw
         // that exact phase. Landing events remain appendable, and
-        // SetStalled and queued-turn observations may clear stale attention.
+        // stall writes and queued-turn observations may clear stale attention.
         if status.phase.is_terminal()
             && !matches!(
                 self,
                 Self::RecordLandingEvent { .. }
-                    | Self::SetStalled { .. }
+                    | Self::SetStall { .. }
+                    | Self::EndStall { .. }
                     | Self::SetTeardownWait { .. }
                     | Self::ObserveQueuedTurnDeliveries { .. }
             )
@@ -2200,8 +2289,8 @@ impl StatusPatch<ConvoyStatus> for ConvoyStatusPatch {
                 {
                     status.phase = previous.phase;
                     status.finished_at = previous.finished_at;
-                    if status.stalled == activated.stalled {
-                        status.stalled = previous.stalled.clone();
+                    if status.stalls == activated.stalls {
+                        status.stalls = previous.stalls.clone();
                     }
                 }
             }
@@ -2231,9 +2320,12 @@ impl StatusPatch<ConvoyStatus> for ConvoyStatusPatch {
             }
             Self::RecordBranchSubjectScanFailure { error } => status.branch_subject_scan_error = Some(error.clone()),
             Self::UnlinkSubject { subject } => status.unlink_subject(subject),
-            Self::SetStalled { condition } => {
-                status.stalled = if status.phase.is_terminal() { None } else { condition.clone() };
+            Self::SetStall { condition } => {
+                if !status.phase.is_terminal() {
+                    status.stalls.set(condition.clone());
+                }
             }
+            Self::EndStall { seat } => status.stalls.end(seat.as_ref().map(|(work, role)| (work.as_str(), role.as_str()))),
             Self::SetNudgeObligations { obligations } => status.nudge_obligations = obligations.clone(),
             Self::SetTeardownWait { message } => status.message = Some(message.clone()),
             Self::SetPlacementDecision { placement_decision } => {
@@ -2593,7 +2685,7 @@ impl StatusPatch<ConvoyStatus> for ConvoyStatusPatch {
                     state.finished_at = None;
                     state.message = Some(message.clone());
                 }
-                status.stalled = Some(StalledCondition {
+                status.stalls.set(StalledCondition {
                     leaves: vec![Leaf {
                         address: LeafAddress::Work { convoy: convoy.clone(), work: vessel.clone() },
                         field_path: format!(".crew.{role}.phase"),
@@ -2684,7 +2776,8 @@ impl StatusPatch<ConvoyStatus> for ConvoyStatusPatch {
                     state.decision_ledger_digest = None;
                     state.message = Some(prompt.clone());
                 }
-                status.stalled = None;
+                // The resumed seat's stall ends, and the stall about no seat; another seat's stays.
+                status.stalls.retain(|stall| stall.seat().is_some() && !stall.names_seat(vessel, role));
             }
             Self::QueueMessageFollowUp { vessel, role, message } => {
                 if let Some(state) = status.crew_work.get_mut(vessel).and_then(|crew| crew.get_mut(role)) {
@@ -2748,11 +2841,9 @@ impl StatusPatch<ConvoyStatus> for ConvoyStatusPatch {
                     state.message = Some(prompt.clone());
                 }
                 // The new turn resumes the crew, which ends the stall it declared.
-                if status.stalled.as_ref().is_some_and(|stall| {
-                    stall.source == StallEvidenceSource::Crew && stall.seat() == Some((vessel.as_str(), role.as_str()))
-                }) {
-                    status.stalled = None;
-                }
+                status
+                    .stalls
+                    .retain(|stall| stall.source != StallEvidenceSource::Crew || stall.seat() != Some((vessel.as_str(), role.as_str())));
                 status.phase = ConvoyPhase::Active;
                 status.finished_at = None;
             }
@@ -2852,8 +2943,20 @@ impl StatusPatch<ConvoyStatus> for ConvoyStatusPatch {
         // Terminal state and its stall condition are one atomic write. The
         // judge may never see this convoy again after settlement or teardown.
         if status.phase.is_terminal() {
-            status.stalled = None;
+            status.stalls.clear();
         }
+    }
+}
+
+impl StatusPatch<ConvoyStatus> for ConvoyStatusPatch {
+    fn diagnostic_name(&self) -> Option<&'static str> {
+        Some(self.name())
+    }
+
+    fn apply(&self, status: &mut ConvoyStatus) {
+        self.change(status);
+        // `stalled` reads the stalls the patch left.
+        status.stalled = status.stalls.oldest().cloned();
     }
 }
 
@@ -3699,12 +3802,13 @@ mod subject_tests {
             message: "needs decision".into(),
         };
         report(now).apply(&mut status);
-        let stall = status.stalled.as_mut().expect("stall");
+        let mut stall = status.stalled.clone().expect("stall");
         stall.supervision_index = Some(1);
         stall.maker = Some(LeafMaker::Supervisor { convoy: "governor".into(), vessel: "watch".into(), role: "governor".into() });
         stall.evidence.push_str("; supervisor reconnecting");
         stall.supervision_message = Some(flotilla_protocol::ResourceRef::new("flotilla.work/v1", "Message", "flotilla", "notice"));
         let expected = stall.clone();
+        status.stalls.set(stall);
         report(now + chrono::Duration::seconds(1)).apply(&mut status);
         assert_eq!(status.stalled.as_ref(), Some(&expected));
     }

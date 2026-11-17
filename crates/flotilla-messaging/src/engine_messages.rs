@@ -142,9 +142,9 @@ pub trait EngineMessages: Send + Sync {
     async fn delivery_wait(&self, namespace: &str) -> Result<Option<String>, String>;
     /// Withdraws this home's open stall records about `seats` (crew role
     /// addresses) once the old stall status shows them not stalled (#3730
-    /// review); a seat that shares `stalled`'s record subject keeps its
+    /// review); a seat that shares a `stalled` seat's record subject keeps its
     /// records. Returns the records withdrawn.
-    async fn end_stalls(&self, namespace: &str, seats: &[String], stalled: Option<&str>, reason: &str) -> Result<Vec<String>, String>;
+    async fn end_stalls(&self, namespace: &str, seats: &[String], stalled: &[String], reason: &str) -> Result<Vec<String>, String>;
     /// Until when messages to `receiver` (a crew role address), admitted at this home and not
     /// yet delivered, hold its delivery; None when none does (#3894).
     async fn delivery_held_until(&self, namespace: &str, receiver: &str) -> Result<Option<chrono::DateTime<chrono::Utc>>, String>;

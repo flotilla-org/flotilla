@@ -143,6 +143,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 branch_subject_scan_error: None,
                 unlinked_subjects: Vec::new(),
                 stalled: None,
+                stalls: Default::default(),
                 provisioning: None,
                 placement_decision: None,
                 phase: ConvoyPhase::Active,

@@ -183,7 +183,7 @@ struct LeafSubscriptionTableInner {
     /// Turn-delivery failures awaiting their convoy's single status write (#3455).
     pending_failures: turn_delivery::PendingFailureMap,
     decisions: crate::decision_log::DecisionLog,
-    supervisor_context: Mutex<HashMap<(String, String), String>>,
+    supervisor_context: Mutex<HashMap<stalls::SupervisorContextKey, String>>,
     operator_told: Mutex<stalls::OperatorTold>,
     #[cfg(test)]
     snapshot_loads: AtomicUsize,

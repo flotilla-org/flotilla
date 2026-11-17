@@ -1239,16 +1239,16 @@ impl MessagePrimitives {
     /// Withdraws this home's open stall records about crew role or convoy
     /// subjects no longer stalled. Subjects shared with `stalled` keep
     /// their records. With no open stall here it reads nothing.
-    pub async fn end_stalls(&self, namespace: &str, seats: &[String], stalled: Option<&str>, reason: &str) -> Result<Vec<String>, String> {
+    pub async fn end_stalls(&self, namespace: &str, seats: &[String], stalled: &[String], reason: &str) -> Result<Vec<String>, String> {
         if seats.is_empty() || !self.awaiting.any_open_stall() {
             return Ok(Vec::new());
         }
         let roles = self.roles(namespace).await?;
-        let kept = stalled.map(|seat| roles.stall_subject(seat)).transpose()?;
+        let kept = stalled.iter().map(|seat| roles.stall_subject(seat)).collect::<Result<Vec<_>, _>>()?;
         let mut subjects = Vec::new();
         for seat in seats {
             let subject = roles.stall_subject(seat)?;
-            if Some(&subject) != kept.as_ref() && !subjects.contains(&subject) {
+            if !kept.contains(&subject) && !subjects.contains(&subject) {
                 subjects.push(subject);
             }
         }
@@ -2069,7 +2069,7 @@ impl flotilla_messaging::EngineMessages for MessagePrimitives {
     ) -> Result<bool, String> {
         MessagePrimitives::await_reply(self, namespace, name, intent, home, kind, about).await
     }
-    async fn end_stalls(&self, namespace: &str, seats: &[String], stalled: Option<&str>, reason: &str) -> Result<Vec<String>, String> {
+    async fn end_stalls(&self, namespace: &str, seats: &[String], stalled: &[String], reason: &str) -> Result<Vec<String>, String> {
         MessagePrimitives::end_stalls(self, namespace, seats, stalled, reason).await
     }
     async fn delivery_held_until(&self, namespace: &str, receiver: &str) -> Result<Option<chrono::DateTime<chrono::Utc>>, String> {

@@ -70,7 +70,8 @@ macro_rules! define_patch_kinds {
 define_patch_kinds! {
     ConvoyPromise => NONE,
     ConvoyRestoreTurnActivation => DUPLICATE,
-    ConvoySetStalled => NONE,
+    ConvoySetStall => NONE,
+    ConvoyEndStall => NONE,
     ConvoySetNudgeObligations => NONE,
     ConvoySetTeardownWait => NONE,
     ConvoySetPlacementDecision => NONE,
@@ -120,7 +121,8 @@ fn convoy_patch_kind(patch: &ConvoyStatusPatch) -> PatchKind {
         | ConvoyStatusPatch::UnlinkSubject { .. } => {
             panic!("admission and subject patches are outside this lifecycle contract")
         }
-        ConvoyStatusPatch::SetStalled { .. } => PatchKind::ConvoySetStalled,
+        ConvoyStatusPatch::SetStall { .. } => PatchKind::ConvoySetStall,
+        ConvoyStatusPatch::EndStall { .. } => PatchKind::ConvoyEndStall,
         ConvoyStatusPatch::SetNudgeObligations { .. } => PatchKind::ConvoySetNudgeObligations,
         ConvoyStatusPatch::SetTeardownWait { .. } => PatchKind::ConvoySetTeardownWait,
         ConvoyStatusPatch::SetPlacementDecision { .. } => PatchKind::ConvoySetPlacementDecision,
@@ -239,6 +241,7 @@ fn active_convoy_status() -> ConvoyStatus {
         branch_subject_scan_at: None,
         branch_subject_scan_error: None,
         stalled: None,
+        stalls: Default::default(),
         nudge_obligations: Vec::new(),
         provisioning: None,
         placement_decision: None,

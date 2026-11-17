@@ -218,30 +218,33 @@ impl ReadProjections<'_> {
                 .map_err(|error| error.to_string())?;
             for source in convoys.items {
                 let convoy = source.object;
-                let Some(status) = convoy.status.as_ref().filter(|status| !status.phase.is_terminal()) else { continue };
+                let Some(status) = convoy.status.as_ref() else { continue };
                 let mut obligations = BTreeMap::new();
-                if let Some(stall) = &status.stalled {
-                    for leaf in &stall.leaves {
-                        if let flotilla_protocol::LeafAddress::Work { work, .. } = &leaf.address {
-                            if let Some(role) = leaf.field_path.strip_prefix(".crew.").and_then(|path| path.strip_suffix(".phase")) {
-                                obligations.insert((Some(work.clone()), role.to_string()), Some(stall));
-                            }
-                        }
-                    }
-                    if obligations.is_empty() {
+                for stall in &status.stalls {
+                    let mut seats = stall
+                        .leaves
+                        .iter()
+                        .filter_map(|leaf| {
+                            let flotilla_protocol::LeafAddress::Work { work, .. } = &leaf.address else { return None };
+                            let role = leaf.field_path.strip_prefix(".crew.")?.strip_suffix(".phase")?;
+                            Some((Some(work.clone()), role.to_string()))
+                        })
+                        .collect::<Vec<_>>();
+                    if seats.is_empty() {
                         if let Some(flotilla_resources::LeafMaker::Actor { vessel, role }) = &stall.maker {
-                            obligations.insert((Some(vessel.clone()), role.clone()), Some(stall));
+                            seats.push((Some(vessel.clone()), role.clone()));
                         }
                     }
-                }
-                // A visible stall must not disappear merely because its maker or
-                // leaves do not identify a crew actor (for example a controller wait).
-                if obligations.is_empty() {
-                    if let Some(stall) = &status.stalled {
-                        obligations.insert((None, String::new()), Some(stall));
+                    // A visible stall must not disappear merely because its maker or
+                    // leaves do not identify a crew actor (for example a controller wait).
+                    if seats.is_empty() {
+                        seats.push((None, String::new()));
+                    }
+                    for seat in seats {
+                        obligations.insert(seat, Some(stall));
                     }
                 }
-                // A later crew declaration can replace the convoy's visible condition.
+                // A seat can read Stalled from its stall record with no condition noted here.
                 // Keep every stalled crew row; absent per-obligation metadata stays unknown.
                 for (vessel, crew) in &status.crew_work {
                     for (role, state) in crew {
@@ -1849,11 +1852,12 @@ impl ReadProjections<'_> {
                 .into_iter()
                 .map(|(vessel, pin)| (vessel, pin.decision))
                 .collect(),
-            stalled: convoy
+            stalls: convoy
                 .status
-                .as_ref()
-                .and_then(|status| status.stalled.as_ref())
-                .and_then(|condition| serde_json::to_value(condition).ok()),
+                .iter()
+                .flat_map(|status| &status.stalls)
+                .filter_map(|condition| serde_json::to_value(condition).ok())
+                .collect(),
             message: convoy.status.as_ref().and_then(|status| status.message.clone()),
             evidence_ttl_seconds: LANDING_EVIDENCE_TTL.as_secs(),
             change_request_stale_after_seconds: change_request_stale_after.as_secs(),

@@ -465,7 +465,7 @@ async fn idle_nudge_scenario() -> Case {
 /// session, `resumed-coder`, running in the work's vessel.
 async fn actor_nudge_scenario(governors: &[(&str, u64, ConvoyPhase)]) -> Case {
     let case = project_supervision_case(governors).await;
-    case.note(|status| status.stalled = None).await;
+    case.note(|status| status.stalls.clear()).await;
     resume_coder(&case);
     case
 }
@@ -653,7 +653,7 @@ async fn coder_beside_governor(declared: bool, governor: Option<TerminalAttentio
     ]);
     let case = supervised_case(workflow, &[]).await;
     if !declared {
-        case.note(|status| status.stalled = None).await;
+        case.note(|status| status.stalls.clear()).await;
         resume_coder(&case);
     }
     let supervise = case.home.vessel(&case.work, "supervise", "env");
@@ -688,7 +688,7 @@ async fn a_declared_crew_stall_reaches_its_supervisor_beside_other_rows() {
             let now = Utc::now();
             let case = coder_beside_governor(true, governor, now).await;
             case.wake.judge_stalls_at("flotilla", &case.objects().await, now).await.expect("judge");
-            let stalled = case.status().await.stalled.expect("stalled");
+            let stalled = case.status().await.stalls.about(Some(("work", "coder"))).cloned().expect("the coder's stall");
             assert_eq!(stalled.source, StallEvidenceSource::Crew, "governor {governor:?}");
             let supervisor = stalled.supervisor.expect("the crew rung");
             assert_eq!((supervisor.vessel.as_str(), supervisor.role.as_str()), ("supervise", "governor"), "governor {governor:?}");

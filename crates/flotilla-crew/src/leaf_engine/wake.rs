@@ -634,7 +634,7 @@ impl ReconcilerWake {
             let convoy_vessels = select_convoy_children(convoy, &vessel_sources);
             inputs.extend(convoy_vessels.keys().cloned());
             if launch_underway(status.phase) {
-                if let Some(stalled) = status.stalled.as_ref().filter(|stalled| stalled.supervisor.is_some()) {
+                for stalled in status.stalls.iter().filter(|stalled| stalled.supervisor.is_some()) {
                     if let Some(maker @ LeafMaker::Supervisor { .. }) = &stalled.maker {
                         desired.push(LeafSubscriptionRow {
                             id: uuid::Uuid::nil(),
@@ -675,7 +675,7 @@ impl ReconcilerWake {
                             {
                                 continue;
                             }
-                            if status.stalled.as_ref().is_some_and(|stalled| {
+                            if status.stalls.iter().any(|stalled| {
                                 stalled.supervisor.is_some()
                                     && stalled.leaves.iter().any(|leaf| {
                                         leaf.address == LeafAddress::Work { convoy: convoy.metadata.name.clone(), work: vessel.clone() }

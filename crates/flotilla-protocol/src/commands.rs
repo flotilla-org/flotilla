@@ -478,8 +478,9 @@ pub struct ConvoyExplanation {
     pub namespace: String,
     pub convoy: String,
     pub phase: String,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub stalled: Option<serde_json::Value>,
+    /// Each open stall, one about each stalled seat and one about no seat.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub stalls: Vec<serde_json::Value>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub message: Option<String>,
     #[serde(default, skip_serializing_if = "std::collections::BTreeMap::is_empty")]

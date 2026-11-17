@@ -187,7 +187,7 @@ async fn a_handoff_no_holder_will_come_for_stalls_its_sender() {
 
     let status = held.convoy(&backend).await.status.expect("status");
     assert_eq!(status.crew_work["work"]["coder"].phase, CrewWorkPhase::Stalled);
-    let stalled = status.stalled.expect("the sender's stall");
+    let stalled = status.stalls.about(Some(("work", "coder"))).cloned().expect("the sender's own stall");
     assert_eq!(stalled.source, flotilla_resources::StallEvidenceSource::Crew);
     assert_eq!(stalled.reason, Some(flotilla_protocol::StallReason::Other));
     assert!(stalled.leaves.iter().any(|leaf| leaf.field_path == ".crew.coder.phase"), "{stalled:?}");
@@ -844,7 +844,7 @@ async fn run_escalation_scenarios(
             // The ruling failed the coder's seat and so the launch: its view shows no stall, and
             // the home's note of it is the stall as it was.
             assert_eq!(after, None);
-            assert_eq!(held.engine.engine().memory().get(&held.launch).stall, before);
+            assert_eq!(held.engine.engine().memory().get(&held.launch).stalls.oldest().cloned(), before);
             assert_eq!(
                 held.convoy(&backend).await.status.expect("status").crew_work["work"]["coder"].message.as_deref(),
                 Some("concurrent ruling")
