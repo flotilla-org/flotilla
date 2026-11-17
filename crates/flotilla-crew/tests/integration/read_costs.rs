@@ -291,6 +291,9 @@ async fn vessels_in_one_environment(others: usize) -> (Vec<EnvironmentVessel>, u
         assert_eq!(every.len(), others + 2, "a full pass finds every vessel: {every:?}");
     }
 
+    // The convoy views' follower reads the writes above through the same port: once it has, the
+    // gets counted below are the delivery's alone.
+    convoys.settled().await;
     let launches = engine.vessels.vessels.launches_read();
     let gets = keyed_gets(&convoys, &engine);
     let (found, reads) = measure_now(|| environment_vessels(convoys.reads().as_ref(), Some(&BTreeSet::from(["shared".to_owned()]))));
