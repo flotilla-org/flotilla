@@ -261,6 +261,8 @@ impl MessagePrimitives {
         index.refresh_off_thread(self).await?;
         let mut report = SweepReport::default();
         let roles = self.roles(namespace).await?;
+        // A message this pass drops undelivered tells the operator, as these roles name them.
+        self.dead_letters.learn(&roles);
         let inbox = self.inbox();
         for name in index.open().map(str::to_owned).collect::<Vec<_>>() {
             let Some(message) = inbox.get_async(&name).await.map_err(|error| error.to_string())? else { continue };

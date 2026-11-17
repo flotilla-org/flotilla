@@ -28,7 +28,7 @@ use std::{
 };
 
 use self::{
-    roles::{designated_fleet_roles, FleetRoles, FLEET_STORE},
+    roles::{designated_fleet_roles, FleetRoles, FLEET_STORE, OPERATOR, TURN_RULES},
     view::{old_view, record_name, ViewLookups},
 };
 use flotilla_address::{Address, Kind as AddressKind};
@@ -88,19 +88,38 @@ impl Observations for GateWorld {
     }
 }
 
-/// Dead letters go to the sender's supervisor. A fleet role and a crew
-/// alike have none declared on this path yet, as the old store dead-letters
-/// only on an operator's batch failure, so no dead letter is sent.
-struct NoSupervisors;
+/// Where the inbox sends a dead letter, the notice that a message was dropped undelivered: to the
+/// operator of its sender's context, the person role `operator` in the sender's project, or under
+/// the fleet for a sender in none, sent as turn-rules. A person's own message is not
+/// dead-lettered to a person. The fleet's roles are learned on each sweep, the pass that drops
+/// messages; none is sent before the first.
+#[derive(Default)]
+struct DeadLetters {
+    roles: std::sync::RwLock<Option<FleetRoles>>,
+}
 
-impl Supervision for NoSupervisors {
-    fn supervisor(&self, _: &Address) -> Option<Address> {
-        None
+impl DeadLetters {
+    fn learn(&self, roles: &FleetRoles) {
+        *self.roles.write().expect("dead letter roles") = Some(roles.clone());
+    }
+}
+
+impl Supervision for DeadLetters {
+    fn supervisor(&self, sender: &Address) -> Option<Address> {
+        let roles = self.roles.read().expect("dead letter roles");
+        let roles = roles.as_ref()?;
+        if roles.person_role_of(sender).is_some() {
+            return None;
+        }
+        match sender.get(AddressKind::Project) {
+            Some(project) => Address::project(project).and_then(|project| project.child(AddressKind::Role, OPERATOR.name)).ok(),
+            None => roles.person(OPERATOR.name),
+        }
     }
     fn system_sender(&self) -> Address {
-        // The inbox asks only when sending a dead letter to a supervisor, and none is declared;
-        // declaring supervisors names the sender too.
-        unreachable!("no supervisor is declared, so no dead letter is sent")
+        // Asked only after `supervisor` named one, so the roles are learned.
+        let roles = self.roles.read().expect("dead letter roles");
+        roles.as_ref().and_then(|roles| roles.address(TURN_RULES.name)).expect("turn-rules is a declared fleet role")
     }
 }
 
@@ -393,6 +412,8 @@ pub struct MessagePrimitives {
     services: Arc<Services>,
     awaiting: Arc<awaiting::AwaitingReplies>,
     world: Arc<GateWorld>,
+    /// Where the inbox sends its dead letters, from the fleet roles each sweep learns.
+    dead_letters: Arc<DeadLetters>,
     /// Weak: the backend holds this path as its Message port and attentions.
     backend: WeakResourceBackend,
     consumers: Mutex<BTreeSet<Receiver>>,
@@ -446,7 +467,9 @@ impl MessagePrimitives {
         let log = flotilla_engine_store::MessageLog::new(store);
         let receipts = log.consumers();
         let world = Arc::new(GateWorld::new(Arc::clone(&clock)));
-        let inbox = SqliteInbox::open(home, log, world.clone(), Arc::new(NoSupervisors)).map_err(|error| error.to_string())?;
+        let dead_letters = Arc::new(DeadLetters::default());
+        let inbox = SqliteInbox::open(home, log, world.clone(), Arc::clone(&dead_letters) as Arc<dyn Supervision>)
+            .map_err(|error| error.to_string())?;
         let sessions = Arc::new(Sessions {
             home: Mutex::new(Home::with_log(home, receipts.clone()).map_err(|error| format!("AgentSession home: {error:?}"))?),
         });
@@ -489,6 +512,7 @@ impl MessagePrimitives {
             services,
             awaiting,
             world,
+            dead_letters,
             consumers: Mutex::new(BTreeSet::new()),
             receipts,
             charter_pass: Arc::default(),

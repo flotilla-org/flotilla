@@ -232,6 +232,43 @@ async fn the_sweep_settles_held_outcomes_and_withdraws_on_a_false_delivery_condi
     assert!(authority.as_str().contains("demo"), "the condition is the authority: {authority}");
 }
 
+// Behaviour: a message dropped undelivered, its inbox unbound past the threshold, tells the
+// operator of its sender's context with a dead letter sent as turn-rules about it: a crew's, the
+// operator role of the crew's project; a fleet role's, the fleet's operator.
+#[tokio::test]
+async fn a_message_dropped_undelivered_sends_a_dead_letter_to_its_senders_operator() {
+    use flotilla_engine_messages::sweep::OpenMessages;
+    let dir = tempfile::tempdir().expect("tempdir");
+    let start = chrono::Utc::now();
+    let clock = Arc::new(flotilla_store_testkit::VirtualClock::new(start));
+    let primitives = primitives_at(&dir, Arc::clone(&clock) as Arc<dyn flotilla_resources::Clock>).await;
+    const REVIEWER: &str = "flotilla/demo/review/reviewer";
+    let from_crew = flotilla_resources::message_record_name(REVIEWER, CREW, "handoff");
+    primitives.admit(&from_crew, &intent(CREW, REVIEWER)).await.expect("handoff");
+    let from_rules = flotilla_resources::message_record_name(CREW, "system:turn-rules", "rule@1");
+    primitives.admit(&from_rules, &intent("system:turn-rules", CREW)).await.expect("turn");
+    let mut open = OpenMessages::default();
+    let now = flotilla_schema::Timestamp::from_datetime(&start);
+    assert_eq!(primitives.sweep(NAMESPACE, now, &mut open).await.expect("sweep").undeliverable, 0);
+
+    let later = start + chrono::Duration::hours(24) + chrono::Duration::seconds(1);
+    clock.set(later);
+    let report = primitives.sweep(NAMESPACE, flotilla_schema::Timestamp::from_datetime(&later), &mut open).await.expect("sweep");
+    assert_eq!(report.undeliverable, 2);
+    for (receiver, record, operator) in
+        [(REVIEWER, &from_crew, "project:flotilla/role:operator"), (CREW, &from_rules, "fleet:lab/role:operator")]
+    {
+        let (dropped, _) = located(&primitives, receiver, record).await;
+        let operator: flotilla_address::Address = operator.parse().expect("operator inbox");
+        let letter = flotilla_inbox::dead_letter_name(&operator, &dropped).expect("dead letter name");
+        let letters = primitives.inbox_messages(&operator).expect("operator's messages");
+        let (_, letter) =
+            letters.iter().find(|(_, message)| message.name() == letter).unwrap_or_else(|| panic!("no dead letter at {operator}"));
+        assert_eq!(letter.spec().sender.as_str(), "fleet:lab/role:turn-rules");
+        assert!(letter.spec().references.iter().any(|reference| reference.subject && reference.address.as_str() == dropped), "{letter:?}");
+    }
+}
+
 // Behaviour (#3108): the sweep's next wake is the earliest of several open messages' deadlines, and
 // once that message expires, the next earliest.
 #[tokio::test]
