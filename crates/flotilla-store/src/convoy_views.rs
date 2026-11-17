@@ -28,7 +28,7 @@ use futures::{stream::BoxStream, FutureExt, StreamExt};
 use flotilla_protocol::{LifecycleReading, NodeId};
 use flotilla_resources::{
     convoy::view::VesselReading,
-    convoy_records::{ConvoyChange, ConvoyJoins, ConvoyNotes, ConvoyRecord, ConvoyRecords, WorkFacts},
+    convoy_records::{ConvoyChange, ConvoyJoins, ConvoyListing, ConvoyNotes, ConvoyRecord, ConvoyRecords, UnreadableLaunch, WorkFacts},
     engine_records::{IndexCover, KindRecords, LogPosition, Record, Since, UnloggedJournal},
     held_joins::{JoinChange, JoinChanges, JoinsReader},
     lifecycle_reads::{ChangeCursor, LifecycleReads},
@@ -425,18 +425,27 @@ impl ConvoyViews {
         Ok(())
     }
 
-    /// Composes the launches owed again from their records; one with no record leaves the views.
-    /// Each stays owed until its view is held.
+    /// Composes the launches owed again from their records; one with no record leaves the views,
+    /// and one that cannot be read is held as unreadable, with why. Each stays owed until its view
+    /// is held.
     async fn recompose(&self, held: &mut HeldViews) -> Result<(), ResourceError> {
         if held.refill_owed {
             return self.refill(held).await;
         }
+        let here = self.convoys().map_err(ResourceError::other)?.home().to_owned();
         while let Some((home, name)) = held.owed.first().cloned() {
             let (key_home, key_name) = (home.clone(), name.clone());
-            let record = self.blocking(move |reads| reads.convoys()?.get(&key_name, Some(&key_home))).await?;
-            let composed = match record {
-                Some(record) => Some(self.compose(vec![record], held).await?.0),
-                None => None,
+            let ConvoyListing { records, unreadable } =
+                self.blocking(move |reads| reads.convoys()?.named(&key_name, Some(&key_home))).await?;
+            let composed = match (records.is_empty(), unreadable.first()) {
+                (false, _) => Some(self.compose(records, held).await?.0),
+                (true, Some(launch)) => Some(vec![Composed {
+                    home: launch.home.clone(),
+                    view: unreadable_view(&self.namespace, &here, launch),
+                    unreadable: Some((launch.version, launch.reason.clone())),
+                    ended: None,
+                }]),
+                (true, None) => None,
             };
             let key = (home, name);
             match composed {
@@ -461,20 +470,12 @@ impl ConvoyViews {
             following.cursors.joins_position = position;
         }
         let here = self.convoys().map_err(ResourceError::other)?.home().to_owned();
-        // A launch that cannot be read stays listed, with why; when another home's last changed
-        // is not known.
-        composed.extend(listing.unreadable.iter().map(|launch| {
-            let provenance = if launch.home == here {
-                ResourceProvenance::Local
-            } else {
-                ResourceProvenance::Replica { origin_root: NodeId::new(launch.home.clone()), last_synced_at: DateTime::UNIX_EPOCH }
-            };
-            Composed {
-                home: launch.home.clone(),
-                view: ReadResourceObject { object: launch.read_view(&self.namespace), provenance },
-                unreadable: Some((launch.version, launch.reason.clone())),
-                ended: None,
-            }
+        // A launch that cannot be read stays listed, with why.
+        composed.extend(listing.unreadable.iter().map(|launch| Composed {
+            home: launch.home.clone(),
+            view: unreadable_view(&self.namespace, &here, launch),
+            unreadable: Some((launch.version, launch.reason.clone())),
+            ended: None,
         }));
         // Each view read again keeps its version while it shows the same; the rest leave.
         let read =
@@ -544,19 +545,18 @@ impl ConvoyViews {
 
     /// Launch `name` at `home`, or at every home when `None`, composed from the store for a read
     /// by name of a launch the views do not hold: a retired one, which reads with how it ended.
-    /// Each is joined with its works' Vessel launches by their index, and their sessions; nothing
-    /// of it is kept.
+    /// Each is joined with its works' Vessel launches by their index, and their sessions; one that
+    /// cannot be read is its unreadable view, with why. Nothing of it is kept.
     async fn stored(&self, name: &str, home: Option<&str>) -> Result<Vec<HeldView>, ResourceError> {
         let (name, home, namespace) = (name.to_owned(), home.map(str::to_owned), self.namespace.clone());
         let views = self
             .blocking(move |reads| {
                 let convoys = reads.convoys()?;
-                let records = match home {
-                    Some(home) => convoys.get(&name, Some(&home))?.into_iter().collect(),
-                    None => convoys.named(&name)?,
-                };
+                let here = convoys.home().to_owned();
+                let ConvoyListing { records, unreadable } = convoys.named(&name, home.as_deref())?;
+                let mut views: Vec<_> = unreadable.iter().map(|launch| unreadable_view(&namespace, &here, launch)).collect();
                 if records.is_empty() {
-                    return Ok(Vec::new());
+                    return Ok(views);
                 }
                 let (vessels, terminals) = (reads.vessels()?, reads.terminals()?);
                 let launches = vessels.of_convoy(&name)?;
@@ -564,16 +564,12 @@ impl ConvoyViews {
                 for launch in &launches {
                     sessions.insert(launch.name.clone(), terminals.of_vessel(&launch.name)?);
                 }
-                let here = convoys.home().to_owned();
-                Ok(records
-                    .iter()
-                    .map(|record| {
-                        let notes = (record.home == here).then(|| convoys.memory().get(&record.name));
-                        let joined =
-                            join(record, notes.as_ref(), launches.clone(), |vessel| sessions.get(vessel).cloned().unwrap_or_default());
-                        view_of(&namespace, &here, record, notes.as_ref(), &joined)
-                    })
-                    .collect::<Vec<_>>())
+                views.extend(records.iter().map(|record| {
+                    let notes = (record.home == here).then(|| convoys.memory().get(&record.name));
+                    let joined = join(record, notes.as_ref(), launches.clone(), |vessel| sessions.get(vessel).cloned().unwrap_or_default());
+                    view_of(&namespace, &here, record, notes.as_ref(), &joined)
+                }));
+                Ok(views)
             })
             .await?;
         let position = self.with_held(|held| held.position()).await?;
@@ -636,6 +632,17 @@ fn view_of(namespace: &str, here: &str, record: &ConvoyRecord, notes: Option<&Co
         ResourceProvenance::Replica { origin_root: NodeId::new(record.home.clone()), last_synced_at: synced }
     };
     ReadResourceObject { object, provenance }
+}
+
+/// Launch `launch`, which cannot be read, as its read view at home `here`, with why; when another
+/// home's last changed is not known.
+fn unreadable_view(namespace: &str, here: &str, launch: &UnreadableLaunch) -> ReadResourceObject<Convoy> {
+    let provenance = if launch.home == here {
+        ResourceProvenance::Local
+    } else {
+        ResourceProvenance::Replica { origin_root: NodeId::new(launch.home.clone()), last_synced_at: DateTime::UNIX_EPOCH }
+    };
+    ReadResourceObject { object: launch.read_view(namespace), provenance }
 }
 
 fn view_record(held: HeldView, home: String) -> Record<Convoy> {

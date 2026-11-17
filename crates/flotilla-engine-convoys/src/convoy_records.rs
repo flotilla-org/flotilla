@@ -125,15 +125,24 @@ impl ConvoyRecords for EngineConvoyRecords {
         })
     }
 
-    fn named(&self, name: &str) -> Result<Vec<ConvoyRecord>, String> {
-        self.read(&format!("{name} at every home"), |read| {
-            let mut records = Vec::new();
-            for id in read.resolve_named(<Resource<Convoy> as Kind>::CODE, name)? {
+    fn named(&self, name: &str, home: Option<&str>) -> Result<ConvoyListing, String> {
+        let code = <Resource<Convoy> as Kind>::CODE;
+        self.read(&format!("{name} at {}", home.unwrap_or("every home")), |read| {
+            let mut listing = ConvoyListing::default();
+            let ids = match home {
+                Some(home) => read.resolve(code, name, home)?.into_iter().collect(),
+                None => read.resolve_named(code, name)?,
+            };
+            for id in ids {
                 if let Some(loaded) = read.load::<Resource<Convoy>>(id)? {
-                    records.extend(record(read, &self.stalls, loaded)?);
+                    match entry(read, &self.stalls, loaded, Retired::Read)? {
+                        Some(Ok(record)) => listing.records.push(record),
+                        Some(Err(unreadable)) => listing.unreadable.push(unreadable),
+                        None => {}
+                    }
                 }
             }
-            Ok(records)
+            Ok(listing)
         })
     }
 

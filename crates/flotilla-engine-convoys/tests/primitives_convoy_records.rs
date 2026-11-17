@@ -232,7 +232,17 @@ fn an_undecodable_launch_is_listed_as_unreadable_beside_the_others() {
     }
     let error = records.get(&unreadable, None).expect_err("an unreadable launch is no record");
     assert!(error.contains(&unreadable), "{error}");
-    assert_eq!(records.get(&readable, None).expect("read").map(|record| record.name), Some(readable));
+    assert_eq!(records.get(&readable, None).expect("read").map(|record| record.name), Some(readable.clone()));
+
+    // A read of every copy of a name lists the unreadable one with why, and fails nothing (#3108).
+    for home in [None, Some(HOME)] {
+        let named = records.named(&unreadable, home).expect("a read by name lists an unreadable launch");
+        assert!(named.records.is_empty());
+        let [launch] = named.unreadable.as_slice() else { panic!("one unreadable launch: {:?}", named.unreadable) };
+        assert!(launch.reason.contains("admission document does not decode"), "{}", launch.reason);
+        let named = records.named(&readable, home).expect("read by name");
+        assert_eq!((named.records.len(), named.unreadable.len()), (1, 0));
+    }
 }
 
 // Behaviour: a crew that hands its work to a crew it fans out reads as handed back, under its old

@@ -17,7 +17,9 @@ use chrono::{DateTime, TimeZone, Utc};
 use flotilla_protocol::{LifecycleReading, PrincipalRef};
 use flotilla_resources::{
     convoy::admission::AdmissionDocument,
-    convoy_records::{ConvoyChange, ConvoyEnd, ConvoyListing, ConvoyMemory, ConvoyNotes, ConvoyRecord, ConvoyRecords, CrewNotes},
+    convoy_records::{
+        ConvoyChange, ConvoyEnd, ConvoyListing, ConvoyMemory, ConvoyNotes, ConvoyRecord, ConvoyRecords, CrewNotes, UnreadableLaunch,
+    },
     engine_records::KindRecords,
     held_joins::HeldJoins,
     lifecycle_reads::{ChangeCursor, CursorSince, LifecycleReads, ProvisioningKind},
@@ -220,11 +222,14 @@ struct Convoys {
     /// While closed, a launch's record read waits, after it tells `reading`.
     gate: (Mutex<bool>, Condvar),
     reading: tokio::sync::Notify,
+    /// Launches held that cannot be read, which a listing leaves out as it does retired ones.
+    unreadable: Mutex<Vec<UnreadableLaunch>>,
 }
 
 impl Convoys {
     fn new(records: Vec<ConvoyRecord>) -> Self {
         Self {
+            unreadable: Mutex::default(),
             records: Mutex::new(records),
             memory: ConvoyMemory::default(),
             read: AtomicUsize::new(0),
@@ -262,6 +267,16 @@ impl ConvoyRecords for Convoys {
         drop(self.gate.1.wait_while(closed, |closed| *closed).expect("gate"));
         let home = home.unwrap_or(HERE);
         Ok(self.records().into_iter().find(|record| record.name == name && record.home == home))
+    }
+    fn named(&self, name: &str, home: Option<&str>) -> Result<ConvoyListing, String> {
+        let records = match home {
+            Some(home) => self.get(name, Some(home))?.into_iter().collect(),
+            None => self.records().into_iter().filter(|record| record.name == name).collect(),
+        };
+        let unreadable = self.unreadable.lock().expect("unreadable").clone();
+        let unreadable =
+            unreadable.into_iter().filter(|launch| launch.name == name && home.is_none_or(|home| launch.home == home)).collect();
+        Ok(ConvoyListing { records, unreadable })
     }
     fn newest(&self, of: &str, _project: &str, home: Option<&str>) -> Result<Option<ConvoyRecord>, String> {
         let home = home.unwrap_or(HERE);
@@ -711,6 +726,50 @@ async fn a_retired_launch_reads_by_name_with_its_ending() {
     assert_eq!(status.message.as_deref(), Some("stopped"));
     let copies = backend.including_replicas::<Convoy>("flotilla").get_all("retired#1").await.expect("copies").items;
     assert_eq!(copies.len(), 1, "every copy of the name reads it too");
+}
+
+// Behaviour (#3108): a read of every copy of a name the views do not hold fails nothing because one
+// copy cannot be read: that copy reads as unreadable, with why, beside the others.
+#[tokio::test]
+async fn a_read_by_name_gives_an_unreadable_copy_beside_the_others() {
+    let mut retired = launch("gone#1", HERE);
+    retired.ended = Some((ConvoyEnd::Abandoned { reason: "stopped".into() }, at(200)));
+    retired.retired = true;
+    let reads = Arc::new(Reads {
+        joins: HeldJoins::default(),
+        convoys: Convoys::new(vec![retired, launch("open#1", HERE)]),
+        terminals: Terminals { records: Vec::new(), observations: TerminalObservations::default() },
+        vessels: Vessels { records: Vec::new() },
+    });
+    reads.convoys.unreadable.lock().expect("unreadable").push(UnreadableLaunch {
+        name: "gone#1".into(),
+        home: "home-b".into(),
+        version: 4,
+        launch_of: "gone".into(),
+        launch: 1,
+        project: "flotilla".into(),
+        workflow_ref: "review".into(),
+        created_at: at(100),
+        reason: "its end is not held here".into(),
+    });
+    let backend = ResourceBackend::new(InMemoryBackend::default());
+    backend.serve_engine_in("flotilla");
+    Arc::new(ConvoyViews::new("flotilla", reads)).install(&backend);
+
+    let copies = backend.including_replicas::<Convoy>("flotilla").get_all("gone#1").await.expect("no copy fails the read").items;
+    let read: BTreeMap<_, _> = copies
+        .iter()
+        .map(|copy| {
+            let unreadable = copy.object.metadata.annotations.get(flotilla_resources::CONVOY_UNREADABLE_ANNOTATION).cloned();
+            let local = matches!(copy.provenance, flotilla_resources::ResourceProvenance::Local);
+            (local, (copy.object.status.as_ref().map(|status| status.phase), unreadable))
+        })
+        .collect();
+    assert_eq!(
+        read,
+        BTreeMap::from([(true, (Some(ConvoyPhase::Abandoned), None)), (false, (None, Some("its end is not held here".to_owned()))),]),
+        "this home's copy with its ending, and home-b's unreadable with why"
+    );
 }
 
 /// `name` held at `home`, ensured from `ensure`, and ended when `ended`.
