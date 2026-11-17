@@ -40,7 +40,12 @@ pub fn validate_message_address(address: &str) -> Result<(), ResourceError> {
 /// so the convoy segment escapes `%` and `/`; [`parse_crew_role_address`] reads it back.
 /// Old 4-part spelling; goes when crew compares engine addresses (#3108 gate task).
 pub fn crew_role_address(project: &str, convoy: &str, vessel: &str, role: &str) -> String {
-    format!("{project}/{}/{vessel}/{role}", convoy_segment(convoy))
+    format!("{}{vessel}/{role}", crew_convoy_prefix(project, convoy))
+}
+
+/// What every [`crew_role_address`] of launch `convoy` in `project` starts with.
+pub fn crew_convoy_prefix(project: &str, convoy: &str) -> String {
+    format!("{project}/{}/", convoy_segment(convoy))
 }
 
 /// The crew members' addresses a convoy's frozen workflow declares: the receivers its crew

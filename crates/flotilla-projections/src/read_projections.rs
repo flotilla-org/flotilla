@@ -2260,7 +2260,10 @@ pub async fn message_views(
                 StoreQuery {
                     field_prefixes: BTreeMap::from([(
                         "spec.receiver".into(),
-                        format!("{}/{}/", convoy.spec.project_ref.as_deref().unwrap_or(namespace), convoy.metadata.name),
+                        flotilla_resources::crew_convoy_prefix(
+                            convoy.spec.project_ref.as_deref().unwrap_or(namespace),
+                            &convoy.metadata.name,
+                        ),
                     )]),
                     ..Default::default()
                 },
@@ -2277,7 +2280,10 @@ pub async fn message_views(
             .filter(|record| record.object.status.as_ref().is_none_or(|status| !status.phase.is_terminal()))
             .filter(|record| {
                 convoy.is_none_or(|convoy| {
-                    let prefix = format!("{}/{}/", convoy.spec.project_ref.as_deref().unwrap_or(namespace), convoy.metadata.name);
+                    let prefix = flotilla_resources::crew_convoy_prefix(
+                        convoy.spec.project_ref.as_deref().unwrap_or(namespace),
+                        &convoy.metadata.name,
+                    );
                     record.object.spec.receiver.starts_with(&prefix) || aliases.contains(&record.object.spec.receiver)
                 })
             })

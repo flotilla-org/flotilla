@@ -116,12 +116,14 @@ pub fn old_address(address: &Address, roles: &FleetRoles, lookups: &dyn ViewLook
     }
     let project = address.get(Kind::Project).ok_or_else(|| format!("`{address}` has no project"))?;
     match address.get(Kind::Convoy) {
-        Some(convoy) => {
-            let vessel = lookups
-                .vessel(convoy, address.name())
-                .ok_or_else(|| format!("no vessel holds `{}` in convoy `{convoy}`", address.name()))?;
-            Ok(format!("{project}/{convoy}/{vessel}/{}", address.name()))
-        }
+        // Spelled by the convoy record's name: a standing launch's holds its address.
+        Some(convoy) => flotilla_resources::convoy::engine::convoy_records(address)
+            .into_iter()
+            .find_map(|record| {
+                let vessel = lookups.vessel(&record, address.name())?;
+                Some(flotilla_resources::crew_role_address(project, &record, &vessel, address.name()))
+            })
+            .ok_or_else(|| format!("no vessel holds `{}` in convoy `{convoy}`", address.name())),
         None => Ok(format!("{project}/{}", address.name())),
     }
 }

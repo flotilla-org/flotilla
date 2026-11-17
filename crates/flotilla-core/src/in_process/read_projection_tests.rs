@@ -1431,7 +1431,7 @@ mod tests {
     // #3005: unrelated message history adds no reads to explain; its messages are exactly the
     // target's, including a standing-role alias.
     #[tokio::test]
-    #[ignore = "a standing launch's seat messages are not listed: the seat spelling fix lands on the mainline first"]
+    #[ignore = "a standing-role alias message is dropped: no terminal holds the alias on the engine, and explain keeps only held or direct receivers"]
     async fn explain_message_reads_are_bounded() {
         use flotilla_resources::MessageRelation;
         use flotilla_store::load_metrics::{measure, ReadCounts};

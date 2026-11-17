@@ -210,6 +210,34 @@ async fn message_routing_refuses_unknown_homes_and_finished_convoys() {
     assert!(daemon.message_creation_origin("flotilla", &document(&coder_inbox(&next))).await.unwrap_err().contains("undeclared vessel"));
 }
 
+// A standing launch (`project:P/convoy:R#n`) is explained with the messages sent to its crew's
+// seats, as the crew address spells them.
+#[tokio::test]
+async fn explaining_a_standing_launch_lists_its_crews_messages() {
+    let temp = tempfile::tempdir().expect("config directory");
+    std::fs::write(temp.path().join("daemon.toml"), "machine_id = \"standing-explain-test\"\n").expect("machine identity");
+    let backend = engine_home_backend();
+    let daemon = InProcessDaemon::new_with_resource_backend(
+        Vec::new(),
+        Arc::new(ConfigStore::with_base(temp.path())),
+        fake_discovery(false),
+        HostName::new("local"),
+        backend.clone(),
+        Arc::new(flotilla_discovery_testkit::HostPeerOverlay::default()),
+    )
+    .await;
+    super::test_engine(&daemon);
+    designate_fleet(&backend).await;
+    let snapshot = flotilla_engine_convoys_testkit::single_agent("coder").workflow_snapshot.expect("workflow");
+    let launch = super::support::admit_standing(&daemon, "flotilla", "guide", snapshot).await;
+    assert!(flotilla_resources::convoy::engine::split_launch(&launch).is_some(), "{launch} is a numbered launch");
+    let seat = flotilla_resources::crew_role_address("flotilla", &launch, "work", "coder");
+    let intent = flotilla_engine_messages_testkit::intent("system:turn-rules", &seat, flotilla_resources::MessageRelation::System, "work");
+    install_engine_messages(&daemon).admit("to-the-seat", &intent).await.expect("admit");
+    let explained = daemon.explain_convoy_internal(Some("flotilla"), &launch).await.expect("explain");
+    assert_eq!(explained.messages.iter().map(|message| message.name.as_str()).collect::<Vec<_>>(), ["to-the-seat"]);
+}
+
 // #3045: sending a message is an interactive request: routing it to the
 // receiver's home and admitting it at that home read the same objects however
 // many unrelated convoys, holders and messages share the namespace. Daemon
