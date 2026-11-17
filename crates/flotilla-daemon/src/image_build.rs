@@ -154,10 +154,11 @@ mod tests {
     async fn daemon_materials_resolve_host_credentials_and_keep_logs() {
         use flotilla_resources::{
             CredentialConsumer, CredentialGrant, CredentialGrantSelector, CredentialGrantSpec, CredentialLifecycle, CredentialSource,
-            CredentialSpec, CredentialSpecSpec, FleetDesignationSpec, Host, HostActionSelector, HostSpec, ImageBuildCapacity,
-            ImageCacheBinding, Project, ProjectSpec,
+            CredentialSpec, CredentialSpecSpec, FleetDesignationSpec, HostActionSelector, HostSpec, ImageBuildCapacity, ImageCacheBinding,
+            Project, ProjectSpec,
         };
-        let backend = ResourceBackend::new(flotilla_store_memory::InMemoryBackend::default());
+        let home = flotilla_provisioning_testkit::EngineBackend::open_in("home", "test");
+        let backend = home.backend.clone();
         let repository = "registry.test/flotilla/crew-images";
         backend
             .definitions::<Project>("test")
@@ -180,21 +181,20 @@ mod tests {
             )
             .await
             .expect("fleet");
-        backend
-            .using::<Host>("test")
-            .create(
-                &InputMeta::builder().name("builder".into()).build(),
-                &HostSpec {
-                    image_build_capacity: Some(ImageBuildCapacity::Builder {
-                        architecture: "amd64".into(),
-                        slots: 1,
-                        reservation: ImageBuildReservation { cpu: 1, disk_bytes: 1 },
-                    }),
-                    ..Default::default()
-                },
-            )
-            .await
-            .expect("host");
+        // The builder publishes its Host at its own daemon; this home receives it.
+        home.put_host_at_its_home(
+            "builder",
+            &HostSpec {
+                image_build_capacity: Some(ImageBuildCapacity::Builder {
+                    architecture: "amd64".into(),
+                    slots: 1,
+                    reservation: ImageBuildReservation { cpu: 1, disk_bytes: 1 },
+                }),
+                ..Default::default()
+            },
+            None,
+        )
+        .await;
         for (name, consumer, env) in [
             (
                 "crew-image-registry-push",

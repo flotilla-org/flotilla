@@ -1,7 +1,3 @@
-#[cfg(test)]
-use flotilla_store_memory::InMemoryBackend;
-#[cfg(test)]
-use flotilla_store_sqlite::SqliteBackend;
 use std::{
     collections::{BTreeMap, HashSet},
     path::{Path, PathBuf},
@@ -13,8 +9,8 @@ use chrono::{Duration, Utc};
 use flotilla_agent::brief_artifact::BriefArtifactWriter;
 use flotilla_protocol::CallerCrew;
 use flotilla_resources::{
-    address::artifact_slot_record_name, Artifact, ArtifactSpec, Convoy, InputMeta, OwnerReference, Resource, ResourceError, ResourceObject,
-    TerminalSession, TerminalSessionSource,
+    address::artifact_slot_record_name, Artifact, ArtifactSpec, InputMeta, ResourceError, ResourceObject, TerminalSession,
+    TerminalSessionSource,
 };
 use flotilla_store::ResourceBackend;
 use tracing::warn;
@@ -117,13 +113,8 @@ impl BriefArtifactWriter for SystemBriefArtifactWriter {
             .expires_at(expires_at)
             .pinned(prior.as_ref().is_some_and(|artifact| artifact.spec.pinned))
             .build();
-        let owner = OwnerReference {
-            api_version: format!("{}/{}", Convoy::API_PATHS.group, Convoy::API_PATHS.version),
-            kind: Convoy::API_PATHS.kind.to_string(),
-            name: convoy.to_string(),
-            controller: false,
-        };
-        let meta = InputMeta::builder().name(name).owner_references(vec![owner]).build();
+        // The spec's convoy is the artifact's owner.
+        let meta = InputMeta::builder().name(name).build();
         match prior {
             Some(prior) => resolver.update(&meta, &prior.metadata.resource_version, &spec).await.map_err(|error| error.to_string())?,
             None => resolver.create(&meta, &spec).await.map_err(|error| error.to_string())?,
@@ -162,14 +153,14 @@ impl ArtifactService<'_> {
         input: ArtifactPutInput,
         retention_days: &BTreeMap<String, u64>,
     ) -> Result<ResourceObject<Artifact>, String> {
-        let (name, spec, owner) = self.prepare_put(caller, input, retention_days).await?;
+        let (name, spec) = self.prepare_put(caller, input, retention_days).await?;
         let resolver = self.backend.using::<Artifact>(self.namespace);
         let prior = match resolver.get(&name).await {
             Ok(prior) => Some(prior),
             Err(ResourceError::NotFound { .. }) => None,
             Err(error) => return Err(error.to_string()),
         };
-        let meta = InputMeta::builder().name(name).owner_references(vec![owner]).build();
+        let meta = InputMeta::builder().name(name).build();
         match prior {
             Some(prior) => resolver.update(&meta, &prior.metadata.resource_version, &spec).await.map_err(|error| error.to_string()),
             None => resolver.create(&meta, &spec).await.map_err(|error| error.to_string()),
@@ -181,7 +172,7 @@ impl ArtifactService<'_> {
         caller: &CallerCrew,
         input: ArtifactPutInput,
         retention_days: &BTreeMap<String, u64>,
-    ) -> Result<(String, ArtifactSpec, OwnerReference), String> {
+    ) -> Result<(String, ArtifactSpec), String> {
         let producer = self.stamped_role(caller).await?;
         if input.kind.is_empty() || input.subject.is_empty() || input.media_type.is_empty() {
             return Err("artifact kind, subject, and media type must be nonempty".into());
@@ -232,13 +223,7 @@ impl ArtifactService<'_> {
             .expires_at(expires_at)
             .pinned(prior.as_ref().is_some_and(|object| object.spec.pinned))
             .build();
-        let owner = OwnerReference {
-            api_version: format!("{}/{}", Convoy::API_PATHS.group, Convoy::API_PATHS.version),
-            kind: Convoy::API_PATHS.kind.to_string(),
-            name: caller.convoy.clone(),
-            controller: false,
-        };
-        Ok((name, spec, owner))
+        Ok((name, spec))
     }
 
     async fn stamped_role(&self, caller: &CallerCrew) -> Result<String, String> {
@@ -367,8 +352,10 @@ pub struct Reaped {
 
 #[cfg(test)]
 mod tests {
+    use flotilla_engine_convoys_testkit::{single_agent, EngineHome};
     use flotilla_protocol::CallerCrew;
-    use flotilla_resources::{Selector, TerminalBrief, TerminalCrewContext, TerminalSessionSpec, TerminalSessionStatus};
+    use flotilla_provisioning_testkit::{EngineBackend, TerminalsFixture};
+    use flotilla_resources::terminal_records::{AgentLaunch, TerminalLaunchFacts};
     use flotilla_store::apply_resource_document;
 
     use super::{ArtifactBody, *};
@@ -382,17 +369,17 @@ mod tests {
         let fleet: Arc<dyn BlobStore> = Arc::new(MemoryBlobStore::default());
         let home_blobs = Arc::new(TieredBlobStore::new(home_dir.path(), vec![("fleet".into(), Arc::clone(&fleet))]));
         let remote_blobs = TieredBlobStore::new(remote_dir.path(), vec![("fleet".into(), fleet)]);
-        let backend = ResourceBackend::new(InMemoryBackend::default());
         let namespace = "flotilla";
-        let convoy = "convoy-cross-host";
-        backend
-            .using::<Convoy>(namespace)
-            .create(
-                &InputMeta::builder().name(convoy.to_string()).build(),
-                &flotilla_resources::ConvoySpec::builder().workflow_ref("workflow".to_string()).build(),
+        let home = EngineHome::open_in("home", namespace);
+        let backend = home.backend().clone();
+        let launch = home
+            .admit(
+                "convoy-cross-host",
+                flotilla_resources::ConvoySpec::builder().workflow_ref("workflow".to_string()).build(),
+                single_agent("coder"),
             )
-            .await
-            .expect("create convoy");
+            .await;
+        let convoy = launch.as_str();
         let writer = SystemBriefArtifactWriter { backend: backend.clone(), blobs: Arc::clone(&home_blobs), retention_days: 3650 };
         let body = b"# crew brief\nExact bytes survive another host.\n";
         let digest =
@@ -410,9 +397,10 @@ mod tests {
         assert_eq!(artifact.spec.summary["charter_commit"], "charter-revision");
         assert_eq!(artifact.spec.subject, convoy);
         assert_eq!(artifact.spec.digest, digest);
-        assert!(!artifact.metadata.owner_references[0].controller);
         home_blobs.sync_once().await.expect("sync to fleet store");
-        backend.using::<Convoy>(namespace).delete(convoy).await.expect("reap convoy");
+        // The launch ends; its brief outlives it.
+        let ended = home.convoy(convoy).await;
+        home.convoys.path().get().expect("the Convoy path").abandon(&ended, "operator", "abandoned").await.expect("end the launch");
         assert!(backend.using::<Artifact>(namespace).get(&artifact.metadata.name).await.is_ok());
         let fetched = remote_blobs.get(&BlobDigest::parse(&digest).expect("valid digest")).await.expect("fetch on remote host");
         assert_eq!(fetched.as_deref(), Some(body.as_slice()));
@@ -463,57 +451,32 @@ mod tests {
             .build()
     }
 
-    async fn contract(backend: ResourceBackend) {
+    // An artifact put by a crew whose session runs at the convoy's home, as the daemon serves it.
+    #[tokio::test]
+    async fn artifact_contract() {
         let namespace = "flotilla";
-        let sessions = backend.using::<TerminalSession>(namespace);
-        let session = sessions
-            .create(
-                &InputMeta::builder().name("terminal-demo-work-coder".to_string()).build(),
-                &TerminalSessionSpec::builder()
-                    .env_ref("env".to_string())
-                    .role("coder".to_string())
-                    .source(TerminalSessionSource::Agent {
-                        selector: Selector::for_capability("coding"),
-                        brief: TerminalBrief { artifact_digest: None, path: "brief.md".into(), content: String::new(), copies: vec![] },
-                        context: Box::new(TerminalCrewContext {
-                            namespace: namespace.into(),
-                            convoy: "demo".into(),
-                            vessel_ref: "demo-work".into(),
-                        }),
-                    })
-                    .cwd("/work".to_string())
-                    .pool("cleat".to_string())
-                    .build(),
-            )
-            .await
-            .expect("create session");
-        sessions
-            .update_status(
-                &session.metadata.name,
-                &session.metadata.resource_version,
-                &TerminalSessionStatus {
-                    crew: Some(
-                        flotilla_resources::CrewSessionStatus::builder()
-                            .id("crew-1".to_string())
-                            .adapter("codex".to_string())
-                            .stance("trusted".to_string())
-                            .build(),
-                    ),
-                    ..TerminalSessionStatus::default()
-                },
-            )
-            .await
-            .expect("mark crew");
+        let home = EngineHome::open_in("home", namespace);
+        let backend = home.backend().clone();
+        let launch = home
+            .admit("demo", flotilla_resources::ConvoySpec::builder().workflow_ref("workflow".into()).build(), single_agent("coder"))
+            .await;
+        let engine = &home.engine.engine;
+        let vessel = engine.vessels.request(&launch, "work", "home");
+        let crew = engine.terminals.request(&TerminalsFixture::agent(&vessel, "coder", "env"));
+        let agent = AgentLaunch { adapter: "codex".into(), model: None, stance: "trusted".into() };
+        engine.terminals.ready(&crew, "crew-session", &TerminalLaunchFacts { agent: Some(agent), ..Default::default() });
         let blobs = MemoryBlobStore::default();
         let retention = BTreeMap::from([("review-round".to_string(), 10)]);
         let service = ArtifactService { backend: &backend, blobs: &blobs, namespace };
+        // The crew as its session reads: its convoy is the launch its vessel serves.
         let caller = CallerCrew::builder()
             .namespace(namespace.to_string())
-            .convoy("demo".to_string())
-            .vessel("demo-work".to_string())
+            .convoy(launch.clone())
+            .vessel(vessel.clone())
             .role("coder".to_string())
-            .crew_id("crew-1".to_string())
+            .crew_id(crew.clone())
             .build();
+        let convoy = launch.as_str();
         for (mut invalid, expected) in [
             (input("head", BTreeMap::new(), b"body"), "kind"),
             (input("", BTreeMap::new(), b"body"), "subject"),
@@ -532,9 +495,8 @@ mod tests {
         // A subject may describe a foreign convoy, commit or review; it never
         // selects artifact ownership or overwrites that convoy's envelope.
         let foreign_subject = service.put(&caller, input("other-convoy", BTreeMap::new(), b"evidence"), &retention).await.unwrap();
-        assert_eq!(foreign_subject.spec.convoy, "demo");
+        assert_eq!(foreign_subject.spec.convoy, convoy);
         assert_eq!(foreign_subject.spec.subject, "other-convoy");
-        assert_eq!(foreign_subject.metadata.owner_references[0].name, "demo");
         assert!(service.list(Some("other-convoy"), None, None).await.unwrap().is_empty());
         backend.using::<Artifact>(namespace).delete(&foreign_subject.metadata.name).await.unwrap();
         let first = service
@@ -542,15 +504,14 @@ mod tests {
             .await
             .expect("put first body");
         assert_eq!(first.spec.producer, "coder");
-        assert!(!first.metadata.owner_references[0].controller);
         assert_eq!(service.get(&format!("artifact/{}", first.metadata.name)).await.expect("get address"), b"one");
         assert_eq!(service.get(&first.spec.digest).await.expect("get digest"), b"one");
         let second = service.put(&caller, input("head-1", BTreeMap::new(), b"two"), &retention).await.expect("replace latest");
         assert_eq!(second.metadata.name, first.metadata.name);
-        assert_eq!(service.list(Some("demo"), Some("review-round"), Some("head-1")).await.expect("list").len(), 1);
+        assert_eq!(service.list(Some(convoy), Some("review-round"), Some("head-1")).await.expect("list").len(), 1);
         assert_eq!(service.get(&second.metadata.name).await.expect("get latest"), b"two");
-        let remote_home = ResourceBackend::new(InMemoryBackend::default());
-        let (remote_name, remote_spec, remote_owner) =
+        let remote_home = EngineHome::open_in("remote", namespace);
+        let (remote_name, remote_spec) =
             service.prepare_put(&caller, input("head-2", BTreeMap::new(), b"remote"), &retention).await.expect("prepare remote envelope");
         apply_resource_document(
             &remote_home,
@@ -558,7 +519,7 @@ mod tests {
             serde_json::json!({
                 "apiVersion": "flotilla.work/v1",
                 "kind": "Artifact",
-                "metadata": {"name": remote_name.clone(), "ownerReferences": [remote_owner]},
+                "metadata": {"name": remote_name.clone()},
                 "spec": remote_spec,
             }),
         )
@@ -574,11 +535,7 @@ mod tests {
         let mut expired = second.spec.clone();
         expired.expires_at = Utc::now() - Duration::days(1);
         resolver
-            .update(
-                &InputMeta::builder().name(second.metadata.name.clone()).owner_references(second.metadata.owner_references.clone()).build(),
-                &second.metadata.resource_version,
-                &expired,
-            )
+            .update(&InputMeta::builder().name(second.metadata.name.clone()).build(), &second.metadata.resource_version, &expired)
             .await
             .expect("expire artifact");
         assert!(service.reap_expired().await.expect("reap").referenced.is_empty());
@@ -587,7 +544,7 @@ mod tests {
         expired.subject = "pinned-head".into();
         expired.pinned = true;
         let pinned_name = flotilla_resources::address::record_name(
-            &flotilla_resources::address::artifact_address("demo", "coder", "review-round", "pinned-head").expect("artifact address"),
+            &flotilla_resources::address::artifact_address(convoy, "coder", "review-round", "pinned-head").expect("artifact address"),
         )
         .expect("record name");
         resolver.create(&InputMeta::builder().name(pinned_name).build(), &expired).await.expect("create pinned artifact");
@@ -596,11 +553,12 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn retention_reports_an_artifact_naming_no_blob_and_collects_the_rest() {
+    async fn retention_collects_an_expired_artifacts_blob() {
         let namespace = "flotilla";
         let state = tempfile::tempdir().expect("blob state");
         let blobs = TieredBlobStore::new(state.path(), Vec::new());
-        let backend = ResourceBackend::new(InMemoryBackend::default()).with_local_root(flotilla_protocol::NodeId::new("this-home"));
+        let home = EngineBackend::open_in("this-home", namespace);
+        let backend = home.backend.clone();
         let spec = |subject: &str, digest: String| {
             ArtifactSpec::builder()
                 .convoy("demo".into())
@@ -625,46 +583,11 @@ mod tests {
             .create(&InputMeta::builder().name(name("expired")).build(), &spec("expired", digest.as_str().to_owned()))
             .await
             .expect("expired artifact");
-        // Stored at another home before a non-digest was refused.
-        let mut stale = spec("stale", "dummy-script-finished".into());
-        stale.expires_at = Utc::now() + Duration::days(1);
-        let object = ResourceObject {
-            metadata: flotilla_resources::ObjectMeta {
-                name: name("stale"),
-                namespace: namespace.into(),
-                resource_version: "1".into(),
-                labels: Default::default(),
-                annotations: Default::default(),
-                owner_references: Vec::new(),
-                finalizers: Vec::new(),
-                deletion_timestamp: None,
-                creation_timestamp: Utc::now(),
-                merge: None,
-            },
-            spec: stale,
-            status: None,
-        };
-        backend
-            .replica_writer::<Artifact>(flotilla_protocol::NodeId::new("other-home"), namespace)
-            .apply(flotilla_resources::WatchEvent::Added(object), Utc::now())
-            .await
-            .expect("replicate the stale artifact");
         let service = ArtifactService { backend: &backend, blobs: &blobs, namespace };
 
-        let reaped = service.reap_expired().await.expect("a sweep past an artifact naming no blob");
-        assert_eq!(reaped.unreadable, vec![name("stale")]);
+        let reaped = service.reap_expired().await.expect("a sweep");
         assert!(reaped.referenced.is_empty());
         blobs.gc_unreferenced(&reaped.referenced, std::time::Duration::ZERO).await.expect("collect");
         assert!(!blobs.has(&digest).await.expect("blob lookup"), "the expired artifact's blob is collected");
-    }
-
-    #[tokio::test]
-    async fn artifact_contract_in_memory() {
-        contract(ResourceBackend::new(InMemoryBackend::default())).await;
-    }
-
-    #[tokio::test]
-    async fn artifact_contract_sqlite() {
-        contract(ResourceBackend::new(SqliteBackend::open_in_memory().expect("sqlite"))).await;
     }
 }

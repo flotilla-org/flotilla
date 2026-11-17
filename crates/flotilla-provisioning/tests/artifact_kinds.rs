@@ -88,7 +88,7 @@ fn spec(summary: BTreeMap<String, serde_json::Value>) -> ArtifactSpec {
         .kind("decision-ledger".into())
         .subject("demo".into())
         .summary(summary)
-        .digest("ef37".into())
+        .digest(flotilla_resources::artifact::blob_digest_of(b"ledger"))
         .size(43)
         .media_type("text/markdown".into())
         .expires_at(Utc.timestamp_opt(1_800_000_000, 0).single().expect("time"))
@@ -155,7 +155,8 @@ fn every_storable_artifact_imports_and_reads_back(tc: hegel::TestCase) {
     assert_eq!(report.dropped.values().sum::<usize>(), usize::from(reserved), "{report:?}");
 }
 
-// Behaviour (ADR 0047): the corpus's artifacts import; a deleted copy drops; a copy whose summary
+// Behaviour (ADR 0047): the corpus's artifacts import; a deleted copy drops, as does one whose
+// digest names no blob, which the engine refuses to write (#3108); a copy whose summary
 // holds a value no put accepts (an array, a null) is refused, named, as is a size above the stored
 // integer range (#3320: stored integers never wrap); one name a home holds in two namespaces is
 // refused in both (#3212: no namespaces), unless one of them is deleted, while the same name at
@@ -166,6 +167,9 @@ fn copies_the_engine_cannot_hold_are_dropped_or_refused() {
     assert!(!corpus.is_empty());
     let mut deleted = object("deleted", spec(BTreeMap::new()));
     deleted.metadata.deletion_timestamp = Some(Utc::now());
+    let mut no_blob = spec(BTreeMap::new());
+    no_blob.digest = "dummy-script-finished".into();
+    let no_blob = object("no-blob", no_blob);
     let nested = object("nested", spec(BTreeMap::from([("list".to_owned(), serde_json::json!([1]))])));
     let null = object("null", spec(BTreeMap::from([("gone".to_owned(), serde_json::Value::Null)])));
     let mut huge = spec(BTreeMap::new());
@@ -179,6 +183,7 @@ fn copies_the_engine_cannot_hold_are_dropped_or_refused() {
     let imported = copies.len() + 3;
     copies.extend([
         copy(deleted, "flotilla", "alpha"),
+        copy(no_blob, "flotilla", "alpha"),
         copy(nested, "flotilla", "alpha"),
         copy(null, "flotilla", "alpha"),
         copy(huge, "flotilla", "alpha"),
@@ -192,7 +197,8 @@ fn copies_the_engine_cannot_hold_are_dropped_or_refused() {
     let mut report = ImportReport::default();
     rehearse_artifacts(&copies, &mut report);
     assert_eq!(report.imported.values().sum::<usize>(), imported, "{report:?}");
-    assert_eq!(report.dropped.values().sum::<usize>(), 2, "{report:?}");
+    assert_eq!(report.dropped.values().sum::<usize>(), 3, "{report:?}");
+    assert_eq!(report.dropped.get(&("Artifact", "names no blob")), Some(&1), "{report:?}");
     let refused: Vec<_> = report.refused.iter().map(|refusal| (refusal.record.as_str(), refusal.reason.contains("`gamma`"))).collect();
     assert_eq!(refused, [("nested", false), ("null", false), ("huge", false), ("shared", true), ("shared", true)], "{report:?}");
 }

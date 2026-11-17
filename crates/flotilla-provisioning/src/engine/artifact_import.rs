@@ -3,6 +3,7 @@
 //! | Old copy | Imported |
 //! |---|---|
 //! | Deleted | dropped |
+//! | A `digest` that names no blob (not 64 lowercase SHA-256 hex digits) | dropped: the engine refuses to write one |
 //! | `spec` | the record's columns, times to the microsecond; the summary as one document |
 //! | A summary value that is null, an array or an object | refused: a put accepts only strings, numbers and booleans |
 //! | A `size` above `i64::MAX` | refused: stored integers are signed and never wrap |
@@ -14,7 +15,7 @@
 
 use std::collections::{BTreeMap, BTreeSet};
 
-use flotilla_resources::{Artifact, ResourceObject};
+use flotilla_resources::{artifact::is_blob_digest, Artifact, ResourceObject};
 
 use flotilla_engine_store::ImportTarget;
 
@@ -41,6 +42,9 @@ pub enum Imported {
 pub fn import_artifact(old: &ResourceObject<Artifact>) -> Result<Imported, String> {
     if old.metadata.deletion_timestamp.is_some() {
         return Ok(Imported::Dropped("deleted"));
+    }
+    if !is_blob_digest(&old.spec.digest) {
+        return Ok(Imported::Dropped("names no blob"));
     }
     ArtifactRecord::from_spec(&old.spec).map(|record| Imported::Record(Box::new(record)))
 }

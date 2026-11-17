@@ -388,13 +388,13 @@ mod tests {
     use std::sync::Mutex;
 
     use flotilla_inbox::InboxBackend;
+    use flotilla_provisioning_testkit::EngineBackend;
     use flotilla_resources::{
         FleetDesignation, FleetDesignationSpec, InputMeta, Project, ProjectSpec, SystemClock, FLEET_DESIGNATION_NAME,
     };
     use flotilla_schema::Frozen;
     use flotilla_schema_sqlite::stream::Service;
     use flotilla_state_machines::machines::message::{MessageReference, MessageSpec, Relation};
-    use flotilla_store_memory::InMemoryBackend;
 
     use super::*;
     use flotilla_engine_messages::{MessagePrimitives, RequestAnswer};
@@ -405,7 +405,8 @@ mod tests {
 
     /// The home's Message primitives, with the backend that serves them held as long as they are.
     async fn primitives(dir: &tempfile::TempDir) -> Served<Arc<MessagePrimitives>> {
-        let backend = ResourceBackend::new(InMemoryBackend::default());
+        let home = EngineBackend::open_in(HOME, NAMESPACE);
+        let backend = home.backend.clone();
         backend
             .clone()
             .using::<Project>(NAMESPACE)
@@ -430,7 +431,7 @@ mod tests {
         let service = Arc::new(
             Service::open(&dir.path().join("decided.sqlite"), HOME, flotilla_engine_store::registry().expect("registry")).expect("store"),
         );
-        Served::new(Arc::new(MessagePrimitives::open(HOME, service, backend.clone(), Arc::new(SystemClock)).expect("primitives")), backend)
+        Served::holding(Arc::new(MessagePrimitives::open(HOME, service, backend, Arc::new(SystemClock)).expect("primitives")), home)
     }
 
     /// The checkouts asked about, and the launch each is realised under.

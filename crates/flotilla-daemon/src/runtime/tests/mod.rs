@@ -77,10 +77,10 @@ use flotilla_resources::{
     CredentialConsumer, CredentialGrant, CredentialLifecycle, CredentialPlacementRequirements, CredentialSource, CredentialSpec,
     CredentialSpecSpec, CrewSource, CrewSpec, EnvironmentSpec, Forge, ForgeSpec, FulfilmentFacts, FulfilmentKind, FulfilmentKindSpec,
     FulfilmentRealisation, Host, HostDirectEnvironmentSpec, HostSpec, HostStatus, HostStatusPatch, InputMeta, ModelProbeState,
-    ObservedCheckoutSpec as ResourceObservedCheckoutSpec, PlacementStatus, Project, Repository, RepositoryKey, RepositorySpec,
-    RepositoryTrust, Resource, ResourceError, Selector, TerminalAttentionState, TerminalSession, TerminalSessionPhase,
-    TerminalSessionSource, TerminalSessionSpec, Vessel, VesselRequirement, VesselSpec, WorkPhase, WorkState, WorkflowTemplate,
-    WorkflowTemplateSpec, ACTUATOR_HOST_REF_ANNOTATION, CREDENTIAL_REFS_ENV, CREDENTIAL_SCOPES_ENV, MANAGED_BY_LABEL,
+    ObservedCheckoutSpec as ResourceObservedCheckoutSpec, Project, Repository, RepositoryKey, RepositorySpec, RepositoryTrust, Resource,
+    ResourceError, Selector, TerminalAttentionState, TerminalSession, TerminalSessionPhase, TerminalSessionSource, TerminalSessionSpec,
+    Vessel, VesselRequirement, WorkPhase, WorkflowTemplate, WorkflowTemplateSpec, ACTUATOR_HOST_REF_ANNOTATION, CREDENTIAL_REFS_ENV,
+    CREDENTIAL_SCOPES_ENV, MANAGED_BY_LABEL,
 };
 use flotilla_store::{controller::Reconciler, watch_resource_kind_including_replicas, ResourceBackend};
 use flotilla_terminal::{
@@ -92,8 +92,7 @@ use tempfile::TempDir;
 use tokio::sync::{Mutex, Notify, RwLock};
 
 use super::{
-    credentials::*, discovery::*, docker::*, environments::*, health::*, ports::*, seed::*, tasks::*, terminal::*,
-    test_git_repo::TestGitRepo, *,
+    credentials::*, discovery::*, docker::*, environments::*, health::*, seed::*, tasks::*, terminal::*, test_git_repo::TestGitRepo, *,
 };
 use crate::{
     environment_tools::{

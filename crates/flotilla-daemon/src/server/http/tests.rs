@@ -22,7 +22,6 @@ use flotilla_resources::{
     AccessDelivery, Clock, InputMeta, CONVOY_LABEL,
 };
 use flotilla_store::ResourceBackend;
-use flotilla_store_memory::InMemoryBackend;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tower::ServiceExt;
 
@@ -613,12 +612,11 @@ async fn kind_discovery_on_the_engine_home_reads_no_old_store() {
 async fn engine_records_are_not_read_through_another_namespace() {
     use flotilla_resources::MessageRelation;
 
-    let backend = ResourceBackend::new(InMemoryBackend::default());
-    backend.serve_engine_in("flotilla");
+    let home = flotilla_engine_convoys_testkit::EngineHome::open_in("home-a", "flotilla");
+    let backend = home.backend().clone();
     flotilla_engine_messages_testkit::designate_fleet(&backend, "flotilla").await;
-    let home = flotilla_engine_messages_testkit::EngineMessagesHome::open("home-a", "flotilla", &backend);
     let spec = flotilla_engine_messages_testkit::intent("flotilla/reviewer", "flotilla/coder", MessageRelation::Peer, "a");
-    home.primitives().admit("to-coder", &spec).await.expect("admit");
+    home.messages.primitives().admit("to-coder", &spec).await.expect("admit");
     let daemon = Incarnation::over(backend, ListenerOrigin::known(ORIGIN));
     let items = |reply: Reply| {
         assert_eq!(reply.status, StatusCode::OK, "{:?}", reply.body);
@@ -637,11 +635,11 @@ async fn engine_records_are_not_read_through_another_namespace() {
 async fn engine_served_kind_refuses_an_undeclared_query_field() {
     use flotilla_resources::MessageRelation;
 
-    let backend = ResourceBackend::new(InMemoryBackend::default());
+    let home = flotilla_engine_convoys_testkit::EngineHome::open_in("home-a", "flotilla");
+    let backend = home.backend().clone();
     flotilla_engine_messages_testkit::designate_fleet(&backend, "flotilla").await;
-    let home = flotilla_engine_messages_testkit::EngineMessagesHome::open("home-a", "flotilla", &backend);
     let spec = flotilla_engine_messages_testkit::intent("flotilla/reviewer", "flotilla/coder", MessageRelation::Peer, "a");
-    home.primitives().admit("to-coder", &spec).await.expect("admit");
+    home.messages.primitives().admit("to-coder", &spec).await.expect("admit");
     let daemon = Incarnation::over(backend, ListenerOrigin::known(ORIGIN));
     let reply = daemon
         .call(CallerAuth::Socket(None), get("/apis/flotilla.work/v1/namespaces/flotilla/messages?fieldSelector=spec.unknown%3Dx"))
@@ -658,9 +656,10 @@ async fn message_queries_answer_only_the_engine_messages_they_select() {
     use flotilla_resources::MessageRelation;
     use flotilla_store::MessageQuery;
 
-    let backend = ResourceBackend::new(InMemoryBackend::default());
+    let engine = flotilla_engine_convoys_testkit::EngineHome::open_in("home-a", "flotilla");
+    let backend = engine.backend().clone();
     flotilla_engine_messages_testkit::designate_fleet(&backend, "flotilla").await;
-    let home = flotilla_engine_messages_testkit::EngineMessagesHome::open("home-a", "flotilla", &backend);
+    let home = &engine.messages;
     let intent =
         |sender: &str, receiver: &str, body: &str| flotilla_engine_messages_testkit::intent(sender, receiver, MessageRelation::Peer, body);
     let primitives = home.primitives();

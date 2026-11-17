@@ -76,6 +76,7 @@ chrono = { version = "0.4", default-features = false, features = ["clock"] }
 tracing-subscriber = { version = "0.3", features = ["env-filter", "json"] }
 uuid = { workspace = true, features = ["v4"] }
 url = { workspace = true }
+percent-encoding = "2"
 reqwest = { workspace = true, features = ["json"] }
 futures = "0.3"
 hyper = { version = "1", features = ["http1", "server"] }

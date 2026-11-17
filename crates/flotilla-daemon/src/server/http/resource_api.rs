@@ -122,7 +122,17 @@ pub(in crate::server) async fn respond(
             serde_json::json!({"kinds": REGISTERED_RESOURCE_KINDS.iter().map(|kind| kind.plural).collect::<Vec<_>>(), "namespaces": namespaces }),
         );
     }
-    let segments = path.trim_matches('/').split('/').collect::<Vec<_>>();
+    // Each segment is percent-decoded once split, so a name holding `/` stays one segment.
+    let segments = match path
+        .trim_matches('/')
+        .split('/')
+        .map(|segment| percent_encoding::percent_decode_str(segment).decode_utf8())
+        .collect::<Result<Vec<_>, _>>()
+    {
+        Ok(segments) => segments,
+        Err(_) => return Reply::error(400, "resource API path is not UTF-8 once decoded"),
+    };
+    let segments = segments.iter().map(|segment| segment.as_ref()).collect::<Vec<_>>();
     let (namespace, kind, name) = match segments.as_slice() {
         ["apis", "flotilla.work", "v1", "namespaces", namespace, kind] => (*namespace, *kind, None),
         ["apis", "flotilla.work", "v1", "namespaces", namespace, kind, name] => (*namespace, *kind, Some(*name)),

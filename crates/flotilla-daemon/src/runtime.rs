@@ -852,6 +852,7 @@ fn spawn_controller_loops(
                     daemon.crew_message_path(),
                 );
                 secondaries.push(daemon.reconciler_wake_watch());
+                secondaries.push(daemon.convoy_wake_watch());
                 secondaries.push(Box::new(flotilla_crew::convoy::EngineConvoyWake { engine: daemon.convoy_engine_path() }));
                 // A convoy's checkouts are the engine's: their changes wake the convoy holding them.
                 if let Ok(service) = daemon.decided_store() {

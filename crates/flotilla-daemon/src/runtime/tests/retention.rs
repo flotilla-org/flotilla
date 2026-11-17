@@ -2,8 +2,8 @@
 
 use super::*;
 use crate::blob_store::{BlobStore, TieredBlobStore};
+use flotilla_provisioning_testkit::EngineBackend;
 use flotilla_resources::{Artifact, ArtifactSpec};
-use flotilla_store_memory::InMemoryBackend;
 
 // Behaviour (#3108): retention wakes when the next unpinned artifact expires, with no timer and
 // no further change: an artifact due to expire soon is reaped at its expiry, a pinned one stays.
@@ -11,7 +11,8 @@ use flotilla_store_memory::InMemoryBackend;
 async fn an_artifact_is_reaped_at_its_expiry_without_a_timer() {
     let state = tempfile::tempdir().expect("state dir");
     let blobs = Arc::new(TieredBlobStore::new(state.path(), Vec::new()));
-    let backend = ResourceBackend::new(InMemoryBackend::default());
+    let home = EngineBackend::open_in("home", NAMESPACE);
+    let backend = home.backend.clone();
     let task = tokio::spawn(run_artifact_gc(backend.clone(), NAMESPACE.into(), Arc::clone(&blobs)));
     let artifacts = backend.using::<Artifact>(NAMESPACE);
     let digest = blobs.put(b"review notes").await.expect("put blob");

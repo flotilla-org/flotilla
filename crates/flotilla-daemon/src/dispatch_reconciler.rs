@@ -603,9 +603,9 @@ fn dispatch_queue_attention(
 mod tests {
     use std::{collections::HashMap, sync::Mutex};
 
+    use flotilla_engine_convoys_testkit::{single_agent, EngineHome};
     use flotilla_protocol::IssueSource;
     use flotilla_resources::ConvoyIssue;
-    use flotilla_resources::ConvoyPhase;
     use flotilla_resources::ConvoySpec;
     use flotilla_resources::InputMeta;
     use flotilla_resources::InputValue;
@@ -613,6 +613,8 @@ mod tests {
     use flotilla_resources::ProjectSpec;
     use flotilla_resources::RepositoryKey;
     use flotilla_store_testkit::VirtualClock;
+
+    use crate::testkits::engine::engine;
 
     use super::*;
 
@@ -772,12 +774,43 @@ mod tests {
         );
     }
 
+    /// Waits until `wake` is told of a convoy change, as the daemon's dispatch task is woken
+    /// before it runs a pass.
+    async fn told(wake: &mut (impl futures::Stream<Item = Result<ReadWatchEvent<Convoy>, ResourceError>> + Unpin)) {
+        tokio::time::timeout(std::time::Duration::from_secs(5), wake.next())
+            .await
+            .expect("told of the convoy in time")
+            .expect("watching convoys")
+            .expect("a convoy change");
+    }
+
+    /// Waits until the watch tells of `launch`, ended or live as `ended` says.
+    async fn told_of(
+        wake: &mut (impl futures::Stream<Item = Result<ReadWatchEvent<Convoy>, ResourceError>> + Unpin),
+        launch: &str,
+        ended: bool,
+    ) {
+        tokio::time::timeout(std::time::Duration::from_secs(5), async {
+            loop {
+                let event = wake.next().await.expect("watching convoys").expect("a convoy change");
+                if let ReadWatchEvent::Added(record) | ReadWatchEvent::Modified(record) = event {
+                    let terminal = record.object.status.as_ref().is_some_and(|status| status.phase.is_terminal());
+                    if record.object.metadata.name == launch && terminal == ended {
+                        return;
+                    }
+                }
+            }
+        })
+        .await
+        .expect("told of the convoy in time");
+    }
+
     async fn harness(
         ready: Vec<Issue>,
         blockers: Vec<Issue>,
         policy: DispatchPolicy,
-    ) -> (ResourceBackend, Arc<FakeIssues>, Arc<VirtualClock>, DispatchReconciler) {
-        let backend = ResourceBackend::new(flotilla_store_memory::InMemoryBackend::default());
+    ) -> (EngineHome, Arc<FakeIssues>, Arc<VirtualClock>, DispatchReconciler) {
+        let backend = EngineHome::open_in("dispatch-home", NAMESPACE);
         backend
             .clone()
             .using::<Project>(NAMESPACE)
@@ -824,7 +857,7 @@ mod tests {
             failing_refs: Mutex::new(Default::default()),
         });
         let clock = Arc::new(VirtualClock::new("2026-08-04T12:00:00Z".parse().expect("clock timestamp")));
-        let reconciler = DispatchReconciler::new(backend.clone(), NAMESPACE, Arc::clone(&issues) as Arc<dyn DispatchIssueSource>)
+        let reconciler = DispatchReconciler::new(backend.backend().clone(), NAMESPACE, Arc::clone(&issues) as Arc<dyn DispatchIssueSource>)
             .with_clock(Arc::clone(&clock) as Arc<dyn Clock>);
         (backend, issues, clock, reconciler)
     }
@@ -834,7 +867,6 @@ mod tests {
     // occupancy independently of graph topology and preserve readiness aging.
     #[tokio::test]
     async fn pass_inventories_and_convoy_deltas_have_bounded_work() {
-        use flotilla_resources::ConvoyStatus;
         let (backend, issues, clock, reconciler) = harness(vec![issue("1", &["ready"], None, IssueState::Open)], vec![], policy(60)).await;
         let spec = backend.using::<Project>(NAMESPACE).get("widgets").await.expect("project").spec;
         for id in 0..12 {
@@ -857,43 +889,34 @@ mod tests {
             assert_eq!(state.occupancy_rebuilds, 13);
             assert_eq!(state.convoy_lists, 1);
         }
-        let convoys = backend.using::<Convoy>(NAMESPACE);
-        convoys
-            .create(
-                &InputMeta::builder().name("watched".into()).build(),
-                &ConvoySpec::builder().workflow_ref("implement".into()).project_ref("widgets".into()).build(),
-            )
-            .await
-            .expect("convoy add");
+        // A launch's project is fixed at its admission and a launch is never deleted (#3108): a
+        // move is one launch ending and another admitted on the destination, and an update is a
+        // landing. Once retirement lands, a retire step here counts one more occupancy update.
+        let mut wake = backend.including_replicas::<Convoy>(NAMESPACE).watch().await.expect("watch convoys");
+        let on = |project: &str| ConvoySpec::builder().workflow_ref("implement".into()).project_ref(project.into()).build();
+        let watched = backend.admit("watched", on("widgets"), single_agent("coder")).await;
+        told_of(&mut wake, &watched, false).await;
         reconciler.reconcile_once().await.expect("add pass");
         assert_eq!(reconciler.mission.lock().await.occupancy_rebuilds, 14);
         let widgets = backend.using::<Project>(NAMESPACE).get("widgets").await.expect("widgets").status.expect("status");
         assert_eq!(widgets.dispatch_queue[0].score.as_ref().expect("score").project_active_crews, 1);
-        let mut moved = convoys.get("watched").await.expect("convoy");
-        moved.spec.project_ref = Some("overlap-0".into());
-        convoys.update(&InputMeta::from(&moved.metadata), &moved.metadata.resource_version, &moved.spec).await.expect("move convoy");
+        let ended = backend.convoy(&watched).await;
+        backend.convoys.path().get().expect("the Convoy path").abandon(&ended, "operator", "abandoned").await.expect("end the launch");
+        told_of(&mut wake, &watched, true).await;
+        let moved = backend.admit("moved", on("overlap-0"), single_agent("coder")).await;
+        told_of(&mut wake, &moved, false).await;
         reconciler.reconcile_once().await.expect("move pass");
         assert_eq!(reconciler.mission.lock().await.occupancy_rebuilds, 16, "old and new scopes each update once");
         let widgets = backend.using::<Project>(NAMESPACE).get("widgets").await.expect("widgets").status.expect("status");
         let moved_project = backend.using::<Project>(NAMESPACE).get("overlap-0").await.expect("destination").status.expect("status");
         assert_eq!(widgets.dispatch_queue[0].score.as_ref().expect("score").project_active_crews, 0);
         assert_eq!(moved_project.dispatch_queue[0].score.as_ref().expect("score").project_active_crews, 1);
-        let current = convoys.get("watched").await.expect("convoy");
-        convoys
-            .update_status(
-                "watched",
-                &current.metadata.resource_version,
-                &ConvoyStatus { phase: ConvoyPhase::Landed, ..Default::default() },
-            )
-            .await
-            .expect("convoy update");
+        flotilla_engine_convoys_testkit::land(&backend.convoys.path(), &backend.convoy(&moved).await).await;
+        told_of(&mut wake, &moved, true).await;
         reconciler.reconcile_once().await.expect("update pass");
-        assert_eq!(reconciler.mission.lock().await.occupancy_rebuilds, 17);
-        convoys.delete("watched").await.expect("convoy remove");
-        reconciler.reconcile_once().await.expect("remove pass");
         {
             let state = reconciler.mission.lock().await;
-            assert_eq!(state.occupancy_rebuilds, 18);
+            assert_eq!(state.occupancy_rebuilds, 17);
             assert_eq!(state.boards.rebuilds(), 13);
             assert_eq!(state.convoy_lists, 1);
         }
@@ -933,15 +956,11 @@ mod tests {
         let (home, issues, _, reconciler) = harness(vec![issue("1", &["ready"], None, IssueState::Open)], Vec::new(), policy(3600)).await;
         let project = home.using::<Project>(NAMESPACE).get("widgets").await.unwrap();
         for root in ["second-reconciler", "third-reconciler"] {
-            let other = ResourceBackend::new(flotilla_store_memory::InMemoryBackend::default())
-                .with_local_root(flotilla_protocol::NodeId::new(root));
-            other.using::<Project>(NAMESPACE).create(&InputMeta::builder().name("widgets".into()).build(), &project.spec).await.unwrap();
-            other
-                .replica_writer::<Project>(home.local_root().unwrap(), NAMESPACE)
-                .replace(&home.using::<Project>(NAMESPACE).list().await.unwrap(), Utc::now())
-                .await
-                .unwrap();
-            let pass = DispatchReconciler::new(other, NAMESPACE, issues.clone()).reconcile_once().await.unwrap();
+            let other = EngineHome::open_in(root, NAMESPACE);
+            home.replicate_to(&other);
+            let replicated = other.including_replicas::<Project>(NAMESPACE).get("widgets").await.unwrap();
+            assert_eq!(replicated.object.spec, project.spec, "the home's Project replicated");
+            let pass = DispatchReconciler::new(other.backend().clone(), NAMESPACE, issues.clone()).reconcile_once().await.unwrap();
             assert_eq!(pass, ReconcilePass::default());
             assert_eq!(*issues.ready_calls.lock().unwrap(), 0);
         }
@@ -1086,12 +1105,11 @@ mod tests {
         reconciler.reconcile_once().await.expect("queue pass");
         let ready_at = backend.using::<Project>(NAMESPACE).get("widgets").await.expect("project").status.expect("status").dispatch_queue[0]
             .ready_observed_at;
-        let convoy = backend
-            .clone()
-            .using::<Convoy>(NAMESPACE)
-            .create(
-                &InputMeta::builder().name("human-dispatch".to_string()).build(),
-                &ConvoySpec {
+        let mut wake = backend.including_replicas::<Convoy>(NAMESPACE).watch().await.expect("watch convoys");
+        let launch = backend
+            .admit(
+                "human-dispatch",
+                ConvoySpec {
                     continuation: None,
                     subjects: Vec::new(),
                     role: String::new(),
@@ -1119,9 +1137,11 @@ mod tests {
                     instruction: None,
                     promises: Vec::new(),
                 },
+                single_agent("coder"),
             )
-            .await
-            .expect("manual convoy");
+            .await;
+        told(&mut wake).await;
+        let convoy = backend.convoy(&launch).await;
         clock.advance(Duration::seconds(90));
 
         let outcome = reconciler.reconcile_once().await.expect("dispatch pass");
@@ -1145,25 +1165,12 @@ mod tests {
         let expected = convoy.metadata.creation_timestamp.signed_duration_since(ready_at).to_std().expect("dispatched after ready");
         assert_eq!(timed(&metrics), (1, u64::try_from(expected.as_micros()).expect("micros")));
         // Only live convoys serve an issue; terminal history cannot suppress a
-        // reopened/retriaged issue forever. Every lifecycle phase is covered.
-        use flotilla_resources::ConvoyStatus;
-        let convoys = backend.clone().using::<Convoy>(NAMESPACE);
-        for phase in [
-            ConvoyPhase::Pending,
-            ConvoyPhase::Active,
-            ConvoyPhase::Interrupted,
-            ConvoyPhase::Landing,
-            ConvoyPhase::Landed,
-            ConvoyPhase::Failed,
-            ConvoyPhase::Abandoned,
-        ] {
-            let current = convoys.get("human-dispatch").await.expect("convoy");
-            convoys
-                .update_status("human-dispatch", &current.metadata.resource_version, &ConvoyStatus { phase, ..Default::default() })
-                .await
-                .expect("phase");
-            assert_eq!(reconciler.reconcile_once().await.expect("phase pass").queued, usize::from(phase.is_terminal()));
-        }
+        // reopened/retriaged issue forever. Which phases are terminal is
+        // ConvoyPhase's own mapping; here the launch lives, then ends.
+        assert_eq!(reconciler.reconcile_once().await.expect("live pass").queued, 0);
+        backend.convoys.path().get().expect("the Convoy path").abandon(&convoy, "operator", "abandoned").await.expect("end the launch");
+        told_of(&mut wake, &launch, true).await;
+        assert_eq!(reconciler.reconcile_once().await.expect("ended pass").queued, 1);
         assert_eq!(timed(&metrics).0, 1);
     }
 
@@ -1173,12 +1180,11 @@ mod tests {
         let waiting = issue("3", &[READY_ISSUE_LABEL], None, IssueState::Open);
         let (backend, issues, clock, reconciler) = harness(vec![dispatched.clone(), waiting.clone()], vec![], policy(60)).await;
         reconciler.reconcile_once().await.expect("queue pass");
+        let mut wake = backend.including_replicas::<Convoy>(NAMESPACE).watch().await.expect("watch convoys");
         backend
-            .clone()
-            .using::<Convoy>(NAMESPACE)
-            .create(
-                &InputMeta::builder().name("missing-workflow-dispatch".to_string()).build(),
-                &ConvoySpec {
+            .admit(
+                "missing-workflow-dispatch",
+                ConvoySpec {
                     continuation: None,
                     subjects: Vec::new(),
                     role: String::new(),
@@ -1206,9 +1212,10 @@ mod tests {
                     instruction: None,
                     promises: Vec::new(),
                 },
+                single_agent("coder"),
             )
-            .await
-            .expect("manual convoy");
+            .await;
+        told(&mut wake).await;
         clock.advance(Duration::seconds(60));
 
         let outcome = reconciler.reconcile_once().await.expect("dispatch pass");
@@ -1550,7 +1557,7 @@ mod tests {
     async fn a_board_change_makes_the_pass_read_the_new_ready_label() {
         let temp = tempfile::tempdir().expect("config");
         std::fs::write(temp.path().join("daemon.toml"), "machine_id = \"dispatch-wake-test\"\n").expect("daemon config");
-        let backend = ResourceBackend::new(flotilla_store_memory::InMemoryBackend::default());
+        let backend = flotilla_store_memory::engine_home_backend();
         let clock = Arc::new(VirtualClock::new(Utc::now()));
         let forge = Arc::new(LabelForge::default());
         let daemon = InProcessDaemon::new_with_resource_backend_and_clock(
@@ -1565,6 +1572,8 @@ mod tests {
             Arc::new(crate::peer::HostPeerOverlay::default()),
         )
         .await;
+        // Composed with its engine, as the runtime composes a daemon.
+        engine(&daemon);
         backend
             .using::<Project>(NAMESPACE)
             .create(

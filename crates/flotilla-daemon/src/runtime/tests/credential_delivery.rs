@@ -3,7 +3,6 @@ use crate::testkits::engine::{admit_convoy, engine, runtime_terminals};
 use flotilla_crew::crew_capabilities::CardScope;
 use flotilla_engine_messages::view::record_name;
 use flotilla_resources::attentions::Subject;
-use flotilla_store_memory::InMemoryBackend;
 use tokio_util::task::AbortOnDropHandle;
 
 #[tokio::test]
@@ -195,6 +194,8 @@ async fn daemon_forgejo_credential_mapping_heartbeat_lifecycle() {
     let temp = TempDir::new().expect("tempdir");
     credential_mapping_config(temp.path(), Some("lba"));
     let daemon = in_memory_daemon(Vec::new(), Arc::new(ConfigStore::with_base(temp.path()))).await;
+    // Checkouts are the engine's; the test reads that none was made.
+    engine(&daemon);
     let backend = daemon.resource_backend();
     declare_mapping_forge(&backend, NAMESPACE).await;
     let host_id = daemon.local_host_id().expect("host id").to_string();
@@ -249,6 +250,8 @@ async fn daemon_forgejo_credential_mapping_resolves_replica_in_another_namespace
     let temp = TempDir::new().expect("tempdir");
     credential_mapping_config(temp.path(), Some("lab"));
     let daemon = in_memory_daemon(Vec::new(), Arc::new(ConfigStore::with_base(temp.path()))).await;
+    // Checkouts are the engine's; the test reads that none was made.
+    engine(&daemon);
     assert!(daemon_forgejo_credential_condition(&daemon, NAMESPACE).await.is_some());
     declare_mapping_forge_at_home(&daemon, "forge-authority").await;
     assert!(daemon_forgejo_credential_condition(&daemon, NAMESPACE).await.is_none());
@@ -994,16 +997,17 @@ async fn slow_work_credential_phase_keeps_heartbeat_available_and_completes() {
 // Credential attention ignores terminal convoy history before decoding it.
 #[tokio::test]
 async fn credential_attention_reads_only_live_convoys() {
-    use flotilla_store_testkit::{measure_reads, ReadCountsBackendExt};
-    let backend = ResourceBackend::new(InMemoryBackend::default()).with_read_counts();
-    flotilla_store_testkit::fixtures::seed_convoy_history()
-        .backend(&backend)
-        .namespace("flotilla")
-        .landed(300)
-        .active(10)
-        .call()
-        .await
-        .expect("convoy history");
+    use flotilla_engine_convoys_testkit::{land, single_agent, EngineHome};
+    let home = EngineHome::open_in("home", "flotilla");
+    let backend = home.backend().clone();
+    // 300 landed launches and 10 live ones.
+    for index in 0..310 {
+        let spec = ConvoySpec::builder().workflow_ref("workflow".into()).build();
+        let launch = home.admit(&format!("history-{index}"), spec, single_agent("coder")).await;
+        if index < 300 {
+            land(&home.convoys.path(), &home.convoy(&launch).await).await;
+        }
+    }
 
     let failure = CredentialRefreshError {
         environment_ref: "missing".into(),
@@ -1014,16 +1018,23 @@ async fn credential_attention_reads_only_live_convoys() {
     };
     // The engine's attentions read no convoy either: only the live convoys are decoded.
     flotilla_engine_messages_testkit::designate_fleet(&backend, "flotilla").await;
-    let messages = flotilla_engine_messages_testkit::EngineMessagesHome::open("home", "flotilla", &backend);
-    let (result, reads) = measure_reads(super::super::credentials::reconcile_credential_refresh_attention_in(
-        messages.primitives().as_ref(),
-        &backend,
-        "flotilla",
-        &[failure],
-    ))
-    .await;
-    result.expect("attention");
-    assert_eq!(reads.of(&backend).objects_by_kind().get("Convoy"), Some(&10));
+    let reads = Arc::new(flotilla_store::load_metrics::CallerReads::default());
+    attributed(
+        Arc::clone(&reads),
+        super::super::credentials::reconcile_credential_refresh_attention_in(
+            home.messages.primitives().as_ref(),
+            &backend,
+            "flotilla",
+            &[failure],
+        ),
+    )
+    .await
+    .expect("attention");
+    // The engine's convoy port returns the live launches' rows alone, and the whole operation
+    // reads no more than those.
+    let counts = reads.snapshot();
+    assert_eq!(counts.get("Convoy port").map(|convoys| convoys.rows), Some(10));
+    assert_eq!(counts.values().map(|kind| kind.keyed + kind.rows).sum::<u64>(), 16, "every read the operation made: {counts:?}");
 }
 
 /// Counts each session's card readings and delivers nothing.

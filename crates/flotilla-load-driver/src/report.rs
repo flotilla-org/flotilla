@@ -92,7 +92,6 @@ pub struct MixSummary {
 /// One home's metrics over the window, as rates and summaries.
 #[derive(Debug, Clone, Default, Serialize)]
 pub struct HomeReport {
-    pub store: Option<StoreReport>,
     pub decided_store: Option<StoreReport>,
     pub controllers: BTreeMap<String, ControllerReport>,
     pub replication: ReplicationReport,
@@ -193,7 +192,6 @@ pub fn window_metrics(start: &TargetSample, end: &TargetSample, window: Duration
                     }
                 })
             };
-            let store = store_report(&end.store, &start.store);
             let decided_store = store_report(&end.decided_store, &start.decided_store);
             let controllers = end
                 .controllers
@@ -221,7 +219,6 @@ pub fn window_metrics(start: &TargetSample, end: &TargetSample, window: Duration
                 .collect();
             let replication = end.replication.since(&start.replication);
             HomeReport {
-                store,
                 decided_store,
                 controllers,
                 replication: ReplicationReport {
@@ -332,7 +329,7 @@ impl LoadReport {
         }
         for (index, home) in self.home_metrics.iter().enumerate() {
             let _ = writeln!(out, "\n**Daemon {index}**\n\n| Measure | Value |\n|---|---|");
-            if let Some(store) = &home.store {
+            if let Some(store) = &home.decided_store {
                 let _ = writeln!(out, "| Write queue wait | {} (peak depth {}) |", latency(&store.write_wait), store.write_queue_peak);
                 let _ = writeln!(out, "| Write execution | {} ({:.1}/s) |", latency(&store.write_execution), store.writes_per_second);
                 let _ = writeln!(out, "| Read queue wait | {} (peak depth {}) |", latency(&store.read_wait), store.read_queue_peak);
@@ -343,10 +340,6 @@ impl LoadReport {
                     store.reads_per_second,
                     store.reads_shed
                 );
-            }
-            if let Some(decided) = &home.decided_store {
-                let _ =
-                    writeln!(out, "| Decided store writes | {} ({:.1}/s) |", latency(&decided.write_execution), decided.writes_per_second);
             }
             let _ = writeln!(out, "| Turn delivery (created → receipt) | {} |", latency(&home.turn_delivery));
             let replication = &home.replication;

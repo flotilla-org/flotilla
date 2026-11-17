@@ -5,8 +5,6 @@
 //! matches the root's baseline, through the kind's normal delete path, and otherwise keeps it and
 //! reports it orphaned for an operator. Adoption remains an explicit operator act.
 
-#[cfg(test)]
-use flotilla_store_memory::InMemoryBackend;
 use std::{
     collections::{BTreeMap, BTreeSet, HashSet},
     fmt,
@@ -942,25 +940,12 @@ impl ResourceManifestReconciler {
         resource_document_spec_hash(&object.value).map_err(|error| error.to_string())
     }
 
+    /// Applies `document`. Ownership enforcement can preserve protected fields, so the stored spec
+    /// may differ from the requested manifest: the root records the hash of what was persisted
+    /// ([`Self::stored_spec_hash`]) as the baseline, so the next pass does not read that
+    /// preservation as drift.
     async fn apply_manifest_document(&self, document: Value) -> Result<(), String> {
-        let applied =
-            apply_manifest_resource_document(&self.backend, &self.default_namespace, document).await.map_err(|error| error.to_string())?;
-        let persisted_hash = resource_document_spec_hash(&applied.value).map_err(|error| error.to_string())?;
-        let recorded_hash = string_map(&applied.value, "annotations")?.get(LAST_APPLIED_HASH_ANNOTATION).cloned();
-        if recorded_hash.as_deref() == Some(persisted_hash.as_str()) {
-            return Ok(());
-        }
-
-        // Ownership enforcement can preserve protected fields, so the stored
-        // spec may differ from the requested manifest. Record the hash of what
-        // was actually persisted or the next pass will misclassify that
-        // preservation as external drift.
-        let mut persisted = applied.value;
-        let metadata =
-            persisted.get_mut("metadata").and_then(Value::as_object_mut).ok_or_else(|| "stored object has invalid metadata".to_string())?;
-        insert_metadata_value(metadata, "annotations", MANIFEST_BASELINE_HASH_ANNOTATION, &persisted_hash)?;
-        insert_metadata_value(metadata, "annotations", LAST_APPLIED_HASH_ANNOTATION, &persisted_hash)?;
-        apply_manifest_resource_document(&self.backend, &self.default_namespace, persisted).await.map_err(|error| error.to_string())?;
+        apply_manifest_resource_document(&self.backend, &self.default_namespace, document).await.map_err(|error| error.to_string())?;
         Ok(())
     }
 }
@@ -1174,7 +1159,6 @@ mod tests {
 
     use flotilla_resources::ManifestRoot;
 
-    use chrono::Utc;
     use flotilla_config::ConfigStore;
     use flotilla_core::in_process::InProcessDaemon;
     use flotilla_discovery_api::EnvironmentAssertion;
@@ -1183,26 +1167,28 @@ mod tests {
     use flotilla_discovery_testkit::fake_discovery_with_provider_set;
     use flotilla_discovery_testkit::FakeDiscoveryProviders;
     use flotilla_paths::path_context::ExecutionEnvironmentPath;
-    use flotilla_protocol::{HostName, NodeId};
+    use flotilla_protocol::HostName;
     use flotilla_provider_runtime::ProcessCommandRunner;
     use flotilla_resources::{
-        FulfilmentCostClass, FulfilmentKind, FulfilmentKindSpec, FulfilmentRealisation, InputMeta, Project, Resolution, WatchStart,
-        WorkflowTemplate,
+        FulfilmentCostClass, FulfilmentKind, FulfilmentKindSpec, FulfilmentRealisation, InputMeta, WatchStart, WorkflowTemplate,
     };
-    use flotilla_store::{patch_resource_annotation, ResourceBackend, MANIFEST_WRITER_SOURCE};
+    use flotilla_store::ResourceBackend;
     use flotilla_vcs::factory::GitVcsFactory;
 
     use crate::testkits::engine::engine;
+    use flotilla_provisioning_testkit::EngineBackend;
     use futures::StreamExt;
 
     use super::*;
 
     const NAMESPACE: &str = "flotilla";
+    /// The home these tests' engine stores are at.
+    pub(super) const HOME: &str = "manifest-home";
 
-    /// The roots these tests record passes in and read back: the old store's ManifestRoot
-    /// resources on `backend`.
-    pub(super) fn old_roots(backend: &ResourceBackend) -> Arc<dyn ManifestRoots> {
-        Arc::new(flotilla_store_testkit::OldStoreManifestRoots::new(backend.clone()))
+    /// The roots these tests record passes in and read back: the engine's ManifestRoot records at
+    /// `home`.
+    pub(super) fn roots(home: &EngineBackend) -> Arc<dyn ManifestRoots> {
+        Arc::clone(&home.ports.manifest_roots)
     }
 
     // #2720: branch-head changes apply without updating a working tree. Invalid
@@ -1217,13 +1203,13 @@ mod tests {
         git(repo.path(), &["add", "."]);
         git(repo.path(), &["commit", "-m", "charter subtree"]);
         let cache = tempfile::tempdir().expect("charter cache");
-        let backend = ResourceBackend::new(InMemoryBackend::default());
+        let backend = EngineBackend::open(HOME);
         let source = CharterSource::Repository {
             repo: repo.path().to_string_lossy().into_owned(),
             branch: "main".into(),
             path: "./charters".into(),
         };
-        let mut reconciler = versioned_reconciler(repo.path(), backend.clone()).await;
+        let mut reconciler = versioned_reconciler(repo.path(), &backend).await;
         reconciler.root = cache.path().to_path_buf();
         reconciler = reconciler.with_binding(Some(source));
         reconciler.reconcile_once_for_test().await.expect("apply first head");
@@ -1306,8 +1292,8 @@ mod tests {
         let dir = tempfile::tempdir().expect("local source");
         let cache = tempfile::tempdir().expect("unused cache");
         write(&dir.path().join("policy.yaml"), &manifest("laptop", "local"));
-        let backend = ResourceBackend::new(InMemoryBackend::default());
-        let mut reconciler = ResourceManifestReconciler::new(backend.clone(), old_roots(&backend), NAMESPACE, cache.path())
+        let backend = EngineBackend::open(HOME);
+        let mut reconciler = ResourceManifestReconciler::new(backend.clone(), roots(&backend), NAMESPACE, cache.path())
             .with_binding(Some(CharterSource::LocalDirectory { directory: dir.path().to_string_lossy().into_owned() }));
         reconciler.reconcile_once_for_test().await.expect("apply directory");
         let first = test_root(&backend).await.status.expect("status").applied_revision.expect("revision");
@@ -1333,13 +1319,13 @@ mod tests {
             let repo = committed_manifest_repo();
             git(repo.path(), &["branch", "-M", "main"]);
             let cache = tempfile::tempdir().expect("charter cache");
-            let backend = ResourceBackend::new(InMemoryBackend::default());
+            let backend = EngineBackend::open(HOME);
             let binding = if repository {
                 CharterSource::Repository { repo: repo.path().to_string_lossy().into_owned(), branch: "main".into(), path: String::new() }
             } else {
                 CharterSource::LocalDirectory { directory: repo.path().to_string_lossy().into_owned() }
             };
-            let mut reconciler = versioned_reconciler(repo.path(), backend.clone()).await;
+            let mut reconciler = versioned_reconciler(repo.path(), &backend).await;
             reconciler.root = cache.path().to_path_buf();
             reconciler = reconciler.with_binding(Some(binding));
             reconciler.reconcile_once_for_test().await.expect("apply source");
@@ -1380,9 +1366,9 @@ mod tests {
         git(retired.path(), &["branch", "-M", "main"]);
         let state = tempfile::tempdir().expect("state");
         let cache = state.path().join("charter-stores");
-        let backend = ResourceBackend::new(InMemoryBackend::default());
+        let backend = EngineBackend::open(HOME);
         let repo_url = repo.path().to_string_lossy().into_owned();
-        let mut reconciler = versioned_reconciler(repo.path(), backend.clone()).await;
+        let mut reconciler = versioned_reconciler(repo.path(), &backend).await;
         reconciler.root = cache.clone();
         reconciler =
             reconciler.with_binding(Some(CharterSource::Repository { repo: repo_url.clone(), branch: "main".into(), path: String::new() }));
@@ -1453,24 +1439,35 @@ mod tests {
         DocumentKey { path: "policy.yaml".into(), kind: "FulfilmentKind".into(), namespace: NAMESPACE.into(), name: name.into() }
     }
 
-    async fn set_resolution(backend: &ResourceBackend, key: DocumentKey, action: ResolutionAction, token: &str) {
-        let roots = backend.using::<ManifestRoot>(NAMESPACE);
-        let root = test_root(backend).await;
-        let mut spec = root.spec.clone();
-        spec.resolutions.insert(key, Resolution { action, token: token.into(), requested_by: "test".into() });
-        roots.update(&InputMeta::from(&root.metadata), &root.metadata.resource_version, &spec).await.expect("set resolution");
+    /// The baseline the root records for `key`: an applied definition on the engine carries no
+    /// baseline annotation (the 2026-10-26 ruling).
+    async fn root_baseline(home: &EngineBackend, key: &DocumentKey) -> Option<String> {
+        let root = test_root(home).await;
+        roots(home).root(NAMESPACE, &root.metadata.name).await.expect("read root").expect("root").baseline(key).map(str::to_owned)
     }
 
-    async fn set_suspended(backend: &ResourceBackend, key: DocumentKey, suspended: bool) {
-        let roots = backend.using::<ManifestRoot>(NAMESPACE);
-        let root = test_root(backend).await;
-        let mut spec = root.spec.clone();
-        if suspended {
-            spec.suspended.insert(key);
-        } else {
-            spec.suspended.remove(&key);
-        }
-        roots.update(&InputMeta::from(&root.metadata), &root.metadata.resource_version, &spec).await.expect("set suspension");
+    /// Asserts the root holds `digest` as `key`'s baseline and the definition carries no
+    /// baseline annotation.
+    async fn assert_root_baseline(home: &EngineBackend, key: &DocumentKey, object: &flotilla_resources::ObjectMeta, digest: &str) {
+        assert_eq!(root_baseline(home, key).await.as_deref(), Some(digest), "the root's baseline for {key:?}");
+        assert!(
+            !object.annotations.contains_key(LAST_APPLIED_HASH_ANNOTATION)
+                && !object.annotations.contains_key(MANIFEST_BASELINE_HASH_ANNOTATION),
+            "the engine keeps no baseline annotation: {:?}",
+            object.annotations
+        );
+    }
+
+    /// Requests `action` for `key` on the root, as `flotilla manifest` does; returns its token.
+    async fn set_resolution(home: &EngineBackend, key: DocumentKey, action: ResolutionAction) -> String {
+        let root = test_root(home).await;
+        roots(home).request_resolution(NAMESPACE, &root.metadata.name, &key, action, "test").await.expect("set resolution")
+    }
+
+    /// Suspends `key` on the root, or resumes it, as `flotilla manifest` does.
+    async fn set_suspended(home: &EngineBackend, key: DocumentKey, suspended: bool) {
+        let root = test_root(home).await;
+        roots(home).set_suspended(NAMESPACE, &root.metadata.name, &key, suspended).await.expect("set suspension");
     }
 
     fn write(path: &Path, content: &str) {
@@ -1494,14 +1491,14 @@ mod tests {
         dir
     }
 
-    async fn versioned_reconciler(dir: &Path, backend: ResourceBackend) -> ResourceManifestReconciler {
+    async fn versioned_reconciler(dir: &Path, backend: &EngineBackend) -> ResourceManifestReconciler {
         let runner = Arc::new(ProcessCommandRunner);
         let bag = EnvironmentBag::new().with(EnvironmentAssertion::binary("git", "/usr/bin/git"));
         let vcs = GitVcsFactory
             .probe(&bag, &ConfigStore::with_base(dir), &ExecutionEnvironmentPath::new(dir), runner)
             .await
             .expect("discover Git VCS");
-        ResourceManifestReconciler::new(backend.clone(), old_roots(&backend), NAMESPACE, dir)
+        ResourceManifestReconciler::new(backend.backend.clone(), roots(backend), NAMESPACE, dir)
             .with_declared_source("project-map", "kiwi")
             .with_vcs(vcs)
     }
@@ -1520,17 +1517,6 @@ mod tests {
         FulfilmentKindSpec::builder().host_ref("host".into()).pool(pool.into()).realisation(FulfilmentRealisation::HostDirect).build()
     }
 
-    fn project_manifest(workflow: &str, detailed_repository: bool) -> String {
-        let repository = if detailed_repository {
-            "{\"repo\":\"repo-key\",\"alias\":\"andamento\",\"roles\":[\"code\",\"ops\",\"knowledge\"]}"
-        } else {
-            "{\"repo\":\"repo-key\"}"
-        };
-        format!(
-            "{{\"apiVersion\":\"flotilla.work/v1\",\"kind\":\"Project\",\"metadata\":{{\"name\":\"andamento\"}},\"spec\":{{\"display_name\":\"andamento\",\"default_workflow_ref\":\"{workflow}\",\"repositories\":[{repository}]}}}}"
-        )
-    }
-
     #[tokio::test]
     async fn fresh_directory_applies_all_documents_with_ownership_and_source() {
         let dir = tempfile::tempdir().expect("tempdir");
@@ -1541,8 +1527,8 @@ mod tests {
             &dir.path().join("beta.json"),
             r#"{"apiVersion":"flotilla.work/v1","kind":"FulfilmentKind","metadata":{"name":"beta"},"spec":{"host_ref":"host","pool":"two","cost_class":"metered","realisation":"host_direct"}}"#,
         );
-        let backend = ResourceBackend::new(InMemoryBackend::default());
-        let mut reconciler = ResourceManifestReconciler::new(backend.clone(), old_roots(&backend), NAMESPACE, dir.path());
+        let backend = EngineBackend::open(HOME);
+        let mut reconciler = ResourceManifestReconciler::new(backend.clone(), roots(&backend), NAMESPACE, dir.path());
 
         let report = reconciler.reconcile_once_for_test().await.expect("manifest pass");
 
@@ -1558,13 +1544,10 @@ mod tests {
                 object.metadata.annotations.get(MANIFEST_RECONCILER_ROOT_ANNOTATION).map(String::as_str),
                 Some(expected_root.as_str())
             );
-            assert_eq!(
-                object.metadata.annotations.get(LAST_APPLIED_HASH_ANNOTATION),
-                Some(
-                    &resource_document_spec_hash(&serde_json::to_value(object.to_k8s_object()).expect("resource document"))
-                        .expect("spec digest")
-                )
-            );
+            let digest = resource_document_spec_hash(&serde_json::to_value(object.to_k8s_object()).expect("resource document"))
+                .expect("spec digest");
+            let key = DocumentKey { path: source.into(), kind: "FulfilmentKind".into(), namespace: NAMESPACE.into(), name: name.into() };
+            assert_root_baseline(&backend, &key, &object.metadata, &digest).await;
         }
         assert_eq!(
             backend.using::<FulfilmentKind>(NAMESPACE).get("beta").await.expect("beta kind").spec.cost_class,
@@ -1578,9 +1561,9 @@ mod tests {
         let feta_dir = tempfile::tempdir().expect("feta tempdir");
         write(&kiwi_dir.path().join("policy.yaml"), &manifest("shared", "current"));
         write(&feta_dir.path().join("policy.yaml"), &manifest("shared", "stale"));
-        let backend = ResourceBackend::new(InMemoryBackend::default());
+        let backend = EngineBackend::open(HOME);
 
-        let mut kiwi = ResourceManifestReconciler::new(backend.clone(), old_roots(&backend), NAMESPACE, kiwi_dir.path())
+        let mut kiwi = ResourceManifestReconciler::new(backend.clone(), roots(&backend), NAMESPACE, kiwi_dir.path())
             .with_declared_source("project-map", "kiwi")
             .with_revision("current-revision");
         kiwi.reconcile_once_for_test().await.expect("declared root pass");
@@ -1599,8 +1582,8 @@ mod tests {
     #[tokio::test]
     async fn clean_manifest_tree_resolves_head_revision() {
         let dir = committed_manifest_repo();
-        let backend = ResourceBackend::new(InMemoryBackend::default());
-        let mut reconciler = versioned_reconciler(dir.path(), backend.clone()).await;
+        let backend = EngineBackend::open(HOME);
+        let mut reconciler = versioned_reconciler(dir.path(), &backend).await;
 
         reconciler.reconcile_once_for_test().await.expect("clean revision");
         let applied = backend.using::<FulfilmentKind>(NAMESPACE).get("versioned").await.expect("applied manifest");
@@ -1612,8 +1595,8 @@ mod tests {
     async fn dirty_manifest_tree_is_rejected_as_unversioned_input() {
         let dir = committed_manifest_repo();
         write(&dir.path().join("untracked.yaml"), &manifest("draft", "uncommitted"));
-        let backend = ResourceBackend::new(InMemoryBackend::default());
-        let mut reconciler = versioned_reconciler(dir.path(), backend).await;
+        let backend = EngineBackend::open(HOME);
+        let mut reconciler = versioned_reconciler(dir.path(), &backend).await;
 
         let error = reconciler.reconcile_once_for_test().await.expect_err("dirty tree must be rejected");
 
@@ -1627,8 +1610,8 @@ mod tests {
         git(dir.path(), &["add", ".gitignore"]);
         git(dir.path(), &["commit", "-m", "ignore local manifests"]);
         write(&dir.path().join("draft.local.yaml"), &manifest("draft", "ignored"));
-        let backend = ResourceBackend::new(InMemoryBackend::default());
-        let mut reconciler = versioned_reconciler(dir.path(), backend).await;
+        let backend = EngineBackend::open(HOME);
+        let mut reconciler = versioned_reconciler(dir.path(), &backend).await;
 
         let error = reconciler.reconcile_once_for_test().await.expect_err("ignored manifest must be rejected");
 
@@ -1638,8 +1621,8 @@ mod tests {
     #[tokio::test]
     async fn manifest_tree_outside_git_is_rejected() {
         let dir = tempfile::tempdir_in("/tmp").expect("non-git tempdir");
-        let backend = ResourceBackend::new(InMemoryBackend::default());
-        let mut reconciler = versioned_reconciler(dir.path(), backend).await;
+        let backend = EngineBackend::open(HOME);
+        let mut reconciler = versioned_reconciler(dir.path(), &backend).await;
 
         let error = reconciler.reconcile_once_for_test().await.expect_err("non-repository must be rejected");
 
@@ -1650,13 +1633,13 @@ mod tests {
     async fn steady_state_and_restart_perform_no_writes_or_events() {
         let dir = tempfile::tempdir().expect("tempdir");
         write(&dir.path().join("policy.yaml"), &manifest("steady", "one"));
-        let backend = ResourceBackend::new(InMemoryBackend::default());
-        let mut first = ResourceManifestReconciler::new(backend.clone(), old_roots(&backend), NAMESPACE, dir.path());
+        let backend = EngineBackend::open(HOME);
+        let mut first = ResourceManifestReconciler::new(backend.clone(), roots(&backend), NAMESPACE, dir.path());
         first.reconcile_once_for_test().await.expect("initial pass");
         let before = backend.using::<FulfilmentKind>(NAMESPACE).get("steady").await.expect("policy");
 
         let mut events = backend.using::<FulfilmentKind>(NAMESPACE).watch(WatchStart::Now).await.expect("watch");
-        let mut restarted = ResourceManifestReconciler::new(backend.clone(), old_roots(&backend), NAMESPACE, dir.path());
+        let mut restarted = ResourceManifestReconciler::new(backend.clone(), roots(&backend), NAMESPACE, dir.path());
         let report = restarted.reconcile_once_for_test().await.expect("restart pass");
         let after = backend.using::<FulfilmentKind>(NAMESPACE).get("steady").await.expect("policy");
 
@@ -1669,8 +1652,8 @@ mod tests {
     async fn unrelated_source_revision_does_not_rewrite_unchanged_object() {
         let dir = tempfile::tempdir().expect("tempdir");
         write(&dir.path().join("policy.yaml"), &manifest("steady-revision", "one"));
-        let backend = ResourceBackend::new(InMemoryBackend::default());
-        let mut reconciler = ResourceManifestReconciler::new(backend.clone(), old_roots(&backend), NAMESPACE, dir.path())
+        let backend = EngineBackend::open(HOME);
+        let mut reconciler = ResourceManifestReconciler::new(backend.clone(), roots(&backend), NAMESPACE, dir.path())
             .with_declared_source("project-map", "kiwi")
             .with_revision("revision-one");
         reconciler.reconcile_once_for_test().await.expect("initial pass");
@@ -1690,10 +1673,10 @@ mod tests {
     async fn loop_recovers_when_manifest_directory_appears_later() {
         let parent = tempfile::tempdir().expect("tempdir");
         let root = parent.path().join("not-created-yet");
-        let backend = ResourceBackend::new(InMemoryBackend::default());
-        materialize_manifest_root(&*old_roots(&backend), NAMESPACE, &root, "local", "local", None).await.expect("materialize root");
+        let backend = EngineBackend::open(HOME);
+        materialize_manifest_root(&*roots(&backend), NAMESPACE, &root, "local", "local", None).await.expect("materialize root");
         let task = tokio::spawn(
-            ResourceManifestReconciler::new(backend.clone(), old_roots(&backend), NAMESPACE, root.clone()).run(Duration::from_millis(5)),
+            ResourceManifestReconciler::new(backend.clone(), roots(&backend), NAMESPACE, root.clone()).run(Duration::from_millis(5)),
         );
         tokio::time::sleep(Duration::from_millis(10)).await;
 
@@ -1718,8 +1701,8 @@ mod tests {
         let dir = tempfile::tempdir().expect("tempdir");
         let path = dir.path().join("policy.yaml");
         write(&path, &manifest("moving", "one"));
-        let backend = ResourceBackend::new(InMemoryBackend::default());
-        let mut reconciler = ResourceManifestReconciler::new(backend.clone(), old_roots(&backend), NAMESPACE, dir.path());
+        let backend = EngineBackend::open(HOME);
+        let mut reconciler = ResourceManifestReconciler::new(backend.clone(), roots(&backend), NAMESPACE, dir.path());
         reconciler.reconcile_once_for_test().await.expect("initial pass");
         let resolver = backend.using::<FulfilmentKind>(NAMESPACE);
         let applied = resolver.get("moving").await.expect("policy");
@@ -1734,15 +1717,10 @@ mod tests {
         assert_eq!(report.updated, 1);
         assert_eq!(object.spec.pool, "two");
         assert_eq!(object.spec.cost_class, FulfilmentCostClass::Metered);
-        assert_eq!(object.metadata.labels.get("another-controller/observation").map(String::as_str), Some("kept"));
-        assert_eq!(
-            object.metadata.annotations.get(LAST_APPLIED_HASH_ANNOTATION),
-            Some(
-                &resource_document_spec_hash(&serde_json::to_value(object.to_k8s_object()).expect("resource document"))
-                    .expect("persisted spec digest")
-            ),
-            "last-applied must describe the ownership-filtered spec"
-        );
+        // The baseline describes the ownership-filtered spec.
+        let digest = resource_document_spec_hash(&serde_json::to_value(object.to_k8s_object()).expect("resource document"))
+            .expect("persisted spec digest");
+        assert_root_baseline(&backend, &key("moving"), &object.metadata, &digest).await;
 
         let settled_version = object.metadata.resource_version;
         let settled = reconciler.reconcile_once_for_test().await.expect("settled pass");
@@ -1766,8 +1744,8 @@ mod tests {
             )
         };
         write(&path, &workflow("echo-one"));
-        let backend = ResourceBackend::new(InMemoryBackend::default());
-        let mut reconciler = ResourceManifestReconciler::new(backend.clone(), old_roots(&backend), NAMESPACE, dir.path());
+        let backend = EngineBackend::open(HOME);
+        let mut reconciler = ResourceManifestReconciler::new(backend.clone(), roots(&backend), NAMESPACE, dir.path());
         reconciler.reconcile_once_for_test().await.expect("initial pass");
 
         let steady = reconciler.reconcile_once_for_test().await.expect("steady pass");
@@ -1818,8 +1796,8 @@ mod tests {
         let dir = tempfile::tempdir().expect("tempdir");
         let path = dir.path().join("policy.yaml");
         write(&path, &manifest("drifted", "one"));
-        let backend = ResourceBackend::new(InMemoryBackend::default());
-        let mut reconciler = ResourceManifestReconciler::new(backend.clone(), old_roots(&backend), NAMESPACE, dir.path());
+        let backend = EngineBackend::open(HOME);
+        let mut reconciler = ResourceManifestReconciler::new(backend.clone(), roots(&backend), NAMESPACE, dir.path());
         reconciler.reconcile_once_for_test().await.expect("initial pass");
         let resolver = backend.using::<FulfilmentKind>(NAMESPACE);
         let applied = resolver.get("drifted").await.expect("policy");
@@ -1846,9 +1824,9 @@ mod tests {
         let dir = tempfile::tempdir().expect("tempdir");
         let path = dir.path().join("policy.yaml");
         write(&path, &manifest("atomic-refusal", "one"));
-        let backend = ResourceBackend::new(InMemoryBackend::default());
+        let backend = EngineBackend::open(HOME);
         let resolver = backend.using::<FulfilmentKind>(NAMESPACE);
-        let mut reconciler = ResourceManifestReconciler::new(backend.clone(), old_roots(&backend), NAMESPACE, dir.path());
+        let mut reconciler = ResourceManifestReconciler::new(backend.clone(), roots(&backend), NAMESPACE, dir.path());
         reconciler.reconcile_once_for_test().await.expect("initial pass");
         let applied = resolver.get("atomic-refusal").await.expect("policy");
         let edited = resolver
@@ -1868,13 +1846,13 @@ mod tests {
     async fn convergent_live_spec_repairs_any_baseline_and_ownership() {
         let dir = tempfile::tempdir().expect("tempdir");
         write(&dir.path().join("policy.yaml"), &manifest("convergent", "same"));
-        let backend = ResourceBackend::new(InMemoryBackend::default());
+        let backend = EngineBackend::open(HOME);
         let resolver = backend.using::<FulfilmentKind>(NAMESPACE);
         resolver
             .create(&InputMeta::builder().name("convergent".to_string()).build(), &kind_spec("same"))
             .await
             .expect("unmanaged but convergent policy");
-        let mut reconciler = ResourceManifestReconciler::new(backend.clone(), old_roots(&backend), NAMESPACE, dir.path());
+        let mut reconciler = ResourceManifestReconciler::new(backend.clone(), roots(&backend), NAMESPACE, dir.path());
 
         let report = reconciler.reconcile_once_for_test().await.expect("repair pass");
         let object = resolver.get("convergent").await.expect("policy");
@@ -1884,15 +1862,15 @@ mod tests {
         assert_eq!(report.drifted, 0);
         assert_eq!(report.unmanaged, 0);
         assert_eq!(object.metadata.labels.get(MANAGED_BY_LABEL).map(String::as_str), Some(MANIFEST_MANAGED_BY_VALUE));
-        assert_eq!(object.metadata.annotations.get(LAST_APPLIED_HASH_ANNOTATION), Some(&digest));
+        assert_root_baseline(&backend, &key("convergent"), &object.metadata, &digest).await;
     }
 
     #[tokio::test]
     async fn fresh_object_has_persisted_baseline_on_following_pass() {
         let dir = tempfile::tempdir().expect("tempdir");
         write(&dir.path().join("policy.yaml"), &manifest("fresh-baseline", "one"));
-        let backend = ResourceBackend::new(InMemoryBackend::default());
-        let mut reconciler = ResourceManifestReconciler::new(backend.clone(), old_roots(&backend), NAMESPACE, dir.path());
+        let backend = EngineBackend::open(HOME);
+        let mut reconciler = ResourceManifestReconciler::new(backend.clone(), roots(&backend), NAMESPACE, dir.path());
 
         assert_eq!(reconciler.reconcile_once_for_test().await.expect("creation pass").created, 1);
         let next = reconciler.reconcile_once_for_test().await.expect("verification pass");
@@ -1901,7 +1879,7 @@ mod tests {
 
         assert_eq!(next.unchanged, 1);
         assert_eq!(next.drifted, 0);
-        assert_eq!(object.metadata.annotations.get(LAST_APPLIED_HASH_ANNOTATION), Some(&digest));
+        assert_root_baseline(&backend, &key("fresh-baseline"), &object.metadata, &digest).await;
     }
 
     #[tokio::test]
@@ -1909,25 +1887,25 @@ mod tests {
         let dir = tempfile::tempdir().expect("tempdir");
         let path = dir.path().join("policy.yaml");
         write(&path, &manifest("suspended", "manifest"));
-        let backend = ResourceBackend::new(InMemoryBackend::default());
+        let backend = EngineBackend::open(HOME);
         let resolver = backend.using::<FulfilmentKind>(NAMESPACE);
-        let mut reconciler = ResourceManifestReconciler::new(backend.clone(), old_roots(&backend), NAMESPACE, dir.path());
+        let mut reconciler = ResourceManifestReconciler::new(backend.clone(), roots(&backend), NAMESPACE, dir.path());
         reconciler.reconcile_once_for_test().await.expect("creation");
         let applied = resolver.get("suspended").await.expect("policy");
-        set_suspended(&reconciler.backend, key("suspended"), true).await;
+        set_suspended(&backend, key("suspended"), true).await;
         resolver
             .update(&InputMeta::from(&applied.metadata), &applied.metadata.resource_version, &kind_spec("hotfix"))
             .await
             .expect("hotfix");
         write(&path, &manifest("suspended", "new-manifest"));
-        set_resolution(&reconciler.backend, key("suspended"), ResolutionAction::Sync, "token-1").await;
+        set_resolution(&backend, key("suspended"), ResolutionAction::Sync).await;
         assert_eq!(reconciler.reconcile_once_for_test().await.expect("suspended pass").unchanged, 1);
         assert_eq!(resolver.get("suspended").await.expect("policy").spec.pool, "hotfix");
         let root = test_root(&reconciler.backend).await;
         let state = &root.status.expect("status").documents[&key("suspended")];
         assert_eq!(state.phase, DocumentPhase::Suspended);
         assert_eq!(state.resolved_token, None);
-        set_suspended(&reconciler.backend, key("suspended"), false).await;
+        set_suspended(&backend, key("suspended"), false).await;
         assert_eq!(reconciler.reconcile_once_for_test().await.expect("sync pass").updated, 1);
         assert_eq!(resolver.get("suspended").await.expect("policy").spec.pool, "new-manifest");
     }
@@ -1937,9 +1915,9 @@ mod tests {
         let dir = tempfile::tempdir().expect("tempdir");
         let path = dir.path().join("policy.yaml");
         write(&path, &manifest("sync-me", "manifest"));
-        let backend = ResourceBackend::new(InMemoryBackend::default());
+        let backend = EngineBackend::open(HOME);
         let resolver = backend.using::<FulfilmentKind>(NAMESPACE);
-        let mut reconciler = ResourceManifestReconciler::new(backend.clone(), old_roots(&backend), NAMESPACE, dir.path());
+        let mut reconciler = ResourceManifestReconciler::new(backend.clone(), roots(&backend), NAMESPACE, dir.path());
         reconciler.reconcile_once_for_test().await.expect("creation");
         let applied = resolver.get("sync-me").await.expect("policy");
         resolver
@@ -1947,7 +1925,7 @@ mod tests {
             .await
             .expect("live edit");
         reconciler.reconcile_once_for_test().await.expect("refusal");
-        set_resolution(&reconciler.backend, key("sync-me"), ResolutionAction::Sync, "token-1").await;
+        let token = set_resolution(&backend, key("sync-me"), ResolutionAction::Sync).await;
 
         let report = reconciler.reconcile_once_for_test().await.expect("sync pass");
         let synced = resolver.get("sync-me").await.expect("synced policy");
@@ -1957,7 +1935,7 @@ mod tests {
         assert!(!synced.metadata.annotations.contains_key("flotilla.work/manifest-refusal"));
         assert_eq!(
             test_root(&reconciler.backend).await.status.expect("status").documents[&key("sync-me")].resolved_token.as_deref(),
-            Some("token-1")
+            Some(token.as_str())
         );
         assert_eq!(reconciler.reconcile_once_for_test().await.expect("same token pass").unchanged, 1);
         let edited = resolver.get("sync-me").await.expect("policy");
@@ -1967,7 +1945,7 @@ mod tests {
             .expect("second live edit");
         assert_eq!(reconciler.reconcile_once_for_test().await.expect("same token cannot resolve again").drifted, 1);
         assert_eq!(resolver.get("sync-me").await.expect("policy").spec.pool, "second-live-edit");
-        set_resolution(&reconciler.backend, key("sync-me"), ResolutionAction::Sync, "token-2").await;
+        set_resolution(&backend, key("sync-me"), ResolutionAction::Sync).await;
         assert_eq!(reconciler.reconcile_once_for_test().await.expect("new token pass").updated, 1);
         assert_eq!(resolver.get("sync-me").await.expect("policy").spec.pool, "manifest");
     }
@@ -1978,24 +1956,17 @@ mod tests {
     // untouched; and a sync request settles once.
     #[tokio::test]
     async fn over_the_engine_roots_drift_is_judged_from_the_root_baseline_and_a_sync_settles_once() {
-        use flotilla_provisioning::engine::manifest_root::EngineManifestRoots;
         let dir = tempfile::tempdir().expect("tempdir");
         write(&dir.path().join("policy.yaml"), &manifest("sync-me", "manifest"));
-        let store = tempfile::tempdir().expect("store dir");
-        let mut kinds = flotilla_schema::KindRegistry::new();
-        flotilla_provisioning::stored::manifest_root::register(&mut kinds).expect("register");
-        let service =
-            Arc::new(flotilla_schema_sqlite::stream::Service::open(&store.path().join("decided.sqlite"), "home", kinds).expect("store"));
-        let roots: Arc<dyn ManifestRoots> =
-            Arc::new(EngineManifestRoots::open(service, Arc::new(flotilla_resources::SystemClock)).expect("engine roots"));
-        let backend = ResourceBackend::new(InMemoryBackend::default());
+        let backend = EngineBackend::open(HOME);
+        let roots = roots(&backend);
         let resolver = backend.using::<FulfilmentKind>(NAMESPACE);
-        let mut reconciler = ResourceManifestReconciler::new(backend, Arc::clone(&roots), NAMESPACE, dir.path());
+        let mut reconciler = ResourceManifestReconciler::new(backend.backend.clone(), Arc::clone(&roots), NAMESPACE, dir.path());
         reconciler.reconcile_once_for_test().await.expect("creation");
         let name = reconciler.root_name();
         let applied = resolver.get("sync-me").await.expect("policy");
-        let baseline = roots.root(NAMESPACE, &name).await.expect("read").expect("root").baseline(&key("sync-me")).map(str::to_owned);
-        assert_eq!(baseline.as_deref(), applied.metadata.annotations.get(MANIFEST_BASELINE_HASH_ANNOTATION).map(String::as_str));
+        let digest = resource_document_spec_hash(&serde_json::to_value(applied.to_k8s_object()).expect("document")).expect("digest");
+        assert_root_baseline(&backend, &key("sync-me"), &applied.metadata, &digest).await;
 
         // With the baseline annotations gone, the live spec still matches the root's baseline, so a
         // source change applies rather than reading as drift.
@@ -2043,7 +2014,6 @@ mod tests {
     // engine keeps no hash annotations: the root's baseline record judges both.
     #[tokio::test]
     async fn over_the_engine_a_manifest_definition_settles_applies_changes_and_reads_drift() {
-        use flotilla_provisioning::engine::{definitions::EngineDefinitions, manifest_root::EngineManifestRoots};
         use flotilla_resources::{definitions::DefinitionOrigin, Forge};
         let forge = |host: &str| {
             format!(
@@ -2052,18 +2022,10 @@ mod tests {
         };
         let dir = tempfile::tempdir().expect("tempdir");
         write(&dir.path().join("forge.yaml"), &forge("lab.example"));
-        let store = tempfile::tempdir().expect("store dir");
-        let mut kinds = flotilla_schema::KindRegistry::new();
-        flotilla_provisioning::stored::manifest_root::register(&mut kinds).expect("register roots");
-        flotilla_provisioning::stored::definition::register(&mut kinds).expect("register definitions");
-        let service =
-            Arc::new(flotilla_schema_sqlite::stream::Service::open(&store.path().join("decided.sqlite"), "home", kinds).expect("store"));
-        let clock: Arc<dyn flotilla_resources::Clock> = Arc::new(flotilla_resources::SystemClock);
-        let roots: Arc<dyn ManifestRoots> = Arc::new(EngineManifestRoots::open(Arc::clone(&service), Arc::clone(&clock)).expect("roots"));
-        let backend = ResourceBackend::new(InMemoryBackend::default());
-        backend.install_engine_records(Arc::new(EngineDefinitions::open(service, clock).expect("definitions")));
+        let backend = EngineBackend::open(HOME);
+        let roots = roots(&backend);
         let forges = backend.definitions::<Forge>(NAMESPACE);
-        let mut reconciler = ResourceManifestReconciler::new(backend, Arc::clone(&roots), NAMESPACE, dir.path());
+        let mut reconciler = ResourceManifestReconciler::new(backend.backend.clone(), Arc::clone(&roots), NAMESPACE, dir.path());
 
         assert_eq!(reconciler.reconcile_once_for_test().await.expect("creation").created, 1);
         let applied = forges.get("lab").await.expect("forge");
@@ -2092,9 +2054,9 @@ mod tests {
     async fn claimed_resolution_is_not_replayed_after_reconciler_restart() {
         let dir = tempfile::tempdir().expect("tempdir");
         write(&dir.path().join("policy.yaml"), &manifest("interrupted", "manifest"));
-        let backend = ResourceBackend::new(InMemoryBackend::default());
+        let backend = EngineBackend::open(HOME);
         let resolver = backend.using::<FulfilmentKind>(NAMESPACE);
-        let mut reconciler = ResourceManifestReconciler::new(backend.clone(), old_roots(&backend), NAMESPACE, dir.path());
+        let mut reconciler = ResourceManifestReconciler::new(backend.clone(), roots(&backend), NAMESPACE, dir.path());
         reconciler.reconcile_once_for_test().await.expect("creation");
         let applied = resolver.get("interrupted").await.expect("policy");
         resolver
@@ -2102,99 +2064,21 @@ mod tests {
             .await
             .expect("live edit");
         reconciler.reconcile_once_for_test().await.expect("drift pass");
-        set_resolution(&backend, key("interrupted"), ResolutionAction::Sync, "token-1").await;
-        assert!(reconciler
-            .roots
-            .claim_resolution(NAMESPACE, &reconciler.root_name(), &key("interrupted"), "token-1")
-            .await
-            .expect("claim"));
+        let token = set_resolution(&backend, key("interrupted"), ResolutionAction::Sync).await;
+        assert!(reconciler.roots.claim_resolution(NAMESPACE, &reconciler.root_name(), &key("interrupted"), &token).await.expect("claim"));
 
-        let mut restarted = ResourceManifestReconciler::new(backend.clone(), old_roots(&backend), NAMESPACE, dir.path());
+        let mut restarted = ResourceManifestReconciler::new(backend.clone(), roots(&backend), NAMESPACE, dir.path());
         assert_eq!(restarted.reconcile_once_for_test().await.expect("restart pass").drifted, 1);
         assert_eq!(resolver.get("interrupted").await.expect("policy").spec.pool, "live");
         let root = test_root(&backend).await;
         let status = root.status.expect("status");
         let state = &status.documents[&key("interrupted")];
-        assert_eq!(state.resolved_token.as_deref(), Some("token-1"));
+        assert_eq!(state.resolved_token.as_deref(), Some(token.as_str()));
         assert_eq!(state.resolution_outcome, Some(ResolutionOutcome::Started));
 
-        set_resolution(&backend, key("interrupted"), ResolutionAction::Sync, "token-2").await;
+        set_resolution(&backend, key("interrupted"), ResolutionAction::Sync).await;
         assert_eq!(restarted.reconcile_once_for_test().await.expect("new token pass").updated, 1);
         assert_eq!(resolver.get("interrupted").await.expect("policy").spec.pool, "manifest");
-    }
-
-    #[tokio::test]
-    async fn only_declared_manifest_reconciler_reauthors_a_divergent_project() {
-        // #1736 owns selecting exactly one reconciler per manifest source. Model
-        // that contract here by constructing only the declared root's loop.
-        let current_dir = tempfile::tempdir().expect("current manifest dir");
-        write(&current_dir.path().join("project.json"), &project_manifest("single-agent", true));
-
-        let current = ResourceBackend::new(InMemoryBackend::default()).with_local_root(NodeId::new("current-root"));
-        let stale = ResourceBackend::new(InMemoryBackend::default()).with_local_root(NodeId::new("stale-root"));
-        let mut current_reconciler = ResourceManifestReconciler::new(current.clone(), old_roots(&current), NAMESPACE, current_dir.path());
-        current_reconciler.reconcile_once_for_test().await.expect("current creation");
-        let stale_document = serde_json::from_str(&project_manifest("single-agent", false)).expect("stale manifest document");
-        apply_manifest_resource_document(&stale, NAMESPACE, stale_document).await.expect("seed pre-existing divergent peer state");
-
-        current
-            .replica_writer::<Project>(NodeId::new("stale-root"), NAMESPACE)
-            .replace(&stale.using::<Project>(NAMESPACE).list().await.expect("stale projects"), Utc::now())
-            .await
-            .expect("replicate stale project to current root");
-        set_resolution(
-            &current,
-            DocumentKey { path: "project.json".into(), kind: "Project".into(), namespace: NAMESPACE.into(), name: "andamento".into() },
-            ResolutionAction::Sync,
-            "token-1",
-        )
-        .await;
-        current_reconciler.reconcile_once_for_test().await.expect("sync current manifest");
-
-        stale
-            .replica_writer::<Project>(NodeId::new("current-root"), NAMESPACE)
-            .replace(&current.using::<Project>(NAMESPACE).list().await.expect("current projects"), Utc::now())
-            .await
-            .expect("replicate synced project to stale root");
-        for iteration in 0..3 {
-            patch_resource_annotation(
-                &stale,
-                NAMESPACE,
-                "projects",
-                "andamento",
-                "test.flotilla.work/peer-observation",
-                &iteration.to_string(),
-            )
-            .await
-            .expect("metadata-only peer observation");
-        }
-
-        let project = stale.definitions::<Project>(NAMESPACE).get("andamento").await.expect("merged project");
-        assert_eq!(project.spec.default_workflow_ref, "single-agent");
-        assert_eq!(project.spec.repositories[0].alias.as_deref(), Some("andamento"));
-        assert_eq!(project.spec.repositories[0].roles.len(), 3);
-        let writer = project
-            .metadata
-            .merge
-            .as_ref()
-            .and_then(|merge| merge.fields.get("spec.default_workflow_ref"))
-            .and_then(|field| field.writer.as_ref())
-            .expect("workflow write attribution");
-        assert_eq!(writer.source.as_deref(), Some(MANIFEST_WRITER_SOURCE));
-        assert_eq!(writer.role, flotilla_resources::WriterRole::ReconcileLoop);
-        assert_eq!(
-            project
-                .metadata
-                .merge
-                .as_ref()
-                .and_then(|merge| merge.fields.get("spec.default_workflow_ref"))
-                .expect("workflow merge metadata")
-                .dot
-                .author_root
-                .as_str(),
-            "current-root",
-            "an undeclared peer's metadata writes must not re-author the declared reconciler's spec",
-        );
     }
 
     #[tokio::test]
@@ -2202,9 +2086,9 @@ mod tests {
         let dir = tempfile::tempdir().expect("tempdir");
         let path = dir.path().join("policy.yaml");
         write(&path, &manifest("adopt-me", "manifest"));
-        let backend = ResourceBackend::new(InMemoryBackend::default());
+        let backend = EngineBackend::open(HOME);
         let resolver = backend.using::<FulfilmentKind>(NAMESPACE);
-        let mut reconciler = ResourceManifestReconciler::new(backend.clone(), old_roots(&backend), NAMESPACE, dir.path());
+        let mut reconciler = ResourceManifestReconciler::new(backend.clone(), roots(&backend), NAMESPACE, dir.path());
         reconciler.reconcile_once_for_test().await.expect("creation");
         let applied = resolver.get("adopt-me").await.expect("policy");
         resolver
@@ -2212,7 +2096,7 @@ mod tests {
             .await
             .expect("live edit");
         reconciler.reconcile_once_for_test().await.expect("refusal");
-        set_resolution(&reconciler.backend, key("adopt-me"), ResolutionAction::Adopt, "token-1").await;
+        set_resolution(&backend, key("adopt-me"), ResolutionAction::Adopt).await;
 
         let report = reconciler.reconcile_once_for_test().await.expect("adopt pass");
         let rendered = std::fs::read_to_string(path).expect("updated manifest");
@@ -2225,13 +2109,13 @@ mod tests {
     async fn unmanaged_object_is_never_adopted() {
         let dir = tempfile::tempdir().expect("tempdir");
         write(&dir.path().join("policy.yaml"), &manifest("unmanaged", "manifest"));
-        let backend = ResourceBackend::new(InMemoryBackend::default());
+        let backend = EngineBackend::open(HOME);
         backend
             .using::<FulfilmentKind>(NAMESPACE)
             .create(&InputMeta::builder().name("unmanaged".to_string()).build(), &kind_spec("live"))
             .await
             .expect("unmanaged policy");
-        let mut reconciler = ResourceManifestReconciler::new(backend.clone(), old_roots(&backend), NAMESPACE, dir.path());
+        let mut reconciler = ResourceManifestReconciler::new(backend.clone(), roots(&backend), NAMESPACE, dir.path());
 
         let report = reconciler.reconcile_once_for_test().await.expect("manifest pass");
         let object = backend.using::<FulfilmentKind>(NAMESPACE).get("unmanaged").await.expect("policy");
@@ -2244,7 +2128,7 @@ mod tests {
         assert_eq!(status.documents[&key("unmanaged")].phase, DocumentPhase::Refused);
         assert!(status.stalled.expect("stall").evidence.contains("unmanaged"));
 
-        set_resolution(&backend, key("unmanaged"), ResolutionAction::Sync, "token-1").await;
+        set_resolution(&backend, key("unmanaged"), ResolutionAction::Sync).await;
         let report = reconciler.reconcile_once_for_test().await.expect("unmanaged sync pass");
         let still_unmanaged = backend.using::<FulfilmentKind>(NAMESPACE).get("unmanaged").await.expect("policy");
         let root = test_root(&backend).await;
@@ -2261,27 +2145,31 @@ mod tests {
     async fn unmanaged_warning_is_rearmed_after_ownership_is_restored() {
         let dir = tempfile::tempdir().expect("tempdir");
         write(&dir.path().join("policy.yaml"), &manifest("unmanaged", "manifest"));
-        let backend = ResourceBackend::new(InMemoryBackend::default());
+        let backend = EngineBackend::open(HOME);
         let resolver = backend.using::<FulfilmentKind>(NAMESPACE);
         resolver.create(&InputMeta::builder().name("unmanaged".to_string()).build(), &kind_spec("live")).await.expect("unmanaged policy");
-        let mut reconciler = ResourceManifestReconciler::new(backend.clone(), old_roots(&backend), NAMESPACE, dir.path());
+        let mut reconciler = ResourceManifestReconciler::new(backend.clone(), roots(&backend), NAMESPACE, dir.path());
         let identity =
             ObjectIdentity { kind: "FulfilmentKind".to_string(), namespace: NAMESPACE.to_string(), name: "unmanaged".to_string() };
 
         reconciler.reconcile_once_for_test().await.expect("initial unmanaged pass");
         assert!(reconciler.warned_unmanaged.contains(&identity));
 
+        // Ownership is the definition's origin on the engine: the manifest takes over an
+        // unmanaged definition whose live spec an operator brings to the declared one.
         let object = resolver.get("unmanaged").await.expect("policy");
-        let mut meta = InputMeta::from(&object.metadata);
-        meta.labels.insert(MANAGED_BY_LABEL.to_string(), MANIFEST_MANAGED_BY_VALUE.to_string());
-        resolver.update(&meta, &object.metadata.resource_version, &object.spec).await.expect("restore ownership");
-        reconciler.reconcile_once_for_test().await.expect("managed pass");
+        resolver
+            .update(&InputMeta::from(&object.metadata), &object.metadata.resource_version, &kind_spec("manifest"))
+            .await
+            .expect("converge");
+        reconciler.reconcile_once_for_test().await.expect("adopting pass");
+        let object = resolver.get("unmanaged").await.expect("policy");
+        assert_eq!(object.metadata.labels.get(MANAGED_BY_LABEL).map(String::as_str), Some(MANIFEST_MANAGED_BY_VALUE));
         assert!(!reconciler.warned_unmanaged.contains(&identity));
 
-        let object = resolver.get("unmanaged").await.expect("policy");
-        let mut meta = InputMeta::from(&object.metadata);
-        meta.labels.remove(MANAGED_BY_LABEL);
-        resolver.update(&meta, &object.metadata.resource_version, &object.spec).await.expect("remove ownership");
+        // An operator's apply without the manifest's stamps makes it the operator's again.
+        let meta = InputMeta::builder().name("unmanaged".to_string()).build();
+        resolver.update(&meta, &object.metadata.resource_version, &kind_spec("live")).await.expect("remove ownership");
         let report = reconciler.reconcile_once_for_test().await.expect("unmanaged again");
 
         assert_eq!(report.unmanaged, 1);
@@ -2293,8 +2181,8 @@ mod tests {
         let dir = tempfile::tempdir().expect("tempdir");
         write(&dir.path().join("broken.yaml"), "kind: [");
         write(&dir.path().join("valid.yaml"), &manifest("valid", "one"));
-        let backend = ResourceBackend::new(InMemoryBackend::default());
-        let mut reconciler = ResourceManifestReconciler::new(backend.clone(), old_roots(&backend), NAMESPACE, dir.path());
+        let backend = EngineBackend::open(HOME);
+        let mut reconciler = ResourceManifestReconciler::new(backend.clone(), roots(&backend), NAMESPACE, dir.path());
 
         let report = reconciler.reconcile_once_for_test().await.expect("manifest pass");
 
@@ -2313,12 +2201,11 @@ mod tests {
     async fn deleting_a_root_does_not_prune_its_objects() {
         let dir = tempfile::tempdir().expect("tempdir");
         write(&dir.path().join("policy.yaml"), &manifest("retained", "one"));
-        let backend = ResourceBackend::new(InMemoryBackend::default());
-        let mut reconciler = ResourceManifestReconciler::new(backend.clone(), old_roots(&backend), NAMESPACE, dir.path());
+        let backend = EngineBackend::open(HOME);
+        let mut reconciler = ResourceManifestReconciler::new(backend.clone(), roots(&backend), NAMESPACE, dir.path());
         reconciler.reconcile_once_for_test().await.expect("initial pass");
 
-        let root = test_root(&backend).await;
-        backend.using::<ManifestRoot>(NAMESPACE).delete(&root.metadata.name).await.expect("remove declared root");
+        roots(&backend).retire(NAMESPACE, &reconciler.root_name()).await.expect("remove declared root");
         backend.using::<FulfilmentKind>(NAMESPACE).get("retained").await.expect("root deletion must not prune object");
     }
 
@@ -2328,27 +2215,15 @@ mod tests {
         )
     }
 
-    /// A store a root's pruning runs over: its name, the directory it lives in, and its backend and roots.
-    type PruningStore = (&'static str, Option<tempfile::TempDir>, ResourceBackend, Arc<dyn ManifestRoots>);
+    /// A store a root's pruning runs over: its name, the engine home that holds it, and its
+    /// backend and roots.
+    type PruningStore = (&'static str, EngineBackend, ResourceBackend, Arc<dyn ManifestRoots>);
 
-    /// The two stores a root's pruning runs over: the old store's roots and definitions, and the
-    /// engine's (behind `[primitives]`).
+    /// The store a root's pruning runs over: the engine's roots and definitions.
     fn pruning_stores() -> Vec<PruningStore> {
-        use flotilla_provisioning::engine::{definitions::EngineDefinitions, manifest_root::EngineManifestRoots};
-        let old = ResourceBackend::new(InMemoryBackend::default());
-        let old_roots: Arc<dyn ManifestRoots> = old_roots(&old);
-        let store = tempfile::tempdir().expect("store dir");
-        let mut kinds = flotilla_schema::KindRegistry::new();
-        flotilla_provisioning::stored::manifest_root::register(&mut kinds).expect("register roots");
-        flotilla_provisioning::stored::definition::register(&mut kinds).expect("register definitions");
-        let service =
-            Arc::new(flotilla_schema_sqlite::stream::Service::open(&store.path().join("decided.sqlite"), "home", kinds).expect("store"));
-        let clock: Arc<dyn flotilla_resources::Clock> = Arc::new(flotilla_resources::SystemClock);
-        let engine_roots: Arc<dyn ManifestRoots> =
-            Arc::new(EngineManifestRoots::open(Arc::clone(&service), Arc::clone(&clock)).expect("roots"));
-        let engine = ResourceBackend::new(InMemoryBackend::default());
-        engine.install_engine_records(Arc::new(EngineDefinitions::open(service, clock).expect("definitions")));
-        vec![("old store", None, old, old_roots), ("engine", Some(store), engine, engine_roots)]
+        let home = EngineBackend::open(HOME);
+        let (backend, roots) = (home.backend.clone(), roots(&home));
+        vec![("engine", home, backend, roots)]
     }
 
     fn forge_key() -> DocumentKey {
@@ -2412,10 +2287,10 @@ mod tests {
     }
 
     /// A reconciler over `dir` that has applied `policy.yaml` declaring `name`, and its backend.
-    async fn applied_policy(dir: &Path, name: &str) -> (ResourceBackend, ResourceManifestReconciler) {
+    async fn applied_policy(dir: &Path, name: &str) -> (EngineBackend, ResourceManifestReconciler) {
         write(&dir.join("policy.yaml"), &manifest(name, "one"));
-        let backend = ResourceBackend::new(InMemoryBackend::default());
-        let mut reconciler = ResourceManifestReconciler::new(backend.clone(), old_roots(&backend), NAMESPACE, dir).with_revision("r1");
+        let backend = EngineBackend::open(HOME);
+        let mut reconciler = ResourceManifestReconciler::new(backend.clone(), roots(&backend), NAMESPACE, dir).with_revision("r1");
         reconciler.reconcile_once_for_test().await.expect("creation");
         (backend, reconciler)
     }
@@ -2491,31 +2366,6 @@ mod tests {
         let state = &test_root(&backend).await.status.expect("status").documents[&key("paused")];
         assert_eq!((state.phase, state.removed_in.as_deref()), (DocumentPhase::Deleted, Some("r2")));
     }
-
-    #[tokio::test]
-    async fn legacy_state_annotations_decode_and_are_stripped_on_apply() {
-        let dir = tempfile::tempdir().expect("tempdir");
-        write(&dir.path().join("policy.yaml"), &manifest("legacy", "one"));
-        let backend = ResourceBackend::new(InMemoryBackend::default());
-        let resolver = backend.using::<FulfilmentKind>(NAMESPACE);
-        let mut reconciler = ResourceManifestReconciler::new(backend.clone(), old_roots(&backend), NAMESPACE, dir.path());
-        reconciler.reconcile_once_for_test().await.expect("initial pass");
-        let object = resolver.get("legacy").await.expect("policy");
-        let mut meta = InputMeta::from(&object.metadata);
-        for key in LEGACY_STATE_ANNOTATIONS {
-            meta.annotations.insert(key.into(), "stale".into());
-        }
-        meta.annotations.insert("flotilla.work/manifest-resolution".into(), "sync".into());
-        let legacy = resolver.update(&meta, &object.metadata.resource_version, &object.spec).await.expect("write legacy metadata");
-        flotilla_store::decode_stored_resource_document(&serde_json::to_value(legacy.to_k8s_object()).expect("encode"))
-            .expect("decode previous-generation annotations");
-        assert_eq!(reconciler.reconcile_once_for_test().await.expect("cleanup pass").updated, 1);
-        let cleaned = resolver.get("legacy").await.expect("policy");
-        for key in LEGACY_STATE_ANNOTATIONS {
-            assert!(!cleaned.metadata.annotations.contains_key(key), "stale state annotation {key}");
-        }
-        assert!(cleaned.metadata.annotations.contains_key(MANIFEST_BASELINE_HASH_ANNOTATION));
-    }
 }
 
 #[cfg(test)]
@@ -2524,14 +2374,14 @@ mod registered_charter_tests {
     use flotilla_core::in_process::InProcessDaemon;
     use flotilla_discovery_testkit::fake_discovery;
     use flotilla_protocol::HostName;
+    use flotilla_provisioning_testkit::EngineBackend;
     use flotilla_resources::{
         CharterPointer, FulfilmentKind, Project, ProjectRepositoryRole, ProjectRepositorySpec, ProjectSpec, RepositoryKey,
         ResourceProvenance,
     };
     use flotilla_resources::{InputMeta, ManifestRoot};
-    use flotilla_store_memory::InMemoryBackend;
 
-    use super::tests::old_roots;
+    use super::tests::{roots, HOME};
     use super::*;
     use crate::testkits::server::spawn_in_memory_request_topology;
 
@@ -2553,11 +2403,11 @@ mod registered_charter_tests {
     #[tokio::test]
     async fn scope_refusal_preserves_the_entire_last_applied_candidate() {
         let directory = tempfile::tempdir().expect("fleet directory");
-        let backend = ResourceBackend::new(InMemoryBackend::default());
+        let backend = EngineBackend::open(HOME);
         let pointer = CharterPointer::Inline { documents: vec![], files: BTreeMap::new() };
         let good = project(pointer);
         std::fs::write(directory.path().join("project.json"), serde_json::to_string(&good).expect("encode")).expect("write");
-        let mut reconciler = ResourceManifestReconciler::new(backend.clone(), old_roots(&backend), "flotilla", directory.path())
+        let mut reconciler = ResourceManifestReconciler::new(backend.clone(), roots(&backend), "flotilla", directory.path())
             .with_binding(Some(CharterSource::LocalDirectory { directory: directory.path().to_string_lossy().into_owned() }));
         reconciler.reconcile_once_for_test().await.expect("initial apply");
         let initial_root = backend.using::<ManifestRoot>("flotilla").get(&reconciler.root_name()).await.expect("root");
@@ -2587,7 +2437,7 @@ mod registered_charter_tests {
     #[tokio::test]
     async fn unbound_source_refreshes_charter_provenance_and_can_return_to_legacy() {
         let directory = tempfile::tempdir().expect("fleet input");
-        let backend = ResourceBackend::new(InMemoryBackend::default());
+        let backend = EngineBackend::open(HOME);
         let ensure = serde_json::json!({"apiVersion": "flotilla.work/v1", "kind": "ConvoyEnsure", "metadata": {"name": "app-governor"}, "spec": {"project_ref": "app", "role": "governor", "workflow_ref": "govern", "repositories": ["app-repo"]}});
         let mut registration = project(CharterPointer::Inline { documents: vec![ensure.clone()], files: BTreeMap::new() });
         let mut legacy_spec: ProjectSpec = serde_json::from_value(registration["spec"].clone()).expect("legacy spec");
@@ -2597,10 +2447,10 @@ mod registered_charter_tests {
             .create(
                 &InputMeta::builder()
                     .name("app".into())
-                    .annotations(BTreeMap::from([(
-                        flotilla_charter::project_declaration::BOOTSTRAP_REPOSITORY_ANNOTATION.into(),
-                        "app-repo".into(),
-                    )]))
+                    .annotations(BTreeMap::from([
+                        (flotilla_charter::project_declaration::BOOTSTRAP_REPOSITORY_ANNOTATION.into(), "app-repo".into()),
+                        (flotilla_resources::definition_provenance::BOOTSTRAP_COMMIT_ANNOTATION.into(), "bootstrap".into()),
+                    ]))
                     .build(),
                 &legacy_spec,
             )
@@ -2609,13 +2459,12 @@ mod registered_charter_tests {
         let path = directory.path().join("project.json");
         std::fs::write(&path, serde_json::to_string(&registration).expect("encode")).expect("registration");
         let mut reconciler =
-            ResourceManifestReconciler::new(backend.clone(), old_roots(&backend), "flotilla", directory.path()).with_revision("first");
+            ResourceManifestReconciler::new(backend.clone(), roots(&backend), "flotilla", directory.path()).with_revision("first");
         let report = reconciler.reconcile_once_for_test().await.expect("first apply");
         assert!(report.errors.is_empty(), "{report:?}");
         let registered = backend.using::<Project>("flotilla").get("app").await.expect("transferred registration");
         assert!(registered.spec.charter.is_some());
         assert_eq!(registered.metadata.labels[MANAGED_BY_LABEL], MANIFEST_MANAGED_BY_VALUE);
-        assert_eq!(registered.metadata.annotations[flotilla_charter::project_declaration::BOOTSTRAP_REPOSITORY_ANNOTATION], "app-repo");
         let ensures = backend.using::<flotilla_resources::ConvoyEnsure>("flotilla");
         assert_eq!(ensures.get("app-governor").await.expect("ensure").metadata.annotations[MANIFEST_REVISION_ANNOTATION], "first");
         reconciler.fixed_revision = Some("second".into());
@@ -2640,7 +2489,7 @@ mod registered_charter_tests {
     #[tokio::test]
     async fn registered_charter_layer_is_removed_with_its_directory() {
         let directory = tempfile::tempdir().expect("fleet input");
-        let backend = ResourceBackend::new(InMemoryBackend::default());
+        let backend = EngineBackend::open(HOME);
         let files = BTreeMap::from([
             (
                 "image/layer.yaml".to_string(),
@@ -2662,7 +2511,7 @@ mod registered_charter_tests {
         let layers = backend.definitions::<flotilla_resources::ImageLayer>("flotilla");
         layers.apply(&InputMeta::builder().name(other.resource_name()).build(), &other.clone().into()).await.expect("other layer");
         let mut reconciler =
-            ResourceManifestReconciler::new(backend.clone(), old_roots(&backend), "flotilla", directory.path()).with_revision("first");
+            ResourceManifestReconciler::new(backend.clone(), roots(&backend), "flotilla", directory.path()).with_revision("first");
         let report = reconciler.reconcile_once_for_test().await.expect("first apply");
         assert!(report.errors.is_empty(), "{report:?}");
         let name = layers
@@ -2695,8 +2544,8 @@ mod registered_charter_tests {
     #[tokio::test]
     async fn fleet_placement_policy_federates_alongside_host_local_policy() {
         let directory = tempfile::tempdir().expect("fleet input");
-        let fleet_backend = ResourceBackend::new(InMemoryBackend::default());
-        let host_backend = ResourceBackend::new(InMemoryBackend::default());
+        let fleet_backend = EngineBackend::open(HOME);
+        let host_backend = EngineBackend::open(HOME);
         for (name, machine) in [("fleet-config", "fleet-root"), ("host-config", "host-root")] {
             let config = directory.path().join(name);
             std::fs::create_dir_all(&config).expect("config directory");

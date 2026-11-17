@@ -1,6 +1,11 @@
 use super::*;
+use crate::testkits::engine::engine;
 use flotilla_store::load_metrics::CallerReads;
-use flotilla_store_testkit::{ReadCountsBackendExt, ReadOperation};
+
+/// The passes `reads` has made: each lists the engine's convoys once, by index or the whole kind.
+fn convoy_listings(reads: &CallerReads) -> u64 {
+    reads.snapshot().get("Convoy port").map_or(0, |convoys| convoys.index + convoys.whole_kind)
+}
 
 // Startup runs one pass. Watch notifications reconcile current Message evidence
 // only, even when replica/session events arrive in separate batches, and no timer
@@ -9,37 +14,41 @@ use flotilla_store_testkit::{ReadCountsBackendExt, ReadOperation};
 async fn startup_runs_one_pass_and_watches_drive_the_rest() {
     let temp = tempfile::tempdir().expect("config");
     fs::write(temp.path().join("daemon.toml"), "machine_id = \"supervisor-turns-test\"\n").expect("daemon config");
-    let backend = ResourceBackend::new(flotilla_store_memory::InMemoryBackend::default()).with_read_counts();
-    let daemon = daemon_with_backend(Vec::new(), Arc::new(ConfigStore::with_base(temp.path())), backend.clone()).await;
+    let daemon = in_memory_daemon(Vec::new(), Arc::new(ConfigStore::with_base(temp.path()))).await;
+    let _engine = engine(&daemon);
     tokio::time::pause();
     let (convoy_sender, convoy_receiver) = futures::channel::mpsc::unbounded();
     let (session_sender, session_receiver) = futures::channel::mpsc::unbounded();
     let receivers = Arc::new(StdMutex::new(Some((convoy_receiver, session_receiver))));
-    let before = backend.read_snapshot();
-    let (task, ready) = super::super::tasks::spawn_pending_supervisor_turn_task_with_watches(daemon, NAMESPACE.into(), move || {
-        let (convoys, sessions) = receivers.lock().expect("receivers").take().expect("one subscription");
-        async move { Ok((convoys.boxed(), sessions.boxed())) }
+    // The task's reads count for one caller.
+    let reads = Arc::new(CallerReads::default());
+    let (task, ready) = within(&reads, || {
+        super::super::tasks::spawn_pending_supervisor_turn_task_with_watches(daemon, NAMESPACE.into(), move || {
+            let (convoys, sessions) = receivers.lock().expect("receivers").take().expect("one subscription");
+            async move { Ok((convoys.boxed(), sessions.boxed())) }
+        })
     });
     let task = tokio_util::task::AbortOnDropHandle::new(task);
     ready.await.expect("startup ready");
-    assert_eq!(backend.read_snapshot().since(&before).calls("Convoy", ReadOperation::Query), 1);
+    assert_eq!(convoy_listings(&reads), 1);
     for sender in [&convoy_sender, &session_sender] {
-        let before = backend.read_snapshot();
+        let before = convoy_listings(&reads);
         sender.unbounded_send(Ok(())).expect("watch event");
-        for _ in 0..100 {
+        // The pass reads on the blocking pool, which runs on wall time while the test's clock is
+        // paused: wait on wall time for it, up to a bound.
+        let deadline = std::time::Instant::now() + Duration::from_secs(10);
+        while convoy_listings(&reads) == before && std::time::Instant::now() < deadline {
             tokio::task::yield_now().await;
-            if backend.read_snapshot().since(&before).calls("Convoy", ReadOperation::Query) > 0 {
-                break;
-            }
         }
-        assert_eq!(backend.read_snapshot().since(&before).calls("Convoy", ReadOperation::Query), 1);
+        assert_eq!(convoy_listings(&reads) - before, 1);
     }
-    let before = backend.read_snapshot();
+    // No timer wakes the task: over ten idle minutes it reads nothing at all.
+    let before = reads.snapshot();
     tokio::time::advance(Duration::from_secs(600)).await;
     for _ in 0..100 {
         tokio::task::yield_now().await;
     }
-    assert_eq!(backend.read_snapshot().since(&before).calls("Convoy", ReadOperation::Query), 0);
+    assert_eq!(reads.snapshot(), before);
     drop(task);
 }
 
@@ -49,8 +58,8 @@ async fn startup_runs_one_pass_and_watches_drive_the_rest() {
 async fn a_message_commit_runs_a_pass_without_listing_messages() {
     let temp = tempfile::tempdir().expect("config");
     fs::write(temp.path().join("daemon.toml"), "machine_id = \"supervisor-turn-message-test\"\n").expect("daemon config");
-    let backend = ResourceBackend::new(flotilla_store_memory::InMemoryBackend::default()).with_read_counts();
-    let daemon = daemon_with_backend(Vec::new(), Arc::new(ConfigStore::with_base(temp.path())), backend.clone()).await;
+    let daemon = in_memory_daemon(Vec::new(), Arc::new(ConfigStore::with_base(temp.path()))).await;
+    let _engine = engine(&daemon);
     let primitives = daemon.open_message_primitives().expect("message path");
     designate_fleet(&daemon).await;
     // The designated fleet here is `fleet`, so turn-rules sends as `fleet:fleet/role:turn-rules`.
@@ -71,10 +80,10 @@ async fn a_message_commit_runs_a_pass_without_listing_messages() {
     let task = tokio_util::task::AbortOnDropHandle::new(task);
     ready.await.expect("startup ready");
 
-    let (before, read) = (backend.read_snapshot(), rows());
+    let (before, read) = (convoy_listings(&reads), rows());
     attributed(Arc::clone(&reads), primitives.admit("turn", &intent)).await.expect("admit");
     tokio::time::timeout(Duration::from_secs(5), async {
-        while backend.read_snapshot().since(&before).calls("Convoy", ReadOperation::Query) == 0 {
+        while convoy_listings(&reads) == before {
             tokio::task::yield_now().await;
         }
     })

@@ -1,5 +1,4 @@
 use flotilla_resources::terminal_records::{AgentLaunch, TerminalLaunchFacts, TerminalRecords as _};
-use flotilla_store_sqlite::SqliteBackend;
 use std::{
     collections::BTreeMap,
     sync::{
@@ -23,7 +22,6 @@ use flotilla_resources::{
     FulfilmentKindSpec, FulfilmentRealisation, HostDirectEnvironmentSpec, InputMeta, Message, MessageExpectation, Selector,
     TerminalSession, Vessel, VesselRequirement, WorkPhase, WorkState, WorkflowSnapshot,
 };
-use flotilla_store::ResourceBackend;
 use futures::StreamExt;
 use tokio_util::task::AbortOnDropHandle;
 
@@ -52,9 +50,8 @@ async fn modern_remote_nudge_uses_ordinary_message_admission() {
 }
 
 async fn remote_turn_scenario(closed_watch: Option<ClosedWatch>) {
-    let home = ResourceBackend::new(SqliteBackend::open_in_memory().expect("home store")).with_local_root(NodeId::new("home"));
-    let placement =
-        ResourceBackend::new(SqliteBackend::open_in_memory().expect("placement store")).with_local_root(NodeId::new("placement"));
+    let home = flotilla_store_memory::engine_home_backend().with_local_root(NodeId::new("home"));
+    let placement = flotilla_store_memory::engine_home_backend().with_local_root(NodeId::new("placement"));
     let home_dir = tempfile::tempdir().expect("home config");
     std::fs::write(home_dir.path().join("daemon.toml"), "machine_id = \"home\"\n").expect("home identity");
     let home_daemon = Arc::new(

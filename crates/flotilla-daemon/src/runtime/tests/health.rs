@@ -1,20 +1,45 @@
 use super::*;
 use crate::runtime::tasks::AGGREGATOR_CONTROLLER;
+use crate::testkits::engine::{admit_convoy, engine};
+use flotilla_engine_convoys_testkit::{single_agent, EngineHome};
 use flotilla_resources::clone_records::CloneRecords as _;
-use flotilla_store_memory::InMemoryBackend;
 use flotilla_store_sqlite::SqliteBackend;
 
+// Behaviour (#3108): reconcile-now on a convoy queues its launch at the Convoy controller and
+// writes nothing; a launch this home does not hold is refused as not found.
 #[tokio::test]
-async fn reconcile_now_wakes_convoy_controller_resource() {
-    let backend = ResourceBackend::new(InMemoryBackend::default());
-    let convoys = backend.clone().using::<Convoy>(NAMESPACE);
-    let convoy = convoys
-        .create(&empty_meta("teardown"), &ConvoySpec::builder().workflow_ref("workflow".to_string()).build())
-        .await
-        .expect("create convoy");
+async fn reconcile_now_queues_the_launch_at_the_convoy_controller() {
+    use flotilla_executor::executor_actions::ExecutorActionPort;
 
-    assert_eq!(wake_controller_resource::<Convoy>(&backend, NAMESPACE, "teardown").await.expect("wake convoy"), "Convoy/teardown woken");
-    assert_ne!(convoys.get("teardown").await.expect("updated convoy").metadata.resource_version, convoy.metadata.resource_version);
+    let temp = TempDir::new().expect("tempdir");
+    let config_base = temp.path().join("config");
+    std::fs::create_dir_all(&config_base).expect("config directory");
+    std::fs::write(config_base.join("daemon.toml"), "machine_id = \"reconcile-now-test\"\n").expect("daemon config");
+    let daemon = in_memory_daemon(Vec::new(), Arc::new(ConfigStore::with_base(config_base))).await;
+    engine(&daemon);
+    let launch = admit_convoy(
+        &daemon,
+        flotilla_engine_convoys_testkit::convoy(
+            NAMESPACE,
+            "teardown",
+            ConvoySpec::builder().workflow_ref("workflow".to_string()).build(),
+            single_agent("coder"),
+        ),
+    )
+    .await;
+    let convoys = daemon.resource_backend().using::<Convoy>(NAMESPACE);
+    let admitted = convoys.get(&launch).await.expect("admitted convoy");
+    let (sender, mut queue) = flotilla_store::controller::WorkQueueSender::channel();
+    let _watch = tokio::spawn(daemon.convoy_wake_watch().spawn(daemon.resource_backend(), NAMESPACE.to_owned(), sender));
+
+    assert_eq!(daemon.reconcile_now(NAMESPACE, "Convoy", &launch).await.expect("wake convoy"), format!("Convoy/{launch} woken"));
+    let queued = tokio::time::timeout(Duration::from_secs(5), queue.recv()).await.expect("queued in time").expect("queue open");
+    assert_eq!(queued, launch.to_string());
+    assert_eq!(convoys.get(&launch).await.expect("convoy").metadata.resource_version, admitted.metadata.resource_version);
+
+    let missing = daemon.reconcile_now(NAMESPACE, "Convoy", "never-admitted").await.expect_err("an unknown launch");
+    assert!(missing.contains("not found"), "{missing}");
+    assert!(queue.try_recv().is_err(), "a refused wake queues nothing");
 }
 
 /// Refuses every clone as a forge that has no such repository.
@@ -56,6 +81,8 @@ async fn clone_controller_failure_is_visible_in_convoy_explain() {
         .with_vessels(Arc::clone(&vessels.vessels) as _),
     );
     daemon.install_lifecycle_reads(Arc::clone(&reads)).expect("engine reads");
+    // Explain reads the convoy's messages too.
+    daemon.open_message_primitives().expect("message path");
     let clone_path = temp.path().join("clone").display().to_string();
     engine.environments.put_ready(
         "host-direct-test",
@@ -185,6 +212,7 @@ async fn fleet_health_surfaces_an_expired_ambient_claude_login_without_any_crew_
     std::fs::write(config_base.join("daemon.toml"), "machine_id = \"expired-ambient-claude-test\"\n").expect("daemon config");
     let config = Arc::new(ConfigStore::with_base(config_base));
     let daemon = in_memory_daemon(Vec::new(), Arc::clone(&config)).await;
+    engine(&daemon);
     let credential_store = CredentialStore::new(
         daemon.resource_backend(),
         NAMESPACE,
@@ -374,12 +402,10 @@ fn projection_parity_sequential_admissions(tc: hegel::TestCase) {
 // also checks that catching up clears the diagnosis at that same instant.
 #[tokio::test]
 async fn projection_parity_creation_age_boundaries() {
-    let backend = ResourceBackend::new(flotilla_store_memory::InMemoryBackend::default());
-    let created = backend
-        .using::<Convoy>(NAMESPACE)
-        .create(&empty_meta("recent"), &ConvoySpec::builder().workflow_ref("workflow".to_string()).build())
-        .await
-        .expect("create local convoy");
+    let home = EngineHome::open_in("home", NAMESPACE);
+    let backend = home.backend().clone();
+    let recent = home.admit("recent", ConvoySpec::builder().workflow_ref("workflow".to_string()).build(), single_agent("coder")).await;
+    let created = backend.using::<Convoy>(NAMESPACE).get(&recent).await.expect("admitted convoy");
     for age_ms in [-1, 0, 1, 9_999, 10_000, 10_001, 60_000] {
         let clock = flotilla_store_testkit::VirtualClock::new(created.metadata.creation_timestamp + chrono::Duration::milliseconds(age_ms));
         let projection = AggregatorProjectionState::new();
@@ -387,14 +413,17 @@ async fn projection_parity_creation_age_boundaries() {
         assert_eq!(condition.is_some(), !(0..10_000).contains(&age_ms), "row age {age_ms}ms");
         if let Some(condition) = condition {
             assert_eq!(condition.reason, "LocalRowsMissing");
-            assert_eq!(condition.message, "durable store has 1 convoys but the local aggregator projection has 0; missing: recent");
+            assert_eq!(
+                condition.message,
+                format!("durable store has 1 convoys but the local aggregator projection has 0; missing: {recent}")
+            );
         }
-        let resource = flotilla_protocol::ResourceRef::new("flotilla.work/v1", "Convoy", NAMESPACE, "recent");
+        let resource = flotilla_protocol::ResourceRef::new("flotilla.work/v1", "Convoy", NAMESPACE, recent.as_str());
         projection.write().await.local_rows.insert(
             resource.clone(),
             flotilla_protocol::ConvoyRow::builder()
                 .resource(resource)
-                .name("recent")
+                .name(recent.as_str())
                 .workflow_ref("workflow")
                 .phase(flotilla_protocol::ConvoyPhase::Pending)
                 .build(),
@@ -408,20 +437,13 @@ async fn projection_parity_creation_age_boundaries() {
 
 #[tokio::test]
 async fn projection_parity_reports_and_clears_missing_local_convoys() {
-    let backend = ResourceBackend::new(flotilla_store_memory::InMemoryBackend::default());
-    let convoys = backend.using::<Convoy>(NAMESPACE);
-    let meta = InputMeta::builder().name("convoy-a".to_string()).finalizers(vec!["flotilla.work/test-finalizer".to_string()]).build();
-    let created =
-        convoys.create(&meta, &ConvoySpec::builder().workflow_ref("workflow".to_string()).build()).await.expect("create durable convoy");
-    let failed = convoys
-        .update_status(
-            &created.metadata.name,
-            &created.metadata.resource_version,
-            &ConvoyStatus { phase: ConvoyPhase::Failed, ..Default::default() },
-        )
-        .await
-        .expect("mark durable convoy failed");
-    convoys.delete(&failed.metadata.name).await.expect("begin durable convoy reaping");
+    // An ended launch is still a durable convoy the projection must show.
+    let home = EngineHome::open_in("home", NAMESPACE);
+    let backend = home.backend().clone();
+    let launch = home.admit("convoy-a", ConvoySpec::builder().workflow_ref("workflow".to_string()).build(), single_agent("coder")).await;
+    let view = home.convoy(&launch).await;
+    home.convoys.path().get().expect("the Convoy path").abandon(&view, "operator", "abandoned").await.expect("end the launch");
+    let created = backend.using::<Convoy>(NAMESPACE).get(&launch).await.expect("ended convoy");
     let projection = AggregatorProjectionState::new();
     let clock = flotilla_store_testkit::VirtualClock::new(created.metadata.creation_timestamp + PROJECTION_PARITY_GRACE);
 
@@ -431,14 +453,14 @@ async fn projection_parity_reports_and_clears_missing_local_convoys() {
         .expect("missing projection should degrade the host");
     assert_eq!(degraded.condition_type, "ProjectionParity");
     assert_eq!(degraded.reason, "LocalRowsMissing");
-    assert!(degraded.message.contains("convoy-a"));
+    assert!(degraded.message.contains(&launch));
 
-    let resource = flotilla_protocol::ResourceRef::new("flotilla.work/v1", "Convoy", NAMESPACE, "convoy-a");
+    let resource = flotilla_protocol::ResourceRef::new("flotilla.work/v1", "Convoy", NAMESPACE, launch.as_str());
     projection.write().await.local_rows.insert(
         resource.clone(),
         flotilla_protocol::ConvoyRow::builder()
             .resource(resource)
-            .name("convoy-a")
+            .name(launch.as_str())
             .workflow_ref("workflow")
             .phase(flotilla_protocol::ConvoyPhase::Pending)
             .build(),
@@ -456,6 +478,7 @@ async fn controller_exhaustion_alarm_is_visible_in_fleet_health() {
     let temp = TempDir::new().expect("tempdir");
     fs::write(temp.path().join("daemon.toml"), "machine_id = \"controller-exhaustion-health-test\"\n").expect("daemon config");
     let daemon = in_memory_daemon(Vec::new(), Arc::new(ConfigStore::with_base(temp.path()))).await;
+    engine(&daemon);
     let profile = own_host_profile(&daemon, false);
     let health = RuntimeHealth::default();
     health.report_restart_budget_exhausted(RestartBudgetExhausted {
@@ -488,7 +511,7 @@ async fn resource_controller_restart_budget_exhaustion_recovers() {
     let signal = Arc::new(StdMutex::new(Some(recovered)));
     let task = spawn_named_controller(
         Checkout::API_PATHS.kind,
-        ResourceBackend::new(flotilla_store_memory::InMemoryBackend::default()),
+        flotilla_store_memory::engine_home_backend(),
         NAMESPACE.to_string(),
         ControllerSupervision {
             max_consecutive_failures: 1,

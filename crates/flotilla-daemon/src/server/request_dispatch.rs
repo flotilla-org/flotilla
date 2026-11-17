@@ -200,7 +200,7 @@ impl<'a> RequestDispatcher<'a> {
                 .body(ArtifactBody::File(temporary.path().to_path_buf()))
                 .build();
             // Validation and storage are the complete submission; settlement needs no forge write.
-            let (name, spec, owner) = service.prepare_put(caller, input, &settings.artifact_retention_days).await?;
+            let (name, spec) = service.prepare_put(caller, input, &settings.artifact_retention_days).await?;
             let target = self
                 .daemon
                 .resolve_existing_convoy_target(&CommandAction::QueryExplainConvoy {
@@ -216,7 +216,7 @@ impl<'a> RequestDispatcher<'a> {
             let document = |spec: &flotilla_resources::ArtifactSpec| {
                 serde_json::json!({
                     "apiVersion": "flotilla.work/v1", "kind": "Artifact",
-                    "metadata": { "name": name, "ownerReferences": [owner] }, "spec": spec,
+                    "metadata": { "name": name }, "spec": spec,
                 })
             };
             let store = async |spec: &flotilla_resources::ArtifactSpec| match self

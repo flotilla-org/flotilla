@@ -1,9 +1,12 @@
 use serde_json::Value;
 
-use crate::{error::ResourceError, http::HttpBackend};
+use crate::{
+    error::ResourceError,
+    http::{segment, HttpBackend},
+};
 
 pub async fn ensure_namespace(backend: &HttpBackend, name: &str) -> Result<(), ResourceError> {
-    let get_url = format!("{}/api/v1/namespaces/{}", backend.base_url.trim_end_matches('/'), name);
+    let get_url = format!("{}/api/v1/namespaces/{}", backend.base_url.trim_end_matches('/'), segment(name));
     let response = backend.http.get(&get_url).send().await.map_err(|err| ResourceError::other(format!("GET namespace: {err}")))?;
     if response.status().is_success() {
         return Ok(());
@@ -34,7 +37,8 @@ pub async fn ensure_crd(backend: &HttpBackend, crd_yaml: &str) -> Result<(), Res
         .and_then(|metadata| metadata.get("name"))
         .and_then(Value::as_str)
         .ok_or_else(|| ResourceError::invalid("CRD YAML missing metadata.name"))?;
-    let object_url = format!("{}/apis/apiextensions.k8s.io/v1/customresourcedefinitions/{}", backend.base_url.trim_end_matches('/'), name);
+    let object_url =
+        format!("{}/apis/apiextensions.k8s.io/v1/customresourcedefinitions/{}", backend.base_url.trim_end_matches('/'), segment(name));
     let response = backend.http.get(&object_url).send().await.map_err(|err| ResourceError::other(format!("GET CRD: {err}")))?;
 
     if response.status().is_success() {

@@ -1,4 +1,3 @@
-use flotilla_store_memory::InMemoryBackend;
 use std::{
     collections::{BTreeMap, BTreeSet, HashMap},
     future::Future,
@@ -2452,6 +2451,56 @@ async fn mistargeted_convoy_delete_routes_to_remote_home() {
     );
 }
 
+/// Reconcile-now on a follower-homed convoy from the leader's client, targeted at the leader when
+/// `mistargeted`: the follower's Convoy controller queues the launch, and the leader's does not.
+async fn convoy_reconcile_now_reaches_the_home_controller(mistargeted: bool) {
+    let leader = empty_daemon_named("leader").await;
+    let follower = empty_daemon_named("follower").await;
+    let topology = spawn_in_memory_request_topology_stateful(leader, follower).await.expect("spawn stateful topology");
+    let namespace = "flotilla";
+    let launch = admit(&topology.follower, "remote-wake", "remote-wake").await;
+    apply_convoy_replica_feed(&topology.leader, namespace, &launch, topology.follower_host.clone()).await;
+    let queue = |daemon: &Arc<InProcessDaemon>| {
+        let (sender, queue) = flotilla_store::controller::WorkQueueSender::channel();
+        tokio::spawn(daemon.convoy_wake_watch().spawn(daemon.resource_backend(), namespace.to_owned(), sender));
+        queue
+    };
+    eventually(Duration::from_secs(5), Duration::from_millis(10), "the follower's convoy should replicate to the leader", || async {
+        topology.leader.resource_backend().including_replicas::<Convoy>(namespace).get(&launch).await.is_ok()
+    })
+    .await;
+    let mut at_follower = queue(&topology.follower);
+    let mut at_leader = queue(&topology.leader);
+
+    let mut rx = topology.leader.subscribe();
+    let mut command = Command::builder()
+        .action(CommandAction::ResourceReconcileNow { namespace: namespace.to_string(), kind: "Convoy".into(), name: launch.clone() })
+        .build();
+    if mistargeted {
+        command.node_id = Some(topology.leader.node_id().clone());
+    }
+    let command_id = topology.client.execute(command).await.expect("dispatch convoy reconcile-now");
+
+    let result = await_command_result(&mut rx, command_id).await;
+    assert!(
+        matches!(result, CommandValue::ResourceReconciled { ref name, .. } if *name == launch),
+        "reconcile-now should succeed at the convoy's home: {result:?}"
+    );
+    let queued = tokio::time::timeout(Duration::from_secs(5), at_follower.recv()).await.expect("queued at the home").expect("queue open");
+    assert_eq!(queued, launch);
+    assert!(at_leader.try_recv().is_err(), "the dispatch host's controller must not be woken for a convoy it does not home");
+}
+
+#[tokio::test]
+async fn hostless_convoy_reconcile_now_wakes_the_remote_home_controller() {
+    convoy_reconcile_now_reaches_the_home_controller(false).await;
+}
+
+#[tokio::test]
+async fn mistargeted_convoy_reconcile_now_wakes_the_remote_home_controller() {
+    convoy_reconcile_now_reaches_the_home_controller(true).await;
+}
+
 #[tokio::test]
 async fn active_convoy_delete_names_the_host_owning_an_unreachable_checkout_environment() {
     use flotilla_inbox::InboxBackend;
@@ -2626,7 +2675,7 @@ async fn hostless_convoy_command_explains_missing_home_route() {
     let stranded = flotilla_engine_convoys_testkit::EngineConvoysHome::over(
         feta.service(),
         namespace,
-        &ResourceBackend::new(InMemoryBackend::default()),
+        &flotilla_store_memory::engine_home_backend(),
         Arc::new(SystemClock),
         topology.leader.lifecycle_reads(),
     )
@@ -3044,11 +3093,12 @@ async fn lagging_start_placement_scenario(explicit: bool, destination_holds_cred
     })
     .await;
 
-    // This is the replication boundary: replace the dispatcher's snapshot with
-    // an older self-report, without changing the authoritative destination.
-    let mut lagging = topology.follower.resource_backend().using::<Host>(namespace).list().await.expect("destination hosts");
-    let host = lagging.items.iter_mut().find(|host| host.metadata.name == remote_host_id).expect("destination host");
-    let status = host.status.as_mut().expect("host status");
+    // This is the replication boundary: the dispatcher holds an older self-report
+    // than the destination, whose own record stays authoritative. Feta reports the
+    // older one, kiwi installs it, and kiwi installs nothing feta reports after.
+    let destination_hosts = topology.follower.resource_backend().using::<Host>(namespace);
+    let current = destination_hosts.get(&remote_host_id).await.expect("destination host");
+    let mut status = current.status.clone().expect("host status");
     status.disk_free_bytes = Some(0);
     status.admission_free_space_floor_bytes = None;
     status.ready = false;
@@ -3058,13 +3108,26 @@ async fn lagging_start_placement_scenario(explicit: bool, destination_holds_cred
         HELD_CREDENTIALS_CAPABILITY.to_string(),
         serde_json::json!(if destination_holds_credential { vec![] } else { vec!["claude-max"] }),
     );
-    topology
+    let older =
+        destination_hosts.update_status(&remote_host_id, &current.metadata.resource_version, &status).await.expect("older self-report");
+    topology.hold_follower_stream_at_leader().await;
+    destination_hosts
+        .update_status(&remote_host_id, &older.metadata.resource_version, current.status.as_ref().expect("host status"))
+        .await
+        .expect("current self-report");
+    let held = topology
         .leader
         .resource_backend()
-        .replica_writer::<Host>(topology.follower.node_id().clone(), namespace)
-        .replace(&lagging, Utc::now())
+        .including_replicas::<Host>(namespace)
+        .get(&remote_host_id)
         .await
-        .expect("lag dispatcher host replica");
+        .expect("dispatcher's replica")
+        .object
+        .status
+        .expect("replica status")
+        .held_credentials()
+        .expect("decode replica held credentials");
+    assert_eq!(held.contains("claude-max"), !destination_holds_credential, "the dispatcher must hold the older self-report");
     let action = CommandAction::ConvoyStart {
         intent: Box::new(
             ConvoyStartIntent::builder()
@@ -3731,11 +3794,9 @@ async fn seed_governor_subscription(a: &InProcessDaemon, b: &InProcessDaemon) {
         )
         .await
         .expect("project subscriptions");
-    b_backend
-        .replica_writer::<Project>(a.node_id().clone(), "flotilla")
-        .replace(&a_backend.using::<Project>("flotilla").list().await.expect("project"), Utc::now())
-        .await
-        .expect("replicate shape");
+    // A's Project reaches B as A's log does.
+    let a_store = a.decided_store().expect("a's decided store");
+    flotilla_provisioning_testkit::replicate_home(&a_store, a_store.home(), &b.decided_store().expect("b's decided store"));
     let ensures = b_backend.using::<ConvoyEnsure>("flotilla");
     ensures
         .create(

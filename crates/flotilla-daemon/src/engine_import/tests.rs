@@ -1166,7 +1166,6 @@ fn snapshots_only_an_ended_convoy_references_are_dropped() {
 async fn an_imported_live_convoys_labelled_snapshot_is_collected_when_it_ends() {
     use std::sync::Arc;
 
-    use flotilla_provisioning::engine::kinds::EngineKinds;
     use flotilla_resources::{CONVOY_LABEL, PLACEMENT_SNAPSHOT_ANNOTATION, PREPARED_SNAPSHOT_LABEL};
     use flotilla_state_machines::{machines::convoy::Convoy as EngineConvoy, Resource as Record};
 
@@ -1199,10 +1198,17 @@ async fn an_imported_live_convoys_labelled_snapshot_is_collected_when_it_ends() 
     let service = Arc::new(
         flotilla_schema_sqlite::stream::Service::open(&path, HERE, crate::runtime::decided_registry().expect("registry")).expect("store"),
     );
-    let backend = flotilla_store::ResourceBackend::new(flotilla_store_memory::InMemoryBackend::default());
-    backend.install_engine_records(Arc::new(
-        EngineKinds::open(service, Arc::new(flotilla_resources::SystemClock) as Arc<dyn flotilla_resources::Clock>).expect("kinds"),
-    ));
+    let backend = flotilla_store_memory::engine_home_backend();
+    let clock = Arc::new(flotilla_resources::SystemClock) as Arc<dyn flotilla_resources::Clock>;
+    // Composed as a daemon composes its engine: the release reads the launches the import wrote,
+    // their vessels, and the definitions their snapshots hold.
+    let ports = flotilla_provisioning::engine::decided::open_ports(&service, HERE, Arc::clone(&clock)).expect("decided store ports");
+    for records in &ports.records {
+        backend.install_engine_records(Arc::clone(records));
+    }
+    let reads = flotilla_provisioning_testkit::EngineFixture::over_service(&service).reads();
+    backend.install_engine_records(Arc::new(flotilla_store::VesselViews::new(backend.clone(), NS, Arc::clone(&reads))));
+    let _convoys = flotilla_engine_convoys_testkit::EngineConvoysHome::over(&service, NS, &backend, clock, reads);
     let kinds = backend.using::<FulfilmentKind>(NS);
     assert!(kinds.get("placement-live").await.is_ok(), "the live convoy's snapshot is imported");
     // The release an ended launch's teardown makes.

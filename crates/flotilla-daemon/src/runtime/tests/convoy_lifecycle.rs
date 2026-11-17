@@ -1,7 +1,5 @@
 use super::*;
 use crate::testkits::engine::{admit_convoy, engine};
-use flotilla_store_memory::InMemoryBackend;
-use flotilla_store_sqlite::SqliteBackend;
 
 #[test]
 fn live_github_scope_expands_only_project_grants_without_explicit_repositories() {
@@ -73,7 +71,7 @@ impl CloneRuntime for UnusedCloneRuntime {
 // ensure admission through the engine's clone changes, not an old Clone watch.
 #[tokio::test]
 async fn a_requested_clone_wakes_standing_ensure_admission() {
-    let backend = ResourceBackend::new(InMemoryBackend::default());
+    let backend = flotilla_store_memory::engine_home_backend();
     let engine = flotilla_provisioning_testkit::clones::RunningClones::start("home", Arc::new(UnusedCloneRuntime));
     let mut wakes = super::super::tasks::convoy_ensure_dependency_watches(&backend, NAMESPACE, &engine.reads).await;
     let repository = RepositorySpec::remote("https://github.com/flotilla-org/flotilla").expect("repository");
@@ -98,18 +96,23 @@ async fn a_requested_clone_wakes_standing_ensure_admission() {
 
 #[tokio::test]
 async fn standing_ensure_dependency_changes_emit_wakes() {
-    let backend = ResourceBackend::new(InMemoryBackend::default());
+    let home = flotilla_engine_convoys_testkit::EngineHome::open_in("home", NAMESPACE);
+    let backend = home.backend().clone();
     for kind in ["Convoy", "ConvoyEnsure", "WorkflowTemplate"] {
         let mut watch = watch_resource_kind_including_replicas(&backend, NAMESPACE, kind).await.expect("dependency watch").stream;
         match kind {
             "Convoy" => {
-                let convoys = backend.clone().using::<Convoy>(NAMESPACE);
-                convoys
-                    .create(&empty_meta("standing"), &ConvoySpec::builder().workflow_ref("workflow".to_string()).build())
-                    .await
-                    .expect("create convoy");
-                watch.next().await.expect("watch should remain open").expect("convoy create event");
-                convoys.delete("standing").await.expect("delete convoy");
+                // Admitted, then ended: a launch is never deleted.
+                let launch = home
+                    .admit(
+                        "standing",
+                        ConvoySpec::builder().workflow_ref("workflow".to_string()).build(),
+                        flotilla_engine_convoys_testkit::single_agent("coder"),
+                    )
+                    .await;
+                watch.next().await.expect("watch should remain open").expect("convoy admit event");
+                let view = home.convoy(&launch).await;
+                home.convoys.path().get().expect("the Convoy path").abandon(&view, "operator", "abandoned").await.expect("end the launch");
             }
             "ConvoyEnsure" => {
                 backend
@@ -133,15 +136,19 @@ async fn standing_ensure_dependency_changes_emit_wakes() {
                     .await
                     .expect("create workflow template");
                 watch.next().await.expect("watch should remain open").expect("template create event");
-                let mut updated_meta = InputMeta::from(&created.metadata);
-                updated_meta.annotations.insert("example.com/revision".to_string(), "2".to_string());
-                templates.update(&updated_meta, &created.metadata.resource_version, &created.spec).await.expect("update workflow template");
+                // A spec edit: the engine keeps a definition's typed origin, not free annotations.
+                let mut edited = created.spec.clone();
+                edited.repository_refs = Some(vec![RepositoryKey("github.com/flotilla-org/flotilla".to_string())]);
+                templates
+                    .update(&InputMeta::from(&created.metadata), &created.metadata.resource_version, &edited)
+                    .await
+                    .expect("update workflow template");
             }
             _ => unreachable!(),
         }
         tokio::time::timeout(Duration::from_secs(1), watch.next())
             .await
-            .expect("dependency change should wake promptly")
+            .unwrap_or_else(|_| panic!("a {kind} change should wake promptly"))
             .expect("watch should remain open")
             .expect("dependency event");
     }
@@ -159,18 +166,22 @@ async fn convoy_reclaims_vessels_after_checkout_authority_collected_the_checkout
     let config = Arc::new(ConfigStore::with_base(config_base));
     let daemon = in_memory_daemon(Vec::new(), config).await;
     let backend = daemon.resource_backend();
-    let convoys = backend.clone().using::<Convoy>(NAMESPACE);
-    let created = convoys
-        .create(&InputMeta::builder().name("raced".to_string()).build(), &ConvoySpec::builder().workflow_ref("wf-a".to_string()).build())
-        .await
-        .expect("create convoy");
-    convoys
-        .update_status("raced", &created.metadata.resource_version, &landed_status_with_placed_checkout("checkout-raced"))
-        .await
-        .expect("mark convoy Landed");
-    let host = daemon.local_host_id().expect("local host");
     let engine = engine(&daemon);
-    let launch = engine.vessels.request("raced", "implement", host.as_str());
+    // The convoy, admitted and landed.
+    let convoy = admit_convoy(
+        &daemon,
+        flotilla_engine_convoys_testkit::convoy(
+            NAMESPACE,
+            "raced",
+            ConvoySpec::builder().workflow_ref("wf-a".to_string()).build(),
+            flotilla_engine_convoys_testkit::single_agent("coder"),
+        ),
+    )
+    .await;
+    let admitted = backend.clone().using::<Convoy>(NAMESPACE).get(&convoy).await.expect("admitted convoy");
+    flotilla_engine_convoys_testkit::land(&daemon.convoy_engine_path(), &admitted).await;
+    let host = daemon.local_host_id().expect("local host");
+    let launch = engine.vessels.request(&convoy, "implement", host.as_str());
 
     // The checkout authority's `OwnerTerminal` cascade already collected
     // the managed checkout: the engine holds no checkout for this convoy.
@@ -484,9 +495,10 @@ async fn daemon_restart_publishes_and_logs_agent_adapter_regression() {
 async fn checkout_authority_observes_replicated_landing_and_convoy_authority_settles_from_evidence() {
     let temp = TempDir::new().expect("tempdir");
     let authority_root = flotilla_protocol::NodeId::new("authority-root");
-    let checkout_root = flotilla_protocol::NodeId::new("checkout-root");
-    let authority = ResourceBackend::new(flotilla_store_memory::InMemoryBackend::default()).with_local_root(authority_root);
-    let checkout_host = ResourceBackend::new(flotilla_store_memory::InMemoryBackend::default()).with_local_root(checkout_root);
+    let authority = flotilla_store_memory::engine_home_backend().with_local_root(authority_root);
+    // Checkout host B is another home, its engine serving its own records.
+    let checkout_home = flotilla_provisioning_testkit::EngineBackend::open_in("checkout-root", NAMESPACE);
+    let checkout_host = checkout_home.backend.clone();
     let authority_config_base = temp.path().join("authority-config");
     fs::create_dir_all(&authority_config_base).expect("config directory");
     fs::write(authority_config_base.join("daemon.toml"), "machine_id = \"checkout-authority-evidence-test\"\n").expect("daemon config");
@@ -496,10 +508,9 @@ async fn checkout_authority_observes_replicated_landing_and_convoy_authority_set
 
     // A's engine readings, which read every home's records in its decided store.
     engine(&authority_daemon);
-    // Checkout host B is another home of A's decided store: each home's log reaches the other.
+    // Checkout host B's log reaches A's decided store.
     let decided = authority_daemon.decided_store().expect("authority decided store");
-    let checkout_home = flotilla_provisioning_testkit::other_home_for(&decided, "checkout-root");
-    let at_checkout_host = flotilla_provisioning_testkit::CheckoutFixture::over("checkout-root", checkout_home.service().store());
+    let at_checkout_host = flotilla_provisioning_testkit::CheckoutFixture::over("checkout-root", checkout_home.service.store());
 
     // The convoy, admitted at authority A, its coder owing a decision ledger.
     let status = ConvoyStatus {
@@ -575,7 +586,7 @@ async fn checkout_authority_observes_replicated_landing_and_convoy_authority_set
     .expect("branch scanned");
     assert_eq!(convoys.get(&convoy_name).await.expect("landing convoy").status.expect("status").phase, ConvoyPhase::Landing);
     // A's launch reaches B, which holds its adopted checkout for it.
-    flotilla_provisioning_testkit::replicate_home(&decided, decided.home(), checkout_home.service());
+    flotilla_provisioning_testkit::replicate_home(&decided, decided.home(), &checkout_home.service);
 
     let git_repo = TestGitRepo::init(temp.path().join("checkout")).with_initial_commit();
     let spec = CheckoutSpec::Observed(ResourceObservedCheckoutSpec {
@@ -632,29 +643,8 @@ async fn checkout_authority_observes_replicated_landing_and_convoy_authority_set
             .expect("record authority-local observation");
     }
 
-    // The CR observation is a decided record homed at the checkout authority: it reaches the
-    // convoy authority as that home's log does.
-    {
-        use flotilla_resources::engine_records::KindRecords;
-        let observations = flotilla_provisioning::engine::observations::EngineObservations::open(
-            Arc::clone(checkout_home.service()),
-            Arc::new(flotilla_resources::SystemClock),
-        )
-        .expect("checkout authority observations");
-        let observations: &dyn KindRecords<flotilla_resources::ChangeRequest> = &observations;
-        let observed = checkout_host
-            .using::<flotilla_resources::ChangeRequest>(NAMESPACE)
-            .list()
-            .await
-            .expect("list checkout authority CR observations");
-        for record in observed.items {
-            let name = &record.metadata.name;
-            observations.apply(name, &record.metadata.labels, &record.metadata.annotations, &record.spec).await.expect("CR at its home");
-            observations.set_status(name, &record.status.expect("CR status")).await.expect("CR status at its home");
-        }
-    }
-    // B's checkout and its observations reach A as B's log does.
-    checkout_home.replicate_to(&decided);
+    // B's checkout and its CR observations, decided records homed at B, reach A as B's log does.
+    flotilla_provisioning_testkit::replicate_home(&checkout_home.service, "checkout-root", &decided);
     let reconciler = ConvoyReconciler::new(authority_daemon.lifecycle_reads()).with_engine(Arc::clone(&engine_path)).with_change_requests(
         authority.including_replicas::<flotilla_resources::ChangeRequest>(NAMESPACE),
         authority_daemon.change_request_stale_after(),
@@ -711,32 +701,7 @@ async fn in_memory_stage4a_flow_reaches_running_and_completes_convoy() {
     let daemon = daemon_with_backend_runner_and_change_requests(
         vec![repo.clone()],
         Arc::clone(&config),
-        ResourceBackend::new(flotilla_store_memory::InMemoryBackend::default()),
-        runner,
-        Some(Arc::new(FakeChangeRequest::new())),
-    )
-    .await;
-    run_stage4a_flow_reaches_running_and_completes_convoy(daemon, config, repo_default_dir, CompletionAction::Retain).await;
-}
-
-#[tokio::test]
-async fn sqlite_stage4a_flow_reaches_running_and_completes_convoy() {
-    let temp = TempDir::new().expect("tempdir");
-    let repo_default_dir = temp.path().join("flotilla-repos");
-    let git_repo =
-        TestGitRepo::init(temp.path().join("repo")).with_initial_commit().with_origin("git@github.com:flotilla-org/flotilla.git");
-    let repo = git_repo.path().to_path_buf();
-    let config_base = temp.path().join("config");
-    fs::create_dir_all(&config_base).expect("config directory");
-    fs::write(config_base.join("daemon.toml"), "machine_id = \"sqlite-stage4a-test\"\n").expect("daemon config");
-    let config = Arc::new(ConfigStore::with_base(config_base));
-    config.add_observation_root(&ExecutionEnvironmentPath::new(&repo)).expect("persist observation root");
-    std::fs::create_dir_all(config.state_dir()).expect("state dir");
-    let runner = Arc::new(Stage4aGitRunner { inner: Arc::new(NoPrProcessRunner), upstream: repo.clone() });
-    let daemon = daemon_with_backend_runner_and_change_requests(
-        vec![repo.clone()],
-        Arc::clone(&config),
-        ResourceBackend::new(SqliteBackend::open(config.state_dir().join("resources.sqlite")).expect("sqlite backend")),
+        flotilla_store_memory::engine_home_backend(),
         runner,
         Some(Arc::new(FakeChangeRequest::new())),
     )
@@ -759,7 +724,7 @@ async fn deleting_a_live_convoy_ends_it_and_releases_its_vessel_checkout_and_ses
     let daemon = daemon_with_backend_runner_and_change_requests(
         vec![repo.clone()],
         Arc::clone(&config),
-        ResourceBackend::new(flotilla_store_memory::InMemoryBackend::default()),
+        flotilla_store_memory::engine_home_backend(),
         Arc::new(Stage4aGitRunner { inner: Arc::new(NoPrProcessRunner), upstream: repo.clone() }),
         Some(Arc::new(FakeChangeRequest::new())),
     )
@@ -796,7 +761,7 @@ async fn passing_teardown_gate_removes_the_managed_worktree_path() {
     let daemon = daemon_with_backend_runner_and_change_requests(
         vec![repo.clone()],
         Arc::clone(&config),
-        ResourceBackend::new(flotilla_store_memory::InMemoryBackend::default()),
+        flotilla_store_memory::engine_home_backend(),
         Arc::new(Stage4aGitRunner { inner: Arc::new(MergedPrProcessRunner::new(884)), upstream: repo.clone() }),
         Some(requests),
     )

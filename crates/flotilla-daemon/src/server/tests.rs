@@ -1,5 +1,4 @@
 use flotilla_store_http::HttpBackend;
-use flotilla_store_memory::InMemoryBackend;
 use std::{
     collections::{BTreeMap, HashMap},
     os::unix::fs::MetadataExt,
@@ -77,6 +76,7 @@ use super::HELLO_HANDSHAKE_TIMEOUT;
 use crate::peer::ConnectionDirection;
 use crate::peer::ConnectionMeta;
 use crate::startup::test_support::GatedCredentialPreflight;
+use crate::testkits::engine::engine;
 use crate::testkits::engine::request_session;
 use crate::testkits::engine::run_session;
 use crate::testkits::engine::runtime_terminals;
@@ -222,29 +222,15 @@ async fn daemon_discovery_path_is_independent_of_its_config_and_socket_paths() {
 
 #[tokio::test]
 async fn resource_http_lists_and_watches_over_a_unix_socket() {
-    let source = ResourceBackend::new(InMemoryBackend::default());
-    let source_convoys = source.using::<Convoy>("flotilla");
-    source_convoys
-        .create(
-            &InputMeta::builder().name("before-watch".to_string()).build(),
-            &ConvoySpec::builder().workflow_ref("workflow".to_string()).build(),
-        )
-        .await
-        .expect("create initial convoy");
-    source_convoys
-        .create(
-            &InputMeta::builder().name("replica-row".to_string()).build(),
-            &ConvoySpec::builder().workflow_ref("workflow".to_string()).build(),
-        )
-        .await
-        .expect("create replica source row");
-    let replica_snapshot = source_convoys.list().await.expect("list replica source rows");
-    source
-        .replica_writer::<Convoy>(NodeId::new("remote-root"), "flotilla")
-        .replace(&replica_snapshot, chrono::Utc::now())
-        .await
-        .expect("seed replica rows");
-    source_convoys.delete("replica-row").await.expect("remove local copy of replica row");
+    use flotilla_engine_convoys_testkit::{single_agent, EngineHome};
+    let spec = || ConvoySpec::builder().workflow_ref("workflow".to_string()).build();
+    // One convoy admitted here, and one admitted at another home and received here.
+    let home = EngineHome::open_in("source-root", "flotilla");
+    let source = home.backend().clone();
+    home.admit("before-watch", spec(), single_agent("coder")).await;
+    let remote_home = EngineHome::open_in("remote-root", "flotilla");
+    let replica_row = remote_home.admit("replica-row", spec(), single_agent("coder")).await;
+    remote_home.replicate_to(&home);
 
     let socket_path = PathBuf::from(format!("/tmp/flotilla-resource-http-{}.sock", uuid::Uuid::new_v4()));
     let listener = tokio::net::UnixListener::bind(&socket_path).expect("bind resource HTTP socket");
@@ -261,14 +247,14 @@ async fn resource_http_lists_and_watches_over_a_unix_socket() {
     let remote = ResourceBackend::new(HttpBackend::from_unix_socket(&socket_path).expect("build Unix-socket resource client"));
     let overlay = remote.including_replicas::<Convoy>("flotilla").list().await.expect("list overlay over Unix-socket HTTP");
     assert!(overlay.items.iter().any(|item| {
-        item.object.metadata.name == "replica-row"
+        item.object.metadata.name == replica_row
             && matches!(
                 item.provenance,
                 ResourceProvenance::Replica { ref origin_root, .. }
                     if origin_root == &NodeId::new("remote-root")
             )
     }));
-    let replica = remote.including_replicas::<Convoy>("flotilla").get("replica-row").await.expect("get replica over Unix-socket HTTP");
+    let replica = remote.including_replicas::<Convoy>("flotilla").get(&replica_row).await.expect("get replica over Unix-socket HTTP");
     assert!(matches!(
         replica.provenance,
         ResourceProvenance::Replica { ref origin_root, .. } if origin_root == &NodeId::new("remote-root")
@@ -278,13 +264,7 @@ async fn resource_http_lists_and_watches_over_a_unix_socket() {
     let mut watch =
         remote.using::<Convoy>("flotilla").watch(WatchStart::resuming_from(&listed)).await.expect("watch convoys over Unix-socket HTTP");
 
-    source_convoys
-        .create(
-            &InputMeta::builder().name("after-watch".to_string()).build(),
-            &ConvoySpec::builder().workflow_ref("workflow".to_string()).build(),
-        )
-        .await
-        .expect("create watched convoy");
+    let after_watch = home.admit("after-watch", spec(), single_agent("coder")).await;
     let event = tokio::time::timeout(Duration::from_secs(2), futures::StreamExt::next(&mut watch))
         .await
         .expect("HTTP watch event timeout")
@@ -292,7 +272,7 @@ async fn resource_http_lists_and_watches_over_a_unix_socket() {
         .expect("valid HTTP watch event");
     assert!(matches!(
         event,
-        WatchEvent::Added(object) if object.metadata.name == "after-watch"
+        WatchEvent::Added(object) if object.metadata.name == after_watch
     ));
 
     server.abort();
@@ -482,37 +462,30 @@ pub(super) async fn daemon_with_decided_store(
     host_name: &str,
     store: Arc<flotilla_schema_sqlite::stream::Service>,
 ) -> (tempfile::TempDir, Arc<InProcessDaemon>) {
-    use flotilla_provisioning::engine::{
-        access_deliveries::EngineAccessDeliveries, account::EngineAccounts, artifacts::EngineArtifacts, definitions::EngineDefinitions,
-        hosts::EngineHosts, kinds::EngineKinds, manifest_root::EngineManifestRoots, observations::EngineObservations,
-        projects::EngineProjects, repositories::EngineRepositories,
-    };
-    use flotilla_store::EnginePort;
+    use flotilla_provisioning::engine::decided::{open_ports, DecidedPorts};
     let tmp = tempfile::tempdir().expect("tempdir");
     let config = test_config_store(tmp.path().join("config"));
+    // The ports the daemon's own opener installs, over the test's store.
     let engine: flotilla_core::in_process::EngineOpener = Box::new(move |identity: flotilla_core::in_process::EngineIdentity| {
         Box::pin(async move {
-            let clock = || Arc::clone(&identity.clock);
-            let records: Vec<Arc<dyn EnginePort>> = vec![
-                Arc::new(EngineDefinitions::open(Arc::clone(&store), clock())?),
-                Arc::new(EngineRepositories::open(Arc::clone(&store), clock())?),
-                Arc::new(EngineProjects::open(Arc::clone(&store), clock())?),
-                Arc::new(EngineArtifacts::open(Arc::clone(&store), clock())?),
-                Arc::new(EngineAccessDeliveries::open(Arc::clone(&store), clock())?),
-                Arc::new(EngineKinds::open(Arc::clone(&store), clock())?),
-                Arc::new(EngineHosts::open(Arc::clone(&store), identity.host_id.to_string(), clock())?),
-            ];
-            let source_observers = Arc::new(flotilla_resources::engine_records::LateSourceObservers::default());
-            let observations = Arc::new(EngineObservations::open(Arc::clone(&store), clock())?.observed_by(source_observers.clone()));
+            let DecidedPorts {
+                records,
+                observations,
+                observation_failures,
+                change_request_branches,
+                source_observers,
+                accounts,
+                manifest_roots,
+            } = open_ports(&store, &identity.host_id.to_string(), identity.clock)?;
             Ok(flotilla_core::in_process::ComposedEngine {
-                accounts: Arc::new(EngineAccounts::open(Arc::clone(&store), clock())?),
-                manifest_roots: Arc::new(EngineManifestRoots::open(Arc::clone(&store), clock())?),
                 service: store,
                 records,
-                observations: observations.clone(),
-                observation_failures: observations.clone(),
-                change_request_branches: observations,
+                observations,
+                observation_failures,
+                change_request_branches,
                 source_observers,
+                accounts,
+                manifest_roots,
             })
         }) as futures::future::BoxFuture<'static, _>
     });
@@ -521,7 +494,7 @@ pub(super) async fn daemon_with_decided_store(
         config,
         fake_discovery(false),
         HostName::new(host_name),
-        ResourceBackend::new(flotilla_store_memory::InMemoryBackend::default()),
+        flotilla_store_memory::engine_home_backend(),
         Arc::new(flotilla_resources::SystemClock),
         std::sync::Arc::new(crate::peer::HostPeerOverlay::default()),
         engine,
@@ -1545,7 +1518,7 @@ async fn dispatch_execute_remote_convoy_failure_names_transport_target_and_cause
     let feta_convoys = flotilla_engine_convoys_testkit::EngineConvoysHome::over(
         feta.service(),
         "flotilla",
-        &ResourceBackend::new(InMemoryBackend::default()),
+        &flotilla_store_memory::engine_home_backend(),
         Arc::new(flotilla_resources::SystemClock),
         daemon.lifecycle_reads(),
     );
@@ -6202,6 +6175,8 @@ async fn routed_only_change_stream_follows_snapshot_and_tail() {
     let target = Arc::new(Service::open(&dir.path().join("target.db"), "local", kinds.clone()).unwrap());
     let fresh = Arc::new(Service::open(&dir.path().join("fresh.db"), "local", kinds).unwrap());
     let (_local_dir, local) = daemon_with_decided_store("local", Arc::clone(&fresh)).await;
+    // Its fleet list reads the engine's records.
+    engine(&local);
     // The home's own tasks poll its decided store, which this test later holds locked from a
     // writer while the follower waits out its frame deadline: they run on a runtime of their
     // own, so they wait without stalling the test's current-thread runtime.

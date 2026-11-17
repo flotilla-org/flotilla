@@ -23,8 +23,7 @@ use flotilla_protocol::{
 };
 use flotilla_resources::{ConvoySpec, PROJECT_LABEL, ROLE_LABEL};
 use flotilla_schema::Table;
-use flotilla_store::ResourceBackend;
-use flotilla_store_memory::InMemoryBackend;
+use flotilla_store_memory::engine_home_backend;
 use flotilla_tracing::{SdkTracerProvider, TracerProvider as _};
 use flotilla_verbs::{Call, NativeVerb, Picks, Presentation, Verb, VerbRegistry};
 use serde::Deserialize;
@@ -139,7 +138,7 @@ async fn fixture() -> Fixture {
     registry.register(Looked, Presentation::default()).unwrap();
     let verbs = verbs::serve(registry, subjects);
     let router = HttpRouter::builder()
-        .backend(ResourceBackend::new(InMemoryBackend::default()))
+        .backend(engine_home_backend())
         .daemon(Arc::clone(&daemon))
         .logins(Arc::new(LoginStore::new(Arc::new(flotilla_resources::SystemClock))))
         .verbs(Arc::new(verbs))
@@ -622,7 +621,7 @@ async fn an_engine_kinds_row_address_acts_on_that_rows_record() {
     registry.register_subject(sessions_of_coder()).unwrap();
     registry.register(SessionNames, Presentation::default()).unwrap();
     let router = HttpRouter::builder()
-        .backend(ResourceBackend::new(InMemoryBackend::default()))
+        .backend(engine_home_backend())
         .daemon(Arc::clone(&daemon))
         .table_store(service)
         .logins(Arc::new(LoginStore::new(Arc::new(flotilla_resources::SystemClock))))

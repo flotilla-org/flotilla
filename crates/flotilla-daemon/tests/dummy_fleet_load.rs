@@ -76,7 +76,6 @@ use flotilla_store::{
     load_metrics::{attributed, caller, callers, inherit, LatencyHistogram, ReplicationLoadMetrics},
     ResourceBackend,
 };
-use flotilla_store_sqlite::SqliteBackend;
 use futures::StreamExt;
 
 const NAMESPACE: &str = "flotilla";
@@ -102,7 +101,6 @@ struct Home {
     daemon: Arc<InProcessDaemon>,
     fleet: Arc<DummyFleet>,
     runtime: DaemonRuntime,
-    store: SqliteBackend,
     database: PathBuf,
     port: Arc<DaemonCommandPort>,
     replication: Arc<ReplicationLoadMetrics>,
@@ -201,16 +199,14 @@ async fn start_home(root: &std::path::Path, index: usize, dummy_fleet: &str, opt
     let fleet = install_dummy_fleet(&daemon_config, config.state_dir().as_path(), &mut discovery)
         .expect("dummy fleet state")
         .expect("dummy fleet configured");
-    // The daemon's own store, opened where flotillad opens it.
-    let database = config.state_dir().as_path().join("resources.sqlite");
-    std::fs::create_dir_all(database.parent().expect("state dir")).expect("state dir");
-    let store = SqliteBackend::open_async(&database).await.expect("sqlite store");
+    // The engine's decided store, which the daemon opens where flotillad opens it.
+    let database = config.state_dir().as_path().join(flotilla_core::in_process::decided::ENGINE_STORE);
     let daemon = InProcessDaemon::new_with_resource_backend(
         vec![],
         Arc::clone(&config),
         discovery,
         HostName::new(format!("load-{index}")),
-        ResourceBackend::new(store.clone()),
+        flotilla_store_memory::engine_home_backend(),
         std::sync::Arc::new(flotilla_discovery_testkit::HostPeerOverlay::default()),
     )
     .await;
@@ -229,7 +225,7 @@ async fn start_home(root: &std::path::Path, index: usize, dummy_fleet: &str, opt
     .await;
     let primitives = daemon.message_primitives().expect("the Message path is composed");
     watch_engine_messages(Arc::clone(primitives.service()), Arc::clone(&view));
-    Home { daemon, fleet, runtime, store, database, port, replication: Arc::default(), view }
+    Home { daemon, fleet, runtime, database, port, replication: Arc::default(), view }
 }
 
 /// Apply the dummy catalog as an operator applies it to a real daemon: the
@@ -646,7 +642,6 @@ impl FleetTarget for InProcessFleet {
             .homes
             .iter()
             .map(|home| HomeSample {
-                store: Some(home.store.load_metrics().snapshot()),
                 decided_store: Some(home.daemon.decided_store_metrics().snapshot()),
                 controllers: home.runtime.controller_metrics.snapshot(),
                 replication: home.replication.snapshot(),
@@ -866,30 +861,25 @@ async fn load_baseline() {
     assert_eq!(observer_failures, 0, "load produced no-ready-forge-observer stall evidence; see observer_failure lines");
 }
 
-// Compare the receiver stage of a pass on one frozen, production dummy-fleet
-// database. A single explicit address should cost only its convoy and crew,
-// regardless of retained fleet history. Ignored because this starts a full fleet.
+// Compare the receiver stage of a pass on one production dummy-fleet home. A
+// single explicit address should cost only its convoy and crew, regardless of
+// retained fleet history. Ignored because this starts a full fleet.
 #[tokio::test(flavor = "multi_thread", worker_threads = 8)]
 #[ignore = "receiver decode measurement: starts the dummy fleet"]
 async fn receiver_snapshot_decode_measurement() {
     use flotilla_messaging::MessageReceiverSnapshot;
     use flotilla_resources::TerminalSession;
-    use flotilla_store_testkit::ReadCountsBackendExt;
+    use flotilla_store::load_metrics::CallerReads;
 
     let fleet = InProcessFleet::start(1, &dummy_fleet_settings(load_long_runner_turns()), RuntimeOptions::default()).await;
-    // This probe freezes active crew records for decoder comparisons. Reuse
-    // the small fleet settings while deliberately leaving its tail open.
+    // This probe reads active crew records. Reuse the small fleet settings
+    // while deliberately leaving its tail open.
     let plan = LoadPlan { drain: Duration::ZERO, window: Duration::from_secs(25), ..smoke_plan() };
     let report = flotilla_load_driver::run(&fleet, &plan).await.expect("load report");
     assert!(report.ramp.reached, "{:?}", report.ramp);
     assert!(report.window.delivered >= 3, "{:?}", report.window);
-    // VACUUM INTO captures a consistent database while the fleet is running;
-    // receiver reads below use an isolated copy without controller traffic.
-    let frozen = fleet._dir.path().join("receiver-measurement.sqlite");
-    let live = rusqlite::Connection::open(&fleet.homes[0].database).expect("live database");
-    live.execute("VACUUM INTO ?1", [frozen.to_str().expect("path")]).expect("freeze database");
-    let store = SqliteBackend::open(&frozen).expect("frozen store");
-    let backend = ResourceBackend::new(store).with_read_counts();
+    // The receiver reads count under their own caller, apart from controller traffic.
+    let backend = fleet.homes[0].daemon.resource_backend();
     let terminal = backend
         .including_replicas::<TerminalSession>(NAMESPACE)
         .list()
@@ -902,33 +892,20 @@ async fn receiver_snapshot_decode_measurement() {
     let labels = &terminal.object.metadata.labels;
     let convoy = &labels["flotilla.work/convoy"];
     let address = format!("{NAMESPACE}/{convoy}/{}/{}", labels["flotilla.work/vessel"], labels["flotilla.work/role"]);
-    let before = backend.read_snapshot();
-    MessageReceiverSnapshot::load(&backend, NAMESPACE).await.expect("full snapshot");
-    let full = backend.read_snapshot().since(&before);
-    let before = backend.read_snapshot();
-    let scoped = MessageReceiverSnapshot::load_for_addresses(&backend, NAMESPACE, &[address]).await.expect("scoped snapshot");
-    let targeted = backend.read_snapshot().since(&before);
-    let db = rusqlite::Connection::open(&frozen).expect("frozen database");
-    // body_json is the exact UTF-8 input passed to the SQLite typed decoder.
-    let bytes = |kind: &str, name: Option<&str>| -> u64 {
-        db.query_row("SELECT COALESCE(SUM(length(CAST(body_json AS BLOB))),0) FROM resource_objects WHERE namespace=?1 AND kind=?2 AND (?3 IS NULL OR name=?3)",
-            rusqlite::params![NAMESPACE, kind, name], |row| row.get(0)).expect("stored bytes")
-    };
-    let full_bytes: u64 = ["Convoy", "TerminalSession", "ConvoyEnsure"].into_iter().map(|kind| bytes(kind, None)).sum();
-    let scoped_bytes = bytes("Convoy", Some(convoy))
-        + scoped.terminals().iter().map(|source| bytes("TerminalSession", Some(&source.object.metadata.name))).sum::<u64>();
-    let rows = |reads: &flotilla_store_testkit::ReadSnapshot| -> usize {
-        ["Convoy", "TerminalSession", "ConvoyEnsure"]
+    let full = Arc::new(CallerReads::default());
+    attributed(Arc::clone(&full), MessageReceiverSnapshot::load(&backend, NAMESPACE)).await.expect("full snapshot");
+    let targeted = Arc::new(CallerReads::default());
+    attributed(Arc::clone(&targeted), MessageReceiverSnapshot::load_for_addresses(&backend, NAMESPACE, &[address]))
+        .await
+        .expect("scoped snapshot");
+    let rows = |reads: &CallerReads| -> u64 {
+        let reads = reads.snapshot();
+        ["Convoy port", "TerminalSession port", "ConvoyEnsure port"]
             .into_iter()
-            .map(|kind| reads.objects_by_kind().get(kind).copied().unwrap_or_default())
+            .map(|kind| reads.get(kind).map_or(0, |counts| counts.rows))
             .sum()
     };
-    eprintln!(
-        "receiver stage per pass: before rows={} bytes={full_bytes}; after rows={} bytes={scoped_bytes}",
-        rows(&full),
-        rows(&targeted)
-    );
-    assert_eq!(rows(&targeted), 2, "one convoy and one crew terminal: {targeted}");
+    eprintln!("receiver stage per pass: before rows={}; after rows={}", rows(&full), rows(&targeted));
+    assert_eq!(rows(&targeted), 2, "one convoy and one crew terminal: {:?}", targeted.snapshot());
     assert!(rows(&full) > rows(&targeted));
-    assert!(full_bytes > scoped_bytes);
 }

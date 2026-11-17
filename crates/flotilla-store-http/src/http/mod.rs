@@ -6,6 +6,14 @@ use serde_json::Value;
 mod bootstrap;
 mod kubeconfig;
 
+/// `value` percent-encoded as one URL path segment, so a name holding `/`, `#` or `?` (a launch
+/// name, `name#n`) stays one segment.
+fn segment(value: &str) -> String {
+    let mut url = reqwest::Url::parse("http://segment.invalid/").expect("a URL with a path");
+    url.path_segments_mut().expect("an http URL has path segments").pop_if_empty().push(value);
+    url.path()[1..].to_owned()
+}
+
 use std::{borrow::Cow, collections::BTreeMap, pin::Pin};
 
 pub use bootstrap::{ensure_crd, ensure_namespace};
@@ -68,12 +76,12 @@ impl HttpBackend {
             self.base_url.trim_end_matches('/'),
             paths.group,
             paths.version,
-            namespace,
+            segment(namespace),
             paths.plural
         );
         if let Some(name) = name {
             url.push('/');
-            url.push_str(name);
+            url.push_str(&segment(name));
         }
         if status {
             url.push_str("/status");

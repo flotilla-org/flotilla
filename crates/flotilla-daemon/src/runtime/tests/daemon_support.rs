@@ -46,26 +46,6 @@ pub(super) async fn publish_merged_change_request(backend: &ResourceBackend, num
         .expect("publish merged CR observation");
 }
 
-pub(super) fn landed_status_with_placed_checkout(checkout_name: &str) -> ConvoyStatus {
-    ConvoyStatus {
-        phase: ConvoyPhase::Landed,
-        observed_workflow_ref: Some("wf-a".to_string()),
-        work: BTreeMap::from([(
-            "implement".to_string(),
-            WorkState::builder()
-                .phase(WorkPhase::Complete)
-                .placement(PlacementStatus {
-                    fields: BTreeMap::from([(
-                        "checkout_refs".to_string(),
-                        serde_json::json!(BTreeMap::from([(RepositoryKey("repo-a".to_string()), checkout_name.to_string())])),
-                    )]),
-                })
-                .build(),
-        )]),
-        ..Default::default()
-    }
-}
-
 pub(super) fn credential_mapping_config(path: &Path, key: Option<&str>) {
     let mut config = "machine_id = \"credential-mapping-test\"\n".to_string();
     if let Some(key) = key {
@@ -205,14 +185,15 @@ pub(super) async fn daemon_with_backend_runner_and_change_requests(
     daemon
 }
 
+/// A daemon whose every kind the engine serves, its decided store in `config`'s state directory.
 pub(super) async fn in_memory_daemon(tracked_repos: Vec<PathBuf>, config: Arc<ConfigStore>) -> Arc<InProcessDaemon> {
-    daemon_with_backend(tracked_repos, config, ResourceBackend::new(flotilla_store_memory::InMemoryBackend::default())).await
+    daemon_with_backend(tracked_repos, config, flotilla_store_memory::engine_home_backend()).await
 }
 
+/// [`in_memory_daemon`] over a state directory made first, so a test may lay files in it.
 pub(super) async fn sqlite_daemon(tracked_repos: Vec<PathBuf>, config: Arc<ConfigStore>) -> Arc<InProcessDaemon> {
     std::fs::create_dir_all(config.state_dir()).expect("state dir");
-    let backend = ResourceBackend::new(SqliteBackend::open(config.state_dir().join("resources.sqlite")).expect("sqlite backend"));
-    daemon_with_backend(tracked_repos, config, backend).await
+    in_memory_daemon(tracked_repos, config).await
 }
 
 pub(super) fn insert_undecodable_resource<T: Resource>(connection: &rusqlite::Connection, name: &str) {
@@ -230,7 +211,7 @@ pub(super) fn insert_undecodable_resource<T: Resource>(connection: &rusqlite::Co
 }
 
 pub(super) async fn crew_daemon(config: Arc<ConfigStore>) -> (Arc<InProcessDaemon>, Arc<FakeTerminalPool>) {
-    crew_daemon_with_backend(config, ResourceBackend::new(flotilla_store_memory::InMemoryBackend::default())).await
+    crew_daemon_with_backend(config, flotilla_store_memory::engine_home_backend()).await
 }
 
 pub(super) async fn crew_daemon_with_backend(

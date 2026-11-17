@@ -692,8 +692,6 @@ mod tests {
     use flotilla_core::in_process::InProcessDaemon;
     use flotilla_protocol::{Command, CommandAction, HostName};
     use flotilla_provider_runtime::CommandRunner;
-    use flotilla_store::ResourceBackend;
-    use flotilla_store_memory::InMemoryBackend;
     use tower::ServiceExt;
 
     use super::*;
@@ -725,7 +723,7 @@ mod tests {
                 config,
                 discovery,
                 HostName::new("http-test"),
-                ResourceBackend::new(InMemoryBackend::default()),
+                flotilla_store_memory::engine_home_backend(),
                 Arc::new(crate::peer::HostPeerOverlay::default()),
             )
             .await;

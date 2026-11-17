@@ -40,9 +40,7 @@ pub struct ConvoyObservation {
 /// One home's load metrics, cumulative since it started.
 #[derive(Debug, Clone, Default)]
 pub struct HomeSample {
-    /// `None` for a store without a single-writer queue (in-memory stores).
-    pub store: Option<StoreLoadSnapshot>,
-    /// The decided (engine) store's writes; `None` for a target without one.
+    /// The decided (engine) store's queues; `None` for a target without one.
     pub decided_store: Option<StoreLoadSnapshot>,
     pub controllers: BTreeMap<String, ControllerLoadSnapshot>,
     pub replication: ReplicationLoadSnapshot,

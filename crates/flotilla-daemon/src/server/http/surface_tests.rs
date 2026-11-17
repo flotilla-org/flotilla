@@ -18,7 +18,7 @@ use flotilla_protocol::{
 };
 use flotilla_resources::{AccessDelivery, Convoy, ConvoySpec, InputMeta};
 use flotilla_store::ResourceBackend;
-use flotilla_store_memory::InMemoryBackend;
+use flotilla_store_memory::engine_home_backend;
 use futures::{SinkExt, StreamExt};
 use rigging_http_serve::{Authentication, Caller, TcpPolicy};
 use serde_json::{json, Value};
@@ -591,8 +591,7 @@ impl Daemon {
         std::fs::write(temp.path().join("daemon.toml"), "machine_id = \"surface-test\"\n").unwrap();
         let config = Arc::new(flotilla_config::ConfigStore::with_base(temp.path()));
         // The engine's home, as the daemon composes its backend.
-        let backend = ResourceBackend::new(InMemoryBackend::default());
-        backend.compose_as_engine_home();
+        let backend = engine_home_backend();
         let daemon = InProcessDaemon::new_with_resource_backend(
             vec![],
             Arc::clone(&config),

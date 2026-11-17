@@ -1,5 +1,6 @@
 //! Both carriers exercise the same router scenario without binding a listener.
 use super::{table_api, CallerAuth, HttpRouter, LoginStore};
+use crate::{server::tests::daemon_with_decided_store, testkits::engine::engine};
 use axum::{
     body::{to_bytes, Body},
     http::{Request, StatusCode},
@@ -8,7 +9,7 @@ use axum::{
 use flotilla_protocol::table::Message;
 use flotilla_resources::{access_delivery::access_key, AccessDelivery, AccessDeliverySpec, ConvoySpec, InputMeta, CONVOY_LABEL};
 use flotilla_store::ResourceBackend;
-use flotilla_store_memory::InMemoryBackend;
+use flotilla_store_memory::engine_home_backend;
 use futures::StreamExt;
 use serde_json::json;
 use std::{
@@ -66,8 +67,7 @@ fn engine_backend_over(namespace: &str, directory: tempfile::TempDir) -> (Resour
         .unwrap(),
     );
     let clock: Arc<dyn flotilla_resources::Clock> = Arc::new(flotilla_resources::SystemClock);
-    let backend = ResourceBackend::new(InMemoryBackend::default());
-    backend.compose_as_engine_home();
+    let backend = engine_home_backend();
     backend.serve_engine_in(namespace);
     backend.install_engine_records(Arc::new(EngineAccessDeliveries::open(Arc::clone(&service), Arc::clone(&clock)).unwrap()));
     backend.install_engine_records(Arc::new(EngineDefinitions::open(Arc::clone(&service), Arc::clone(&clock)).unwrap()));
@@ -145,7 +145,7 @@ fn condition(text: &str) -> String {
 }
 async fn messages(router: &Router, path: &str, cbor: bool) -> Vec<Message> {
     let response = call(router, path, cbor).await;
-    assert_eq!(response.status(), StatusCode::OK);
+    assert_eq!(response.status(), StatusCode::OK, "{path}");
     decode(&to_bytes(response.into_body(), 8 * 1024 * 1024).await.unwrap(), cbor)
 }
 
@@ -321,8 +321,7 @@ async fn convoys_table_watch_delivers_a_launch_on_both_carriers() {
             .unwrap(),
         );
         let store = EngineStore { service: Arc::clone(&decided), _directory: directory };
-        let backend = ResourceBackend::new(InMemoryBackend::default());
-        backend.compose_as_engine_home();
+        let backend = engine_home_backend();
         let engine = flotilla_provisioning_testkit::EngineFixture::over_service(&decided);
         let convoys = flotilla_engine_convoys_testkit::EngineConvoysHome::over(
             &decided,
@@ -370,8 +369,7 @@ async fn a_notes_change_reaches_a_convoys_table_watch_and_moves_its_sequence() {
         .unwrap(),
     );
     let store = EngineStore { service: Arc::clone(&decided), _directory: directory };
-    let backend = ResourceBackend::new(InMemoryBackend::default());
-    backend.compose_as_engine_home();
+    let backend = engine_home_backend();
     let engine = flotilla_provisioning_testkit::EngineFixture::over_service(&decided);
     let convoys = flotilla_engine_convoys_testkit::EngineConvoysHome::over(
         &decided,
@@ -483,9 +481,8 @@ async fn derived_table_router_uses_native_values_and_sql_predicates() {
             Ok(())
         })
         .unwrap();
-    let backend = ResourceBackend::new(InMemoryBackend::default());
     let router = HttpRouter::builder()
-        .backend(backend)
+        .backend(engine_home_backend())
         .table_store(service)
         .logins(Arc::new(LoginStore::new(Arc::new(flotilla_resources::SystemClock))))
         .build()
@@ -592,7 +589,7 @@ async fn primitive_diagrams_describe_declared_and_observed_transitions() {
     sessions.create("session", (), &world, flotilla_schema::Timestamp(1)).unwrap();
     sessions.apply("session", End { reason: EndReason::Completed, observed }, &world, flotilla_schema::Timestamp(2)).unwrap();
     let router = HttpRouter::builder()
-        .backend(ResourceBackend::new(InMemoryBackend::default()))
+        .backend(engine_home_backend())
         .table_store(service)
         .logins(Arc::new(LoginStore::new(Arc::new(flotilla_resources::SystemClock))))
         .build()
@@ -654,8 +651,11 @@ async fn served_tables_type_addresses_and_carry_enum_names() {
     sessions.create("ended", (), &world, flotilla_schema::Timestamp(1)).unwrap();
     sessions.apply("ended", End { reason: EndReason::Completed, observed }, &world, flotilla_schema::Timestamp(2)).unwrap();
     sessions.create("live", (), &world, flotilla_schema::Timestamp(3)).unwrap();
+    // A daemon composed over the store, serving every resource table from its engine.
+    let (_daemon_dir, daemon) = daemon_with_decided_store("home", Arc::clone(&service)).await;
+    engine(&daemon);
     let router = HttpRouter::builder()
-        .backend(ResourceBackend::new(InMemoryBackend::default()))
+        .backend(daemon.resource_backend())
         .table_store(service)
         .logins(Arc::new(LoginStore::new(Arc::new(flotilla_resources::SystemClock))))
         .build()
@@ -1056,7 +1056,7 @@ async fn messages_filter_under_a_convoy_address() {
         mail.create(name.as_str(), spec, &world, Timestamp(1)).unwrap();
     }
     let router = HttpRouter::builder()
-        .backend(ResourceBackend::new(InMemoryBackend::default()))
+        .backend(engine_home_backend())
         .table_store(service)
         .logins(Arc::new(LoginStore::new(Arc::new(flotilla_resources::SystemClock))))
         .build()
@@ -1129,8 +1129,7 @@ async fn convoy_rows_name_their_subject_by_address() {
         .unwrap(),
     );
     let store = EngineStore { service: Arc::clone(&decided), _directory: directory };
-    let backend = ResourceBackend::new(InMemoryBackend::default());
-    backend.compose_as_engine_home();
+    let backend = engine_home_backend();
     let engine = flotilla_provisioning_testkit::EngineFixture::over_service(&decided);
     let convoys = flotilla_engine_convoys_testkit::EngineConvoysHome::over(
         &decided,

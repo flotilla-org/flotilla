@@ -19,8 +19,8 @@ use flotilla_provisioning::checkout_runtime::{
 };
 use flotilla_provisioning::reconcilers::clone::runtime::CloneControllerRuntime;
 use flotilla_provisioning::reconcilers::{CloneRuntime, ForgeDefaultBranchResolver};
-use flotilla_resources::{canonicalize_repo_url, ChangeRequest, CloneCredentials, Convoy, Forge, ForgeIdentity, InputMeta, Resource};
-use flotilla_store::{ReplicaReadResolver, ResourceBackend};
+use flotilla_resources::{canonicalize_repo_url, ChangeRequest, CloneCredentials, Convoy, Forge, ForgeIdentity};
+use flotilla_store::ReplicaReadResolver;
 use flotilla_vcs::vcs::CheckoutMaterialisationError;
 use flotilla_vcs::vcs::CheckoutRegistration;
 use flotilla_vcs::vcs::WorktreeMetadata;
@@ -135,25 +135,12 @@ impl OperatorReconciler for RuntimeOperatorReconciler {
                 self.state.credential_events.deliver(name).await?;
                 Ok(format!("CredentialDelivery/{name} reconciled"))
             }
-            "convoy" | "convoys" => wake_controller_resource::<Convoy>(&self.state.daemon.resource_backend(), namespace, name).await,
+            // Convoy is woken by the daemon itself (`InProcessDaemon::wake_convoy`).
             _ => Err(format!(
                 "resource kind `{kind}` does not support reconcile-now; expected Clone, Convoy, ConvoyEnsure, CredentialDelivery, ManifestRoot, or Repository"
             )),
         }
     }
-}
-
-pub(super) async fn wake_controller_resource<T: Resource>(
-    backend: &ResourceBackend,
-    namespace: &str,
-    name: &str,
-) -> Result<String, String> {
-    let resources = backend.clone().using::<T>(namespace);
-    let object = resources.get(name).await.map_err(|error| error.to_string())?;
-    let mut meta = InputMeta::from(&object.metadata);
-    meta.annotations.insert(RECONCILE_NOW_ANNOTATION.to_string(), Utc::now().to_rfc3339());
-    resources.update(&meta, &object.metadata.resource_version, &object.spec).await.map_err(|error| error.to_string())?;
-    Ok(format!("{}/{} woken", T::API_PATHS.kind, name))
 }
 
 /// Process-local six-hour successes, keyed by service/repository. Per-key locks
@@ -479,8 +466,6 @@ pub(super) fn unauthorised_clone(url: &str, credentials: &CloneCredentials, erro
     }
 }
 
-pub(super) const RECONCILE_NOW_ANNOTATION: &str = "flotilla.work/reconcile-now-at";
-
 #[cfg(test)]
 mod unauthorised_clone_tests {
     use super::*;
@@ -517,6 +502,8 @@ mod unauthorised_clone_tests {
 
 #[cfg(test)]
 mod chained_default_branch_tests {
+    use flotilla_resources::InputMeta;
+
     use super::*;
 
     // Process boundary fake: count only the default-branch gh command.
@@ -566,7 +553,7 @@ mod chained_default_branch_tests {
         flotilla_resources::ResourceObject<flotilla_resources::Repository>,
     ) {
         let runner = Arc::new(DefaultBranchRunner { calls: Default::default(), failures: failures.into(), error: None });
-        let backend = ResourceBackend::new(flotilla_store_memory::InMemoryBackend::default());
+        let backend = flotilla_provisioning_testkit::EngineBackend::open_in("home", "ops");
         let spec = flotilla_resources::RepositorySpec::remote("https://github.com/org/repo.git").expect("spec");
         let repository = backend
             .using::<flotilla_resources::Repository>("ops")

@@ -1,7 +1,8 @@
 use super::*;
 use crate::runtime::tasks::LocalFulfilmentProbe;
+use crate::testkits::engine::{admit_convoy, engine};
+use flotilla_provisioning_testkit::EngineBackend;
 use flotilla_resources::FulfilmentGrant;
-use flotilla_store_memory::InMemoryBackend;
 
 #[tokio::test]
 async fn heartbeat_publishes_ambient_claude_expiry_metadata_without_material() {
@@ -358,6 +359,8 @@ async fn heartbeat_task_updates_host_status_without_socket_server() {
     fs::write(temp.path().join("daemon.toml"), "machine_id = \"heartbeat-no-socket-test\"\n").expect("daemon config");
     let config = Arc::new(ConfigStore::with_base(temp.path()));
     let daemon = in_memory_daemon(Vec::new(), Arc::clone(&config)).await;
+    // Fleet health reads the engine's records.
+    engine(&daemon);
     let host_id = daemon.local_host_id().expect("local host id").to_string();
     let profile = own_host_profile(&daemon, false);
 
@@ -474,7 +477,8 @@ async fn unresolved_fulfilment_provider_publishes_unknown() {
         for ambiguous in [false, true] {
             for prior in [false, true] {
                 for pool in [false, true] {
-                    let backend = ResourceBackend::new(InMemoryBackend::default());
+                    let home = EngineBackend::open_in("host", NAMESPACE);
+                    let backend = home.backend.clone();
                     ensure_host_exists(&backend, NAMESPACE, "host", "test", None).await.expect("host");
                     let realisation = if docker {
                         FulfilmentRealisation::DockerPerVessel { image: Some("crew:test".into()) }
@@ -644,6 +648,8 @@ async fn capped_docker_kind_publishes_free_slots_from_the_hosts_vessels() {
     let temp = TempDir::new().expect("tempdir");
     fs::write(temp.path().join("daemon.toml"), "machine_id = \"docker-cap-test\"\nmax_vessels = 2\n").expect("daemon config");
     let daemon = in_memory_daemon(Vec::new(), Arc::new(ConfigStore::with_base(temp.path()))).await;
+    // The host's vessels are counted from the engine's convoys.
+    engine(&daemon);
     let host_id = daemon.local_host_id().expect("local host id").to_string();
     ensure_host_exists(&daemon.resource_backend(), NAMESPACE, &host_id, "feta", Some(2)).await.expect("host registration");
     daemon
@@ -693,11 +699,6 @@ async fn capped_docker_kind_publishes_free_slots_from_the_hosts_vessels() {
     assert_eq!(first["docker-feta"].free_vessel_slots, Some(2));
 
     // A host-direct convoy admitted to the same host holds one of its slots.
-    let convoys = daemon.resource_backend().using::<flotilla_resources::Convoy>(NAMESPACE);
-    let convoy = convoys
-        .create(&empty_meta("host-direct-work"), &flotilla_resources::ConvoySpec::builder().workflow_ref("missing".to_string()).build())
-        .await
-        .expect("convoy");
     let decision = flotilla_protocol::PlacementDecision {
         provider_instance: None,
         provider_workspace_root: None,
@@ -712,14 +713,19 @@ async fn capped_docker_kind_publishes_free_slots_from_the_hosts_vessels() {
         viable_not_selected: Vec::new(),
         allocation: None,
     };
-    convoys
-        .update_status(
+    admit_convoy(
+        &daemon,
+        flotilla_engine_convoys_testkit::convoy(
+            NAMESPACE,
             "host-direct-work",
-            &convoy.metadata.resource_version,
-            &flotilla_resources::ConvoyStatus { placement_decision: Some(decision), ..Default::default() },
-        )
-        .await
-        .expect("admitted placement");
+            flotilla_resources::ConvoySpec::builder().workflow_ref("missing".to_string()).build(),
+            flotilla_resources::ConvoyStatus {
+                placement_decision: Some(decision),
+                ..flotilla_engine_convoys_testkit::single_agent("coder")
+            },
+        ),
+    )
+    .await;
     let reused = observe(first.clone()).await;
     assert_eq!(reused["docker-feta"].observed_at, first["docker-feta"].observed_at, "the recent probe is reused");
     assert_eq!(reused["docker-feta"].free_vessel_slots, Some(1));

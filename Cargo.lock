@@ -2557,6 +2557,7 @@ dependencies = [
  "libc",
  "opentelemetry-otlp",
  "opentelemetry_sdk",
+ "percent-encoding",
  "prometheus-parse",
  "reqwest 0.13.2",
  "rigging-condition",

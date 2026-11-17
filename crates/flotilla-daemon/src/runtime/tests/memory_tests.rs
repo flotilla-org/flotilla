@@ -94,6 +94,8 @@ async fn memory_incident_survives_backing_loss_and_is_visible_in_explain() {
     );
     // The work's launch, ready in its environment; the planner reads it as the old store's view.
     let engine = engine(&daemon);
+    // Explain reads the launch's messages, which the engine's Message path serves.
+    daemon.open_message_primitives().expect("message path");
     let launch = engine.vessels.request(&convoy, "work", daemon.local_host_id().expect("local host").as_str());
     // Its container, requested for it and running.
     let host_ref = daemon.local_host_id().expect("local host").to_string();

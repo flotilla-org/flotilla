@@ -192,6 +192,67 @@ pub trait SecondaryWatch: Send + Sync {
     ) -> Pin<Box<dyn Future<Output = Result<(), ResourceError>> + Send>>;
 }
 
+/// Names a controller is asked to reconcile now (an operator's reconcile-now), as a secondary
+/// watch that queues each name sent once it has started. A wake writes nothing, so it serves
+/// records admitted on the engine, which no generic write may touch.
+pub struct NamedWakes<R> {
+    names: tokio::sync::broadcast::Sender<String>,
+    kind: PhantomData<fn() -> R>,
+}
+
+impl<R> Clone for NamedWakes<R> {
+    fn clone(&self) -> Self {
+        Self { names: self.names.clone(), kind: PhantomData }
+    }
+}
+
+impl<R> Default for NamedWakes<R> {
+    fn default() -> Self {
+        Self { names: tokio::sync::broadcast::channel(64).0, kind: PhantomData }
+    }
+}
+
+impl<R> NamedWakes<R> {
+    /// Queues `name` at every controller watching these wakes; false when none is.
+    pub fn wake(&self, name: &str) -> bool {
+        self.names.send(name.to_owned()).is_ok()
+    }
+}
+
+impl<R: Resource> SecondaryWatch for NamedWakes<R> {
+    type Primary = R;
+
+    fn clone_box(&self) -> Box<dyn SecondaryWatch<Primary = Self::Primary>> {
+        Box::new(self.clone())
+    }
+
+    fn spawn(
+        self: Box<Self>,
+        _backend: ResourceBackend,
+        _namespace: String,
+        sender: WorkQueueSender,
+    ) -> Pin<Box<dyn Future<Output = Result<(), ResourceError>> + Send>> {
+        // Subscribed as the watch is spawned, so a wake sent after that is queued.
+        let mut names = self.names.subscribe();
+        Box::pin(async move {
+            loop {
+                match names.recv().await {
+                    Ok(name) => {
+                        if sender.send(name).await.is_err() {
+                            return Ok(());
+                        }
+                    }
+                    // A missed wake is covered by the controller's resync.
+                    Err(tokio::sync::broadcast::error::RecvError::Lagged(missed)) => {
+                        warn!(missed, kind = R::API_PATHS.kind, "a controller fell behind its reconcile-now wakes");
+                    }
+                    Err(tokio::sync::broadcast::error::RecvError::Closed) => return Ok(()),
+                }
+            }
+        })
+    }
+}
+
 /// Nonblocking, deduplicating producer for a controller's work queue.
 /// A name remains queued until the controller starts processing it.
 #[derive(Clone)]

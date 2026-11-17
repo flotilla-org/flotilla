@@ -5,8 +5,8 @@ use flotilla_daemon_api::daemon::DaemonHandle;
 use flotilla_discovery_testkit::fake_discovery;
 use flotilla_protocol::{HostName, NodeId, QueryCursor, QueryId};
 use flotilla_resources::{Convoy, ConvoySpec, ConvoyStatus};
-use flotilla_store::{ResourceBackend, ViewSnapshot, WatchView};
-use flotilla_store_memory::InMemoryBackend;
+use flotilla_store::{ViewSnapshot, WatchView};
+use flotilla_store_memory::engine_home_backend;
 use std::{
     alloc::{GlobalAlloc, Layout, System},
     sync::{
@@ -74,7 +74,7 @@ async fn memory_scenario(n: usize) -> Vec<(usize, usize, usize, usize)> {
     let scenario_start = counters();
     let temp = tempfile::tempdir().unwrap();
     std::fs::write(temp.path().join("daemon.toml"), "machine_id = \"memory-scenario\"\n").unwrap();
-    let backend = ResourceBackend::new(InMemoryBackend::default()).with_local_root(NodeId::new("memory-scenario"));
+    let backend = engine_home_backend().with_local_root(NodeId::new("memory-scenario"));
     eprintln!("N={n} owner=store live_delta={}", counters().0.saturating_sub(scenario_start.0));
     let daemon = InProcessDaemon::new_with_resource_backend(
         vec![],

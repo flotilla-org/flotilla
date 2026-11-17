@@ -1362,23 +1362,9 @@ mod source_contract_tests {
         kinds.register::<FeedSample>().unwrap();
         let service = Arc::new(flotilla_schema_sqlite::stream::Service::open(&directory.path().join("feed.db"), "home", kinds).unwrap());
         // Convoys are served from the engine, composed with its vessels, as on the daemon.
-        let backend = ResourceBackend::new(flotilla_store_memory::InMemoryBackend::default());
-        let decided = Arc::new(
-            flotilla_schema_sqlite::stream::Service::open(
-                &directory.path().join("decided.sqlite"),
-                "home",
-                flotilla_provisioning::stored::decided_registry().unwrap(),
-            )
-            .unwrap(),
-        );
-        let engine = flotilla_provisioning_testkit::EngineFixture::over_service(&decided);
-        let _convoys = flotilla_engine_convoys_testkit::EngineConvoysHome::over(
-            &decided,
-            "default",
-            &backend,
-            Arc::new(flotilla_resources::SystemClock),
-            engine.reads(),
-        );
+        let home = flotilla_engine_convoys_testkit::EngineHome::open_in("home", "default");
+        let backend = home.backend().clone();
+        let decided = Arc::clone(home.service());
         for source in [
             TableSource::Resource {
                 backend: backend.clone(),

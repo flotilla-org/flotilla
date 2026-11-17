@@ -1,7 +1,7 @@
 use super::*;
 use crate::testkits::engine::request_session;
+use flotilla_engine_convoys_testkit::{single_agent, EngineHome};
 use flotilla_orchestration_testkit::InProcessDiscoveryExt;
-use flotilla_store_memory::InMemoryBackend;
 
 #[test]
 fn missing_tool_session_is_stopped_but_a_dead_generation_is_lost() {
@@ -15,7 +15,8 @@ fn missing_tool_session_is_stopped_but_a_dead_generation_is_lost() {
 
 #[tokio::test]
 async fn agent_launch_reads_grants_from_its_own_vessel_pin() {
-    let backend = ResourceBackend::new(InMemoryBackend::default());
+    let home = EngineHome::open_in("host", NAMESPACE);
+    let backend = home.backend().clone();
     let kinds = backend.using::<FulfilmentKind>(NAMESPACE);
     let broad = BTreeSet::from([flotilla_resources::FulfilmentGrant::host_account_reach()]);
     let restricted = BTreeSet::from([flotilla_resources::FulfilmentGrant::platform("linux".to_string())]);
@@ -47,46 +48,20 @@ async fn agent_launch_reads_grants_from_its_own_vessel_pin() {
             flotilla_resources::VesselPlacementPin { kind_ref: "snapshot-ops".to_string(), decision: decision("restricted") },
         ),
     ]);
-    let convoys = backend.using::<Convoy>(NAMESPACE);
-    let convoy = convoys
-        .create(
-            &InputMeta::builder()
-                .name("demo".to_string())
-                .annotations(BTreeMap::from([(
-                    flotilla_resources::VESSEL_PLACEMENTS_ANNOTATION.to_string(),
-                    serde_json::to_string(&pins).expect("pins serialize"),
-                )]))
-                .build(),
-            &ConvoySpec::builder().workflow_ref("workflow".to_string()).build(),
-        )
-        .await
-        .expect("convoy");
-    convoys
-        .update_status(
-            "demo",
-            &convoy.metadata.resource_version,
-            &ConvoyStatus { placement_decision: Some(decision("broad")), ..ConvoyStatus::default() },
-        )
-        .await
-        .expect("convoy status");
-    backend
-        .using::<Vessel>(NAMESPACE)
-        .create(
-            &empty_meta("demo-ops"),
-            &VesselSpec {
-                convoy_ref: "demo".to_string(),
-                vessel_name: "ops".to_string(),
-                fulfilment_kind_ref: "snapshot-ops".to_string(),
-                adopted_checkout_refs: BTreeMap::new(),
-            },
-        )
-        .await
-        .expect("ops vessel");
-    let context = flotilla_resources::TerminalCrewContext {
-        namespace: NAMESPACE.to_string(),
-        convoy: "demo".to_string(),
-        vessel_ref: "demo-ops".to_string(),
-    };
+    // Admitted with each vessel's pin and the convoy's own placement, as admission freezes them.
+    let mut convoy = flotilla_engine_convoys_testkit::convoy(
+        NAMESPACE,
+        "demo",
+        ConvoySpec::builder().workflow_ref("workflow".to_string()).build(),
+        ConvoyStatus { placement_decision: Some(decision("broad")), ..single_agent("coder") },
+    );
+    convoy
+        .metadata
+        .annotations
+        .insert(flotilla_resources::VESSEL_PLACEMENTS_ANNOTATION.to_string(), serde_json::to_string(&pins).expect("pins serialize"));
+    let launch = home.convoys.launch(convoy).await;
+    let vessel = home.engine.engine.vessels.request(&launch, "ops", "host");
+    let context = flotilla_resources::TerminalCrewContext { namespace: NAMESPACE.to_string(), convoy: launch.clone(), vessel_ref: vessel };
     assert_eq!(fulfilment_grants_for_terminal(&backend, &context).await, Some(restricted));
 }
 

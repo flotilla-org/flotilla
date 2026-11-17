@@ -1,20 +1,5 @@
 use super::*;
 
-pub(super) async fn replicate_local_kind<T: Resource>(source: &InProcessDaemon, target: &InProcessDaemon) {
-    let listed = source
-        .resource_backend()
-        .using::<T>(NAMESPACE)
-        .list()
-        .await
-        .unwrap_or_else(|error| panic!("list {} for test replication: {error}", T::API_PATHS.kind));
-    target
-        .resource_backend()
-        .replica_writer::<T>(source.node_id().clone(), NAMESPACE)
-        .replace(&listed, Utc::now())
-        .await
-        .unwrap_or_else(|error| panic!("replicate {} in test: {error}", T::API_PATHS.kind));
-}
-
 /// Sends everything `source`'s decided store holds of its own home to `target`'s, as its log
 /// arrives at a peer.
 pub(super) fn replicate_decided_store(source: &InProcessDaemon, target: &InProcessDaemon) {
@@ -23,15 +8,9 @@ pub(super) fn replicate_decided_store(source: &InProcessDaemon, target: &InProce
     flotilla_provisioning_testkit::replicate_home(&from, source.node_id().as_str(), &to);
 }
 
+/// One round of each daemon's engine home to the other, as their followers receive them.
 pub(super) async fn bridge_runtime_resource_stores(first: &InProcessDaemon, second: &InProcessDaemon) {
-    replicate_local_kind::<Convoy>(first, second).await;
-    replicate_local_kind::<Vessel>(first, second).await;
-    replicate_local_kind::<TerminalSession>(first, second).await;
     follow_engine_home(first, second).await;
-
-    replicate_local_kind::<Convoy>(second, first).await;
-    replicate_local_kind::<Vessel>(second, first).await;
-    replicate_local_kind::<TerminalSession>(second, first).await;
     follow_engine_home(second, first).await;
 }
 
@@ -97,23 +76,10 @@ pub(super) async fn remote_shared_clone_placement_reaches_running(docker: bool) 
     fs::create_dir_all(&feta_profile.repo_default_dir).expect("feta repo root");
     let kiwi_provisioning = engine_startup(&kiwi, NAMESPACE, &kiwi_profile).await.expect("register kiwi resources");
     let feta_provisioning = engine_startup(&feta, NAMESPACE, &feta_profile).await.expect("register feta resources");
-    assert!(
-        feta.resource_backend()
-            .replica_writer::<Convoy>(kiwi.node_id().clone(), NAMESPACE)
-            .cursor()
-            .await
-            .expect("read initial Convoy replica cursor")
-            .is_none(),
-        "the placement host must begin with an empty replica store"
-    );
-    assert!(
-        feta.resource_backend()
-            .replica_writer::<Vessel>(kiwi.node_id().clone(), NAMESPACE)
-            .cursor()
-            .await
-            .expect("read initial Vessel replica cursor")
-            .is_none(),
-        "the placement host must begin with an empty replica store"
+    assert_eq!(
+        feta.decided_store().expect("feta decided store").last_sequence(kiwi.node_id().as_str()).expect("feta's cursor on kiwi"),
+        0,
+        "the placement host must begin holding nothing of kiwi's"
     );
 
     let kiwi_state = Arc::new(ControllerRuntimeState::new(

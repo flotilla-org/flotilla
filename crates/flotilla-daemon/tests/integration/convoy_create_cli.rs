@@ -1,8 +1,7 @@
 //! Integration tests for the `ConvoyCreate` + `WorkflowTemplateApply` daemon actions
 //! and the bundled WorkflowTemplates registered at startup.
 
-use flotilla_store_memory::InMemoryBackend;
-use flotilla_store_sqlite::SqliteBackend;
+use flotilla_store_memory::engine_home_backend;
 use futures::StreamExt;
 use std::{collections::BTreeMap, sync::Arc, time::Duration};
 
@@ -47,7 +46,7 @@ fn test_config(dir: std::path::PathBuf) -> Arc<ConfigStore> {
 }
 
 async fn start_daemon() -> (Arc<InProcessDaemon>, ResourceBackend, Arc<ConfigStore>, DaemonRuntime, tempfile::TempDir) {
-    start_daemon_with_backend(ResourceBackend::new(InMemoryBackend::default())).await
+    start_daemon_with_backend(engine_home_backend()).await
 }
 
 async fn start_daemon_with_backend(
@@ -80,7 +79,8 @@ async fn start_sqlite_daemon(
 ) -> (Arc<InProcessDaemon>, ResourceBackend, Arc<ConfigStore>, DaemonRuntime, tempfile::TempDir) {
     let tmp = tempfile::TempDir::new().expect("tempdir");
     let config = test_config(tmp.path().join("config"));
-    let backend = ResourceBackend::new(SqliteBackend::open(config.state_dir().as_path().join("resources.sqlite")).expect("sqlite open"));
+    // The engine's decided store is the daemon's SQLite file in its state directory.
+    let backend = engine_home_backend();
     let daemon = InProcessDaemon::new_with_resource_backend(
         vec![],
         Arc::clone(&config),
@@ -153,7 +153,7 @@ async fn builtin_workflow_templates_are_readable_at_startup() {
 
 #[tokio::test]
 async fn builtin_template_is_the_code_spec_at_dispatch() {
-    let backend = ResourceBackend::new(InMemoryBackend::default());
+    let backend = engine_home_backend();
     let templates = backend.clone().definitions::<WorkflowTemplate>("flotilla");
 
     let (daemon, backend, _config, _runtime, _tmp) = start_daemon_with_backend(backend).await;

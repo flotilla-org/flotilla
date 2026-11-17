@@ -280,6 +280,11 @@ impl VesselViews {
 
     /// [`Self::listed`], and what `at` reads of the listing they were copied from.
     async fn listed_at<T>(&self, at: impl FnOnce(&Listing) -> T) -> Result<(Vec<Record<Vessel>>, T), ResourceError> {
+        self.passed(|listing| (listing.works.values().filter_map(|entry| entry.view.clone()).collect(), at(listing))).await
+    }
+
+    /// What `at` reads of the listing, brought up to date first.
+    async fn passed<T>(&self, at: impl FnOnce(&Listing) -> T) -> Result<T, ResourceError> {
         let mut listing = self.listing.lock().await;
         let (mut dirt, watched) = {
             let mut held = self.dirt.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
@@ -317,7 +322,7 @@ impl VesselViews {
             listing.current = false;
             return Err(error);
         }
-        Ok((listing.works.values().filter_map(|entry| entry.view.clone()).collect(), at(&listing)))
+        Ok(at(&listing))
     }
 
     /// Reads and composes every launch afresh into `listing`, kept from pass to pass when `keep`.
@@ -674,6 +679,13 @@ impl KindRecords<Vessel> for VesselViews {
     /// The one launch `name` names, as launch names are unique across homes.
     async fn copies(&self, name: &str) -> Result<Vec<Record<Vessel>>, String> {
         Ok(self.get(name).await?.into_iter().collect())
+    }
+
+    /// The listed launch `name` names: a launch released, or ended once its convoy is over, is
+    /// listed no more, though a read by name still finds it.
+    async fn sources_named(&self, name: &str) -> Result<Vec<Record<Vessel>>, String> {
+        let listed = |listing: &Listing| listing.names.get(name).and_then(|work| listing.works.get(work)?.view.clone());
+        Ok(self.passed(listed).await.map_err(|error| error.to_string())?.into_iter().collect())
     }
 
     async fn positioned(&self) -> Result<(Vec<Record<Vessel>>, LogPosition), String> {

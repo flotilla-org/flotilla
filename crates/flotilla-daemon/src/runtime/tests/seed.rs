@@ -1,24 +1,37 @@
 use super::*;
+use flotilla_provisioning_testkit::EngineBackend;
 use flotilla_resources::{definition_provenance::SEEDING_MANAGER, FulfilmentGrant, PlacementImageSource};
-use flotilla_store_sqlite::SqliteBackend;
 
 #[tokio::test]
 async fn canonicalizes_display_name_kind_host_refs_to_the_host_id() {
-    let backend = ResourceBackend::new(flotilla_store_memory::InMemoryBackend::default());
     let host_id = "b2aac222-host-id";
-    backend
-        .clone()
-        .using::<Host>(NAMESPACE)
-        .create(&empty_meta(host_id), &HostSpec { display_name: "udder".into(), connection: Default::default(), ..HostSpec::default() })
+    let home = EngineBackend::open_in(host_id, NAMESPACE);
+    let backend = home.backend.clone();
+    // This daemon's own Host, and two SSH hosts it owns that share a display name.
+    let hosts = flotilla_provisioning::engine::hosts::EngineHosts::open(
+        Arc::clone(&home.service),
+        host_id.to_string(),
+        Arc::new(flotilla_resources::SystemClock),
+    )
+    .expect("this home's hosts");
+    let hosts: &dyn flotilla_resources::engine_records::KindRecords<Host> = &hosts;
+    hosts
+        .apply(
+            host_id,
+            &Default::default(),
+            &Default::default(),
+            &HostSpec { display_name: "udder".into(), connection: Default::default(), ..HostSpec::default() },
+        )
         .await
         .expect("seed host");
     for name in ["collision-a", "collision-b"] {
-        backend
-            .clone()
-            .using::<Host>(NAMESPACE)
-            .create(
-                &empty_meta(name),
-                &HostSpec { display_name: "collision".into(), connection: Default::default(), ..HostSpec::default() },
+        let connection = flotilla_resources::HostConnection::SshHost { owning_daemon: host_id.to_string(), destination: name.to_string() };
+        hosts
+            .apply(
+                name,
+                &Default::default(),
+                &Default::default(),
+                &HostSpec { display_name: "collision".into(), connection, ..HostSpec::default() },
             )
             .await
             .expect("seed ambiguous host");
@@ -154,7 +167,8 @@ fn seeded_labels() -> BTreeMap<String, String> {
 // Seeding writes this host's kinds directly, labelled as seeding's.
 #[tokio::test]
 async fn seeding_writes_host_direct_and_docker_kinds() {
-    let backend = ResourceBackend::new(flotilla_store_memory::InMemoryBackend::default());
+    let home = EngineBackend::open_in("host-test", NAMESPACE);
+    let backend = home.backend.clone();
     let profile = manual_profile("host-test", true);
     ensure_default_kinds(&backend, NAMESPACE, &profile, "macos").await.expect("seed kinds");
 
@@ -171,8 +185,7 @@ async fn seeding_writes_host_direct_and_docker_kinds() {
 
 #[tokio::test]
 async fn kind_seeding_keeps_operator_grants_and_corrects_owned_drift() {
-    let temp = TempDir::new().expect("tempdir");
-    let database_path = temp.path().join("resources.sqlite");
+    let home = EngineBackend::open_in("host-test", NAMESPACE);
     let profile = manual_profile("host-test", false);
     let operator_grants = BTreeSet::from([
         FulfilmentGrant::platform("windows".to_string()),
@@ -180,7 +193,7 @@ async fn kind_seeding_keeps_operator_grants_and_corrects_owned_drift() {
         FulfilmentGrant::toolchain("rust".to_string()),
     ]);
     {
-        let backend = ResourceBackend::new(SqliteBackend::open(&database_path).expect("initial sqlite resource backend should open"));
+        let backend = home.backend.clone();
         ensure_default_kinds(&backend, NAMESPACE, &profile, "linux").await.expect("initial seeding should succeed");
 
         let kinds = backend.using::<FulfilmentKind>(NAMESPACE);
@@ -201,7 +214,7 @@ async fn kind_seeding_keeps_operator_grants_and_corrects_owned_drift() {
             .expect("operator kind apply should succeed");
     }
 
-    let backend = ResourceBackend::new(SqliteBackend::open(&database_path).expect("restarted sqlite resource backend should open"));
+    let backend = home.backend.clone();
     ensure_default_kinds(&backend, NAMESPACE, &profile, "linux").await.expect("re-seeding should succeed");
 
     let kinds = backend.using::<FulfilmentKind>(NAMESPACE);
@@ -228,7 +241,8 @@ async fn kind_seeding_keeps_operator_grants_and_corrects_owned_drift() {
 
 #[tokio::test]
 async fn kind_seeding_refreshes_platform_and_adopts_unlabelled_kinds() {
-    let backend = ResourceBackend::new(flotilla_store_memory::InMemoryBackend::default());
+    let home = EngineBackend::open_in("host-test", NAMESPACE);
+    let backend = home.backend.clone();
     let profile = manual_profile("host-test", true);
     let kinds = backend.clone().using::<FulfilmentKind>(NAMESPACE);
     let mut stale_docker = docker_kind_spec(&profile);
@@ -251,22 +265,30 @@ async fn kind_seeding_refreshes_platform_and_adopts_unlabelled_kinds() {
 
 #[tokio::test]
 async fn kind_seeding_leaves_kind_managed_elsewhere_untouched() {
-    let backend = ResourceBackend::new(flotilla_store_memory::InMemoryBackend::default());
+    let home = EngineBackend::open_in("host-test", NAMESPACE);
+    let backend = home.backend.clone();
     let profile = manual_profile("host-test", false);
     let kinds = backend.clone().using::<FulfilmentKind>(NAMESPACE);
     let mut manifest_spec = host_direct_kind_spec(&profile, "windows");
     manifest_spec.host_ref = "manifest-host".to_string();
     manifest_spec.pool = "manifest-pool".to_string();
-    let manifest = kinds
-        .create(
-            &empty_meta_with_labels(
-                &profile.host_direct_policy_name(),
-                BTreeMap::from([(MANAGED_BY_LABEL.to_string(), "manifest".to_string())]),
-            ),
-            &manifest_spec,
-        )
-        .await
-        .expect("manifest-managed kind should exist");
+    // Stamped as the manifest reconciler writes it.
+    let mut meta = empty_meta_with_labels(
+        &profile.host_direct_policy_name(),
+        BTreeMap::from([(MANAGED_BY_LABEL.to_string(), "manifest".to_string())]),
+    );
+    {
+        use flotilla_resources::definition_provenance::{
+            MANIFEST_PATH_ANNOTATION, MANIFEST_RECONCILER_ROOT_ANNOTATION, MANIFEST_REVISION_ANNOTATION, MANIFEST_SOURCE_ANNOTATION,
+        };
+        meta.annotations.extend([
+            (MANIFEST_RECONCILER_ROOT_ANNOTATION.to_string(), "host-test".to_string()),
+            (MANIFEST_SOURCE_ANNOTATION.to_string(), "ops".to_string()),
+            (MANIFEST_PATH_ANNOTATION.to_string(), "kinds.yaml".to_string()),
+            (MANIFEST_REVISION_ANNOTATION.to_string(), "revision-1".to_string()),
+        ]);
+    }
+    let manifest = kinds.create(&meta, &manifest_spec).await.expect("manifest-managed kind should exist");
 
     ensure_default_kinds(&backend, NAMESPACE, &profile, "linux").await.expect("seeding should tolerate managed collision");
 

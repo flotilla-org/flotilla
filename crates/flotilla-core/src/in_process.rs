@@ -817,6 +817,9 @@ pub struct InProcessDaemon {
     fleet: Arc<FleetService>,
     repository_inspector: RwLock<Option<Arc<dyn RepositoryInspector>>>,
     operator_reconciler: RwLock<Option<Arc<dyn OperatorReconciler>>>,
+    /// The convoy launches an operator asks the Convoy controller to reconcile now: a launch is
+    /// admitted on the engine, not written, so the wake is its name, sent here (#3108).
+    convoy_wakes: flotilla_store::controller::NamedWakes<flotilla_resources::Convoy>,
     /// Sessions on SSH hosts run in their vessels' agents (#3792).
     ssh_host_vessels: std::sync::RwLock<Option<Arc<dyn SshHostVesselAccess>>>,
     /// Process-lifetime host discovery, independent of tracked-root membership.
@@ -1489,6 +1492,7 @@ impl InProcessDaemon {
             )),
             repository_inspector: RwLock::new(None),
             operator_reconciler: RwLock::new(None),
+            convoy_wakes: Default::default(),
             ssh_host_vessels: std::sync::RwLock::new(None),
             local_provider_statuses,
             local_placement_provider_statuses: RwLock::new(Vec::new()),
@@ -2582,6 +2586,21 @@ impl InProcessDaemon {
 
     pub fn reconciler_wake_watch(&self) -> Box<dyn flotilla_store::controller::SecondaryWatch<Primary = flotilla_resources::Convoy>> {
         self.crew.reconciler_wake_watch()
+    }
+
+    /// The Convoy controller's watch of operators' reconcile-now wakes.
+    pub fn convoy_wake_watch(&self) -> Box<dyn flotilla_store::controller::SecondaryWatch<Primary = flotilla_resources::Convoy>> {
+        Box::new(self.convoy_wakes.clone())
+    }
+
+    /// Wakes the Convoy controller for this home's launch `name`, writing nothing; a launch
+    /// this home does not hold is refused as not found.
+    async fn wake_convoy(&self, namespace: &str, name: &str) -> Result<String, String> {
+        self.resource_backend().using::<flotilla_resources::Convoy>(namespace).get(name).await.map_err(|error| error.to_string())?;
+        if !self.convoy_wakes.wake(name) {
+            return Err(format!("Convoy/{name}: the Convoy controller is not running on this daemon"));
+        }
+        Ok(format!("Convoy/{name} woken"))
     }
 
     pub fn change_request_stale_after(&self) -> Duration {
@@ -6214,6 +6233,9 @@ impl executor_actions::ExecutorActionPort for InProcessDaemon {
         InProcessDaemon::local_checkout_for_repository(self, key).await
     }
     async fn reconcile_now(&self, namespace: &str, kind: &str, name: &str) -> Result<String, String> {
+        if matches!(kind.to_ascii_lowercase().as_str(), "convoy" | "convoys") {
+            return self.wake_convoy(namespace, name).await;
+        }
         let reconciler = self.operator_reconciler.read().await.clone();
         match reconciler {
             Some(reconciler) => reconciler.reconcile_now(namespace, kind, name).await,

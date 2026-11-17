@@ -3,7 +3,7 @@
 //! Verifies that creating a Convoy resource causes a ResultSet event to
 //! reach subscribed clients through the daemon's broadcast event bus.
 
-use flotilla_store_memory::InMemoryBackend;
+use flotilla_store_memory::engine_home_backend;
 use std::{
     collections::{BTreeMap, HashMap},
     sync::Arc,
@@ -33,11 +33,10 @@ use flotilla_protocol::TerminalStatus;
 use flotilla_protocol_testkit::TestIssue;
 use flotilla_resources::terminal_records::TerminalLaunchRequest;
 use flotilla_resources::{
-    CheckoutSpec, Convoy, ConvoyPhase as ResourceConvoyPhase, ConvoySpec, ConvoyStatus, Environment, EnvironmentSpec,
-    HostDirectEnvironmentSpec, InputMeta, ObservedCheckoutSpec, Project, ProjectRepositorySpec, ProjectSpec, Repository, RepositorySpec,
-    TerminalSessionSource, TerminalSessionSpec, VesselRequirement, WorkPhase as ResourceWorkPhase, WorkState, WorkflowSnapshot,
+    CheckoutSpec, Convoy, ConvoyPhase as ResourceConvoyPhase, ConvoySpec, ConvoyStatus, EnvironmentSpec, HostDirectEnvironmentSpec,
+    InputMeta, ObservedCheckoutSpec, Project, ProjectRepositorySpec, ProjectSpec, Repository, RepositorySpec, TerminalSessionSource,
+    TerminalSessionSpec, VesselRequirement, WorkPhase as ResourceWorkPhase, WorkState, WorkflowSnapshot,
 };
-use flotilla_store::ResourceBackend;
 use flotilla_terminal::{TerminalSession as PoolTerminalSession, TerminalSessionLiveness};
 
 fn test_config(dir: std::path::PathBuf) -> Arc<ConfigStore> {
@@ -135,7 +134,7 @@ async fn scoped_checkout_queries_emit_observed_rows_and_removal_deltas() {
         Arc::clone(&config),
         fake_discovery(false),
         HostName::new("local"),
-        ResourceBackend::new(InMemoryBackend::default()),
+        engine_home_backend(),
         std::sync::Arc::new(flotilla_discovery_testkit::HostPeerOverlay::default()),
     )
     .await;
@@ -320,24 +319,24 @@ async fn scoped_checkout_queries_emit_observed_rows_and_removal_deltas() {
 async fn runtime_start_republishes_engine_adopted_checkouts_before_query_bootstrap() {
     let tmp = tempfile::TempDir::new().expect("tempdir");
     let config = test_config(tmp.path().join("config"));
-    let backend = ResourceBackend::new(InMemoryBackend::default());
-    let repository_spec = RepositorySpec::remote("https://github.com/widgets/api.git").expect("remote repository");
-    let repository_key = repository_spec.key();
-    backend
-        .clone()
-        .using::<Repository>("flotilla")
-        .create(&InputMeta::builder().name(repository_key.to_string()).build(), &repository_spec)
-        .await
-        .expect("create repository");
     let daemon = InProcessDaemon::new_with_resource_backend(
         vec![],
         Arc::clone(&config),
         fake_discovery(false),
         HostName::new("local"),
-        backend.clone(),
+        engine_home_backend(),
         std::sync::Arc::new(flotilla_discovery_testkit::HostPeerOverlay::default()),
     )
     .await;
+    // The Repository is the daemon's engine record, written through its store.
+    let repository_spec = RepositorySpec::remote("https://github.com/widgets/api.git").expect("remote repository");
+    let repository_key = repository_spec.key();
+    daemon
+        .resource_backend()
+        .using::<Repository>("flotilla")
+        .create(&InputMeta::builder().name(repository_key.to_string()).build(), &repository_spec)
+        .await
+        .expect("create repository");
     // The engine held the adopted checkout before this start.
     let engine = flotilla_daemon_testkit::engine::runtime_checkouts(&daemon);
     let launch = engine.put_ready(
@@ -396,7 +395,7 @@ async fn runtime_start_republishes_engine_adopted_checkouts_before_query_bootstr
 async fn project_issue_subscription_materializes_window_and_ephemeral_search() {
     let tmp = tempfile::TempDir::new().expect("tempdir");
     let config = test_config(tmp.path().join("config"));
-    let backend = ResourceBackend::new(InMemoryBackend::default());
+    let backend = engine_home_backend();
     let provider = Arc::new(FakeIssueProvider::new());
     provider
         .add_issues(
@@ -514,7 +513,7 @@ async fn aggregator_emits_result_set_events() {
     let tmp = tempfile::TempDir::new().expect("tempdir");
     let config = test_config(tmp.path().join("config"));
 
-    let backend = ResourceBackend::new(InMemoryBackend::default());
+    let backend = engine_home_backend();
     let daemon = InProcessDaemon::new_with_resource_backend(
         vec![],
         Arc::clone(&config),
@@ -570,7 +569,7 @@ async fn an_undecodable_launch_is_listed_and_the_daemon_serves_the_others() {
 
     let tmp = tempfile::TempDir::new().expect("tempdir");
     let config = test_config(tmp.path().join("config"));
-    let backend = ResourceBackend::new(InMemoryBackend::default());
+    let backend = engine_home_backend();
     let daemon = InProcessDaemon::new_with_resource_backend(
         vec![],
         Arc::clone(&config),
@@ -645,7 +644,7 @@ async fn an_attention_raised_on_the_engine_marks_its_convoys_row() {
     };
     let tmp = tempfile::TempDir::new().expect("tempdir");
     let config = test_config(tmp.path().join("config"));
-    let backend = ResourceBackend::new(InMemoryBackend::default());
+    let backend = engine_home_backend();
     let daemon = InProcessDaemon::new_with_resource_backend(
         vec![],
         Arc::clone(&config),
@@ -712,7 +711,7 @@ async fn an_attention_raised_on_the_engine_marks_its_convoys_row() {
 async fn running_convoyless_session_emits_attachable_independent_row() {
     let tmp = tempfile::TempDir::new().expect("tempdir");
     let config = test_config(tmp.path().join("config"));
-    let backend = ResourceBackend::new(InMemoryBackend::default());
+    let backend = engine_home_backend();
     let pool = Arc::new(FakeTerminalPool::new());
     pool.add_sessions(vec![
         PoolTerminalSession::builder().session_name("cleat-convoy-coder".to_string()).status(TerminalStatus::Disconnected).build(),
@@ -759,11 +758,6 @@ async fn running_convoyless_session_emits_attachable_independent_row() {
         host_direct: Some(HostDirectEnvironmentSpec { host_ref: host_id.to_string(), repo_default_dir: "/tmp".to_string() }),
         docker: None,
     };
-    let environments = backend.using::<Environment>("flotilla");
-    environments
-        .create(&InputMeta::builder().name(environment_name.clone()).build(), &environment_spec)
-        .await
-        .expect("create attach environment");
     // The convoy is the engine's launch, its work `coder` running.
     let convoy_a = admit_convoy(
         &daemon,
@@ -994,7 +988,7 @@ async fn subscribe_queries_replays_result_set_after_seq() {
     let tmp = tempfile::TempDir::new().expect("tempdir");
     let config = test_config(tmp.path().join("config"));
 
-    let backend = ResourceBackend::new(InMemoryBackend::default());
+    let backend = engine_home_backend();
     let daemon = InProcessDaemon::new_with_resource_backend(
         vec![],
         Arc::clone(&config),
@@ -1138,7 +1132,7 @@ async fn assert_adopted_checkout_cleanup(admission_conflict: bool) {
     use flotilla_resources::{CrewSource, CrewSpec, WorkflowTemplate, WorkflowTemplateSpec};
     let tmp = tempfile::TempDir::new().expect("tempdir");
     let config = test_config(tmp.path().join("config"));
-    let backend = ResourceBackend::new(InMemoryBackend::default());
+    let backend = engine_home_backend();
     let daemon = InProcessDaemon::new_with_resource_backend(
         vec![],
         Arc::clone(&config),

@@ -1,5 +1,4 @@
-use flotilla_store_memory::InMemoryBackend;
-use flotilla_store_sqlite::SqliteBackend;
+use flotilla_store_memory::engine_home_backend;
 use std::{collections::BTreeMap, sync::Arc, time::Duration};
 
 use flotilla_config::ConfigStore;
@@ -25,13 +24,7 @@ fn config(path: std::path::PathBuf, machine_id: &str) -> Arc<ConfigStore> {
 }
 
 async fn daemon(path: std::path::PathBuf, machine_id: &str, host: &str) -> Arc<InProcessDaemon> {
-    daemon_with_backend(path, machine_id, host, ResourceBackend::new(InMemoryBackend::default())).await
-}
-
-async fn sqlite_daemon(path: std::path::PathBuf, machine_id: &str, host: &str) -> Arc<InProcessDaemon> {
-    std::fs::create_dir_all(&path).expect("create sqlite daemon directory");
-    let backend = ResourceBackend::new(SqliteBackend::open(path.join("resources.sqlite")).expect("open sqlite backend"));
-    daemon_with_backend(path, machine_id, host, backend).await
+    daemon_with_backend(path, machine_id, host, engine_home_backend()).await
 }
 
 async fn daemon_with_backend(path: std::path::PathBuf, machine_id: &str, host: &str, backend: ResourceBackend) -> Arc<InProcessDaemon> {
@@ -70,10 +63,12 @@ async fn await_host_replica(at: &InProcessDaemon, home: &InProcessDaemon) -> flo
 // what decisions read: its generation, and when its home was last heard as its heartbeat. Its
 // version, start time, free disk and memory are display figures and metrics, not recorded there.
 #[tokio::test]
-async fn sqlite_daemons_expose_remote_host_self_report_in_fleet_health() {
+async fn daemons_expose_remote_host_self_report_in_fleet_health() {
     let temp = tempfile::tempdir().expect("tempdir");
-    let kiwi = sqlite_daemon(temp.path().join("kiwi"), "kiwi-root", "kiwi").await;
-    let feta = sqlite_daemon(temp.path().join("feta"), "feta-root", "feta").await;
+    let kiwi = daemon(temp.path().join("kiwi"), "kiwi-root", "kiwi").await;
+    let feta = daemon(temp.path().join("feta"), "feta-root", "feta").await;
+    // Fleet health reads kiwi's engine records.
+    crate::engine(&kiwi);
     let feta_host_id = feta.local_host_summary().await.environment_id.host_id().expect("feta host id").to_string();
     let reported_at = chrono::Utc::now();
     let feta_hosts = feta.resource_backend().using::<Host>("flotilla");
@@ -95,7 +90,7 @@ async fn sqlite_daemons_expose_remote_host_self_report_in_fleet_health() {
         .await
         .expect("publish feta host self-report");
 
-    let topology = spawn_in_memory_request_topology(Arc::clone(&kiwi), Arc::clone(&feta)).await.expect("connect sqlite daemons");
+    let topology = spawn_in_memory_request_topology(Arc::clone(&kiwi), Arc::clone(&feta)).await.expect("connect daemons");
     let replicated = await_host_replica(&kiwi, &feta).await;
     assert_eq!(replicated.status.as_ref().and_then(|status| status.daemon_generation.as_deref()), Some("feta-generation"));
 
@@ -830,21 +825,7 @@ mod governor_relay {
     }
 
     #[tokio::test]
-    async fn in_memory_http_relays_governor_template_across_three_roots() {
-        governor_relay_contract(TestBackend::InMemory).await;
-    }
-
-    #[tokio::test]
-    async fn sqlite_http_relays_governor_template_across_three_roots() {
-        governor_relay_contract(TestBackend::Sqlite).await;
-    }
-
-    enum TestBackend {
-        InMemory,
-        Sqlite,
-    }
-
-    async fn governor_relay_contract(storage: TestBackend) {
+    async fn http_relays_governor_template_across_three_roots() {
         let temp = tempfile::tempdir().expect("temporary stores");
         let mut roots = Vec::new();
         for host in ["feta", "kiwi", "udder"] {
@@ -853,18 +834,12 @@ mod governor_relay {
             std::fs::write(config_path.join("daemon.toml"), format!("machine_id = \"{host}\"\n[admission]\nfree_space_floor_gib = 0\n"))
                 .expect("machine identity");
             let config = Arc::new(ConfigStore::with_base(config_path));
-            let backend = match storage {
-                TestBackend::Sqlite => {
-                    ResourceBackend::new(SqliteBackend::open(temp.path().join(format!("{host}.sqlite"))).expect("open store"))
-                }
-                TestBackend::InMemory => ResourceBackend::new(InMemoryBackend::default()),
-            };
             let daemon = InProcessDaemon::new_with_resource_backend(
                 vec![],
                 config,
                 fake_discovery(false),
                 HostName::new(host),
-                backend,
+                engine_home_backend(),
                 std::sync::Arc::new(flotilla_discovery_testkit::HostPeerOverlay::default()),
             )
             .await;
