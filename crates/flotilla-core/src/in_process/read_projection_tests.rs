@@ -1433,7 +1433,6 @@ mod tests {
     // #3005: unrelated message history adds no reads to explain; its messages are exactly the
     // target's, including a standing-role alias.
     #[tokio::test]
-    #[ignore = "a standing-role alias message is dropped: no terminal holds the alias on the engine, and explain keeps only held or direct receivers"]
     async fn explain_message_reads_are_bounded() {
         use flotilla_resources::MessageRelation;
         use flotilla_store::load_metrics::{measure, ReadCounts};
@@ -1493,6 +1492,9 @@ mod tests {
                     )
                     .await;
             }
+            // The views are filled once, at their first read, as a running daemon's already are.
+            fixture.home.convoys.settled().await;
+            fixture.backend.using::<flotilla_resources::TerminalSession>("flotilla").list().await.expect("the session views");
             let (explanation, reads) = measure(fixture.projections().explain_convoy("flotilla", "guide@flotilla")).await;
             let explanation = explanation.expect("explain");
             assert_eq!(

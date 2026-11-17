@@ -2336,7 +2336,9 @@ pub async fn message_views(
             let names_convoy = |address: &str| {
                 flotilla_resources::parse_crew_role_address(address).is_some_and(|(_, name, _, _)| name == convoy.metadata.name)
             };
-            let is_direct = names_convoy(&message.spec.receiver);
+            // A standing role's alias names this convoy while it is the role's current generation,
+            // which is how `aliases` was chosen; no terminal holds it.
+            let is_direct = names_convoy(&message.spec.receiver) || aliases.contains(&message.spec.receiver);
             // An unresolvable receiver has no holder to confirm the convoy, so
             // keep it on the evidence `may_address_convoy` already required: a
             // four-part address naming this convoy, or a role declaration or
