@@ -958,8 +958,12 @@ fn open_demands_import_as_the_attentions_their_writers_send() {
         let id = read.resolve(<MessageResource as Kind>::CODE, name, HERE).expect("resolve").expect(name);
         read.load::<MessageResource>(id).expect("load").expect(name).value
     };
+    // A hold is on the role's generation by its launch name, as the ensure pass raises and clears it.
+    let generation = flotilla_resources::convoy::engine::convoy_reference_address("project:flotilla/convoy:gui#0", Some("flotilla"))
+        .expect("launch address")
+        .to_string();
     let cases = [
-        ("project:flotilla/role:operator/message:ensure-attention-standing-gui", "standing", "project:flotilla/convoy:standing-gui-1"),
+        ("project:flotilla/role:operator/message:ensure-attention-standing-gui", "standing", generation.as_str()),
         ("project:flotilla/role:operator/message:ensure-config-drift-standing-gui", "standing", "project:flotilla/role:gui"),
         ("fleet:lab/role:operator/message:reclaim-refusal-finished", "teardown", "convoy:finished"),
         ("project:flotilla/role:operator/message:credential-refresh-demo-work", "capabilities", "project:flotilla/convoy:demo/vessel:work"),

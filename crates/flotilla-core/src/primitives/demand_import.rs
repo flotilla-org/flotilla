@@ -6,7 +6,7 @@
 //!
 //! | Demand name | Attention |
 //! |---|---|
-//! | `ensure-attention-<ensure>` | [`Cause::Hold`] of the convoy |
+//! | `ensure-attention-<ensure>` | [`Cause::Hold`] of the generation, by its launch name |
 //! | `ensure-config-drift-<ensure>` | [`Cause::Drift`] of the ensure's standing role |
 //! | `reclaim-refusal-<convoy>` | [`Cause::ReclaimRefused`] of the convoy |
 //! | `credential-refresh-<vessel>-<credential>` | [`Cause::CredentialRefresh`], one per vessel |
@@ -17,7 +17,10 @@ use std::collections::BTreeMap;
 
 use flotilla_address::{Address, Kind};
 use flotilla_protocol::ResourceRef;
-use flotilla_resources::{Convoy, ConvoyEnsure, MessageReference, ResourceObject, TerminalSession, Vessel, CONVOY_LABEL, ROLE_LABEL};
+use flotilla_resources::{
+    convoy::engine::{convoy_reference_address, standing_name},
+    Convoy, ConvoyEnsure, MessageReference, ResourceObject, TerminalSession, Vessel, CONVOY_LABEL, ROLE_LABEL,
+};
 use flotilla_schema::Timestamp;
 use flotilla_state_machines::{
     machines::message::{Message as Machine, MessageState},
@@ -75,7 +78,7 @@ enum Mapped {
 
 /// The live writer that raised an open demand, with the records its name and target name.
 enum Writer<'r> {
-    Hold { convoy: &'r str },
+    Hold { ensure: &'r str, convoy: &'r str },
     Drift { ensure: &'r str, convoy: &'r str },
     Reclaim { convoy: &'r str },
     Delivery { session: &'r str },
@@ -205,8 +208,8 @@ fn classify<'r>(old: &'r OldDemand<'_>, records: &DemandRecords<'_>) -> Class<'r
         } else {
             Err(format!("it is about a {kind}, not a TerminalSession"))
         }
-    } else if name.starts_with(HOLD) {
-        convoy().map(|convoy| Writer::Hold { convoy })
+    } else if let Some(ensure) = name.strip_prefix(HOLD) {
+        convoy().map(|convoy| Writer::Hold { ensure, convoy })
     } else if let Some(ensure) = name.strip_prefix(ENSURE_DRIFT_ATTENTION_PREFIX) {
         convoy().map(|convoy| Writer::Drift { ensure, convoy })
     } else if name.starts_with(RECLAIM) {
@@ -288,8 +291,13 @@ fn map(
             let reason = reason(record, DELIVERY_HOLD_REASON_ANNOTATION, || "Turn delivery is held until a person rules.".into());
             Ok(attention(Cause::DeliveryHeld { role }, reason, held))
         }
-        Writer::Hold { convoy: target } => {
+        Writer::Hold { ensure, convoy: target } => {
             let Some((held, read)) = convoy(target)? else { return gone() };
+            let Some(ensure) = records.ensures.get(ensure) else { return Ok(Mapped::Dropped("its ConvoyEnsure is gone")) };
+            // The hold is on the role's generation by its launch name, as the ensure pass raises and
+            // clears it: `<standing name>#<generation>`.
+            let launch = format!("{}#{}", standing_name(&ensure.spec.project_ref, &ensure.spec.role)?, held.spec.generation);
+            let read = Read { address: convoy_reference_address(&launch, held.spec.project_ref.as_deref())?, revision: read.revision };
             let reason = reason(record, ENSURE_HOLD_REASON_ANNOTATION, || format!("Standing convoy `{target}` is held."));
             Ok(attention(Cause::Hold { convoy: read }, reason, held))
         }

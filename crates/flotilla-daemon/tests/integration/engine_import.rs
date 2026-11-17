@@ -6,6 +6,7 @@ use std::{collections::BTreeMap, path::Path, sync::Arc, time::Duration};
 
 use flotilla_config::{ConfigStore, DaemonConfig};
 use flotilla_core::in_process::InProcessDaemon;
+use flotilla_core::primitives::demand_import::retired::ENSURE_HOLD_REASON_ANNOTATION;
 use flotilla_daemon::{
     dummy_fleet::{attach_dummy_fleet, install_dummy_fleet},
     engine_import::{Source, ENGINE_STORE, IMPORTING, OLD_STORE},
@@ -13,17 +14,18 @@ use flotilla_daemon::{
 };
 use flotilla_daemon_testkit::{
     daemon::{OldStoreImport, OldStoreMode, TestDaemon},
-    import_fixture::populated,
+    import_fixture::{demand, designation, document, own, own_retired, populated},
 };
 use flotilla_discovery_testkit::fake_discovery;
 use flotilla_protocol::{HostName, NodeId};
 use flotilla_provisioning::stored::{artifact::ArtifactRecord, repository::RepositoryRecord};
 use flotilla_resources::{
+    attentions::{OpenAttention, Sender, Subject},
     definition_provenance::{
         MATERIALIZED_PROJECT_ANNOTATION, SOURCE_COMMIT_ANNOTATION, SOURCE_ENTRY_PATH_ANNOTATION, SOURCE_REPOSITORY_ANNOTATION,
     },
     definitions::{origin, DefinitionOrigin},
-    Artifact, ConvoyEnsure, InputMeta, Repository, RepositorySpec, Resource, TerminalSession,
+    Artifact, ConvoyEnsure, FleetDesignation, InputMeta, Project, Repository, RepositorySpec, Resource, TerminalSession,
 };
 use flotilla_schema::Kind;
 use flotilla_schema_sqlite::Snapshot;
@@ -307,6 +309,61 @@ async fn an_ensure_held_at_two_homes_acts_at_its_earliest_copys_home_after_impor
     let at_home = hosts[0].daemon().reconcile_convoy_ensures_once(NS).await.expect_err("the earliest copy's home acts");
     assert!(at_home.contains("parent Project/absent-project is absent"), "{at_home}");
     assert_eq!(hosts[1].daemon().reconcile_convoy_ensures_once(NS).await, Ok(Vec::new()), "the later copy's home skips it");
+}
+
+/// Standing role `role`'s ensure and its `failures` failed generations, each with the annotation
+/// admission stamps, and an open hold demand on its last, stored as the old store holds them.
+async fn held_role(host: &Host, role: &str, failures: u64, reason: &str) {
+    let ensure = json!({"project_ref": "flotilla", "role": role, "repositories": []});
+    host.own::<ConvoyEnsure>(&format!("standing-{role}"), ensure.clone(), Value::Null).await;
+    for generation in 1..=failures {
+        let mut convoy = document(
+            "Convoy",
+            &format!("{role}-{generation}"),
+            json!({"workflow_ref": "w", "inputs": {}, "project_ref": "flotilla", "role": role, "generation": generation}),
+            json!({"phase": "Failed", "ensure_admission": ensure, "finished_at": format!("2026-10-19T00:0{generation}:00Z"),
+                "message": "clone failed"}),
+        );
+        convoy["metadata"]["annotations"] = json!({"flotilla.work/ensured-from": format!("standing-{role}")});
+        own_retired(host.dir.path(), convoy);
+    }
+    let held = format!("{role}-{failures}");
+    own_retired(
+        host.dir.path(),
+        demand(&format!("ensure-attention-standing-{role}"), ("Convoy", &held), &[(ENSURE_HOLD_REASON_ANNOTATION, reason)], "escalated"),
+    );
+}
+
+// #3108: an imported hold on a standing role is the one its ensure pass raises and clears. A role
+// held at its strike limit raises no second hold beside the imported one, and a role whose hold
+// is answered clears the imported one.
+#[tokio::test]
+async fn an_imported_hold_is_the_one_its_ensure_pass_raises_and_clears() {
+    let host = Host::new("imported-hold").await;
+    own::<FleetDesignation>(&host.backend, designation()).await;
+    host.own::<Project>(
+        "flotilla",
+        json!({"default_workflow_ref": "w", "display_name": "flotilla", "issue_source_bindings": [], "repositories": []}),
+        Value::Null,
+    )
+    .await;
+    let limit = flotilla_admission::reconcilers::convoy_ensure::restart_limit_reason(3);
+    held_role(&host, "governor", 3, &limit).await;
+    held_role(&host, "reviewer", 1, "standing convoy teardown held: no backing environment evidence").await;
+    let _runtime = host.start().await.expect("runtime");
+    let daemon = host.daemon();
+    let holds = || async {
+        let open = daemon.attentions().open(NS, Some(Sender::Standing), None).await.expect("open attentions");
+        open.into_iter().filter(OpenAttention::is_hold).map(|hold| hold.subject).collect::<Vec<_>>()
+    };
+    let launch = |role: &str, n: u64| {
+        let standing = flotilla_resources::convoy::engine::standing_name("flotilla", role).expect("standing name");
+        Subject::convoy(format!("{standing}#{n}"))
+    };
+    // The runtime's own passes may act first; this one settles both roles either way. It may
+    // refuse admission for other reasons; the holds are what it decided first.
+    let pass = daemon.reconcile_convoy_ensures_once(NS).await;
+    assert_eq!(holds().await, [launch("governor", 3)], "the held role keeps its one hold and the answered one is cleared: {pass:?}");
 }
 
 /// What a daemon started over an old store read back: the import's report, the records of each
