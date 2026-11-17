@@ -684,12 +684,43 @@ _Avoid_: Peering (the legacy merge implementation being retired), clustering,
 mesh-as-a-noun.
 
 **Tender**:
-The slim, standalone, per-host daemon that realises **Federation**: it owns host
+The slim, standalone daemon that realises **Federation**: it owns host
 inventory, identity, the pluggable transport, and arbitrary UDS-listener
-forwarding, exposed via its own HTTP-over-UDS control API. Carries no Flotilla
-domain semantics; the whole product family uses it. Named for a tender boat —
-it ferries and services connections between ship and shore.
-_Avoid_: Bridge, peer, gateway, proxy, router, tug.
+forwarding, exposed via its own HTTP-over-UDS control API. Each **Tender
+instance** acts as one OS account on one machine, so it can open exactly the
+sockets that account can; a machine with several users runs several (#3995).
+Carries no Flotilla domain semantics; the whole product family uses it, with
+or without Flotilla. Named for a tender boat — it ferries and services
+connections between ship and shore.
+_Avoid_: Bridge, peer, gateway, proxy, router, tug; per-host daemon.
+
+**Trusted Group**:
+The **Tender** instances that act for one person, held as a list of instance
+public keys. A **Publication**'s audience defaults to its publisher's Trusted
+Group, and publishers cannot widen it. A transport such as ssh carries the
+trust; it is not the trust.
+_Avoid_: Mesh, peers, ssh account (as the identity).
+
+**Publication**:
+An endpoint made reachable through **Tender**. Its identity is a **scope** (a
+vessel, or the publishing Tender instance for a host endpoint) plus a **name**
+chosen by whoever asked for it, opaque to Tender; it also carries a protocol
+**label** (`cleat`, `agent-view`, `http`, …), which the application's own
+handshake checks, display text and an audience. Its current route is not part
+of its identity, so a vessel that moves keeps its Publications. One service
+holding many sessions is one Publication (a cleat daemon, not each session).
+Facts name Publications, never routes.
+_Avoid_: Service record; Exposure (drydock's socket on its own machine,
+reaching into or out of a vessel, which the host's instance publishes).
+
+**Binding**:
+A standing association, on one machine, between a **Publication** and a
+Local Endpoint there (a Unix socket or named pipe). A client asks its own
+machine's **Tender** instance for one; it is available, unavailable or revoked,
+and connecting to the Local Endpoint opens a stream over the current route.
+Bindings are shared on the machine, and binding never starts anything. Tender
+owns the listener and nothing behind it.
+_Avoid_: Local exposure, tunnel, forward.
 
 **Convergent Facts**:
 The cross-root resource class whose records are natural-keyed and true
