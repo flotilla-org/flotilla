@@ -112,6 +112,10 @@ impl ResourceBackend {
     }
     /// The namespace the engine's records are served in, the daemon's provisioning namespace: a
     /// namespace scan of a kind the engine serves answers with it.
+    ///
+    /// The engine has no namespaces, and the fleet's data holds only `flotilla`, so this is that
+    /// one name. Do not serve or read a second namespace: the namespace parameter of the read and
+    /// write APIs is to be deleted (after the R2 field removal), not given a meaning.
     pub fn serve_engine_in(&self, namespace: &str) {
         self.engines.write().unwrap_or_else(std::sync::PoisonError::into_inner).namespace = Some(namespace.to_owned());
     }
