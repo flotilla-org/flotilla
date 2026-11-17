@@ -308,6 +308,26 @@ async fn a_crew_condition_reads_its_convoy_by_key() {
     no_listing(&cost);
 }
 
+// Behaviour: a gate condition on a crew role is read through its convoy's snapshot, for a finite
+// launch and a standing one, whose role's convoy segment is not its record's name; no session is
+// searched for by its labels.
+#[tokio::test]
+async fn a_condition_on_a_launchs_role_reads_its_crew() {
+    let mut home = Home::open(0, 0).await;
+    let standing = home.standing().await;
+    home.crew_here(&standing);
+    let project = Address::project(NAMESPACE).expect("project");
+    for launch in [home.crew.clone(), standing] {
+        let role = flotilla_resources::convoy::engine::seat_address(&project, &launch, "coder").expect("the role");
+        let condition: Condition = format!("{role} .phase == Working").parse().expect("condition");
+        let (value, reads) =
+            flotilla_store::load_metrics::measure(home.messages.primitives().conditions().value(NAMESPACE, &condition)).await;
+        assert_eq!(value, Ok(flotilla_resources::ThreeValue::True), "{launch}'s coder is working");
+        let searched = reads.get("TerminalSession port").map_or(0, |counts| counts.index + counts.whole_kind);
+        assert_eq!(searched, 0, "no session search by label for {launch}: {reads:#?}");
+    }
+}
+
 // Behaviour: a message about a crew seat is shown in the old shape with the session holding that
 // seat as its subject, for a finite launch and a standing one, whose seat's convoy segment is not
 // its record's name.

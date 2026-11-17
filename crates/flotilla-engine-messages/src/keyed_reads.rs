@@ -5,13 +5,13 @@
 //! Forge catalog and this home's session launches, which have no key to read by.
 
 use std::{
-    collections::{BTreeMap, BTreeSet},
+    collections::BTreeSet,
     sync::{Arc, OnceLock},
 };
 
 use flotilla_resources::{
     lifecycle_reads::LifecycleReads, terminal_records::TerminalRecord, vessel_records::VesselRecord, Convoy, ForgeSpec, Resource,
-    ResourceError, ResourceObject, ResourceProvenance, TerminalSession, CONVOY_LABEL, ROLE_LABEL,
+    ResourceError, ResourceObject, ResourceProvenance,
 };
 use flotilla_schema::reads::carry;
 use flotilla_schema_sqlite::stream::Service;
@@ -125,25 +125,6 @@ impl KeyedReads {
     pub async fn forges(&self, namespace: &str) -> Result<Vec<ForgeSpec>, ResourceError> {
         let backend = self.backend().map_err(ResourceError::other)?;
         Ok(backend.definitions::<flotilla_resources::Forge>(namespace).list().await?.into_iter().map(|forge| forge.spec).collect())
-    }
-
-    /// The sessions labelled as holding `role` in `convoy`, at every home.
-    pub async fn labelled_sessions(
-        &self,
-        namespace: &str,
-        convoy: &str,
-        role: &str,
-    ) -> Result<Vec<ResourceObject<TerminalSession>>, ResourceError> {
-        let backend = self.backend().map_err(ResourceError::other)?;
-        let labels = BTreeMap::from([(CONVOY_LABEL.to_owned(), convoy.to_owned()), (ROLE_LABEL.to_owned(), role.to_owned())]);
-        Ok(backend
-            .including_replicas::<TerminalSession>(namespace)
-            .list_matching_labels(&labels)
-            .await?
-            .items
-            .into_iter()
-            .map(|read| read.object)
-            .collect())
     }
 
     /// The sessions of the vessel launched for the work holding `role` in `convoy`, through the

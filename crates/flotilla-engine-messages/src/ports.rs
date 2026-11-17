@@ -227,21 +227,18 @@ pub struct RecordConditions {
 pub const UNINSTALLED_STALENESS: std::time::Duration = std::time::Duration::from_secs(300);
 
 impl RecordConditions {
-    /// The convoy record and the work holding role `address` in it: from the convoy's snapshot,
-    /// else from the labels of a session holding the role.
+    /// The convoy record and the work holding role `address` in it, from the snapshot of the first
+    /// convoy record the address may name.
     async fn work(&self, namespace: &str, address: &Address) -> Result<(String, String), String> {
         let convoy = address.get(Kind::Convoy).ok_or_else(|| format!("`{address}` names no convoy"))?;
         let role = address.name();
-        let held = self.keyed.convoy(namespace, convoy).await.map_err(|error| error.to_string())?;
-        if let Some(work) = held.and_then(|held| snapshot_work(&held.object, role)) {
-            return Ok((convoy.to_owned(), work));
+        for record in flotilla_resources::convoy::engine::convoy_records(address) {
+            let held = self.keyed.convoy(namespace, &record).await.map_err(|error| error.to_string())?;
+            if let Some(work) = held.and_then(|held| snapshot_work(&held.object, role)) {
+                return Ok((record, work));
+            }
         }
-        let sessions = self.keyed.labelled_sessions(namespace, convoy, role).await.map_err(|error| error.to_string())?;
-        sessions
-            .iter()
-            .find_map(|session| session.metadata.labels.get(VESSEL_LABEL).cloned())
-            .map(|work| (convoy.to_owned(), work))
-            .ok_or_else(|| format!("no vessel holds `{role}` in convoy `{convoy}`"))
+        Err(format!("no vessel holds `{role}` in convoy `{convoy}`"))
     }
 }
 
