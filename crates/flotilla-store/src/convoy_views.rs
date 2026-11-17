@@ -230,8 +230,11 @@ impl ConvoyViews {
             Some(home) => home.to_owned(),
             None => self.convoys().map_err(ResourceError::other)?.home().to_owned(),
         };
-        let key = (home, name.to_owned());
-        self.with_held(move |held| held.views.get(&key).cloned()).await
+        let key = (home.clone(), name.to_owned());
+        match self.with_held(move |held| held.views.get(&key).cloned()).await? {
+            Some(held) => Ok(Some(held)),
+            None => Ok(self.stored(name, Some(&home)).await?.pop()),
+        }
     }
 
     /// This home's launches that have not ended, from the views held: a read composes again only
@@ -529,25 +532,52 @@ impl ConvoyViews {
         let composed = records
             .into_iter()
             .zip(joined)
-            .map(|(record, (notes, joined))| {
-                let working = record.working(&joined.live, notes.as_ref());
-                let object =
-                    record.read_view(&self.namespace, ConvoyJoins { works: &joined.works, working: &working, notes: notes.as_ref() });
-                let provenance = if record.home == here {
-                    ResourceProvenance::Local
-                } else {
-                    let synced = record.ended.as_ref().map_or(record.admitted_at, |(_, at)| *at);
-                    ResourceProvenance::Replica { origin_root: NodeId::new(record.home.clone()), last_synced_at: synced }
-                };
-                Composed {
-                    home: record.home.clone(),
-                    view: ReadResourceObject { object, provenance },
-                    unreadable: None,
-                    ended: record.ended.as_ref().map(|_| joined.works),
-                }
+            .map(|(record, (notes, joined))| Composed {
+                home: record.home.clone(),
+                view: view_of(&self.namespace, &here, &record, notes.as_ref(), &joined),
+                unreadable: None,
+                ended: record.ended.as_ref().map(|_| joined.works),
             })
             .collect();
         Ok((composed, at))
+    }
+
+    /// Launch `name` at `home`, or at every home when `None`, composed from the store for a read
+    /// by name of a launch the views do not hold: a retired one, which reads with how it ended.
+    /// Each is joined with its works' Vessel launches by their index, and their sessions; nothing
+    /// of it is kept.
+    async fn stored(&self, name: &str, home: Option<&str>) -> Result<Vec<HeldView>, ResourceError> {
+        let (name, home, namespace) = (name.to_owned(), home.map(str::to_owned), self.namespace.clone());
+        let views = self
+            .blocking(move |reads| {
+                let convoys = reads.convoys()?;
+                let records = match home {
+                    Some(home) => convoys.get(&name, Some(&home))?.into_iter().collect(),
+                    None => convoys.named(&name)?,
+                };
+                if records.is_empty() {
+                    return Ok(Vec::new());
+                }
+                let (vessels, terminals) = (reads.vessels()?, reads.terminals()?);
+                let launches = vessels.of_convoy(&name)?;
+                let mut sessions = BTreeMap::new();
+                for launch in &launches {
+                    sessions.insert(launch.name.clone(), terminals.of_vessel(&launch.name)?);
+                }
+                let here = convoys.home().to_owned();
+                Ok(records
+                    .iter()
+                    .map(|record| {
+                        let notes = (record.home == here).then(|| convoys.memory().get(&record.name));
+                        let joined =
+                            join(record, notes.as_ref(), launches.clone(), |vessel| sessions.get(vessel).cloned().unwrap_or_default());
+                        view_of(&namespace, &here, record, notes.as_ref(), &joined)
+                    })
+                    .collect::<Vec<_>>())
+            })
+            .await?;
+        let position = self.with_held(|held| held.position()).await?;
+        Ok(views.into_iter().map(|view| HeldView { view, version: position }).collect())
     }
 
     async fn blocking<T: Send + 'static>(
@@ -595,6 +625,19 @@ impl std::fmt::Debug for ConvoyViews {
 
 /// `held`, held at `home`, as the engine port hands it out. Each is counted as a Convoy converted
 /// to the port's shape.
+/// `record` as a read view at home `here`, joined as `joined` with its home's `notes`.
+fn view_of(namespace: &str, here: &str, record: &ConvoyRecord, notes: Option<&ConvoyNotes>, joined: &Joined) -> ReadResourceObject<Convoy> {
+    let working = record.working(&joined.live, notes);
+    let object = record.read_view(namespace, ConvoyJoins { works: &joined.works, working: &working, notes });
+    let provenance = if record.home == here {
+        ResourceProvenance::Local
+    } else {
+        let synced = record.ended.as_ref().map_or(record.admitted_at, |(_, at)| *at);
+        ResourceProvenance::Replica { origin_root: NodeId::new(record.home.clone()), last_synced_at: synced }
+    };
+    ReadResourceObject { object, provenance }
+}
+
 fn view_record(held: HeldView, home: String) -> Record<Convoy> {
     flotilla_schema::reads::converted("Convoy", 1);
     crate::held_listing::view_record(held.view.object, home, held.version)
@@ -643,12 +686,13 @@ impl KindRecords<Convoy> for ConvoyViews {
 
     async fn get(&self, name: &str) -> Result<Option<Record<Convoy>>, String> {
         let home = self.home();
-        match self.find_held(name, None).await.map_err(|error| error.to_string())? {
-            Some(held) => Ok(Some(view_record(held, home))),
-            // Another home's launch of this name reads where this home holds none: the lexically
-            // first home's, as a listing chooses.
-            None => Ok(self.engine_copies(name).await?.into_iter().min_by(|a, b| a.home.cmp(&b.home))),
+        let key = (home.clone(), name.to_owned());
+        if let Some(held) = self.with_held(move |held| held.views.get(&key).cloned()).await.map_err(|error| error.to_string())? {
+            return Ok(Some(view_record(held, home)));
         }
+        // This home's launch of the name where it has one, else another home's: the lexically
+        // first home's, as a listing chooses.
+        Ok(self.copies(name).await?.into_iter().min_by(|a, b| (a.home != home, &a.home).cmp(&(b.home != home, &b.home))))
     }
 
     /// Each launch, this home's where it holds one of the name, else the lexically first home's.
@@ -668,8 +712,25 @@ impl KindRecords<Convoy> for ConvoyViews {
         self.engine_sources().await
     }
 
+    /// Every home's launch of the name as held; where the views hold none of it, every home's
+    /// composed from the store, a retired one with how it ended.
     async fn copies(&self, name: &str) -> Result<Vec<Record<Convoy>>, String> {
-        self.engine_copies(name).await
+        let copies = self.engine_copies(name).await?;
+        if !copies.is_empty() {
+            return Ok(copies);
+        }
+        let here = self.home();
+        let stored = self.stored(name, None).await.map_err(|error| error.to_string())?;
+        Ok(stored
+            .into_iter()
+            .map(|view| {
+                let home = match &view.view.provenance {
+                    ResourceProvenance::Local => here.clone(),
+                    ResourceProvenance::Replica { origin_root, .. } => origin_root.as_str().to_owned(),
+                };
+                view_record(view, home)
+            })
+            .collect())
     }
 
     /// The views `cover` selects, from the views' index, this home's alone when `local`: only

@@ -267,11 +267,13 @@ impl ConvoyRecords for Convoys {
         let home = home.unwrap_or(HERE);
         Ok(self.records().into_iter().filter(|record| record.launch_of == of && record.home == home).max_by_key(|record| record.launch))
     }
+    // A listing leaves retired launches out, as the engine's does.
     fn at(&self, home: &str) -> Result<ConvoyListing, String> {
-        Ok(ConvoyListing { records: self.records().into_iter().filter(|record| record.home == home).collect(), unreadable: Vec::new() })
+        let records = self.records().into_iter().filter(|record| record.home == home && !record.retired).collect();
+        Ok(ConvoyListing { records, unreadable: Vec::new() })
     }
     fn every(&self) -> Result<ConvoyListing, String> {
-        let records = self.records();
+        let records: Vec<_> = self.records().into_iter().filter(|record| !record.retired).collect();
         self.read.fetch_add(records.len(), Ordering::SeqCst);
         self.listed.fetch_add(1, Ordering::SeqCst);
         Ok(ConvoyListing { records, unreadable: Vec::new() })
@@ -681,6 +683,34 @@ async fn a_read_by_name_converts_only_that_launch() {
     let large = converted_by_one_read(400).await;
     assert_eq!(small, (2, 1), "the copies convert both homes' launches; a remote get converts one");
     assert_eq!(large, small, "the cost does not grow with the launches held");
+}
+
+// Behaviour (#3108 retirement): a retired launch, which the views never hold, still reads by name
+// through the generic Convoy reads with how it ended, and a listing leaves it out.
+#[tokio::test]
+async fn a_retired_launch_reads_by_name_with_its_ending() {
+    let mut retired = launch("retired#1", HERE);
+    retired.ended = Some((ConvoyEnd::Abandoned { reason: "stopped".into() }, at(200)));
+    retired.retired = true;
+    let reads = Arc::new(Reads {
+        joins: HeldJoins::default(),
+        convoys: Convoys::new(vec![retired, launch("open#1", HERE)]),
+        terminals: Terminals { records: Vec::new(), observations: TerminalObservations::default() },
+        vessels: Vessels { records: Vec::new() },
+    });
+    let backend = ResourceBackend::new(InMemoryBackend::default());
+    backend.serve_engine_in("flotilla");
+    Arc::new(ConvoyViews::new("flotilla", reads)).install(&backend);
+    let convoys = backend.using::<Convoy>("flotilla");
+
+    let names: Vec<_> = convoys.list().await.expect("list").items.into_iter().map(|convoy| convoy.metadata.name).collect();
+    assert_eq!(names, ["open#1"], "a listing leaves a retired launch out");
+    let read = convoys.get("retired#1").await.expect("a retired launch reads by name");
+    let status = read.status.expect("status");
+    assert_eq!(status.phase, ConvoyPhase::Abandoned);
+    assert_eq!(status.message.as_deref(), Some("stopped"));
+    let copies = backend.including_replicas::<Convoy>("flotilla").get_all("retired#1").await.expect("copies").items;
+    assert_eq!(copies.len(), 1, "every copy of the name reads it too");
 }
 
 /// `name` held at `home`, ensured from `ensure`, and ended when `ended`.

@@ -125,6 +125,18 @@ impl ConvoyRecords for EngineConvoyRecords {
         })
     }
 
+    fn named(&self, name: &str) -> Result<Vec<ConvoyRecord>, String> {
+        self.read(&format!("{name} at every home"), |read| {
+            let mut records = Vec::new();
+            for id in read.resolve_named(<Resource<Convoy> as Kind>::CODE, name)? {
+                if let Some(loaded) = read.load::<Resource<Convoy>>(id)? {
+                    records.extend(record(read, &self.stalls, loaded)?);
+                }
+            }
+            Ok(records)
+        })
+    }
+
     fn newest(&self, of: &str, project: &str, home: Option<&str>) -> Result<Option<ConvoyRecord>, String> {
         let home = home.unwrap_or(&self.home).to_owned();
         let project = Address::project(project).map_err(|error| format!("project `{project}`: {error}"))?;

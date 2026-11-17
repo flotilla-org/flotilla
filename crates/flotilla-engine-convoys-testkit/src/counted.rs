@@ -237,6 +237,11 @@ impl ConvoyRecords for CountedConvoys {
         self.records.get(name, home)
     }
 
+    fn named(&self, name: &str) -> Result<Vec<ConvoyRecord>, String> {
+        Meter::count(&self.meter.convoys);
+        self.records.named(name)
+    }
+
     fn newest(&self, of: &str, project: &str, home: Option<&str>) -> Result<Option<ConvoyRecord>, String> {
         Meter::count(&self.meter.convoys);
         self.records.newest(of, project, home)

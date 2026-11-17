@@ -601,6 +601,11 @@ pub trait ConvoyRecords: Send + Sync {
     fn home(&self) -> &str;
     /// Launch `name` held at `home`, or at this home when `None`.
     fn get(&self, name: &str, home: Option<&str>) -> Result<Option<ConvoyRecord>, String>;
+    /// Launch `name` at every home that holds one, a retired one with how it ended. A port that
+    /// reads one home reads this home's.
+    fn named(&self, name: &str) -> Result<Vec<ConvoyRecord>, String> {
+        Ok(self.get(name, None)?.into_iter().collect())
+    }
     /// The newest launch of `of` in `project` held at `home`, or at this home when `None`.
     fn newest(&self, of: &str, project: &str, home: Option<&str>) -> Result<Option<ConvoyRecord>, String>;
     /// Every launch held at `home`; one that cannot be read is listed as unreadable.
