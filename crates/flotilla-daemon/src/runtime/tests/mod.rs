@@ -74,9 +74,9 @@ use flotilla_resources::environment_records::EnvironmentRecords;
 use flotilla_resources::{
     clone_key, Checkout, CheckoutSpec, CheckoutSpec as ResourceCheckoutSpec, CheckoutWorktreeSpec, Clone, CloneSpec, ConditionValue,
     Convoy, ConvoyEnsure, ConvoyEnsureSpec, ConvoyPhase, ConvoyProvisioningState, ConvoyRepositorySpec, ConvoySpec, ConvoyStatus,
-    CredentialConsumer, CredentialGrant, CredentialLifecycle, CredentialPlacementRequirements, CredentialSource, CredentialSpec,
-    CredentialSpecSpec, CrewSource, CrewSpec, EnvironmentSpec, Forge, ForgeSpec, FulfilmentFacts, FulfilmentKind, FulfilmentKindSpec,
-    FulfilmentRealisation, Host, HostDirectEnvironmentSpec, HostSpec, HostStatus, HostStatusPatch, InputMeta, ModelProbeState,
+    CredentialConsumer, CredentialLifecycle, CredentialPlacementRequirements, CredentialSource, CredentialSpec, CredentialSpecSpec,
+    CrewSource, CrewSpec, EnvironmentSpec, Forge, ForgeSpec, FulfilmentFacts, FulfilmentKind, FulfilmentKindSpec, FulfilmentRealisation,
+    Host, HostDirectEnvironmentSpec, HostSpec, HostStatus, HostStatusPatch, InputMeta, ModelProbeState,
     ObservedCheckoutSpec as ResourceObservedCheckoutSpec, Project, Repository, RepositoryKey, RepositorySpec, RepositoryTrust, Resource,
     ResourceError, Selector, TerminalAttentionState, TerminalSession, TerminalSessionPhase, TerminalSessionSource, TerminalSessionSpec,
     Vessel, VesselRequirement, WorkPhase, WorkflowTemplate, WorkflowTemplateSpec, ACTUATOR_HOST_REF_ANNOTATION, CREDENTIAL_REFS_ENV,

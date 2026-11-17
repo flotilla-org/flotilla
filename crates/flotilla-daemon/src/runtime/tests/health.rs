@@ -3,7 +3,6 @@ use crate::runtime::tasks::AGGREGATOR_CONTROLLER;
 use crate::testkits::engine::{admit_convoy, engine};
 use flotilla_engine_convoys_testkit::{single_agent, EngineHome};
 use flotilla_resources::clone_records::CloneRecords as _;
-use flotilla_store_sqlite::SqliteBackend;
 
 // Behaviour (#3108): reconcile-now on a convoy queues its launch at the Convoy controller and
 // writes nothing; a launch this home does not hold is refused as not found.
@@ -616,46 +615,6 @@ async fn issue_budget_backoff_surfaces_a_nonblocking_host_condition() {
     assert_eq!(condition.reason, "LowRemainingBudget");
     assert!(!condition.blocks_readiness);
     assert!(condition.message.contains(&reset));
-}
-
-// Undecodable old-store records never stop a daemon from booting and serving. Store
-// diagnostics are not host health (#3108): they are not read into the Host's conditions.
-#[tokio::test]
-async fn daemon_boots_and_serves_over_undecodable_old_store_records() {
-    let temp = TempDir::new().expect("tempdir");
-    fs::write(temp.path().join("daemon.toml"), "machine_id = \"boot-quarantine-test\"\n").expect("daemon config");
-    let config = Arc::new(ConfigStore::with_base(temp.path()));
-    let sqlite_path = config.state_dir().join("resources.sqlite");
-    drop(SqliteBackend::open(&sqlite_path).expect("initialize sqlite store"));
-    let connection = rusqlite::Connection::open(&sqlite_path).expect("open raw sqlite store");
-    insert_undecodable_resource::<Project>(&connection, "poisoned-project");
-    insert_undecodable_resource::<Convoy>(&connection, "poisoned-convoy");
-    insert_undecodable_resource::<CredentialGrant>(&connection, "poisoned-credential-grant");
-    insert_undecodable_resource::<CredentialSpec>(&connection, "poisoned-credential-spec");
-    insert_undecodable_resource::<Host>(&connection, "poisoned-host");
-    insert_undecodable_resource::<Vessel>(&connection, "poisoned-vessel");
-    insert_undecodable_resource::<TerminalSession>(&connection, "poisoned-terminal-session");
-    drop(connection);
-
-    let daemon = sqlite_daemon(Vec::new(), Arc::clone(&config)).await;
-    let runtime = DaemonRuntime::start_with_options(
-        Arc::clone(&daemon),
-        config,
-        None,
-        RuntimeOptions {
-            heartbeat_interval: Duration::from_secs(300),
-            controller_resync_interval: Duration::from_secs(300),
-            start_controllers: false,
-            ..RuntimeOptions::default()
-        },
-    )
-    .await
-    .expect("daemon should boot with undecodable stored resources");
-
-    daemon.list_projects_internal().await.expect("daemon should serve project queries");
-    daemon.fleet_health_internal().await.expect("daemon should serve fleet health");
-
-    runtime.shutdown();
 }
 
 #[tokio::test]

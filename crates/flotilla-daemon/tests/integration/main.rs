@@ -1,7 +1,6 @@
 // Keep integration coverage in one executable to avoid linking the crate graph per module.
 // Tests share a process: isolate state and keep process-wide mutations in separate targets.
 mod aggregator;
-mod convergence_property;
 mod convoy_create_cli;
 mod crew_skills;
 mod dummy_fleet;

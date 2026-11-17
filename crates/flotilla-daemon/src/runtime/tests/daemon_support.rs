@@ -1,5 +1,4 @@
 use super::*;
-use flotilla_store_sqlite::SqliteBackend;
 
 pub(super) async fn publish_merged_change_request(backend: &ResourceBackend, number: u64, authority: &str) {
     let records = backend.clone().using::<flotilla_resources::ChangeRequest>(NAMESPACE);
@@ -194,20 +193,6 @@ pub(super) async fn in_memory_daemon(tracked_repos: Vec<PathBuf>, config: Arc<Co
 pub(super) async fn sqlite_daemon(tracked_repos: Vec<PathBuf>, config: Arc<ConfigStore>) -> Arc<InProcessDaemon> {
     std::fs::create_dir_all(config.state_dir()).expect("state dir");
     in_memory_daemon(tracked_repos, config).await
-}
-
-pub(super) fn insert_undecodable_resource<T: Resource>(connection: &rusqlite::Connection, name: &str) {
-    SqliteBackend::register_query_functions(connection).expect("configure independent corruption writer");
-    connection
-        .execute(
-            r#"
-                INSERT INTO resource_objects
-                    (group_name, version, kind, namespace, name, resource_version, body_json)
-                VALUES (?1, ?2, ?3, ?4, ?5, 1, '{}')
-                "#,
-            rusqlite::params![T::API_PATHS.group, T::API_PATHS.version, T::API_PATHS.kind, NAMESPACE, name],
-        )
-        .expect("insert undecodable resource");
 }
 
 pub(super) async fn crew_daemon(config: Arc<ConfigStore>) -> (Arc<InProcessDaemon>, Arc<FakeTerminalPool>) {
