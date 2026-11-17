@@ -217,6 +217,39 @@ impl<T: Resource> DefinitionResolver<T> {
         Some(self.reads(&records.home(), copies, Some(name)))
     }
 
+    /// [`Self::engine_copies`] of those a listing holds: none that only a read by name finds.
+    pub(crate) async fn engine_listed_copies(&self, name: &str) -> Option<Result<Vec<ReadResourceObject<T>>, ResourceError>> {
+        let records = self.records()?;
+        let copies = match self.holds_engine_records() {
+            false => Vec::new(),
+            true => match port_reads::sources_named(&*records, name).await {
+                Ok(copies) => copies,
+                Err(error) => return Some(Err(ResourceError::other(error))),
+            },
+        };
+        Some(self.reads(&records.home(), copies, Some(name)))
+    }
+
+    /// Record `name` as a get reads it: the one the port chooses among the homes holding one, else
+    /// a built-in of the name; this home's first. Reads no other copy of the name.
+    pub(crate) async fn engine_get(&self, name: &str) -> Option<Result<Option<ReadResourceObject<T>>, ResourceError>> {
+        let records = self.records()?;
+        let chosen = match self.holds_engine_records() {
+            false => None,
+            true => match port_reads::get(&*records, name).await {
+                Ok(chosen) => chosen,
+                Err(error) => return Some(Err(ResourceError::other(error))),
+            },
+        };
+        Some(self.reads(&records.home(), chosen.into_iter().collect(), Some(name)).map(|mut reads| {
+            let local = reads.iter().position(|read| matches!(read.provenance, ResourceProvenance::Local));
+            match local {
+                Some(index) => Some(reads.swap_remove(index)),
+                None => reads.into_iter().next(),
+            }
+        }))
+    }
+
     /// `listed` as replica reads, each home's copy with its home as provenance and this home's as
     /// local, followed by the built-ins (those named `name`, when given).
     fn reads(&self, home: &str, listed: Vec<Record<T>>, name: Option<&str>) -> Result<Vec<ReadResourceObject<T>>, ResourceError> {

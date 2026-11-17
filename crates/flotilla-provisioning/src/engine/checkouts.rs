@@ -616,8 +616,9 @@ async fn holder_convoys(
 ) -> Result<std::collections::BTreeSet<String>, flotilla_resources::ResourceError> {
     let convoys = backend.including_replicas::<flotilla_resources::Convoy>(namespace);
     let mut held = std::collections::BTreeSet::new();
+    // A retired convoy, which no listing holds, has nothing to wake.
     for holder in holders {
-        for convoy in convoys.get_all(holder).await?.items {
+        for convoy in convoys.get_all_listed(holder).await?.items {
             if flotilla_resources::convoy::engine::checkout_holder(&convoy.object)
                 .is_some_and(|CheckoutHolder::Convoy(launch)| holders.contains(&launch))
             {

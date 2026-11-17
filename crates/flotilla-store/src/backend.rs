@@ -377,14 +377,11 @@ impl<T: Resource> ReplicaReadResolver<T> {
     }
 
     async fn get_local_first(&self, name: &str) -> Result<ReadResourceObject<T>, ResourceError> {
-        if let Some(reads) = self.engine_copies(name).await {
-            // This home's copy first, then the lexically first home's, as the port resolves.
-            let mut reads = reads?;
-            let local = reads.iter().position(|read| matches!(read.provenance, ResourceProvenance::Local));
-            return match local {
-                Some(index) => Ok(reads.swap_remove(index)),
-                None => reads.into_iter().next().ok_or_else(|| ResourceError::not_found(name)),
-            };
+        if T::REPLICATION_CLASS != crate::ReplicationClass::Definitions {
+            if let Some(read) = self.backend.definitions::<T>(&self.namespace).engine_get(name).await {
+                // This home's copy first, then the one the port resolves.
+                return read?.ok_or_else(|| ResourceError::not_found(name));
+            }
         }
         if T::REPLICATION_CLASS == crate::ReplicationClass::None {
             return self
@@ -414,6 +411,17 @@ impl<T: Resource> ReplicaReadResolver<T> {
             }
             Err(error) => Err(error),
         }
+    }
+
+    /// [`Self::get_all`] of the copies a listing holds: none that only a read by name finds, such
+    /// as a retired convoy. For a watch that wakes what is listed.
+    pub async fn get_all_listed(&self, name: &str) -> Result<ReadResourceList<T>, ResourceError> {
+        if T::REPLICATION_CLASS != crate::ReplicationClass::Definitions {
+            if let Some(reads) = self.backend.definitions::<T>(&self.namespace).engine_listed_copies(name).await {
+                return reads.map(|items| ReadResourceList { items });
+            }
+        }
+        self.get_all(name).await
     }
 
     /// Read every visible provenance for one name without listing the namespace.
@@ -811,16 +819,19 @@ impl<T: Resource> TypedResolver<T> {
     }
 
     pub async fn get(&self, name: &str) -> Result<ResourceObject<T>, ResourceError> {
-        if let Some(copies) = self.backend.definitions::<T>(&self.namespace).engine_copies(name).await {
-            // This home's own record: no built-in and no other home's.
-            return copies?
-                .into_iter()
-                .find(|read| {
-                    matches!(read.provenance, ResourceProvenance::Local)
-                        && !flotilla_resources::builtins::is_builtin(T::API_PATHS.kind, name)
-                })
-                .map(|read| read.object)
-                .ok_or_else(|| ResourceError::not_found(name));
+        let definitions = self.backend.definitions::<T>(&self.namespace);
+        let own = |read: &ReadResourceObject<T>| {
+            matches!(read.provenance, ResourceProvenance::Local) && !flotilla_resources::builtins::is_builtin(T::API_PATHS.kind, name)
+        };
+        // This home's own record: no built-in and no other home's. Most ports choose it where this
+        // home holds one; only where the port chose another, or none, are every home's copies read.
+        if let Some(chosen) = definitions.engine_get(name).await {
+            if let Some(read) = chosen?.filter(own) {
+                return Ok(read.object);
+            }
+        }
+        if let Some(copies) = definitions.engine_copies(name).await {
+            return copies?.into_iter().find(own).map(|read| read.object).ok_or_else(|| ResourceError::not_found(name));
         }
         dispatch_backend!(self, get_typed, name)
     }
@@ -919,6 +930,13 @@ impl<T: Resource> TypedResolver<T> {
         name: &str,
     ) -> Result<Option<flotilla_resources::engine_records::Record<T>>, ResourceError> {
         let home = records.home();
+        // Most ports choose this home's record where it holds one; only where the port chose
+        // another home's, or none, are every home's copies read.
+        if let Some(chosen) = crate::port_reads::get(records, name).await.map_err(ResourceError::other)? {
+            if chosen.home == home {
+                return Ok(Some(chosen));
+            }
+        }
         let copies = crate::port_reads::copies(records, name).await.map_err(ResourceError::other)?;
         Ok(copies.into_iter().find(|record| record.home == home))
     }

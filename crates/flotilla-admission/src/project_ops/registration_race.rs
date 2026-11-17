@@ -66,6 +66,24 @@ impl RacingRepositories {
         self.racing.store(false, Ordering::SeqCst);
         pass
     }
+
+    /// Persistent contention: a storage writer moves the record on before each read of it, so
+    /// every version registration checks is stale.
+    async fn race(&self, name: &str) -> Result<(), String> {
+        if matches!(self.contention, Contention::Persistent) && !self.racing.load(Ordering::SeqCst) {
+            if self.armed.swap(false, Ordering::SeqCst) {
+                self.controller_pass(name).await?;
+            } else if let Some(held) = self.inner.copies(name).await?.into_iter().find(|record| record.home == self.inner.home()) {
+                // Only a spec edit moves an engine record's version: the writer counts its
+                // writes in a verification command registration leaves alone.
+                let mut commands = held.spec.verification_commands().clone();
+                let writes = commands.get("storage-writes").and_then(|count| count.parse::<u64>().ok()).unwrap_or(0);
+                commands.insert("storage-writes".to_owned(), (writes + 1).to_string());
+                self.inner.apply(name, &held.labels, &held.annotations, &held.spec.clone().with_verification_commands(commands)).await?;
+            }
+        }
+        Ok(())
+    }
 }
 
 #[async_trait]
@@ -80,6 +98,7 @@ impl KindRecords<Repository> for RacingRepositories {
         self.inner.home()
     }
     async fn get(&self, name: &str) -> Result<Option<Record<Repository>>, String> {
+        self.race(name).await?;
         self.inner.get(name).await
     }
     async fn list(&self) -> Result<Vec<Record<Repository>>, String> {
@@ -98,20 +117,7 @@ impl KindRecords<Repository> for RacingRepositories {
         self.inner.changed_since(position).await
     }
     async fn copies(&self, name: &str) -> Result<Vec<Record<Repository>>, String> {
-        // Persistent contention: a storage writer moves the record on before each read, so every
-        // version registration checks is stale.
-        if matches!(self.contention, Contention::Persistent) && !self.racing.load(Ordering::SeqCst) {
-            if self.armed.swap(false, Ordering::SeqCst) {
-                self.controller_pass(name).await?;
-            } else if let Some(held) = self.inner.copies(name).await?.into_iter().find(|record| record.home == self.inner.home()) {
-                // Only a spec edit moves an engine record's version: the writer counts its
-                // writes in a verification command registration leaves alone.
-                let mut commands = held.spec.verification_commands().clone();
-                let writes = commands.get("storage-writes").and_then(|count| count.parse::<u64>().ok()).unwrap_or(0);
-                commands.insert("storage-writes".to_owned(), (writes + 1).to_string());
-                self.inner.apply(name, &held.labels, &held.annotations, &held.spec.clone().with_verification_commands(commands)).await?;
-            }
-        }
+        self.race(name).await?;
         self.inner.copies(name).await
     }
     async fn apply(

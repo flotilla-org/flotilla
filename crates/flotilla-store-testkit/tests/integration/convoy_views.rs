@@ -772,6 +772,41 @@ async fn a_read_by_name_gives_an_unreadable_copy_beside_the_others() {
     );
 }
 
+// Behaviour (#3108): a read by name shows every home's launch of the name, retired or held: a
+// launch the views hold at one home, and a retired one of the same name at another, which they
+// do not, read side by side.
+#[tokio::test]
+async fn a_read_by_name_gives_a_held_and_a_retired_launch_of_the_name() {
+    let mut retired = launch("shared#1", "home-b");
+    retired.ended = Some((ConvoyEnd::Abandoned { reason: "stopped".into() }, at(200)));
+    retired.retired = true;
+    let reads = Arc::new(Reads {
+        joins: HeldJoins::default(),
+        convoys: Convoys::new(vec![launch("shared#1", HERE), retired]),
+        terminals: Terminals { records: Vec::new(), observations: TerminalObservations::default() },
+        vessels: Vessels { records: Vec::new() },
+    });
+    let backend = ResourceBackend::new(InMemoryBackend::default());
+    backend.serve_engine_in("flotilla");
+    Arc::new(ConvoyViews::new("flotilla", reads)).install(&backend);
+    let convoys = backend.including_replicas::<Convoy>("flotilla");
+    assert_eq!(convoys.list().await.expect("list").items.len(), 1, "the listing holds the open launch alone");
+
+    let copies = convoys.get_all("shared#1").await.expect("every home's launch").items;
+    let read: BTreeMap<_, _> = copies
+        .iter()
+        .map(|copy| {
+            let local = matches!(copy.provenance, flotilla_resources::ResourceProvenance::Local);
+            (local, copy.object.status.as_ref().map(|status| status.phase))
+        })
+        .collect();
+    assert_eq!(
+        read,
+        BTreeMap::from([(true, Some(ConvoyPhase::Active)), (false, Some(ConvoyPhase::Abandoned))]),
+        "this home's held launch, and home-b's retired one with its ending"
+    );
+}
+
 /// `name` held at `home`, ensured from `ensure`, and ended when `ended`.
 fn ensured(name: &str, home: &str, ensure: &str, ended: bool) -> ConvoyRecord {
     let mut record = launch(name, home);

@@ -233,7 +233,7 @@ impl ConvoyViews {
         let key = (home.clone(), name.to_owned());
         match self.with_held(move |held| held.views.get(&key).cloned()).await? {
             Some(held) => Ok(Some(held)),
-            None => Ok(self.stored(name, Some(&home)).await?.pop()),
+            None => Ok(self.stored(name, Some(&home), BTreeSet::new()).await?.pop()),
         }
     }
 
@@ -545,15 +545,18 @@ impl ConvoyViews {
 
     /// Launch `name` at `home`, or at every home when `None`, composed from the store for a read
     /// by name of a launch the views do not hold: a retired one, which reads with how it ended.
-    /// Each is joined with its works' Vessel launches by their index, and their sessions; one that
-    /// cannot be read is its unreadable view, with why. Nothing of it is kept.
-    async fn stored(&self, name: &str, home: Option<&str>) -> Result<Vec<HeldView>, ResourceError> {
+    /// The homes in `held`, whose launch of the name the views hold, are left out. Each is joined
+    /// with its works' Vessel launches by their index, and their sessions; one that cannot be read
+    /// is its unreadable view, with why. Nothing of it is kept.
+    async fn stored(&self, name: &str, home: Option<&str>, held: BTreeSet<String>) -> Result<Vec<HeldView>, ResourceError> {
         let (name, home, namespace) = (name.to_owned(), home.map(str::to_owned), self.namespace.clone());
         let views = self
             .blocking(move |reads| {
                 let convoys = reads.convoys()?;
                 let here = convoys.home().to_owned();
-                let ConvoyListing { records, unreadable } = convoys.named(&name, home.as_deref())?;
+                let ConvoyListing { mut records, mut unreadable } = convoys.named(&name, home.as_deref())?;
+                records.retain(|record| !held.contains(&record.home));
+                unreadable.retain(|launch| !held.contains(&launch.home));
                 let mut views: Vec<_> = unreadable.iter().map(|launch| unreadable_view(&namespace, &here, launch)).collect();
                 if records.is_empty() {
                     return Ok(views);
@@ -719,25 +722,27 @@ impl KindRecords<Convoy> for ConvoyViews {
         self.engine_sources().await
     }
 
-    /// Every home's launch of the name as held; where the views hold none of it, every home's
+    /// Every home's launch of the name: each the views hold as held, and every other home's
     /// composed from the store, a retired one with how it ended.
     async fn copies(&self, name: &str) -> Result<Vec<Record<Convoy>>, String> {
-        let copies = self.engine_copies(name).await?;
-        if !copies.is_empty() {
-            return Ok(copies);
-        }
+        let mut copies = self.engine_copies(name).await?;
+        let held: BTreeSet<String> = copies.iter().map(|copy| copy.home.clone()).collect();
+        let stored = self.stored(name, None, held).await.map_err(|error| error.to_string())?;
         let here = self.home();
-        let stored = self.stored(name, None).await.map_err(|error| error.to_string())?;
-        Ok(stored
-            .into_iter()
-            .map(|view| {
-                let home = match &view.view.provenance {
-                    ResourceProvenance::Local => here.clone(),
-                    ResourceProvenance::Replica { origin_root, .. } => origin_root.as_str().to_owned(),
-                };
-                view_record(view, home)
-            })
-            .collect())
+        copies.extend(stored.into_iter().map(|view| {
+            let home = match &view.view.provenance {
+                ResourceProvenance::Local => here.clone(),
+                ResourceProvenance::Replica { origin_root, .. } => origin_root.as_str().to_owned(),
+            };
+            view_record(view, home)
+        }));
+        Ok(copies)
+    }
+
+    /// The launches of the name the views hold: what a reader of the listing holds of it, never
+    /// a retired one composed from the store.
+    async fn sources_named(&self, name: &str) -> Result<Vec<Record<Convoy>>, String> {
+        self.engine_copies(name).await
     }
 
     /// The views `cover` selects, from the views' index, this home's alone when `local`: only
