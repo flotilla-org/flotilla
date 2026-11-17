@@ -150,10 +150,10 @@ impl HostSpec {
 pub enum HostConnection {
     #[default]
     Daemon,
-    SshHost {
-        owning_daemon: String,
-        destination: String,
-    },
+    // ADR 0047: the frozen fleet (release/73aa22b9b) still stores the pre-#4001 name, which
+    // #4339 retired too early; the cut-over import (#3108) reads it. Remove one roll after it.
+    #[serde(alias = "agentless_ssh")]
+    SshHost { owning_daemon: String, destination: String },
 }
 
 impl HostConnection {

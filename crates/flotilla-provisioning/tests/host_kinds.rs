@@ -400,6 +400,26 @@ fn a_previous_generations_ssh_host_and_missing_baseline_import() {
     assert_eq!(observation.agent_adapter_baseline, BTreeSet::from(["claude-code".to_owned()]));
 }
 
+// Behaviour (ADR 0047, #3108): the frozen fleet still stores an SSH host under its pre-#4001
+// names, the `agentless_ssh` connection and the `agentless` key; the cut-over import reads it as
+// an SSH host, its marker dropped as the connection carries it.
+#[test]
+fn the_frozen_fleets_pre_4001_ssh_host_imports() {
+    let connection: HostConnection =
+        serde_json::from_value(json!({"kind": "agentless_ssh", "owning_daemon": "udder", "destination": "crew@b1"})).expect("decodes");
+    let spec = HostSpec { connection, ..ssh("udder") };
+    let status = HostStatus {
+        capabilities: serde_json::from_value(json!({
+            "agentless": true, "transport": "ssh", "placement": "host_direct_only", "owning_daemon": "udder"
+        }))
+        .expect("capabilities"),
+        ..HostStatus::default()
+    };
+    let (host, _, dropped) = records(import_host(&object("b1", spec, Some(status)), "udder").expect("imports"));
+    assert!(matches!(host.connection, host_kinds::Connection::SshHost { ref owning_daemon, .. } if owning_daemon == "udder"));
+    assert!(dropped.contains(&("HostObservation", "the SSH capability markers, which the connection carries")), "{dropped:?}");
+}
+
 // Behaviour (#3824 layer 4c): nothing is dropped silently. An unknown capability key, a capability
 // that does not decode, a provider instance or condition type held twice, an SSH owner that differs
 // from the connection's, and one name held in two namespaces at a home are each refused, named.
