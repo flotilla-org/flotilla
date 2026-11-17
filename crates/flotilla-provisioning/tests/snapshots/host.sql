@@ -118,6 +118,7 @@ CREATE TABLE "host_observation" (
   "id" INTEGER PRIMARY KEY REFERENCES "resource_identity" ("id"),
   "version" INTEGER NOT NULL,
   "daemon_generation" TEXT,
+  "protocol_fingerprint" TEXT,
   "architecture" TEXT,
   "below_free_space_floor" INTEGER CHECK ("below_free_space_floor" IN (0, 1)),
   "codex_central_login" INTEGER NOT NULL CHECK ("codex_central_login" IN (0, 1))
@@ -237,6 +238,7 @@ CREATE VIEW "host_observation_view" AS SELECT
   "host_observation"."id",
   "host_observation"."version",
   "host_observation"."daemon_generation",
+  "host_observation"."protocol_fingerprint",
   "host_observation"."architecture",
   "host_observation"."below_free_space_floor",
   "host_observation"."codex_central_login"

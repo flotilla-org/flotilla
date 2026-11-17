@@ -221,6 +221,7 @@ pub fn status(
         heartbeat_at: heard,
         ready: true,
         daemon_generation: observation.daemon_generation.clone(),
+        protocol_fingerprint: observation.protocol_fingerprint.clone(),
         below_free_space_floor: observation.below_free_space_floor,
         conditions,
         ..HostStatus::default()

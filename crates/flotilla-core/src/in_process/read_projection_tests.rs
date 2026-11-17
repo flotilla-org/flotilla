@@ -493,9 +493,10 @@ mod tests {
     }
 
     #[tokio::test]
-    #[ignore = "the engine's host record drops protocol_fingerprint; restoring it waits on a schema look-over"]
     async fn fleet_health_projection_includes_local_fulfilment() {
         let fixture = ProjectionFixture::new();
+        // A host is homed at its own daemon: the local host is the one this home's node names.
+        let host_id = fixture.node_id.to_string();
         fixture
             .backend
             .clone()
@@ -503,32 +504,38 @@ mod tests {
             .create(
                 &InputMeta::builder().name("local-kind".to_string()).build(),
                 &FulfilmentKindSpec::builder()
-                    .host_ref("local-id".to_string())
+                    .host_ref(host_id.clone())
                     .pool("cleat".to_string())
                     .realisation(FulfilmentRealisation::HostDirect)
                     .build(),
             )
             .await
             .expect("kind");
-        fixture
-            .home
-            .put_host_at_its_home(
-                "local-id",
+        // The local host is written at this home, as its own heartbeat writes it.
+        let hosts = fixture.backend.clone().using::<flotilla_resources::Host>("flotilla");
+        let host = hosts
+            .create(
+                &InputMeta::builder().name(host_id.clone()).build(),
                 &HostSpec { display_name: "local".to_string(), connection: Default::default(), ..HostSpec::default() },
-                Some(&ResourceHostStatus {
+            )
+            .await
+            .expect("host");
+        hosts
+            .update_status(
+                &host_id,
+                &host.metadata.resource_version,
+                &ResourceHostStatus {
                     heartbeat_at: Some(Utc::now()),
                     ready: true,
                     protocol_fingerprint: Some("local-wire".to_string()),
                     ..Default::default()
-                }),
+                },
             )
-            .await;
-        let host_list = fixture.registry.list_hosts(&HashMap::new()).await;
-        let response = fixture
-            .projections()
-            .fleet_health("flotilla", host_list, Vec::new(), Some("local-id".to_string()), Utc::now())
             .await
-            .expect("fleet health");
+            .expect("host status");
+        let host_list = fixture.registry.list_hosts(&HashMap::new()).await;
+        let response =
+            fixture.projections().fleet_health("flotilla", host_list, Vec::new(), Some(host_id), Utc::now()).await.expect("fleet health");
         let local = response.hosts.iter().find(|host| host.host == HostName::new("local")).expect("local host");
         // Local fleet health uses the fingerprint from its own persisted heartbeat.
         assert_eq!(local.protocol_fingerprint.as_deref(), Some("local-wire"));
@@ -742,7 +749,6 @@ mod tests {
     }
 
     #[tokio::test]
-    #[ignore = "the engine's host record drops protocol_fingerprint; restoring it waits on a schema look-over"]
     async fn fleet_views_trust_only_host_self_reports_and_merge_configured_hosts() {
         let fixture = ProjectionFixture::new();
         let now = Utc::now();

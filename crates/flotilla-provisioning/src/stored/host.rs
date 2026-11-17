@@ -269,6 +269,8 @@ impl Facts {
 #[store(kind = "HostObservation", code = "ob")]
 pub struct HostObservation {
     pub daemon_generation: Option<String>,
+    /// The fingerprint of the protocol the daemon speaks; `flotilla fleet spread` groups by it.
+    pub protocol_fingerprint: Option<String>,
     /// The image architecture (`amd64`, `arm64`); none for an SSH host.
     pub architecture: Option<String>,
     /// Free disk is below admission's floor; none when either figure is unknown, which placement

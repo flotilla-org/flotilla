@@ -7,11 +7,11 @@
 //! |---|---|
 //! | Deleted | dropped |
 //! | `spec` | a Host record; `expected_concurrent_rust_crews` and an SSH host's destination dropped, as nothing reads them from here, and counted when set |
-//! | `status` | a HostObservation record: generation, architecture, the free-space floor as a flag, the conditions that can block readiness or forge observation, providers (class, readiness and capabilities), adapters and their baseline, held credentials and their expiry, image digests, the Codex central login |
+//! | `status` | a HostObservation record: generation, protocol fingerprint, architecture, the free-space floor as a flag, the conditions that can block readiness or forge observation, providers (class, readiness and capabilities), adapters and their baseline, held credentials and their expiry, image digests, the Codex central login |
 //! | `status.conditions` | each condition's observation time, and diagnostic conditions (blocking neither readiness nor forge observation), dropped: a judgement, and metrics |
 //! | `status.fulfilment_facts` | facts by FulfilmentKind name: a missing crew pool (no free slots on a host without a vessel cap), GUI login, harness and toolchain versions; each fact's observation time, any other free slot count, the image and its presence, and model facts dropped, as judgements or read by nothing |
 //! | Heartbeat time, readiness, `sleeping_until`, model probes | dropped: readiness is a judgement, and nothing sets the others |
-//! | The host summary (but its architecture), protocol fingerprint, daemon version and start time, sleep inhibition state, provider implementation names | dropped: display only or read by nothing; the sleep condition carries what readiness needs |
+//! | The host summary (but its architecture), daemon version and start time, sleep inhibition state, provider implementation names | dropped: display only or read by nothing; the sleep condition carries what readiness needs |
 //! | Free disk and the free-space floor | only whether free disk is below the floor |
 //! | Memory, store and blob-sync figures, `io_pressure`, `store_read_retries`, `forge_budgets` | dropped: metrics |
 //! | `terminal_pools`, `docker` and `os` capabilities | dropped: no decision reads them |
@@ -183,9 +183,6 @@ pub(crate) fn observation(
     if description.is_some() {
         uncarried("the host summary but its architecture, display only");
     }
-    if status.protocol_fingerprint.is_some() {
-        uncarried("the protocol fingerprint, display only");
-    }
     if status.daemon_version.is_some() || status.daemon_started_at.is_some() {
         uncarried("the daemon's version and start time, display only");
     }
@@ -224,6 +221,7 @@ pub(crate) fn observation(
     }
     Ok(HostObservation {
         daemon_generation: status.daemon_generation.clone(),
+        protocol_fingerprint: status.protocol_fingerprint.clone(),
         architecture: description
             .and_then(|summary| summary.system.arch.as_deref())
             .map(|arch| canonical_image_architecture(arch).to_owned()),

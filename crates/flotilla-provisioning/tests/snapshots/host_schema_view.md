@@ -5,7 +5,7 @@ Kind tables only; the shared tables are in `host.sql`.
 | Table | Role | Columns | From enum expansion | Child tables | Indexes |
 |---|---|--:|---|---|---|
 | `host` | root | 12 | 7: `connection` 2, `image_builds` 5 | – | – |
-| `host_observation` | root | 6 | – | `host_observation_conditions` (child), `host_observation_providers` (child), `host_observation_agent_adapters` (child), `host_observation_agent_adapter_baseline` (child), `host_observation_held_credentials` (child), `host_observation_credential_expiry` (child), `host_observation_image_digests` (child), `host_observation_facts` (child) | – |
+| `host_observation` | root | 7 | – | `host_observation_conditions` (child), `host_observation_providers` (child), `host_observation_agent_adapters` (child), `host_observation_agent_adapter_baseline` (child), `host_observation_held_credentials` (child), `host_observation_credential_expiry` (child), `host_observation_image_digests` (child), `host_observation_facts` (child) | – |
 | `host_observation_conditions` | child | 7 | – | – | – |
 | `host_observation_providers` | child | 8 | 2: `readiness` 2 | – | – |
 | `host_observation_agent_adapters` | child | 2 | – | – | – |
