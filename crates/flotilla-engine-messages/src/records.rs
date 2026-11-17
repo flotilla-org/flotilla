@@ -85,6 +85,10 @@ impl KindRecords<OldMessage> for MessageRecords {
         Some(flotilla_resources::engine_records::CommitMark::new(set, setter))
     }
 
+    fn writes(&self) -> bool {
+        false
+    }
+
     fn home(&self) -> String {
         self.primitives.home().to_owned()
     }

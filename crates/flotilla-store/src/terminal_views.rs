@@ -617,6 +617,10 @@ impl KindRecords<TerminalSession> for TerminalViews {
         Some(self.reads.terminals().map_or(0, |terminals| terminals.observations().changed()))
     }
 
+    fn writes(&self) -> bool {
+        false
+    }
+
     fn home(&self) -> String {
         self.terminals().map(|terminals| terminals.home().to_owned()).unwrap_or_default()
     }

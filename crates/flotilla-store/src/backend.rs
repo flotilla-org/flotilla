@@ -950,6 +950,9 @@ impl<T: Resource> TypedResolver<T> {
     pub async fn update(&self, meta: &InputMeta, resource_version: &str, spec: &T::Spec) -> Result<ResourceObject<T>, ResourceError> {
         self.refuse_engine_write_elsewhere()?;
         if let Some(records) = self.engine_owned() {
+            if !records.writes() {
+                return self.engine_apply(&*records, meta, spec).await;
+            }
             self.engine_current(&*records, &meta.name, resource_version).await?;
             let current = self.get(&meta.name).await?;
             T::validate_spec_update(&current.spec, spec)?;
@@ -987,7 +990,9 @@ impl<T: Resource> TypedResolver<T> {
         };
         // A definition kind with a status (Project, #3824 layer 3b) writes it through its port too.
         if let Some(records) = self.backend.engine_records::<T>() {
-            self.engine_current(&*records, name, resource_version).await?;
+            if records.writes() {
+                self.engine_current(&*records, name, resource_version).await?;
+            }
             let record = records.set_status(name, status).await.map_err(ResourceError::other)?;
             return Ok(crate::definition::record_object(&self.namespace, record));
         }
@@ -1110,6 +1115,9 @@ mod tests {
         fn reads(&self) -> bool {
             self.reads
         }
+        fn writes(&self) -> bool {
+            false
+        }
         fn home(&self) -> String {
             "kiwi".into()
         }
@@ -1193,6 +1201,23 @@ mod tests {
         backend.install_engine_kind::<Artifact>(Arc::new(Port { records: Vec::new(), reads: true, failing: true }));
         let error = backend.stored_namespace_inventory().await.expect_err("a failing kind fails discovery").to_string();
         assert!(error.contains("Artifact") && error.contains("could not be read"), "the failing kind is named: {error}");
+    }
+
+    // Behaviour: a write of a kind its port never writes is refused for that reason, though the
+    // record moved since the writer read it: a moved record is no conflict where nothing is
+    // written, and a conflict would send its writer to read and write again.
+    #[tokio::test]
+    async fn a_write_the_port_refuses_is_refused_whatever_version_it_names() {
+        let backend = crate::test_store::memory_backend();
+        backend.serve_engine_in("flotilla");
+        backend.install_engine_kind::<Vessel>(Port::serving(vec![vessel()]));
+        let vessels = backend.using::<Vessel>("flotilla");
+        let meta = crate::InputMeta::builder().name("v#1".into()).build();
+        let stale = "0";
+        let refused = vessels.update(&meta, stale, &vessel().spec).await.expect_err("a spec write is refused");
+        assert!(refused.to_string().contains("read only"), "refused by its port, not as a conflict: {refused}");
+        let refused = vessels.update_status("v#1", stale, &Default::default()).await.expect_err("a status write is refused");
+        assert!(refused.to_string().contains("read only"), "refused by its port, not as a conflict: {refused}");
     }
 
     thread_local! {

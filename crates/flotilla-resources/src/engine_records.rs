@@ -297,6 +297,12 @@ pub trait KindRecords<R: crate::Resource>: Send + Sync + std::fmt::Debug {
     fn reads(&self) -> bool {
         true
     }
+    /// Whether the resource commands write the kind's records here. A port that refuses every
+    /// spec and status write says no, so a write is refused for that reason, which no version
+    /// check is made before: a record that moved since its reader read it is no conflict there.
+    fn writes(&self) -> bool {
+        true
+    }
     /// This home: the writer of the records it holds.
     fn home(&self) -> String;
     /// The record `name`, as several homes' resolve.

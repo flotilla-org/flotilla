@@ -515,6 +515,10 @@ impl<R: LifecycleKind> KindRecords<R> for LifecycleViews {
         R::SET.is_some()
     }
 
+    fn writes(&self) -> bool {
+        false
+    }
+
     fn home(&self) -> String {
         self.here()
     }

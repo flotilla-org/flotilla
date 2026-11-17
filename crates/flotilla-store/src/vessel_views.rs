@@ -618,6 +618,10 @@ impl KindRecords<Vessel> for VesselViews {
         Some(self.reads.convoys().map_or(0, |convoys| convoys.memory().changed()))
     }
 
+    fn writes(&self) -> bool {
+        false
+    }
+
     fn home(&self) -> String {
         self.vessels().map(|vessels| vessels.home().to_owned()).unwrap_or_default()
     }

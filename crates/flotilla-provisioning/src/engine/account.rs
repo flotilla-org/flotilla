@@ -892,6 +892,10 @@ impl KindRecords<BindingResource> for EngineAccounts {
         Some(super::commit_mark(&self.service, KindRecords::<BindingResource>::codes(self)))
     }
 
+    fn writes(&self) -> bool {
+        false
+    }
+
     fn home(&self) -> String {
         self.home.clone()
     }
