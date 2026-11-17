@@ -112,7 +112,7 @@ use flotilla_state_machines::{
     placement::{self, Dimension, Evidence, Host, Lease, Ledger, LedgerError, Units, VesselId},
     AttemptPolicy, Cause, CauseCategory, Edge, Ended, Handle, Home, Kind, Machine, Outcome, Ref, Resource, Transport, Version, WriteError,
 };
-use itf::{address, boolean, int, list, map_of, number, pairs, payload, set, set_of, slot, tag, text, variant};
+use itf::{address, at, boolean, int, list, map_of, number, pairs, payload, set, set_of, slot, tag, text, variant};
 use serde_json::{json, Value};
 
 fn small(v: &Value) -> u32 {
@@ -597,12 +597,21 @@ fn refuse_without_evidence(
 // target, a submission's reference and a supervisor are addresses; a vessel
 // class is its number as text; a duty's terms are its note.
 
-fn convoy_work(state: &Value) -> &Value {
-    &state["work"]
+/// The spec keeps each part of a convoy in its own variable, keyed by convoy.
+const CONVOY_PARTS: [&str; 9] = ["phase", "project", "priority", "duties", "retired", "quota", "promises", "seats", "subjects"];
+
+/// The convoys the model has admitted.
+fn convoy_ids(state: &Value) -> BTreeSet<i64> {
+    pairs(store(state, "C::phase")).iter().map(|pair| number(&pair[0])).collect()
 }
 
-fn convoy_open(state: &Value) -> bool {
-    tag(&state["phase"]) == "Open"
+/// Convoy `id`'s parts as one record, field by field from their variables.
+fn convoy_parts(state: &Value, id: i64) -> Value {
+    Value::Object(CONVOY_PARTS.iter().map(|part| (part.to_string(), at(store(state, &format!("C::{part}")), id).clone())).collect())
+}
+
+fn convoy_open(parts: &Value) -> bool {
+    tag(&parts["phase"]) == "Open"
 }
 
 fn class(n: u32) -> VesselClass {
@@ -653,14 +662,11 @@ fn authority_of(v: &Value) -> convoy::Authority {
     }
 }
 
-/// The request the model admitted, from the state it admitted: its fixed
-/// fields, its promises as admitted, its seats, and the quota in force at
-/// admission.
-/// The request the model admitted as convoy `id`: a launch of the id's text.
-fn convoy_request(id: i64, state: &Value) -> ConvoyRequest {
-    let work = convoy_work(state);
-    let spec = &work["spec"];
-    let promises = pairs(&work["promises"])
+/// The request the model admitted as convoy `id`, a launch of the id's text,
+/// from the parts it admitted: its fixed fields, its promises as admitted,
+/// its seats, and the quota in force at admission.
+fn convoy_request(id: i64, parts: &Value) -> ConvoyRequest {
+    let promises = pairs(&parts["promises"])
         .iter()
         .map(|pair| {
             let record = &pair[1];
@@ -674,7 +680,7 @@ fn convoy_request(id: i64, state: &Value) -> ConvoyRequest {
             (PromiseId(small(&pair[0])), promise)
         })
         .collect();
-    let duties = pairs(&spec["duties"])
+    let duties = pairs(&parts["duties"])
         .iter()
         .map(|pair| {
             let duty = &pair[1];
@@ -686,12 +692,12 @@ fn convoy_request(id: i64, state: &Value) -> ConvoyRequest {
             (convoy::DutyId(small(&pair[0])), convoy::Duty { owner: seat(&duty["owner"]), scope, terms })
         })
         .collect();
-    let mut seats: Vec<convoy::Seat> = text_keyed(&work["seats"])
+    let mut seats: Vec<convoy::Seat> = text_keyed(&parts["seats"])
         .into_iter()
         .map(|(name, record)| convoy::Seat {
             failed: None,
             retired: false,
-            replacements: small(&record["replacements"]),
+            replacements: 0,
             role: name.into(),
             seat: String::new(),
             parent: (tag(&record["parent"]) == "Under").then(|| seat(payload(&record["parent"]))),
@@ -704,12 +710,12 @@ fn convoy_request(id: i64, state: &Value) -> ConvoyRequest {
         workflow_ref: "w".into(),
         admission: flotilla_schema::Frozen::new(flotilla_state_machines::machines::convoy::AdmissionBytes::new(Vec::new()))
             .expect("freeze"),
-        project: address(&spec["project"]),
+        project: address(&parts["project"]),
         promises,
         duties,
         seats,
-        quota: quota(&work["quota"]),
-        priority: Priority(small(&spec["priority"])),
+        quota: quota(&parts["quota"]),
+        priority: Priority(small(&parts["priority"])),
         kinds: flotilla_schema::Frozen::new(convoy::PromiseKinds::default()).expect("freeze"),
     }
 }
@@ -723,10 +729,9 @@ fn progress_name(progress: convoy::Progress) -> &'static str {
     }
 }
 
-/// The spec's `{ work, phase }`, where `Work = { spec, promises, seats,
-/// retired, quota, retiredSeats, subjects }`: the spec's fixed fields and
-/// records, the subjects linked now, and the state's retired duties and quota
-/// in force.
+/// The spec's parts of a convoy ([`CONVOY_PARTS`]), field by field: its phase,
+/// the spec's fixed fields and records, every link row, and the state's
+/// retired duties and quota in force.
 fn convoy_value(resource: &Resource<Convoy>) -> Value {
     let spec = resource.spec();
     let state = resource.state();
@@ -759,6 +764,7 @@ fn convoy_value(resource: &Resource<Convoy>) -> Value {
             "supervisedBy": record.supervised_by.name(),
             "replacements": int(record.replacements.into()),
             "failed": record.failed.as_deref().unwrap_or_default(),
+            "retired": record.retired,
         });
         (seat_text(&record.name()), seat)
     }));
@@ -772,15 +778,20 @@ fn convoy_value(resource: &Resource<Convoy>) -> Value {
             json!({ "owner": seat_text(&duty.owner), "scope": scope, "terms": duty.terms.note.as_deref().unwrap_or_default() }),
         )
     });
-    let work = json!({
-        "spec": { "project": spec.project.name(), "duties": map_of(duties), "priority": int(spec.priority.0.into()) },
-        "promises": map_of(promises),
-        "seats": seats,
-        "retiredSeats": set_of(spec.seats.iter().filter(|r| r.record.retired).map(|r| json!(r.record.role))),
-        "subjects": set_of(spec.linked().into_iter().map(|subject| json!(subject.name()))),
-        "retired": set_of(state.retired().iter().map(|d| int(d.0.into()))),
-        "quota": quota_value(state.quota()),
-    });
+    let subjects: Vec<Value> = spec
+        .subjects
+        .iter()
+        .map(|row| {
+            let link = &row.record;
+            let source = match link.source {
+                convoy::LinkSource::Claim => "Claim",
+                convoy::LinkSource::Operator => "ByOperator",
+                convoy::LinkSource::Relay => "Relay",
+                convoy::LinkSource::Branch => "Branch",
+            };
+            json!({ "subject": link.subject.name(), "source": constant(source), "unlinked": link.unlinked })
+        })
+        .collect();
     let phase = match state {
         ConvoyState::Open { .. } => constant("Open"),
         ConvoyState::Delivered { disposition, .. } => variant("Delivered", json!(disposition)),
@@ -793,11 +804,33 @@ fn convoy_value(resource: &Resource<Convoy>) -> Value {
         }
         ConvoyState::Retired => constant("Retired"),
     };
-    json!({ "work": work, "phase": phase })
+    json!({
+        "phase": phase,
+        "project": spec.project.name(),
+        "priority": int(spec.priority.0.into()),
+        "duties": map_of(duties),
+        "retired": set_of(state.retired().iter().map(|d| int(d.0.into()))),
+        "quota": quota_value(state.quota()),
+        "promises": map_of(promises),
+        "seats": seats,
+        "subjects": subjects,
+    })
 }
 
+/// Every convoy at `home` is one the model admitted, and each of its parts
+/// agrees with the model's.
 fn check_convoys(home: &Home<Convoy>, state: &Value, step: &Step) {
-    check_store(home, store(state, "::convoys"), |_, convoy| convoy_value(convoy), step, "convoy");
+    let ids = convoy_ids(state);
+    let stray: Vec<&str> = home.resources().map(Resource::name).filter(|name| !ids.contains(&id_of(name))).collect();
+    assert!(stray.is_empty(), "{step}: convoys {stray:?} exist in Rust only");
+    for id in ids {
+        let name = convoy_name(home, id);
+        let rust = convoy_value(home.get(&name).unwrap_or_else(|| panic!("{step}: the model admitted convoy {id}; Rust holds none")));
+        let model = convoy_parts(state, id);
+        for part in CONVOY_PARTS {
+            same(&rust[part], &model[part], step, &format!("convoy {id} {part}"));
+        }
+    }
 }
 
 /// The convoy world: the authorised edges read `authorised`, and the one
@@ -829,8 +862,8 @@ fn abandon(reason: &str) -> convoy::Abandon {
 }
 
 fn admit(home: &mut Home<Convoy>, step: &Step, id: i64, tally: &mut Tally) {
-    let model = slot_at(step.after, "::convoys", id).expect("admitted convoy");
-    let request = convoy_request(id, model);
+    assert!(convoy_ids(step.after).contains(&id), "{step}: the model admitted no convoy {id}");
+    let request = convoy_request(id, &convoy_parts(step.after, id));
     // The model admitted it, so its project was known.
     let world = MemoryConvoyWorld::default().with_limits(3, 1).with_project(&request.project);
     create(home, &id.to_string(), request, &world, step, tally);
@@ -849,10 +882,9 @@ fn convoy_name(home: &Home<Convoy>, id: i64) -> String {
 fn probe_convoys(home: &mut Home<Convoy>, state: &Value, now: Timestamp, step: &Step, tally: &mut Tally) {
     let world = convoy_world(true, true);
     let operator = SeatName::new("operator", "");
-    for (id, model) in entries(state, "::convoys") {
-        let Some(model) = model else { continue };
+    for id in convoy_ids(state) {
+        let model = convoy_parts(state, id);
         let name = convoy_name(home, id);
-        let work = convoy_work(model);
         let current = home.get(&name).expect("convoy").state().quota().clone();
         let retract =
             |promise| convoy::Retract { promise, by: operator.clone(), authority: convoy::Authority::Operator, reason: "decision".into() };
@@ -862,7 +894,7 @@ fn probe_convoys(home: &mut Home<Convoy>, state: &Value, now: Timestamp, step: &
             authority: convoy::Authority::Operator,
             reason: "decision".into(),
         };
-        if !convoy_open(model) {
+        if !convoy_open(&model) {
             let probes: Vec<ConvoyEdge> = vec![
                 verdict(PromiseId(0)).into(),
                 retract(PromiseId(0)).into(),
@@ -893,7 +925,7 @@ fn probe_convoys(home: &mut Home<Convoy>, state: &Value, now: Timestamp, step: &
             let kind = edge.kind();
             assert!(!would_accept(home, &name, edge, decision_world, now, tally), "{step}: convoy {id} {kind:?} unauthorised");
         }
-        let promises = pairs(&work["promises"]);
+        let promises = pairs(&model["promises"]);
         let open = |pair: &&Value| matches!(tag(&pair[1]["state"]), "Pending" | "Submitted");
         if would_accept(home, &name, delivered(), &world, now, tally) {
             assert!(!promises.iter().any(|pair| open(&pair)), "{step}: convoy {id} delivers with a promise open");

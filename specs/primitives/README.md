@@ -30,7 +30,11 @@ A pure `step(state, event)` uses `match` and returns `Moved(state) | Refused(rea
 Every gate reads typed local evidence on the event inside `step`. Admission
 validates a typed request before creating a slot. Named actions look up a slot,
 run the rule and guard a single store assignment; `unchanged` composes with other
-machines. Refused actions are disabled and write nothing.
+machines. Refused actions are disabled and write nothing. Convoy keeps each part
+of a convoy (phase, fixed fields, retired duties, quota, promises, seats and link
+rows) in its own variable keyed by convoy, and each named action writes only the
+parts its edge changes; `outcome` reads an edge's acceptance or refusal code from
+the current parts, which the conformance harness and scenario properties probe.
 
 Scenarios choose identities and model only the world: ordered streams, clock,
 host death, adapter acceptance and capacities. Their `any` lists pair machine

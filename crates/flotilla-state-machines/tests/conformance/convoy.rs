@@ -28,16 +28,23 @@
 //! - A duty's terms are its note.
 //! - A submission's revision is fixed: the spec's reference is all it compares.
 //!
-//! State mapping: the spec's `Work = {spec, promises, seats, retired, quota,
-//! retiredSeats, subjects}` is the spec's project, duties and priority, the
-//! promise and seat records keyed by id and name, the state's retired duties
-//! and quota, and the subjects linked now (the spec keeps no unlinked rows).
-//! The state is `{work, phase}`: `Open { .. }` is phase `Open`,
-//! `Delivered { disposition, .. }` is `Delivered(disposition)` and
-//! `Abandoned { cause, reason, .. }` is `Abandoned({cause, reason})`, and
-//! `Retired` is `Retired`, its quota and retired duties empty. The
-//! frozen promise kinds, each link's source and each row's stamps and times
-//! are not in the spec.
+//! State mapping: the spec keeps each part of a convoy in its own variable,
+//! keyed by convoy; the harness admits convoy 0. [`spec_nodes`] reads those
+//! parts into one record, `{phase, project, priority, duties, retired, quota,
+//! promises, seats, subjects}`, which [`ConvoyConformance::encode`] builds
+//! field by field from the Rust value:
+//! - `phase`: `Open { .. }` is `Open`, `Delivered { disposition, .. }` is
+//!   `Delivered(disposition)`, `Abandoned { cause, reason, .. }` is
+//!   `Abandoned({cause, reason})` and `Retired` is `Retired`;
+//! - `project`, `priority` and `duties`: the spec's;
+//! - `retired` and `quota`: the state's retired duties and quota in force,
+//!   both empty once retired;
+//! - `promises` and `seats`: the records keyed by id and seat name, a seat's
+//!   `retired` its flag;
+//! - `subjects`: every link row in order, with its source and whether it was
+//!   unlinked.
+//!
+//! The frozen promise kinds and each row's stamps and times are not in the spec.
 
 use flotilla_schema::{Frozen, Timestamp};
 use flotilla_state_machines::{
@@ -166,16 +173,16 @@ fn duty_value(duty: &Duty) -> Value {
     json!({ "owner": seat_text(&duty.owner), "scope": scope, "terms": duty.terms.note.as_deref().unwrap_or_default() })
 }
 
+/// A seat as admission takes it: the spec's `{parent, supervisedBy}`.
 fn seat_of(name: &str, v: &Value) -> Seat {
     let parent = match tag(&v["parent"]) {
         "Root" => None,
         _ => Some(seat(payload(&v["parent"]))),
     };
-    let failed = text(&v["failed"]);
     Seat {
-        failed: (!failed.is_empty()).then(|| failed.into()),
+        failed: None,
         retired: false,
-        replacements: id(&v["replacements"]),
+        replacements: 0,
         role: name.into(),
         seat: String::new(),
         parent,
@@ -193,7 +200,17 @@ fn seat_value(seat: &Seat) -> Value {
         "supervisedBy": seat.supervised_by.name(),
         "replacements": int(seat.replacements.into()),
         "failed": seat.failed.as_deref().unwrap_or_default(),
+        "retired": seat.retired,
     })
+}
+
+fn link_source_name(source: LinkSource) -> &'static str {
+    match source {
+        LinkSource::Claim => "Claim",
+        LinkSource::Operator => "ByOperator",
+        LinkSource::Relay => "Relay",
+        LinkSource::Branch => "Branch",
+    }
 }
 
 fn kinds() -> Frozen<PromiseKinds> {
@@ -288,9 +305,16 @@ fn progress_name(progress: Progress) -> &'static str {
     }
 }
 
-/// The spec's `Work`: the spec's fixed fields, the records keyed by id and
-/// name, and the state's retired duties and quota in force.
-fn work(spec: &ConvoySpec, state: &ConvoyState) -> Value {
+/// The spec's parts of a convoy, field by field from the Rust value.
+fn parts(spec: &ConvoySpec, state: &ConvoyState) -> Value {
+    let phase = match state {
+        ConvoyState::Open { .. } => bare("Open"),
+        ConvoyState::Delivered { disposition, .. } => variant("Delivered", json!(disposition)),
+        ConvoyState::Abandoned { cause, reason, .. } => {
+            variant("Abandoned", json!({ "cause": bare(cause_name(*cause)), "reason": reason }))
+        }
+        ConvoyState::Retired => bare("Retired"),
+    };
     let promises = spec.promises.iter().map(|row| {
         let promise = &row.record;
         let submissions: Vec<Value> = promise.submissions.iter().map(|row| json!({ "reference": row.record.address.name() })).collect();
@@ -305,38 +329,89 @@ fn work(spec: &ConvoySpec, state: &ConvoyState) -> Value {
     });
     let seats: Map<String, Value> = spec.seats.iter().map(|row| (row.record.role.clone(), seat_value(&row.record))).collect();
     let duties = spec.duties.iter().map(|(d, duty)| (int(d.0.into()), duty_value(duty)));
+    let subjects: Vec<Value> = spec
+        .subjects
+        .iter()
+        .map(|row| {
+            let link = &row.record;
+            json!({ "subject": link.subject.name(), "source": bare(link_source_name(link.source)), "unlinked": link.unlinked })
+        })
+        .collect();
     json!({
-        "spec": { "project": spec.project.name(), "duties": map_of(duties), "priority": int(spec.priority.0.into()) },
-        "promises": map_of(promises),
-        "seats": Value::Object(seats),
-        "retiredSeats": set_of(spec.seats.iter().filter(|r| r.record.retired).map(|r| seat_text(&r.record.name()))),
-        "subjects": set_of(spec.linked().into_iter().map(|subject| json!(subject.name()))),
+        "phase": phase,
+        "project": spec.project.name(),
+        "priority": int(spec.priority.0.into()),
+        "duties": map_of(duties),
         "retired": set_of(state.retired().iter().map(|d| int(d.0.into()))),
         "quota": quota_value(state.quota()),
+        "promises": map_of(promises),
+        "seats": Value::Object(seats),
+        "subjects": subjects,
     })
 }
 
-/// The request that admitted an initial open `work`: its fixed fields, its
+/// The request that admitted an initial open convoy: its fixed fields, its
 /// promises as admitted and its seats, with the quota in force as the
 /// admitted quota.
-fn admitted_request(work: &Value) -> ConvoyRequest {
-    let spec = &work["spec"];
-    let promises: Vec<Value> = pairs(&work["promises"])
+fn admitted_request(convoy: &Value) -> ConvoyRequest {
+    let promises: Vec<Value> = pairs(&convoy["promises"])
         .iter()
         .map(|p| {
             assert!(list(&p[1]["submissions"]).is_empty(), "an initial convoy's promises have no submissions");
             json!([p[0], { "promise": p[1]["promise"], "source": p[1]["source"], "owner": p[1]["owner"] }])
         })
         .collect();
+    let seats: Map<String, Value> = named(&convoy["seats"])
+        .into_iter()
+        .map(|(name, v)| (name.to_owned(), json!({ "parent": v["parent"], "supervisedBy": v["supervisedBy"] })))
+        .collect();
     let request = json!({
-        "project": spec["project"],
+        "project": convoy["project"],
         "promises": { "#map": promises },
-        "duties": spec["duties"],
-        "seats": work["seats"],
-        "quota": work["quota"],
-        "priority": spec["priority"],
+        "duties": convoy["duties"],
+        "seats": Value::Object(seats),
+        "quota": convoy["quota"],
+        "priority": convoy["priority"],
     });
     request_of(&request)
+}
+
+/// The harness's convoy, the one each run admits.
+const CONVOY: i64 = 0;
+
+/// Convoy [`CONVOY`]'s parts in `node`, one variable each, read into one record.
+fn spec_parts(node: &Value) -> Value {
+    let mut parts = Map::new();
+    for (name, value) in node.as_object().expect("a graph node is a record") {
+        let Some(part) = name.rsplit_once("_C_").map(|(_, part)| part) else { continue };
+        let entry = pairs(value).iter().find(|pair| number(&pair[0]) == CONVOY).unwrap_or_else(|| panic!("convoy {CONVOY} has no {part}"));
+        parts.insert(part.to_owned(), entry[1].clone());
+    }
+    Value::Object(parts)
+}
+
+/// The harness's graph in the shape [`graph::check`] reads: each probe's
+/// outcome becomes `Moved` to the convoy's parts after it, or the refusal.
+/// The start state, before any admission, is no probe.
+fn spec_nodes(nodes: &[Value]) -> Vec<Value> {
+    let result = |node: &Value, outcome: &Value| match tag(outcome) {
+        "Accepted" => variant("Moved", spec_parts(node)),
+        _ => variant("Refused", payload(outcome).clone()),
+    };
+    nodes
+        .iter()
+        .filter_map(|node| {
+            let probe = &node["probe"];
+            let p = payload(probe);
+            let probe = match tag(probe) {
+                "Unadmitted" => return None,
+                "Admitted" => variant("Admitted", json!({ "request": p["request"], "result": result(node, &p["outcome"]) })),
+                "Stepped" => variant("Stepped", json!({ "from": p["from"], "event": p["event"], "result": result(node, &p["outcome"]) })),
+                other => panic!("unknown probe {other}"),
+            };
+            Some(json!({ "probe": probe }))
+        })
+        .collect()
 }
 
 /// The world admission reads: the request's project exists when the spec's
@@ -365,7 +440,7 @@ impl Conformance for ConvoyConformance {
 
     fn create(state: &Value) -> Home<Convoy> {
         let mut home = Home::<Convoy>::new("home").expect("valid declaration");
-        let request = admitted_request(&state["work"]);
+        let request = admitted_request(state);
         // An admitted convoy's project was known.
         home.create(LAUNCH_OF, request.clone(), &projects(&request, true), Timestamp(0)).expect("admitted");
         home
@@ -476,15 +551,7 @@ impl Conformance for ConvoyConformance {
 
     fn encode(home: &Home<Convoy>) -> Value {
         let c = convoy(home);
-        let phase = match c.state() {
-            ConvoyState::Open { .. } => bare("Open"),
-            ConvoyState::Delivered { disposition, .. } => variant("Delivered", json!(disposition)),
-            ConvoyState::Abandoned { cause, reason, .. } => {
-                variant("Abandoned", json!({ "cause": bare(cause_name(*cause)), "reason": reason }))
-            }
-            ConvoyState::Retired => bare("Retired"),
-        };
-        json!({ "work": work(c.spec(), c.state()), "phase": phase })
+        parts(c.spec(), c.state())
     }
 
     fn version(home: &Home<Convoy>) -> u64 {
@@ -521,7 +588,7 @@ fn check_admissions(nodes: &[Value], report: &mut Report) {
 #[test]
 #[ignore = "export graphs with specs/primitives/check.sh"]
 fn convoy_follows_the_full_graph() {
-    let nodes = graph::load(ConvoyConformance::MACHINE);
+    let nodes = spec_nodes(&graph::load(ConvoyConformance::MACHINE));
     let mut report = Report::new("convoy");
     check_admissions(&nodes, &mut report);
     graph::check::<ConvoyConformance>(&nodes, &mut report);

@@ -1,10 +1,10 @@
 --- a/machines/convoy.qnt
 +++ b/machines/convoy.qnt
-@@ -215,7 +215,6 @@
-   pure def replaceSeatRule(w: Work, seat: Seat): Next =
-     if (not(w.seats.keys().contains(seat))) Refused(UnknownSeat)
-     else if (w.retiredSeats.contains(seat)) Refused(SeatRetired)
--    else if (w.seats.get(seat).replacements >= REPLACEMENT_LIMIT) Refused(ReplacementsExhausted)
-     else withSeat(w, seat, { ...w.seats.get(seat), replacements: w.seats.get(seat).replacements + 1 })
-   // A relink after an unlink is a new link row in the store.
-   pure def linkRule(w: Work, a: { subject: str, source: LinkSource, authorised: bool }): Next =
+@@ -230,7 +230,6 @@
+   def seatReplaced(id: int, seat: Seat): Outcome =
+     if (not(known(id, seat))) Refused(UnknownSeat)
+     else if (seatRetired(id, seat)) Refused(SeatRetired)
+-    else if (seats.get(id).get(seat).replacements >= REPLACEMENT_LIMIT) Refused(ReplacementsExhausted)
+     else Accepted
+   def subjectLinked(id: int, a: { subject: str, source: LinkSource, authorised: bool }): Outcome =
+     if (not(a.authorised)) Refused(Unauthorised) else if (linked(id).contains(a.subject)) Refused(SubjectLinked) else Accepted

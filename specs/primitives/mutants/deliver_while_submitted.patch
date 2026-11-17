@@ -1,11 +1,11 @@
 --- a/machines/convoy.qnt
 +++ b/machines/convoy.qnt
-@@ -227,7 +227,7 @@
-     else if (not(w.subjects.contains(a.subject))) Refused(UnknownSubject)
-     else opened({ ...w, subjects: w.subjects.exclude(Set(a.subject)) })
-   pure def deliverRule(w: Work, d: { disposition: str }): Next =
--    if (openPromises(w).size() > 0) Refused(PromisesOutstanding(openPromises(w)))
-+    if (openPromises(w).filter(p => w.promises.get(p).state == Pending).size() > 0) Refused(PromisesOutstanding(openPromises(w)))
-     else if (holdingDuties(w).size() > 0) Refused(DutyHolds(holdingDuties(w)))
-     else Moved({ work: w, phase: Delivered(d.disposition) })
-   pure def abandonRule(w: Work, a: { authorised: bool, cause: AbandonCause, reason: str }): Next =
+@@ -237,7 +237,7 @@
+   def subjectUnlinked(id: int, a: { subject: str, authorised: bool }): Outcome =
+     if (not(a.authorised)) Refused(Unauthorised) else if (not(linked(id).contains(a.subject))) Refused(UnknownSubject) else Accepted
+   def delivered(id: int): Outcome =
+-    if (openPromises(id).size() > 0) Refused(PromisesOutstanding(openPromises(id)))
++    if (openPromises(id).filter(p => promises.get(id).get(p).state == Pending).size() > 0) Refused(PromisesOutstanding(openPromises(id)))
+     else if (holdingDuties(id).size() > 0) Refused(DutyHolds(holdingDuties(id)))
+     else Accepted
+   def abandoned(a: { authorised: bool, cause: AbandonCause, reason: str }): Outcome =

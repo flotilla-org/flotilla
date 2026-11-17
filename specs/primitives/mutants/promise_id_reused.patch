@@ -1,11 +1,11 @@
 --- a/machines/convoy.qnt
 +++ b/machines/convoy.qnt
-@@ -157,7 +157,7 @@
-     else rule(w.promises.get(id))
-   // One rule per edge, over an open convoy's work.
-   pure def declareRule(w: Work, d: { promise: PromiseId, definition: Promise, owner: Seat }): Next =
--    if (w.promises.keys().contains(d.promise)) Refused(PromiseExists)
+@@ -181,7 +181,7 @@
+     else rule(promises.get(id).get(p))
+   // One outcome per edge, over an open convoy.
+   def declared(id: int, d: { promise: PromiseId, definition: Promise, owner: Seat }): Outcome =
+-    if (promises.get(id).keys().contains(d.promise)) Refused(PromiseExists)
 +    if (false) Refused(PromiseExists)
-     else if (not(w.seats.keys().contains(d.owner))) Refused(UnknownSeat)
-     else if (w.retiredSeats.contains(d.owner)) Refused(SeatRetired)
-     else withPromise(w, d.promise, { promise: d.definition, source: Crew, owner: d.owner, state: Pending, submissions: [] })
+     else if (not(known(id, d.owner))) Refused(UnknownSeat)
+     else if (seatRetired(id, d.owner)) Refused(SeatRetired)
+     else Accepted

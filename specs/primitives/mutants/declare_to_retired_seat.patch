@@ -1,10 +1,10 @@
 --- a/machines/convoy.qnt
 +++ b/machines/convoy.qnt
-@@ -159,7 +159,6 @@
-   pure def declareRule(w: Work, d: { promise: PromiseId, definition: Promise, owner: Seat }): Next =
-     if (w.promises.keys().contains(d.promise)) Refused(PromiseExists)
-     else if (not(w.seats.keys().contains(d.owner))) Refused(UnknownSeat)
--    else if (w.retiredSeats.contains(d.owner)) Refused(SeatRetired)
-     else withPromise(w, d.promise, { promise: d.definition, source: Crew, owner: d.owner, state: Pending, submissions: [] })
-   pure def submitRule(w: Work, a: { promise: PromiseId, by: Seat, reference: str, durable: bool }): Next = onOpen(w, a.promise, p =>
-     if (a.by != p.owner) Refused(NotOwner)
+@@ -183,7 +183,6 @@
+   def declared(id: int, d: { promise: PromiseId, definition: Promise, owner: Seat }): Outcome =
+     if (promises.get(id).keys().contains(d.promise)) Refused(PromiseExists)
+     else if (not(known(id, d.owner))) Refused(UnknownSeat)
+-    else if (seatRetired(id, d.owner)) Refused(SeatRetired)
+     else Accepted
+   def submitted(id: int, a: { promise: PromiseId, by: Seat, reference: str, durable: bool }): Outcome = onOpen(id, a.promise, p =>
+     if (a.by != p.owner) Refused(NotOwner) else if (not(a.durable)) Refused(NotDurable) else Accepted)
