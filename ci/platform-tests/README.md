@@ -1,14 +1,12 @@
 # Selected platform tests
 
 `selectors.txt` owns the selected Cargo tests. Each row is `scope|arguments`:
-`windows`, `macos`, `all` (both desktop OSes), or `tender-ssh` (the isolated
-real-SSH proof). `all` rows run only on Windows/macOS; Tender SSH runs only
-`tender-ssh` rows and never inherits `all`. Blank lines and full-line comments are ignored. Arguments are
+`windows`, `macos`, or `all` (both desktop OSes). Blank lines and full-line comments are ignored. Arguments are
 whitespace-separated literal argv, with no shell quoting or expansion. Arguments
 cannot contain `|`, which is reserved for the scope delimiter. Duplicate
 rows execute twice; write shared coverage once using `all`.
 
-Run `ci/platform-tests/run.sh windows`, `macos`, or `tender-ssh`. The runner
+Run `ci/platform-tests/run.sh windows` or `macos`. The runner
 validates the entire file before invoking Cargo and stops at the first failure.
 It adds `cargo --config 'profile.dev.package."*".debug=0' test` to each row.
 No new selected test needs a workflow edit. Build, check and runtime smoke

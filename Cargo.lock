@@ -297,7 +297,7 @@ dependencies = [
  "binnacle-layout",
  "binnacle-memory",
  "ciborium",
- "rigging-condition",
+ "rigging-condition 0.1.0 (git+https://github.com/flotilla-org/rigging?rev=1e28bbbbb8c64a7ab9b4fe59c29331075440bdbd)",
  "serde",
  "serde_json",
 ]
@@ -1100,13 +1100,13 @@ dependencies = [
  "libc",
  "percent-encoding",
  "reqwest 0.13.2",
- "rigging-http-client",
- "rigging-http-serve",
+ "rigging-http-client 0.1.0 (git+https://github.com/flotilla-org/rigging?rev=1e28bbbbb8c64a7ab9b4fe59c29331075440bdbd)",
+ "rigging-http-serve 0.1.0 (git+https://github.com/flotilla-org/rigging?rev=1e28bbbbb8c64a7ab9b4fe59c29331075440bdbd)",
  "rigging-paths",
- "rigging-process",
- "rigging-relay-protocol",
- "rigging-stream",
- "rigging-tls",
+ "rigging-process 0.1.0 (git+https://github.com/flotilla-org/rigging?rev=1e28bbbbb8c64a7ab9b4fe59c29331075440bdbd)",
+ "rigging-relay-protocol 0.1.0 (git+https://github.com/flotilla-org/rigging?rev=1e28bbbbb8c64a7ab9b4fe59c29331075440bdbd)",
+ "rigging-stream 0.1.0 (git+https://github.com/flotilla-org/rigging?rev=1e28bbbbb8c64a7ab9b4fe59c29331075440bdbd)",
+ "rigging-tls 0.1.0 (git+https://github.com/flotilla-org/rigging?rev=1e28bbbbb8c64a7ab9b4fe59c29331075440bdbd)",
  "rustix",
  "serde",
  "serde_json",
@@ -1180,9 +1180,9 @@ dependencies = [
  "http",
  "json-patch",
  "reqwest 0.13.2",
- "rigging-http-client",
- "rigging-stream",
- "rigging-tls",
+ "rigging-http-client 0.1.0 (git+https://github.com/flotilla-org/rigging?rev=1e28bbbbb8c64a7ab9b4fe59c29331075440bdbd)",
+ "rigging-stream 0.1.0 (git+https://github.com/flotilla-org/rigging?rev=1e28bbbbb8c64a7ab9b4fe59c29331075440bdbd)",
+ "rigging-tls 0.1.0 (git+https://github.com/flotilla-org/rigging?rev=1e28bbbbb8c64a7ab9b4fe59c29331075440bdbd)",
  "serde",
  "serde_json",
  "serde_path_to_error",
@@ -1217,12 +1217,12 @@ dependencies = [
  "hyper-util",
  "libc",
  "reqwest 0.13.2",
- "rigging-http-client",
- "rigging-http-serve",
+ "rigging-http-client 0.1.0 (git+https://github.com/flotilla-org/rigging?rev=1e28bbbbb8c64a7ab9b4fe59c29331075440bdbd)",
+ "rigging-http-serve 0.1.0 (git+https://github.com/flotilla-org/rigging?rev=1e28bbbbb8c64a7ab9b4fe59c29331075440bdbd)",
  "rigging-paths",
- "rigging-process",
- "rigging-ssh",
- "rigging-stream",
+ "rigging-process 0.1.0 (git+https://github.com/flotilla-org/rigging?rev=1e28bbbbb8c64a7ab9b4fe59c29331075440bdbd)",
+ "rigging-ssh 0.1.0 (git+https://github.com/flotilla-org/rigging?rev=1e28bbbbb8c64a7ab9b4fe59c29331075440bdbd)",
+ "rigging-stream 0.1.0 (git+https://github.com/flotilla-org/rigging?rev=1e28bbbbb8c64a7ab9b4fe59c29331075440bdbd)",
  "rustls",
  "serde",
  "serde_json",
@@ -1246,7 +1246,7 @@ dependencies = [
  "drydock-protocol",
  "http",
  "reqwest 0.13.2",
- "rigging-http-client",
+ "rigging-http-client 0.1.0 (git+https://github.com/flotilla-org/rigging?rev=1e28bbbbb8c64a7ab9b4fe59c29331075440bdbd)",
  "serde_json",
  "sha2",
 ]
@@ -1276,9 +1276,9 @@ dependencies = [
  "drydock-protocol",
  "hyper",
  "hyper-util",
- "rigging-http-client",
- "rigging-process",
- "rigging-stream",
+ "rigging-http-client 0.1.0 (git+https://github.com/flotilla-org/rigging?rev=1e28bbbbb8c64a7ab9b4fe59c29331075440bdbd)",
+ "rigging-process 0.1.0 (git+https://github.com/flotilla-org/rigging?rev=1e28bbbbb8c64a7ab9b4fe59c29331075440bdbd)",
+ "rigging-stream 0.1.0 (git+https://github.com/flotilla-org/rigging?rev=1e28bbbbb8c64a7ab9b4fe59c29331075440bdbd)",
  "serde",
  "serde_json",
  "serde_path_to_error",
@@ -1581,7 +1581,7 @@ dependencies = [
  "hegeltest",
  "libc",
  "reqwest 0.13.2",
- "rigging-tls",
+ "rigging-tls 0.1.0 (git+https://github.com/flotilla-org/rigging?rev=261a4460166fc79e1b6442a693f62d4e41bef8d4)",
  "serde",
  "serde_json",
  "serde_yml",
@@ -1744,7 +1744,7 @@ dependencies = [
  "flotilla-replay-testkit",
  "http",
  "reqwest 0.13.2",
- "rigging-tls",
+ "rigging-tls 0.1.0 (git+https://github.com/flotilla-org/rigging?rev=261a4460166fc79e1b6442a693f62d4e41bef8d4)",
  "serde",
  "serde_json",
  "tokio",
@@ -2115,7 +2115,7 @@ dependencies = [
  "insta",
  "libc",
  "reqwest 0.13.2",
- "rigging-tls",
+ "rigging-tls 0.1.0 (git+https://github.com/flotilla-org/rigging?rev=261a4460166fc79e1b6442a693f62d4e41bef8d4)",
  "serde",
  "serde_json",
  "serde_yml",
@@ -2181,7 +2181,7 @@ dependencies = [
  "flotilla-replay-testkit",
  "http",
  "reqwest 0.13.2",
- "rigging-tls",
+ "rigging-tls 0.1.0 (git+https://github.com/flotilla-org/rigging?rev=261a4460166fc79e1b6442a693f62d4e41bef8d4)",
  "serde",
  "serde_json",
  "tempfile",
@@ -2377,7 +2377,7 @@ dependencies = [
  "rand_core 0.6.4",
  "reqwest 0.13.2",
  "rigging-replay-testkit",
- "rigging-tls",
+ "rigging-tls 0.1.0 (git+https://github.com/flotilla-org/rigging?rev=261a4460166fc79e1b6442a693f62d4e41bef8d4)",
  "rusqlite",
  "serde",
  "serde_json",
@@ -2435,7 +2435,7 @@ dependencies = [
  "http",
  "jsonwebtoken",
  "reqwest 0.13.2",
- "rigging-tls",
+ "rigging-tls 0.1.0 (git+https://github.com/flotilla-org/rigging?rev=261a4460166fc79e1b6442a693f62d4e41bef8d4)",
  "serde",
  "serde_json",
  "sha2",
@@ -2508,7 +2508,7 @@ dependencies = [
  "hegeltest",
  "indexmap",
  "insta",
- "rigging-tls",
+ "rigging-tls 0.1.0 (git+https://github.com/flotilla-org/rigging?rev=261a4460166fc79e1b6442a693f62d4e41bef8d4)",
  "rstest",
  "serde",
  "serde_json",
@@ -2622,13 +2622,14 @@ dependencies = [
  "opentelemetry_sdk",
  "prometheus-parse",
  "reqwest 0.13.2",
- "rigging-condition",
- "rigging-http-serve",
+ "rigging-condition 0.1.0 (git+https://github.com/flotilla-org/rigging?rev=261a4460166fc79e1b6442a693f62d4e41bef8d4)",
+ "rigging-http-serve 0.1.0 (git+https://github.com/flotilla-org/rigging?rev=261a4460166fc79e1b6442a693f62d4e41bef8d4)",
  "rigging-http-wire",
- "rigging-process",
- "rigging-relay-protocol",
+ "rigging-process 0.1.0 (git+https://github.com/flotilla-org/rigging?rev=261a4460166fc79e1b6442a693f62d4e41bef8d4)",
+ "rigging-relay-protocol 0.1.0 (git+https://github.com/flotilla-org/rigging?rev=261a4460166fc79e1b6442a693f62d4e41bef8d4)",
  "rigging-replay-testkit",
- "rigging-tls",
+ "rigging-ssh 0.1.0 (git+https://github.com/flotilla-org/rigging?rev=261a4460166fc79e1b6442a693f62d4e41bef8d4)",
+ "rigging-tls 0.1.0 (git+https://github.com/flotilla-org/rigging?rev=261a4460166fc79e1b6442a693f62d4e41bef8d4)",
  "rusqlite",
  "serde",
  "serde_json",
@@ -2637,7 +2638,6 @@ dependencies = [
  "subtle",
  "tar",
  "tempfile",
- "tender",
  "tokio",
  "tokio-tungstenite 0.29.0",
  "tokio-util",
@@ -2759,7 +2759,7 @@ dependencies = [
  "flotilla-provider-runtime",
  "flotilla-replay-testkit",
  "flotilla-resources",
- "rigging-process",
+ "rigging-process 0.1.0 (git+https://github.com/flotilla-org/rigging?rev=261a4460166fc79e1b6442a693f62d4e41bef8d4)",
  "tempfile",
  "tokio",
  "toml 0.8.23",
@@ -2915,9 +2915,9 @@ dependencies = [
  "http",
  "libc",
  "reqwest 0.13.2",
- "rigging-http-serve",
- "rigging-stream",
- "rigging-tls",
+ "rigging-http-serve 0.1.0 (git+https://github.com/flotilla-org/rigging?rev=261a4460166fc79e1b6442a693f62d4e41bef8d4)",
+ "rigging-stream 0.1.0 (git+https://github.com/flotilla-org/rigging?rev=261a4460166fc79e1b6442a693f62d4e41bef8d4)",
+ "rigging-tls 0.1.0 (git+https://github.com/flotilla-org/rigging?rev=261a4460166fc79e1b6442a693f62d4e41bef8d4)",
  "serde",
  "serde_json",
  "sha2",
@@ -3038,7 +3038,7 @@ dependencies = [
  "flotilla-resources",
  "http",
  "reqwest 0.13.2",
- "rigging-tls",
+ "rigging-tls 0.1.0 (git+https://github.com/flotilla-org/rigging?rev=261a4460166fc79e1b6442a693f62d4e41bef8d4)",
  "serde_json",
  "tempfile",
  "tokio",
@@ -3254,7 +3254,7 @@ dependencies = [
  "flotilla-test-support",
  "hegeltest",
  "reqwest 0.13.2",
- "rigging-tls",
+ "rigging-tls 0.1.0 (git+https://github.com/flotilla-org/rigging?rev=261a4460166fc79e1b6442a693f62d4e41bef8d4)",
  "serde",
  "serde_json",
  "tempfile",
@@ -3332,7 +3332,7 @@ dependencies = [
  "hegeltest",
  "http",
  "reqwest 0.13.2",
- "rigging-tls",
+ "rigging-tls 0.1.0 (git+https://github.com/flotilla-org/rigging?rev=261a4460166fc79e1b6442a693f62d4e41bef8d4)",
  "serde",
  "serde_json",
  "sha2",
@@ -3424,7 +3424,7 @@ dependencies = [
  "flotilla-verbs",
  "futures",
  "hegeltest",
- "rigging-tls",
+ "rigging-tls 0.1.0 (git+https://github.com/flotilla-org/rigging?rev=261a4460166fc79e1b6442a693f62d4e41bef8d4)",
  "serde",
  "serde_json",
  "sysinfo",
@@ -3495,10 +3495,10 @@ dependencies = [
  "http",
  "libc",
  "reqwest 0.13.2",
- "rigging-http-client",
- "rigging-process",
+ "rigging-http-client 0.1.0 (git+https://github.com/flotilla-org/rigging?rev=261a4460166fc79e1b6442a693f62d4e41bef8d4)",
+ "rigging-process 0.1.0 (git+https://github.com/flotilla-org/rigging?rev=261a4460166fc79e1b6442a693f62d4e41bef8d4)",
  "rigging-replay-testkit",
- "rigging-tls",
+ "rigging-tls 0.1.0 (git+https://github.com/flotilla-org/rigging?rev=261a4460166fc79e1b6442a693f62d4e41bef8d4)",
  "sha2",
  "sysinfo",
  "tempfile",
@@ -3608,7 +3608,7 @@ dependencies = [
  "libc",
  "reqwest 0.13.2",
  "rigging-replay-testkit",
- "rigging-tls",
+ "rigging-tls 0.1.0 (git+https://github.com/flotilla-org/rigging?rev=261a4460166fc79e1b6442a693f62d4e41bef8d4)",
  "serde",
  "serde_yml",
  "tempfile",
@@ -3705,7 +3705,7 @@ dependencies = [
  "flotilla-schema-derive",
  "hegeltest",
  "libc",
- "rigging-condition",
+ "rigging-condition 0.1.0 (git+https://github.com/flotilla-org/rigging?rev=261a4460166fc79e1b6442a693f62d4e41bef8d4)",
  "serde",
  "serde_json",
  "sha2",
@@ -3743,7 +3743,7 @@ dependencies = [
  "flotilla-state-machines",
  "hegeltest",
  "libc",
- "rigging-condition",
+ "rigging-condition 0.1.0 (git+https://github.com/flotilla-org/rigging?rev=261a4460166fc79e1b6442a693f62d4e41bef8d4)",
  "rusqlite",
  "serde",
  "serde_json",
@@ -3833,7 +3833,7 @@ dependencies = [
  "hegeltest",
  "indexmap",
  "reqwest 0.13.2",
- "rigging-tls",
+ "rigging-tls 0.1.0 (git+https://github.com/flotilla-org/rigging?rev=261a4460166fc79e1b6442a693f62d4e41bef8d4)",
  "rstest",
  "rustls",
  "serde",
@@ -3946,7 +3946,7 @@ dependencies = [
  "futures",
  "hegeltest",
  "reqwest 0.13.2",
- "rigging-tls",
+ "rigging-tls 0.1.0 (git+https://github.com/flotilla-org/rigging?rev=261a4460166fc79e1b6442a693f62d4e41bef8d4)",
  "rstest",
  "rusqlite",
  "serde",
@@ -3986,7 +3986,7 @@ dependencies = [
  "flotilla-client",
  "flotilla-daemon-api",
  "ratatui",
- "rigging-tls",
+ "rigging-tls 0.1.0 (git+https://github.com/flotilla-org/rigging?rev=261a4460166fc79e1b6442a693f62d4e41bef8d4)",
  "serde_json",
  "tokio",
 ]
@@ -4118,7 +4118,7 @@ dependencies = [
  "insta",
  "libc",
  "ratatui",
- "rigging-tls",
+ "rigging-tls 0.1.0 (git+https://github.com/flotilla-org/rigging?rev=261a4460166fc79e1b6442a693f62d4e41bef8d4)",
  "serde",
  "serde_json",
  "tempfile",
@@ -6380,6 +6380,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "rigging-condition"
+version = "0.1.0"
+source = "git+https://github.com/flotilla-org/rigging?rev=261a4460166fc79e1b6442a693f62d4e41bef8d4#261a4460166fc79e1b6442a693f62d4e41bef8d4"
+dependencies = [
+ "serde",
+ "thiserror 2.0.18",
+]
+
+[[package]]
 name = "rigging-http-client"
 version = "0.1.0"
 source = "git+https://github.com/flotilla-org/rigging?rev=1e28bbbbb8c64a7ab9b4fe59c29331075440bdbd#1e28bbbbb8c64a7ab9b4fe59c29331075440bdbd"
@@ -6388,8 +6397,22 @@ dependencies = [
  "bytes",
  "http",
  "reqwest 0.13.2",
- "rigging-process",
- "rigging-tls",
+ "rigging-process 0.1.0 (git+https://github.com/flotilla-org/rigging?rev=1e28bbbbb8c64a7ab9b4fe59c29331075440bdbd)",
+ "rigging-tls 0.1.0 (git+https://github.com/flotilla-org/rigging?rev=1e28bbbbb8c64a7ab9b4fe59c29331075440bdbd)",
+ "tokio",
+]
+
+[[package]]
+name = "rigging-http-client"
+version = "0.1.0"
+source = "git+https://github.com/flotilla-org/rigging?rev=261a4460166fc79e1b6442a693f62d4e41bef8d4#261a4460166fc79e1b6442a693f62d4e41bef8d4"
+dependencies = [
+ "async-trait",
+ "bytes",
+ "http",
+ "reqwest 0.13.2",
+ "rigging-process 0.1.0 (git+https://github.com/flotilla-org/rigging?rev=261a4460166fc79e1b6442a693f62d4e41bef8d4)",
+ "rigging-tls 0.1.0 (git+https://github.com/flotilla-org/rigging?rev=261a4460166fc79e1b6442a693f62d4e41bef8d4)",
  "tokio",
 ]
 
@@ -6410,9 +6433,25 @@ dependencies = [
 ]
 
 [[package]]
+name = "rigging-http-serve"
+version = "0.1.0"
+source = "git+https://github.com/flotilla-org/rigging?rev=261a4460166fc79e1b6442a693f62d4e41bef8d4#261a4460166fc79e1b6442a693f62d4e41bef8d4"
+dependencies = [
+ "axum",
+ "getrandom 0.3.4",
+ "hyper",
+ "hyper-util",
+ "libc",
+ "sha2",
+ "subtle",
+ "tempfile",
+ "tokio",
+]
+
+[[package]]
 name = "rigging-http-wire"
 version = "0.1.0"
-source = "git+https://github.com/flotilla-org/rigging?rev=1e28bbbbb8c64a7ab9b4fe59c29331075440bdbd#1e28bbbbb8c64a7ab9b4fe59c29331075440bdbd"
+source = "git+https://github.com/flotilla-org/rigging?rev=261a4460166fc79e1b6442a693f62d4e41bef8d4#261a4460166fc79e1b6442a693f62d4e41bef8d4"
 dependencies = [
  "axum",
  "flotilla-cbor",
@@ -6425,13 +6464,26 @@ name = "rigging-paths"
 version = "0.1.0"
 source = "git+https://github.com/flotilla-org/rigging?rev=1e28bbbbb8c64a7ab9b4fe59c29331075440bdbd#1e28bbbbb8c64a7ab9b4fe59c29331075440bdbd"
 dependencies = [
- "rigging-process",
+ "rigging-process 0.1.0 (git+https://github.com/flotilla-org/rigging?rev=1e28bbbbb8c64a7ab9b4fe59c29331075440bdbd)",
 ]
 
 [[package]]
 name = "rigging-process"
 version = "0.1.0"
 source = "git+https://github.com/flotilla-org/rigging?rev=1e28bbbbb8c64a7ab9b4fe59c29331075440bdbd#1e28bbbbb8c64a7ab9b4fe59c29331075440bdbd"
+dependencies = [
+ "async-trait",
+ "libc",
+ "sysinfo",
+ "tokio",
+ "tracing",
+ "uuid",
+]
+
+[[package]]
+name = "rigging-process"
+version = "0.1.0"
+source = "git+https://github.com/flotilla-org/rigging?rev=261a4460166fc79e1b6442a693f62d4e41bef8d4#261a4460166fc79e1b6442a693f62d4e41bef8d4"
 dependencies = [
  "async-trait",
  "libc",
@@ -6451,18 +6503,27 @@ dependencies = [
 ]
 
 [[package]]
+name = "rigging-relay-protocol"
+version = "0.1.0"
+source = "git+https://github.com/flotilla-org/rigging?rev=261a4460166fc79e1b6442a693f62d4e41bef8d4#261a4460166fc79e1b6442a693f62d4e41bef8d4"
+dependencies = [
+ "serde",
+ "serde_json",
+]
+
+[[package]]
 name = "rigging-replay-testkit"
 version = "0.1.0"
-source = "git+https://github.com/flotilla-org/rigging?rev=1e28bbbbb8c64a7ab9b4fe59c29331075440bdbd#1e28bbbbb8c64a7ab9b4fe59c29331075440bdbd"
+source = "git+https://github.com/flotilla-org/rigging?rev=261a4460166fc79e1b6442a693f62d4e41bef8d4#261a4460166fc79e1b6442a693f62d4e41bef8d4"
 dependencies = [
  "async-trait",
  "axum",
  "bytes",
  "http",
  "reqwest 0.13.2",
- "rigging-http-client",
- "rigging-process",
- "rigging-tls",
+ "rigging-http-client 0.1.0 (git+https://github.com/flotilla-org/rigging?rev=261a4460166fc79e1b6442a693f62d4e41bef8d4)",
+ "rigging-process 0.1.0 (git+https://github.com/flotilla-org/rigging?rev=261a4460166fc79e1b6442a693f62d4e41bef8d4)",
+ "rigging-tls 0.1.0 (git+https://github.com/flotilla-org/rigging?rev=261a4460166fc79e1b6442a693f62d4e41bef8d4)",
  "serde",
  "serde_norway",
  "tokio",
@@ -6477,7 +6538,18 @@ version = "0.1.0"
 source = "git+https://github.com/flotilla-org/rigging?rev=1e28bbbbb8c64a7ab9b4fe59c29331075440bdbd#1e28bbbbb8c64a7ab9b4fe59c29331075440bdbd"
 dependencies = [
  "async-trait",
- "rigging-stream",
+ "rigging-stream 0.1.0 (git+https://github.com/flotilla-org/rigging?rev=1e28bbbbb8c64a7ab9b4fe59c29331075440bdbd)",
+ "tempfile",
+ "tokio",
+]
+
+[[package]]
+name = "rigging-ssh"
+version = "0.1.0"
+source = "git+https://github.com/flotilla-org/rigging?rev=261a4460166fc79e1b6442a693f62d4e41bef8d4#261a4460166fc79e1b6442a693f62d4e41bef8d4"
+dependencies = [
+ "async-trait",
+ "rigging-stream 0.1.0 (git+https://github.com/flotilla-org/rigging?rev=261a4460166fc79e1b6442a693f62d4e41bef8d4)",
  "tempfile",
  "tokio",
 ]
@@ -6491,9 +6563,26 @@ dependencies = [
 ]
 
 [[package]]
+name = "rigging-stream"
+version = "0.1.0"
+source = "git+https://github.com/flotilla-org/rigging?rev=261a4460166fc79e1b6442a693f62d4e41bef8d4#261a4460166fc79e1b6442a693f62d4e41bef8d4"
+dependencies = [
+ "tokio",
+]
+
+[[package]]
 name = "rigging-tls"
 version = "0.1.0"
 source = "git+https://github.com/flotilla-org/rigging?rev=1e28bbbbb8c64a7ab9b4fe59c29331075440bdbd#1e28bbbbb8c64a7ab9b4fe59c29331075440bdbd"
+dependencies = [
+ "reqwest 0.13.2",
+ "rustls",
+]
+
+[[package]]
+name = "rigging-tls"
+version = "0.1.0"
+source = "git+https://github.com/flotilla-org/rigging?rev=261a4460166fc79e1b6442a693f62d4e41bef8d4#261a4460166fc79e1b6442a693f62d4e41bef8d4"
 dependencies = [
  "reqwest 0.13.2",
  "rustls",
@@ -7301,29 +7390,6 @@ dependencies = [
  "once_cell",
  "rustix",
  "windows-sys 0.61.2",
-]
-
-[[package]]
-name = "tender"
-version = "0.1.0"
-dependencies = [
- "async-trait",
- "ed25519-dalek",
- "flotilla-build-features",
- "flotilla-build-features-async",
- "flotilla-build-features-base",
- "flotilla-build-features-os",
- "flotilla-build-features-signing",
- "flotilla-build-features-tracing",
- "hegeltest",
- "libc",
- "rand_core 0.6.4",
- "serde",
- "serde_json",
- "sha2",
- "tempfile",
- "tokio",
- "tracing",
 ]
 
 [[package]]

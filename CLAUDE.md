@@ -192,12 +192,12 @@ User actions flow: **TableIntent/UI action → Command → daemon executor → p
 | `rigging-process` (external) | Command supervision, invocation macros, environment variables, filesystem/space probes, scan cache and binary/version detection |
 | `rigging-http-serve` (external) | Axum serving over Unix sockets, accepted connections and loopback TCP: typed caller identity, the token file, and the Host/Origin/cookie-Origin TCP policy around consumer authentication |
 | `rigging-http-client` (external) | Injectable HTTP execution and the reqwest implementation |
+| `rigging-ssh` (external) | OpenSSH argument builders and the forwarded-socket waiter for the peer transport, from the pinned Rigging revision |
 | `rigging-replay-testkit` (external, dev-only) | Replay sessions, recording, masks, mock runners and HTTP stand-ins |
 | `flotilla-replay-testkit` | GitHub replay channel over `rigging-replay-testkit` scheduling, masks and test helpers |
 | `flotilla-controllers` | Cross-capability reconciler tests and the `provisioned_mount` helper, pending retirement |
 | `flotilla-commands` | Resource-oriented command preparation and execution |
 | `flotilla-transport` | Framed message sessions over Unix sockets or in-memory channels for daemon client and peer connections |
-| `tender` | Publication, discovery, pinned-exposure, and raw-stream contracts with an in-memory adapter and shared behavior tests |
 | `flotilla` (root) | Thin `src/main.rs` entry point |
 
 ### Key Modules
