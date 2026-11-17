@@ -16,6 +16,7 @@ flotilla-projections = { path = "../flotilla-projections" }
 flotilla-protocol = { path = "../flotilla-protocol" }
 flotilla-resources = { path = "../flotilla-resources" }
 tokio = { workspace = true }
+futures = { workspace = true }
 serde_json = { workspace = true }
 async-trait = { workspace = true }
 toml = "0.8"

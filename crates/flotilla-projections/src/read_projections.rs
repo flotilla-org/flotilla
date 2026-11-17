@@ -1286,7 +1286,7 @@ impl ReadProjections<'_> {
         generations.field_matches_query = StoreQuery::related(&ensured_from, &ensured_from, selected_query.clone()).field_matches_query;
         // Select candidate identities, their roles' live generations and linked landed evidence in
         // one indexed operation; `ConvoyName::select` owns the role, record and ambiguity rules.
-        let convoy_sources = self
+        let mut convoy_sources = self
             .backend
             .query_declared::<ResourceConvoy>(
                 namespace,
@@ -1306,6 +1306,16 @@ impl ReadProjections<'_> {
             )
             .await
             .map_err(|error| error.to_string())?;
+        // A retired record leaves the indexed selection; it still reads by name.
+        if convoy_name.select(&convoy_sources.items)?.is_none() {
+            let named = self
+                .backend
+                .including_replicas::<ResourceConvoy>(namespace)
+                .get_all(convoy_name.name)
+                .await
+                .map_err(|error| error.to_string())?;
+            convoy_sources.items.extend(named.items);
+        }
         let convoy_source = convoy_name.select(&convoy_sources.items)?.ok_or_else(|| format!("no convoy matches `{convoy_name}`"))?;
         // With the engine holding the convoy, the promises explained are the engine's (#3587 layer 8).
         let convoy = flotilla_resources::convoy::engine::viewed_read(self.convoy_engine, convoy_source)?;

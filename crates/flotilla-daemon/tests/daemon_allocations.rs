@@ -88,8 +88,12 @@ async fn memory_scenario(n: usize) -> Vec<(usize, usize, usize, usize)> {
     // Composed with its Message path and engine, as the runtime composes a daemon.
     daemon.open_message_primitives().expect("the engine Message path");
     flotilla_daemon_testkit::engine::engine(&daemon);
-    // The inventory is the engine's launches: one in eight active, the rest landed.
+    // The inventory is the engine's launches: every other one landed, which retires and leaves the
+    // listing, and the rest active, so the live inventory scales with n.
     let path = daemon.convoy_engine_path();
+    let landed = n.div_ceil(2);
+    let live = n - landed;
+    let mut retiring = backend.including_replicas::<Convoy>("flotilla").watch().await.unwrap();
     for i in 0..n {
         let status: ConvoyStatus = serde_json::from_value(serde_json::json!({"phase": "Active", "message":"diagnostic ".repeat(1500), "workflow_snapshot": {"vessels": flotilla_resources::single_agent_workflow_spec().vessels}})).unwrap();
         let mut convoy = flotilla_engine_convoys_testkit::convoy(
@@ -99,10 +103,23 @@ async fn memory_scenario(n: usize) -> Vec<(usize, usize, usize, usize)> {
             status,
         );
         convoy.metadata.name = flotilla_engine_convoys_testkit::launch(&path, convoy.clone()).await;
-        if i % 8 != 0 {
+        if i % 2 == 0 {
             flotilla_engine_convoys_testkit::land(&path, &convoy).await;
         }
     }
+    // Every landed launch has retired before the aggregator reads the inventory.
+    let mut retired = 0;
+    while retired < landed {
+        let event = tokio::time::timeout(std::time::Duration::from_secs(10), futures::StreamExt::next(&mut retiring))
+            .await
+            .expect("the landed launches retire")
+            .expect("watching")
+            .unwrap();
+        if matches!(event, flotilla_resources::ReadWatchEvent::Deleted(_) | flotilla_resources::ReadWatchEvent::DeletedByName { .. }) {
+            retired += 1;
+        }
+    }
+    drop(retiring);
     eprintln!("N={n} owner=engine_inventory live={}", counters().0);
     eprintln!("N={n} owner=daemon live={}", counters().0);
     let mut bootstrap_events = daemon.subscribe();
@@ -139,7 +156,7 @@ async fn memory_scenario(n: usize) -> Vec<(usize, usize, usize, usize)> {
             let event = bootstrap_events.recv().await.expect("daemon bootstrap events");
             if let flotilla_protocol::DaemonEvent::ResultSet(set) = event {
                 if set.query() == (QueryId::Convoys { scope: None }) {
-                    assert_eq!(set.rows.len(), n);
+                    assert_eq!(set.rows.len(), live, "the live launches; the retired have left");
                     break;
                 }
             }

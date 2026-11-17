@@ -147,7 +147,8 @@ impl<'a> ConvoyName<'a> {
         Ok(candidates)
     }
 
-    /// The convoy this name answers with in `namespace`, read through one indexed query.
+    /// The convoy this name answers with in `namespace`, read through one indexed query; where
+    /// that selects none, the record of the name read by name, which gives a retired one too.
     pub async fn lookup(
         &self,
         backend: &crate::ResourceBackend,
@@ -155,7 +156,16 @@ impl<'a> ConvoyName<'a> {
     ) -> Result<Option<flotilla_resources::ReadResourceObject<flotilla_resources::Convoy>>, String> {
         let rows =
             backend.query_declared::<flotilla_resources::Convoy>(namespace, &self.query()).await.map_err(|error| error.to_string())?;
-        Ok(self.select(&rows.items)?.cloned())
+        if let Some(selected) = self.select(&rows.items)? {
+            return Ok(Some(selected.clone()));
+        }
+        let copies = backend
+            .including_replicas::<flotilla_resources::Convoy>(namespace)
+            .get_all(self.name)
+            .await
+            .map_err(|error| error.to_string())?
+            .items;
+        Ok(self.select(&copies)?.cloned())
     }
 }
 

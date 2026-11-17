@@ -32,6 +32,7 @@
 //! imported and is not seeded with the dummy catalog.
 
 use std::{
+    collections::BTreeSet,
     sync::{
         atomic::{AtomicU64, Ordering},
         Arc, Mutex,
@@ -41,7 +42,7 @@ use std::{
 
 use async_trait::async_trait;
 use flotilla_client::{
-    resource::{ResourceClient, ResourceGetRequest, ResourceListRequest},
+    resource::{ResourceClient, ResourceGetRequest, ResourceListRequest, ResourceWatchRequest},
     SocketDaemon,
 };
 use flotilla_config::{ConfigStore, DaemonConfig};
@@ -437,11 +438,25 @@ impl TestDaemon {
         assert!(matches!(applied, CommandValue::ResourceObject(_)), "apply {} {name}: {applied:?}", T::API_PATHS.kind);
     }
 
-    /// Wait until some `T` satisfies `done`, and return the first that does.
-    /// The wait fails with every `T`'s last state.
+    /// Every `T` listed and, for a Convoy, every other the operator has seen, read by name: one
+    /// that ended and retired has left the listing, and reads with how it ended.
+    pub async fn every<T: Resource>(&self) -> Vec<ResourceObject<T>> {
+        let mut items = self.list::<T>().await;
+        if T::API_PATHS.kind == Convoy::API_PATHS.kind {
+            let listed: BTreeSet<String> = items.iter().map(|item| item.metadata.name.clone()).collect();
+            let unlisted: Vec<String> = self.operator.convoys_seen.lock().expect("convoys seen").difference(&listed).cloned().collect();
+            for name in unlisted {
+                items.extend(self.get::<T>(&name).await);
+            }
+        }
+        items
+    }
+
+    /// Wait until some `T` satisfies `done`, and return the first that does: of [`Self::every`],
+    /// so a Convoy that ended and retired is found. The wait fails with every `T`'s last state.
     pub fn wait<'a, T: Resource>(&'a self, what: &'a str, done: impl Fn(&ResourceObject<T>) -> bool + 'a) -> Wait<'a, ResourceObject<T>> {
         Wait::new(WAIT, async move |deadline| loop {
-            let mut items = self.list::<T>().await;
+            let mut items = self.every::<T>().await;
             if let Some(found) = items.iter().position(&done) {
                 return items.swap_remove(found);
             }
@@ -825,11 +840,29 @@ struct Operator {
     resources: ResourceClient,
     _shutdown: watch::Sender<bool>,
     session: tokio::task::JoinHandle<()>,
+    /// Every Convoy the operator's watch has read, by name.
+    convoys_seen: Arc<Mutex<BTreeSet<String>>>,
+    seeing: tokio::task::JoinHandle<()>,
 }
 
 impl Drop for Operator {
     fn drop(&mut self) {
+        self.seeing.abort();
         self.session.abort();
+    }
+}
+
+/// Records the name of every Convoy `resources` watches, opening the watch again whenever it
+/// ends, until the daemon is gone.
+async fn see_convoys(resources: ResourceClient, seen: Arc<Mutex<BTreeSet<String>>>) {
+    loop {
+        let request =
+            ResourceWatchRequest::builder().kind(Convoy::API_PATHS.kind.into()).namespace(NAMESPACE.into()).include_replicas(true).build();
+        let Ok(mut watch) = resources.watch(request).await else { return };
+        while let Ok(Some(envelope)) = watch.next().await {
+            let names = envelope.records.into_iter().filter_map(|record| Some(record.object?["metadata"]["name"].as_str()?.to_owned()));
+            seen.lock().expect("convoys seen").extend(names);
+        }
     }
 }
 
@@ -865,7 +898,9 @@ impl Operator {
         });
         let client = SocketDaemon::from_session_stateful(client_session).await.expect("client handshake");
         let resources = ResourceClient::new(Arc::clone(&client) as Arc<dyn DaemonHandle>);
-        Self { client, resources, _shutdown: shutdown, session }
+        let convoys_seen = Arc::default();
+        let seeing = tokio::spawn(see_convoys(resources.clone(), Arc::clone(&convoys_seen)));
+        Self { client, resources, _shutdown: shutdown, session, convoys_seen, seeing }
     }
 
     /// Send `action` and return its value, as `flotilla` does for each command.

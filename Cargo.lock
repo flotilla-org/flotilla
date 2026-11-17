@@ -3443,6 +3443,7 @@ dependencies = [
  "flotilla-store",
  "flotilla-store-memory",
  "flotilla-store-testkit",
+ "futures",
  "serde_json",
  "sha2",
  "tempfile",

@@ -534,7 +534,7 @@ async fn standing_role(fleet: &TestDaemon, ensure: &str) -> Option<flotilla_prot
 /// The generations of the standing role ensure `ensure` declares.
 async fn generations_of(fleet: &TestDaemon, ensure: &str) -> Vec<ResourceObject<Convoy>> {
     fleet
-        .list::<Convoy>()
+        .every::<Convoy>()
         .await
         .into_iter()
         .filter(|convoy| convoy.metadata.annotations.get(flotilla_resources::ENSURED_FROM_ANNOTATION).map(String::as_str) == Some(ensure))
@@ -561,7 +561,7 @@ async fn create_through_admission(fleet: &TestDaemon, role: &str, workflow: &str
 /// The record name of the convoy whose role is `role`.
 async fn convoy_named(fleet: &TestDaemon, role: &str) -> String {
     fleet
-        .list::<Convoy>()
+        .every::<Convoy>()
         .await
         .into_iter()
         .find(|convoy| convoy.spec.role == role)

@@ -101,7 +101,9 @@ pub async fn convoy_explain_refuses_multiple_terminal_generations(factory: &dyn 
     let (daemon, _backend, _clock, _temp) = standing_ensure_fixture(factory).await;
     let one = create_identity_convoy(&daemon, "convoy-one", "reviewer", Some("flotilla")).await;
     let two = create_identity_convoy(&daemon, "convoy-two", "reviewer", Some("flotilla")).await;
+    // Each generation ends held, as an unread message to its seat holds it: neither retires.
     for name in [&one, &two] {
+        hold_with_message(&daemon, name, "reviewer").await;
         land_convoy(&daemon, name).await;
     }
 
@@ -109,6 +111,40 @@ pub async fn convoy_explain_refuses_multiple_terminal_generations(factory: &dyn 
         daemon.explain_convoy_internal(None, "reviewer@flotilla").await,
         Err(format!("convoy `reviewer@flotilla` is held by several records; name one by its record: {one}, {two}"))
     );
+}
+
+// #3108 retirement: a role address selects among live and ended-but-unretired holders, as a
+// listing does. Once every generation has retired the role names none, and each is reached by its
+// record name, which reports how it ended.
+pub async fn convoy_explain_names_retired_generations_by_record_only(factory: &dyn EnsureScenarioController) {
+    let (daemon, backend, _clock, _temp) = standing_ensure_fixture(factory).await;
+    let mut watch = backend.including_replicas::<ResourceConvoy>("flotilla").watch().await.expect("watch");
+    let one = create_identity_convoy(&daemon, "convoy-one", "reviewer", Some("flotilla")).await;
+    let two = create_identity_convoy(&daemon, "convoy-two", "reviewer", Some("flotilla")).await;
+    for name in [&one, &two] {
+        land_convoy(&daemon, name).await;
+    }
+    // Each leaves the listing as it retires.
+    let mut retired = BTreeSet::new();
+    while retired.len() < 2 {
+        let event =
+            tokio::time::timeout(std::time::Duration::from_secs(10), futures::StreamExt::next(&mut watch)).await.expect("retired in time");
+        match event.expect("watching").expect("event") {
+            flotilla_resources::ReadWatchEvent::Deleted(read) => retired.insert(read.object.metadata.name),
+            flotilla_resources::ReadWatchEvent::DeletedByName { tombstone, .. } => retired.insert(tombstone.name),
+            _ => false,
+        };
+    }
+    assert_eq!(retired, BTreeSet::from([one.clone(), two.clone()]));
+
+    assert_eq!(
+        daemon.explain_convoy_internal(None, "reviewer@flotilla").await.map(|explanation| explanation.convoy),
+        Err("no convoy matches `reviewer@flotilla`".to_string())
+    );
+    for record in [&one, &two] {
+        let explanation = daemon.explain_convoy_internal(None, record).await.expect("a retired generation explains by its record");
+        assert_eq!(explanation.phase, "Landed", "{record}");
+    }
 }
 
 // #4272: the lookup is exact. A bare role names the convoy of no project holding it, not one in

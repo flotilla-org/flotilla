@@ -3892,8 +3892,13 @@ impl InProcessDaemon {
         // failure written between a read and a later watch would reach neither.
         let mut watch =
             convoys.watch(WatchStart::Now).await.map_err(|error| format!("watch convoy {address} while waiting to attach: {error}"))?;
-        let listed = convoys.list().await.map_err(|error| format!("watch convoy {address} while waiting to attach: {error}"))?;
-        if let Some(message) = listed.items.iter().find(|convoy| convoy.metadata.name == name).and_then(convoy_start_failure) {
+        // Read by name: a launch that ended and retired has left the listing.
+        let held = match convoys.get(name).await {
+            Ok(convoy) => Some(convoy),
+            Err(ResourceError::NotFound { .. }) => None,
+            Err(error) => return Err(format!("watch convoy {address} while waiting to attach: {error}")),
+        };
+        if let Some(message) = held.as_ref().and_then(convoy_start_failure) {
             return Err(message);
         }
         let deadline = tokio::time::Instant::now() + CONVOY_ATTACH_WAIT;

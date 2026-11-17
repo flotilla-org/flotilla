@@ -4834,9 +4834,12 @@ async fn convoy_admission_generates_records_and_enforces_one_live_role_generatio
         matches!(recv_command_finished(&mut events, second_id).await, CommandValue::ConvoyStarted { name, .. } if name == "governor@flotilla")
     );
     let generations = convoys.list().await.expect("list generations").items;
-    assert_eq!(generations.len(), 2, "terminal history must be retained");
-    let second_generation = generations.iter().map(|convoy| convoy.spec.generation).max().expect("generations");
+    assert_eq!(generations.len(), 1, "the list shows the live generation alone");
+    let second_generation = generations[0].spec.generation;
     assert!(second_generation > first_generation, "the next launch is ordered after the first");
+    let retired = convoys.get(&first.metadata.name).await.expect("the retired generation reads by name");
+    assert_eq!(retired.status.as_ref().map(|status| status.phase), Some(ConvoyPhase::Failed));
+    let second_name = generations[0].metadata.name.clone();
 
     // A delete by role address ends the live generation; an ended convoy is kept, never removed.
     let delete_id = daemon
@@ -4848,11 +4851,8 @@ async fn convoy_admission_generates_records_and_enforces_one_live_role_generatio
         .await
         .expect("delete by role address");
     assert_eq!(recv_command_finished(&mut events, delete_id).await, CommandValue::Ok);
-    let generations = convoys.list().await.expect("list after addressed delete").items;
-    assert_eq!(generations.len(), 2, "ended generations are kept");
-    let second = generations.iter().find(|convoy| convoy.spec.generation == second_generation).expect("second generation");
+    let second = convoys.get(&second_name).await.expect("the ended generation reads by name");
     assert_eq!(second.status.as_ref().map(|status| status.phase), Some(ConvoyPhase::Abandoned));
-    assert!(generations.iter().all(|convoy| convoy.status.as_ref().is_some_and(|status| status.phase.is_terminal())));
     drop(temp);
 }
 

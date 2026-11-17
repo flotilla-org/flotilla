@@ -7,10 +7,11 @@ mod query;
 use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine};
 use flotilla_address::Address;
 use flotilla_protocol::table::{Message, Row};
-use flotilla_resources::WatchStart;
+use flotilla_resources::{ResourceError, WatchStart};
 use flotilla_schema::{ColumnType, Filterable, Layout, Table, TableSet};
 use flotilla_store::{
-    query_resource_kind, subject_record_name, watch_resource_kind_from, ResourceBackend, StoreQuery, REGISTERED_RESOURCE_KINDS,
+    get_resource_kind, query_resource_kind, subject_record_name, watch_resource_kind_from, ResourceBackend, StoreQuery,
+    REGISTERED_RESOURCE_KINDS,
 };
 use flotilla_verbs::SubjectTable;
 use futures::{stream::BoxStream, StreamExt};
@@ -492,9 +493,18 @@ impl Catalog {
         match TableSource::open(subject.table.to_owned(), self).map_err(|failure| failure.to_string())? {
             TableSource::Resource { backend, name, subject, .. } => {
                 let Some(record) = subject_record_name(&backend, namespace, address).await? else { return Ok(None) };
-                let query = StoreQuery::names([record], false);
+                let query = StoreQuery::names([record.clone()], false);
                 let document = query_resource_kind(&backend, namespace, &name, &query).await.map_err(|error| error.to_string())?;
-                Ok(resource_rows(&document, table, subject.as_ref())?.into_iter().next())
+                if let Some(row) = resource_rows(&document, table, subject.as_ref())?.into_iter().next() {
+                    return Ok(Some(row));
+                }
+                // A record its listing leaves out, such as a retired convoy, still reads by name.
+                let read = match get_resource_kind(&backend, namespace, &name, &record).await {
+                    Ok(read) => read.value,
+                    Err(ResourceError::NotFound { .. }) => return Ok(None),
+                    Err(error) => return Err(error.to_string()),
+                };
+                Ok(resource_rows(&json!({ "items": [read] }), table, subject.as_ref())?.into_iter().next())
             }
             source @ TableSource::Decided { .. } => {
                 let Some(record) = flotilla_address::record_name(address) else { return Ok(None) };

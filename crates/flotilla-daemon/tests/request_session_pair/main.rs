@@ -1629,13 +1629,14 @@ async fn in_memory_mutation_preserves_socket_caller_in_status_and_explain() {
     assert!(matches!(await_command_result(&mut events, command_id).await, CommandValue::ConvoyAbandoned { .. }));
 
     // A lifecycle mutation's caller is its trace (#3108, as ruled), not the convoy's status: the
-    // mutation is made through the socket caller's session and the convoy is explained by role.
+    // mutation is made through the socket caller's session and the convoy is explained by its
+    // record: ended, it may have retired, and a role address names only a live or unretired one.
     assert_eq!(convoys.get(&launch).await.expect("convoy").status.expect("status").phase, ResourceConvoyPhase::Abandoned);
     let value = topology
         .client
         .execute_query(
             Command::builder()
-                .action(CommandAction::QueryExplainConvoy { namespace: Some("flotilla".into()), name: address.clone() })
+                .action(CommandAction::QueryExplainConvoy { namespace: Some("flotilla".into()), name: launch.clone() })
                 .build(),
             uuid::Uuid::nil(),
         )

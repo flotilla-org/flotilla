@@ -168,6 +168,16 @@ async fn land_convoy(daemon: &InProcessDaemon, name: &str) {
     engine.deliver(&convoy, "claim").await.expect("deliver");
 }
 
+/// Holds launch `name` of project `flotilla` as an unread message to its `role` seat does: ended,
+/// it stays unretired while the message waits.
+async fn hold_with_message(daemon: &InProcessDaemon, name: &str, role: &str) {
+    let messages = daemon.message_primitives().expect("the engine Message path");
+    let receiver = format!("flotilla/{name}/work/{role}");
+    let intent =
+        flotilla_engine_messages_testkit::intent("fleet/operator", &receiver, flotilla_resources::MessageRelation::Supervisor, "hold");
+    messages.admit(&format!("hold-{role}-{}", name.replace('#', "-")), &intent).await.expect("the message admitted");
+}
+
 async fn seed_convoy_routing_row(
     daemon: &InProcessDaemon,
     record: &str,

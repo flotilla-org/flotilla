@@ -533,6 +533,7 @@ async fn a_convoy_rows_address_acts_on_that_rows_convoy() {
     let namespace = daemon.provisioning_namespace().await;
     let backend = daemon.resource_backend();
     let engine = Arc::clone(daemon.convoy_engine_path().get().expect("the engine Convoy path"));
+    let mut retired = None;
     for (record, role, landed) in [("lander", "coder", false), ("convoy-1", "lander", true), ("convoy-2", "lander", false)] {
         let labels = BTreeMap::from([(ROLE_LABEL.to_owned(), role.to_owned()), (PROJECT_LABEL.to_owned(), "flotilla".to_owned())]);
         let spec = ConvoySpec::builder().workflow_ref("workflow".into()).project_ref("flotilla".into()).role(role.into()).build();
@@ -546,8 +547,10 @@ async fn a_convoy_rows_address_acts_on_that_rows_convoy() {
             let scope = flotilla_resources::convoy::engine::VerdictScope { vessel: "work".to_string(), role: None };
             engine.keep_by_verdict(&convoy, &scope, "operator", "landed").await.expect("keep the work");
             engine.deliver(&convoy, "claim").await.expect("deliver");
+            retired = Some(launch);
         }
     }
+    let retired = retired.expect("the landed convoy");
     let mut registry = VerbRegistry::new();
     flotilla_store::register_subjects(&mut registry).unwrap();
     registry.register(Records, Presentation::default()).unwrap();
@@ -558,14 +561,21 @@ async fn a_convoy_rows_address_acts_on_that_rows_convoy() {
         .registry(registry)
         .build()
         .into_router();
+    // The landed convoy retired: the table lists the live two, as a listing does.
     let rows = rows(&router, &format!("/tables/convoys/rows?namespace={namespace}")).await;
-    assert_eq!(rows.len(), 3);
+    assert_eq!(rows.len(), 2);
     for row in rows {
         let request = json!({"invocation": "r", "subjects": [row["address"]]});
         let (status, body) = invoke(&router, CallerAuth::Bearer, "convoy.record", request).await;
         assert_eq!(status, StatusCode::OK, "{body}");
         assert_eq!((&body["outcomes"][0]["status"], &body["outcomes"][0]["result"]), (&json!("done"), &row["metadata.name"]), "{body}");
     }
+    // Its record address still acts on it, read by name.
+    let identity = flotilla_store::ConvoyIdentity { record: &retired, role: Some("lander"), project: Some("flotilla"), terminal: true };
+    let address = identity.address().expect("the retired convoy's record address").to_string();
+    let (status, body) = invoke(&router, CallerAuth::Bearer, "convoy.record", json!({"invocation": "r", "subjects": [address]})).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!((&body["outcomes"][0]["status"], &body["outcomes"][0]["result"]), (&json!("done"), &json!(retired)), "{body}");
 }
 
 /// A read verb on an agent session, answering with its session's record name.

@@ -122,6 +122,11 @@ async fn convoy_explain_refuses_multiple_terminal_generations() {
 }
 
 #[tokio::test]
+async fn convoy_explain_names_retired_generations_by_record_only() {
+    ensure_scenarios::convoy_explain_names_retired_generations_by_record_only(&Controller).await;
+}
+
+#[tokio::test]
 async fn convoy_explain_names_a_bare_role_only_without_a_project() {
     ensure_scenarios::convoy_explain_names_a_bare_role_only_without_a_project(&Controller).await;
 }

@@ -29,7 +29,7 @@ use flotilla_resources::{
     },
     vessel_records::{VesselChange, VesselLaunchRequest, VesselRecord, VesselRecords, VesselStep},
     workflow_template::{CrewSource, CrewSpec, Selector, VesselRequirement},
-    Convoy, ConvoyAttention, ConvoyPhase, CrewWorkPhase, WorkPhase, WorkflowSnapshot,
+    Convoy, ConvoyAttention, ConvoyPhase, CrewWorkPhase, ReadWatchEvent, WorkPhase, WorkflowSnapshot,
 };
 use flotilla_store::{
     live_convoys_query,
@@ -224,6 +224,8 @@ struct Convoys {
     reading: tokio::sync::Notify,
     /// Launches held that cannot be read, which a listing leaves out as it does retired ones.
     unreadable: Mutex<Vec<UnreadableLaunch>>,
+    /// What tells the follower a record changed, as a commit does.
+    told: tokio::sync::broadcast::Sender<ConvoyChange>,
 }
 
 impl Convoys {
@@ -239,11 +241,24 @@ impl Convoys {
             failing: Arc::default(),
             gate: (Mutex::new(false), Condvar::new()),
             reading: tokio::sync::Notify::new(),
+            told: tokio::sync::broadcast::channel(16).0,
         }
     }
 
     fn records(&self) -> Vec<ConvoyRecord> {
         self.records.lock().expect("records").clone()
+    }
+
+    /// Writes `record` in place of its launch's, and tells the cursor and the follower, as a
+    /// committed edge does.
+    fn commit(&self, record: ConvoyRecord) {
+        let change = ConvoyChange::Changed { name: record.name.clone(), home: record.home.clone() };
+        let mut records = self.records.lock().expect("records");
+        records.retain(|held| (&held.name, &held.home) != (&record.name, &record.home));
+        records.push(record);
+        drop(records);
+        self.written.lock().expect("written").push(change.clone());
+        let _ = self.told.send(change);
     }
 
     fn set_gate(&self, closed: bool) {
@@ -295,6 +310,9 @@ impl ConvoyRecords for Convoys {
     }
     fn memory(&self) -> &ConvoyMemory {
         &self.memory
+    }
+    fn changes(&self) -> tokio::sync::broadcast::Receiver<ConvoyChange> {
+        self.told.subscribe()
     }
     fn cursor(&self) -> Option<Box<dyn ChangeCursor<ConvoyChange>>> {
         Some(Box::new(Written {
@@ -805,6 +823,110 @@ async fn a_read_by_name_gives_a_held_and_a_retired_launch_of_the_name() {
         BTreeMap::from([(true, Some(ConvoyPhase::Active)), (false, Some(ConvoyPhase::Abandoned))]),
         "this home's held launch, and home-b's retired one with its ending"
     );
+}
+
+/// Views over launches `names`, held here and joined with nothing, installed as a backend's
+/// Convoy kind.
+fn installed(names: &[&str]) -> (Arc<Reads>, ConvoyViews, ResourceBackend) {
+    let (reads, views) = views_of(names);
+    let backend = ResourceBackend::new(InMemoryBackend::default());
+    backend.serve_engine_in("flotilla");
+    Arc::new(views.clone()).install(&backend);
+    (reads, views, backend)
+}
+
+/// `name` held here, abandoned as "stopped" and retired.
+fn retired(name: &str) -> ConvoyRecord {
+    let mut record = launch(name, HERE);
+    record.ended = Some((ConvoyEnd::Abandoned { reason: "stopped".into() }, at(200)));
+    record.retired = true;
+    record
+}
+
+/// The next event a watcher reads: its launch, and its phase and message, or `None` where it left.
+async fn next_event<E: std::fmt::Debug>(
+    watch: &mut (impl futures::Stream<Item = Result<ReadWatchEvent<Convoy>, E>> + Unpin),
+) -> (String, Option<(ConvoyPhase, Option<String>)>) {
+    let event = tokio::time::timeout(Duration::from_secs(5), watch.next()).await.expect("an event").expect("watching").expect("event");
+    match event {
+        ReadWatchEvent::Added(read) | ReadWatchEvent::Modified(read) => {
+            let status = read.object.status.expect("status");
+            (read.object.metadata.name, Some((status.phase, status.message)))
+        }
+        ReadWatchEvent::Deleted(read) => (read.object.metadata.name, None),
+        ReadWatchEvent::DeletedByName { tombstone, .. } => (tombstone.name, None),
+    }
+}
+
+/// What a watcher reads of launch `name` until it leaves, the other launches' events skipped.
+async fn read_until_gone<E: std::fmt::Debug>(
+    watch: &mut (impl futures::Stream<Item = Result<ReadWatchEvent<Convoy>, E>> + Unpin),
+    name: &str,
+) -> Vec<(ConvoyPhase, Option<String>)> {
+    let mut seen = Vec::new();
+    loop {
+        match next_event(watch).await {
+            (launch, Some(read)) if launch == name => seen.push(read),
+            (launch, None) if launch == name => return seen,
+            _ => {}
+        }
+    }
+}
+
+/// Changes launch `other`'s view and reads to its event: what a watcher reads of any launch on the
+/// way.
+async fn read_through_a_change_of<E: std::fmt::Debug>(
+    reads: &Reads,
+    watch: &mut (impl futures::Stream<Item = Result<ReadWatchEvent<Convoy>, E>> + Unpin),
+    other: &str,
+) -> Vec<String> {
+    assert!(reads.convoys.memory.update(other, attention).1);
+    let mut on_the_way = Vec::new();
+    loop {
+        match next_event(watch).await {
+            (launch, _) if launch == other => return on_the_way,
+            (launch, _) => on_the_way.push(launch),
+        }
+    }
+}
+
+// Behaviour (#3108 retirement): a held launch that ends and retires is read by its watcher with how
+// it ended exactly once and then leaves, on the watcher's next read, not at a later sweep. The
+// views hold nothing of it after, and a read by name still gives its ending.
+#[tokio::test]
+async fn a_retired_launch_is_told_ended_once_then_leaves_the_views() {
+    let (reads, views, backend) = installed(&["open#1"]);
+    let mut watch = backend.including_replicas::<Convoy>("flotilla").watch().await.expect("watch");
+    let alone = views.held().await.expect("held");
+
+    reads.convoys.commit(launch("fix-it#1", HERE));
+    while next_event(&mut watch).await.0 != "fix-it#1" {}
+    assert!(views.held().await.expect("held") > alone, "the live launch is held");
+
+    reads.convoys.commit(retired("fix-it#1"));
+    let seen = read_until_gone(&mut watch, "fix-it#1").await;
+    assert_eq!(seen, [(ConvoyPhase::Abandoned, Some("stopped".to_owned()))], "the watcher read its ending once, then it left");
+    assert!(read_through_a_change_of(&reads, &mut watch, "open#1").await.is_empty(), "nothing more is told of it");
+    assert_eq!(views.held().await.expect("held"), alone, "the views hold nothing of the retired launch");
+    assert!(views.sources().await.expect("sources").iter().all(|read| read.object.metadata.name != "fix-it#1"));
+    let read = backend.using::<Convoy>("flotilla").get("fix-it#1").await.expect("read by name");
+    assert_eq!(read.status.expect("status").phase, ConvoyPhase::Abandoned);
+}
+
+// Behaviour (#3108 retirement): a launch the views first see retired, born ended or ended and
+// retired between two passes, is read by its watcher with how it ended exactly once and then
+// leaves; the views hold nothing of it after.
+#[tokio::test]
+async fn a_launch_first_seen_retired_is_told_ended_once_then_leaves() {
+    let (reads, views, backend) = installed(&["open#1"]);
+    let mut watch = backend.including_replicas::<Convoy>("flotilla").watch().await.expect("watch");
+    let alone = views.held().await.expect("held");
+
+    reads.convoys.commit(retired("born#1"));
+    let seen = read_until_gone(&mut watch, "born#1").await;
+    assert_eq!(seen, [(ConvoyPhase::Abandoned, Some("stopped".to_owned()))], "the watcher read its ending once, then it left");
+    assert!(read_through_a_change_of(&reads, &mut watch, "open#1").await.is_empty(), "nothing more is told of it");
+    assert_eq!(views.held().await.expect("held"), alone, "the views hold nothing of the retired launch");
 }
 
 /// `name` held at `home`, ensured from `ensure`, and ended when `ended`.
