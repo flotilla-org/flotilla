@@ -6,7 +6,7 @@ use std::{collections::BTreeMap, sync::Arc};
 use chrono::{TimeZone, Utc};
 use flotilla_engine_convoys::{
     convoy_records::EngineConvoyRecords,
-    convoys::{Convoys, Retirement},
+    convoys::{declare_carried, Convoys, Retirement},
 };
 use flotilla_engine_messages::awaiting::{AwaitingReplies, OpenAwaiting, STALL};
 use flotilla_protocol::{PrincipalRef, Relationship};
@@ -251,10 +251,13 @@ fn an_undecodable_launch_is_listed_as_unreadable_beside_the_others() {
     }
 }
 
-/// A decided store at `home` holding every kind a retirement reads for holds.
+/// A decided store at `home` holding every kind a retirement reads for holds, declaring what a
+/// Convoy snapshot carries as the daemon's store does when it opens.
 fn service_at(dir: &tempfile::TempDir, home: &str) -> Arc<Service> {
     let registry = flotilla_provisioning::stored::decided_registry().expect("registry");
-    Arc::new(Service::open(&dir.path().join("decided.sqlite"), home, registry).expect("store"))
+    let service = Arc::new(Service::open(&dir.path().join("decided.sqlite"), home, registry).expect("store"));
+    declare_carried(&service);
+    service
 }
 
 /// One round of `home`'s stream, as `from` serves it after `after`, received into `to`.
@@ -393,9 +396,9 @@ fn a_relay_holding_a_retired_launch_by_snapshot_snapshots_a_follower_behind_its_
     let cursor = home_c.watermark("home-b").expect("cursor").home_seq;
     failed_and_retired(&convoys, &launch);
 
+    // The relay's store declares what a Convoy snapshot carries as it opens: it relays them
+    // without its own convoys opened.
     let relay = service_at(&dirs[1], HOME);
-    // Every daemon opens its convoys, which names what their snapshots carry, relayed ones too.
-    let _relay_convoys = Convoys::open(HOME, &relay).expect("open");
     assert!(round(&home_b, "home-b", None, &relay).snapshot);
     assert!(round(&relay, "home-b", Some(cursor), &home_c).snapshot, "a follower behind the relay's cut is snapshotted");
     let records =

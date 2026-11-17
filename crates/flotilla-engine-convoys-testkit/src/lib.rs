@@ -44,6 +44,9 @@ impl EngineConvoysHome {
         reads: Arc<dyn LifecycleReads>,
     ) -> Self {
         let home = service.home().to_owned();
+        // The daemon declares this as it opens its store; a test's store is opened by kits that
+        // know nothing of convoys, so it is declared here, before any of its snapshots is served.
+        flotilla_engine_convoys::convoys::declare_carried(service);
         let convoys = Arc::new(Convoys::open(&home, service).expect("engine Convoy home"));
         let stalls = flotilla_engine_messages::awaiting::OpenAwaiting::open(service).expect("the open AwaitingReply records");
         let records = EngineConvoyRecords::new(&home, Arc::clone(service), Arc::clone(convoys.memory()), stalls);

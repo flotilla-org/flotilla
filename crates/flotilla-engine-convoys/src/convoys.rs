@@ -49,6 +49,13 @@ pub struct Convoys {
 /// retired afresh.
 const RETIREMENTS: usize = 256;
 
+/// Declares on `service` what a snapshot of a Convoy carries: a retired launch's end entry, which
+/// its record no longer holds. Declared where the store is opened, before it serves any
+/// replication, so what a snapshot carries never waits on the convoy path's install.
+pub fn declare_carried(service: &Service) {
+    service.carry(<Resource<Convoy> as Kind>::CODE, Arc::new(crate::convoy_records::carried_ends));
+}
+
 fn locked<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
     mutex.lock().unwrap_or_else(PoisonError::into_inner)
 }
@@ -80,7 +87,6 @@ impl Convoys {
         for convoy in stored {
             convoys.restore(convoy).map_err(|error| format!("{error:?}"))?;
         }
-        service.carry(<Resource<Convoy> as Kind>::CODE, Arc::new(crate::convoy_records::carried_ends));
         Ok(Self {
             home_name: home.to_owned(),
             service: Arc::clone(service),
