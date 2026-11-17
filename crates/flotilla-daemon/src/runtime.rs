@@ -1023,7 +1023,17 @@ fn counted<F: std::future::Future>(state: &ControllerRuntimeState, caller: &str,
 /// realising them through the host's providers and told by its probes what became of them.
 fn spawn_environment_controller(state: &Arc<ControllerRuntimeState>, engine: &ProvisioningLifecycles) -> Option<JoinHandle<()>> {
     use flotilla_provisioning::engine::{controller::Controller, environment_actuator::EnvironmentActuator, reads::StoreReads};
-    let backings = state.environment_backing_events.lock().unwrap_or_else(std::sync::PoisonError::into_inner).take()?;
+    let mut observed = state.environment_backing_events.lock().unwrap_or_else(std::sync::PoisonError::into_inner).take()?;
+    // The probes report without waiting on the controller, which starts after startup adoption
+    // has judged every backing; the controller takes their reports in order from here.
+    let (backing, backings) = tokio::sync::mpsc::channel(64);
+    tokio::spawn(async move {
+        while let Some(event) = observed.recv().await {
+            if backing.send(event).await.is_err() {
+                break;
+            }
+        }
+    });
     let service = match state.daemon.decided_store() {
         Ok(service) => service,
         Err(error) => {

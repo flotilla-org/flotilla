@@ -87,9 +87,10 @@ pub(super) struct ControllerRuntimeState {
     /// Per-kind controller loop load metrics (#3206).
     pub(super) controller_metrics: Arc<ControllerMetricsRegistry>,
     /// What the host's probes observe of its environments' backings, for the Environment
-    /// controller: the sender the probes use, and the receiver its controller takes once.
-    pub(super) environment_backings: tokio::sync::mpsc::Sender<BackingEvent>,
-    pub(super) environment_backing_events: StdMutex<Option<tokio::sync::mpsc::Receiver<BackingEvent>>>,
+    /// controller: the sender the probes use, and the receiver its controller takes once. It is
+    /// unbounded: startup adoption reports every lost backing before the controller runs.
+    pub(super) environment_backings: tokio::sync::mpsc::UnboundedSender<BackingEvent>,
+    pub(super) environment_backing_events: StdMutex<Option<tokio::sync::mpsc::UnboundedReceiver<BackingEvent>>>,
     /// The checkout launches a host probe saw change, for the Checkout controller to observe
     /// again: the sender the probe uses, and the receiver its controller takes once.
     pub(super) checkout_rechecks: tokio::sync::mpsc::Sender<String>,
@@ -160,7 +161,7 @@ impl ControllerRuntimeState {
 
     /// Tells the Environment controller what a probe observed of `name`'s backing.
     pub(super) async fn observe_environment_backing(&self, name: &str, observed: flotilla_provisioning::engine::controller::Backing) {
-        if self.environment_backings.send(BackingEvent { name: name.to_owned(), observed }).await.is_err() {
+        if self.environment_backings.send(BackingEvent { name: name.to_owned(), observed }).is_err() {
             tracing::warn!(environment = name, "the Environment controller is not running; the backing observation is dropped");
         }
     }
@@ -302,7 +303,7 @@ impl ControllerRuntimeState {
             Arc::new(flotilla_vcs::vcs::FlotillaVcs::object_cache(Arc::clone(&daemon.discovery_runtime().runner))),
             config.state_dir().as_path().join("skill-source-cache"),
         ));
-        let (environment_backings, environment_backing_events) = tokio::sync::mpsc::channel(64);
+        let (environment_backings, environment_backing_events) = tokio::sync::mpsc::unbounded_channel();
         let (checkout_rechecks, checkout_recheck_events) = tokio::sync::mpsc::channel(64);
         let (vessel_rechecks, vessel_recheck_events) = tokio::sync::mpsc::channel(64);
         Self {

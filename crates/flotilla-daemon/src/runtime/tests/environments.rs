@@ -599,6 +599,60 @@ async fn cloud_unknown_does_not_abort_gone_sibling() {
     }
 }
 
+// Behaviour (C): at startup, before the Environment controller runs, adoption finds every
+// backing its vendor no longer holds lost at once, however many there are; none waits out
+// the adoption timeout.
+#[tokio::test(start_paused = true)]
+async fn startup_adoption_reports_every_absent_backing_lost_at_once() {
+    use crate::runtime::environments::ENVIRONMENT_ADOPTION_TIMEOUT;
+    let temp = TempDir::new().unwrap();
+    fs::create_dir_all(temp.path().join("config")).unwrap();
+    fs::write(temp.path().join("config/daemon.toml"), r#"machine_id = "absent-backings-test""#).unwrap();
+    let config = Arc::new(ConfigStore::with_base(temp.path().join("config")));
+    let daemon = InProcessDaemon::new(
+        Vec::new(),
+        config.clone(),
+        fake_discovery_with_provider_set(FakeDiscoveryProviders::new()),
+        HostName::new("controller"),
+        Arc::new(crate::peer::HostPeerOverlay::default()),
+    )
+    .await;
+    let address: flotilla_address::Address = "account:cloud/provider:cloud".parse().unwrap();
+    engine_environments(&daemon);
+    let mut state = ControllerRuntimeState::new(
+        daemon.clone(),
+        config,
+        Arc::new(ProviderRegistry::new()),
+        None,
+        daemon.local_host_id().unwrap().to_string(),
+        "direct".into(),
+    );
+    // The vendor holds none of them.
+    state.environment_providers.insert(address.clone(), Arc::new(AdoptionEnvironmentProvider { handles: Vec::new() })).unwrap();
+    let state = Arc::new(state);
+    let environments = engine_environments(&daemon);
+    let spec: flotilla_resources::EnvironmentSpec = serde_json::from_value(serde_json::json!({
+        "provider_address": address.to_string(), "cloud_sandbox": {
+            "image": "cloud", "size": {"cpus":1,"memory_bytes":1024,"disk_bytes":1024}, "env": {} }
+    }))
+    .unwrap();
+    let names = (0..200).map(|index| format!("env-{index:03}")).collect::<Vec<_>>();
+    for name in &names {
+        environments.put_ready(name, &spec, None, &format!("backing-{name}"), Default::default());
+    }
+    tokio::time::timeout(ENVIRONMENT_ADOPTION_TIMEOUT / 4, reconcile_provisioned_environments(&state, NAMESPACE))
+        .await
+        .expect("adoption judges absent backings without waiting")
+        .expect("absent backings are an observation, not an error");
+    let mut lost = observed_backings(&state)
+        .into_iter()
+        .filter(|event| matches!(event.observed, Backing::Absent { .. }))
+        .map(|event| event.name)
+        .collect::<Vec<_>>();
+    lost.sort();
+    assert_eq!(lost, names, "every absent backing is reported lost");
+}
+
 // #3780: bound active cloud work, admit queued siblings in order as slots free,
 // and cancel timed-out jobs without letting Unknown/slow jobs abort siblings.
 // The jobs stand in for provider/SSH IO; the actual production scheduler runs.
