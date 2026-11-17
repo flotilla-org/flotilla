@@ -16,6 +16,10 @@ members:
   - alias: rigging
     url: https://github.com/flotilla-org/rigging
     roles: [code]
+  # Fearnought: the agent conversation contract, client, server and feeders (wheelhouse#782).
+  - alias: fearnought
+    url: https://github.com/flotilla-org/fearnought
+    roles: [code]
 skills:
   '*':
     - flotilla-org/flotilla@flotilla-commands
