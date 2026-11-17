@@ -140,8 +140,10 @@ async fn old_store_reads_see_each_sessions_newest_launch() {
     assert_eq!(failed.phase, TerminalSessionPhase::Failed);
     assert!(failed.message.expect("reason").contains("engine ending reason"));
 
-    let listed = sessions.list().await.expect("list").items;
-    assert_eq!(listed.iter().map(|session| session.metadata.name.as_str()).collect::<Vec<_>>(), [request.session.as_str()]);
+    // Nothing holds the failed launch (its vessel doesn't exist), so the listing drops it while
+    // a read by name still finds it in the store.
+    assert!(sessions.list().await.expect("list").items.is_empty(), "an unheld ended session leaves the listing");
+    assert_eq!(read().await.phase, TerminalSessionPhase::Failed, "the store still reads it by name");
     assert!(sessions.delete(&request.session).await.is_err(), "a session ends with its holder; it is not deleted");
 }
 

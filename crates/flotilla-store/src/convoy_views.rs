@@ -171,6 +171,8 @@ impl Cursors {
                                 let vessel = joins.holder(vessel.as_deref()?, home)?;
                                 Some((vessel.convoy_home.clone(), vessel.convoy.clone()))
                             }
+                            // Evicted once no view composes from it.
+                            JoinChange::TerminalEvicted { .. } => None,
                         })
                         .collect::<Vec<_>>(),
                 ),

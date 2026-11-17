@@ -21,7 +21,7 @@ use flotilla_resources::{
     environment_records::{EnvironmentChange, EnvironmentRecord},
     held_joins::{self, JoinChange, JoinChanges, JoinsReader},
     lifecycle_reads::{ChangeCursor, LifecycleReads},
-    terminal_records::{newest_launches, TerminalHolderView, TerminalRecord, TerminalRecords},
+    terminal_records::{launched, newest_launches, TerminalHolderView, TerminalRecord, TerminalRecords},
     vessel_seats::VesselSeats,
     ReadResourceObject, ResourceError, ResourceObject, ResourceProvenance, TerminalSession, TerminalSessionSpec, TerminalSessionStatus,
 };
@@ -83,6 +83,17 @@ impl Listing {
                 None => self.index.remove(&session),
             }
             self.sessions.insert(session, entry);
+        }
+    }
+
+    /// Stops holding `session` where `launch` is its launch held: the held joins evicted it, so
+    /// it ended and no view lists it.
+    fn evict(&mut self, session: &Session, launch: &str) {
+        if self.sessions.get(session).is_some_and(|entry| entry.record.name == launch) {
+            self.index.remove(session);
+            if self.sessions.remove(session).is_some_and(|entry| entry.view.is_some()) {
+                self.changed.record([session.1.clone()]);
+            }
         }
     }
 
@@ -207,7 +218,9 @@ impl Cursors {
             match joins.since(*seen) {
                 JoinChanges::Everything => dirt.all = true,
                 JoinChanges::Changed(changes) => changes.into_iter().for_each(|change| match change {
-                    JoinChange::Terminal { name, home, .. } => drop(dirt.terminals.insert((name.clone(), home.clone()))),
+                    JoinChange::Terminal { name, home, .. } | JoinChange::TerminalEvicted { name, home } => {
+                        dirt.terminals.insert((name.clone(), home.clone()));
+                    }
                     JoinChange::Vessel { name, .. } => drop(dirt.vessels.insert(name.clone())),
                 }),
             }
@@ -362,13 +375,19 @@ impl TerminalViews {
     /// Composes again the sessions `dirt` touched in `listing`, and takes in their new launches.
     async fn pass(&self, listing: &mut Listing, dirt: Dirt) -> Result<(), ResourceError> {
         let Dirt { terminals, observed, environments, vessels, .. } = dirt;
-        let changed = self
+        let (changed, evicted) = self
             .blocking(move |reads| {
                 reads.joins()?.read(reads, |joins| {
-                    terminals.iter().filter_map(|(name, home)| joins.terminal(name, home).cloned()).collect::<Vec<_>>()
+                    let (held, evicted): (Vec<_>, Vec<_>) =
+                        terminals.into_iter().partition(|(name, home)| joins.terminal(name, home).is_some());
+                    (held.iter().filter_map(|(name, home)| joins.terminal(name, home).cloned()).collect::<Vec<_>>(), evicted)
                 })
             })
             .await?;
+        // A launch the held joins no longer hold has ended and is listed no more.
+        for (name, home) in evicted {
+            listing.evict(&(home, launched(&name).to_owned()), &name);
+        }
         let here = self.terminals().map_err(ResourceError::other)?.home().to_owned();
         let mut again: BTreeSet<Session> = listing
             .sessions
@@ -420,6 +439,11 @@ impl TerminalViews {
             ((record.home.clone(), record.session_name().to_owned()), Entry { record, view: None, unresolved: false, keys: Vec::new() })
         }));
         Ok(entries)
+    }
+
+    /// How many sessions the listing holds: what grows with the sessions held.
+    pub async fn held(&self) -> Result<usize, ResourceError> {
+        Ok(self.passed().await?.sessions.len())
     }
 
     /// This home's sessions' newest launches.

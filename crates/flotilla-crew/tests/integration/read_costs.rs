@@ -577,6 +577,8 @@ struct CrewedConvoys {
     store: OtherHome,
     engine: EngineFixture,
     convoys: EngineConvoysHome,
+    /// The TerminalSession views `backend` serves.
+    sessions: Arc<flotilla_store::TerminalViews>,
     backend: ResourceBackend,
     /// The first convoy's launch and its coder's session.
     target: (String, String),
@@ -596,7 +598,8 @@ async fn crewed_convoys(others: usize, own_environments: bool) -> CrewedConvoys 
     let engine = EngineFixture::over_service(store.service());
     let backend = ResourceBackend::new(InMemoryBackend::default());
     let convoys = EngineConvoysHome::over(store.service(), NAMESPACE, &backend, Arc::new(SystemClock), engine.reads());
-    backend.install_engine_records(Arc::new(TerminalViews::new(NAMESPACE, Arc::clone(convoys.reads()))));
+    let sessions = Arc::new(TerminalViews::new(NAMESPACE, Arc::clone(convoys.reads())));
+    backend.install_engine_records(Arc::clone(&sessions) as _);
     let host_direct = EnvironmentSpec {
         host_direct: Some(HostDirectEnvironmentSpec { host_ref: "host".into(), repo_default_dir: "/repo".into() }),
         ..Default::default()
@@ -627,7 +630,7 @@ async fn crewed_convoys(others: usize, own_environments: bool) -> CrewedConvoys 
         launches.push((launch, vessel, session));
     }
     let (target, target_session) = (target.expect("the target convoy"), target_session.expect("the target's session"));
-    CrewedConvoys { store, engine, convoys, backend, target, target_session, launches }
+    CrewedConvoys { store, engine, convoys, sessions, backend, target, target_session, launches }
 }
 
 /// What each of a scoped fleet listing's selecting queries read, by kind, with `others` convoys
@@ -832,4 +835,85 @@ async fn ended_launches_leave_the_held_joins() {
     let again = convoys.get(&ended[0].0).await.expect("an ended convoy").status.expect("its status");
     assert_eq!(again.branch_subject_scan_error.as_deref(), Some("noted after the end"), "the view is composed again");
     assert_eq!(again.work, composed, "its works show what they did");
+}
+
+/// What the held joins, the session views and the Vessel views hold.
+#[derive(Debug, PartialEq, Eq)]
+struct HeldWork {
+    joins: (usize, usize),
+    sessions: usize,
+    vessels: usize,
+}
+
+/// What is held with `convoys` convoys running, and again once each has ended with its Vessel and
+/// session launches: every other one released, the rest ended Broke and Lost and never released.
+/// With `watched`, the Vessel views are watched, as a daemon's are, and keep their listing from
+/// pass to pass; unwatched, each read lists them afresh.
+async fn held_before_and_after_ending(convoys: usize, watched: bool) -> (HeldWork, HeldWork) {
+    use flotilla_resources::{vessel_records::VesselStep, TerminalSession, Vessel};
+    use flotilla_store::VesselViews;
+
+    let crewed = crewed_convoys(convoys - 1, false).await;
+    let vessel_views = Arc::new(VesselViews::new(crewed.backend.clone(), NAMESPACE, Arc::clone(crewed.convoys.reads())));
+    crewed.backend.install_engine_records(Arc::clone(&vessel_views) as _);
+    let _watch = match watched {
+        true => Some(crewed.backend.clone().including_replicas::<Vessel>(NAMESPACE).watch().await.expect("watch the vessels")),
+        false => None,
+    };
+    let views = (
+        crewed.backend.clone().using::<Convoy>(NAMESPACE),
+        crewed.backend.clone().using::<TerminalSession>(NAMESPACE),
+        crewed.backend.clone().using::<Vessel>(NAMESPACE),
+    );
+    let joins = crewed.convoys.reads().joins().expect("the held joins");
+    let held = || async {
+        // Each view reads what changed: the ends, the joins' evictions after them, and those.
+        for _ in 0..3 {
+            views.0.list().await.expect("the convoy views");
+            views.1.list().await.expect("the session views");
+            views.2.list().await.expect("the vessel views");
+        }
+        let joins = joins.held();
+        HeldWork {
+            joins: (joins.vessels, joins.terminals),
+            sessions: crewed.sessions.held().await.expect("the session views"),
+            vessels: vessel_views.held().await.expect("the vessel views"),
+        }
+    };
+    let running = held().await;
+
+    let engine = crewed.convoys.path().get().cloned().expect("the Convoy path");
+    for (n, (launch, vessel, session)) in crewed.launches.iter().enumerate() {
+        let view = views.0.get(launch).await.expect("the convoy");
+        engine.abandon(&view, "operator", "ended").await.expect("end the convoy");
+        if n % 2 == 0 {
+            crewed.engine.terminals.release(session);
+            crewed.engine.vessels.step(vessel, VesselStep::Released);
+        } else {
+            crewed.engine.terminals.lost(session, "gone");
+            crewed.engine.vessels.step(vessel, VesselStep::Broke { reason: "gone".into() });
+        }
+    }
+    let ended = held().await;
+    // The second convoy's launches ended and were never released.
+    let (_, vessel, session) = &crewed.launches[1];
+    let lost = crewed.engine.terminals.record(session);
+    assert!(views.1.get(lost.session_name()).await.is_ok(), "a session that ended is read by name");
+    assert!(views.2.get(vessel).await.is_ok(), "a Vessel launch that ended is read by name");
+    (running, ended)
+}
+
+// Behaviour: the joins and the session and Vessel views hold live work, not history. Once every
+// convoy has ended, and its launches have ended released or ended and were never released, they
+// hold nothing, whether 3 convoys ran or 12. A read by name still finds an ended launch.
+#[tokio::test]
+async fn ended_work_leaves_the_views_at_any_size() {
+    for watched in [true, false] {
+        let (small_running, small) = held_before_and_after_ending(3, watched).await;
+        let (large_running, large) = held_before_and_after_ending(12, watched).await;
+        assert_eq!(small_running, HeldWork { joins: (3, 3), sessions: 3, vessels: 6 }, "each live launch is held");
+        assert_eq!(large_running, HeldWork { joins: (12, 12), sessions: 12, vessels: 24 }, "each live launch is held");
+        let none = || HeldWork { joins: (0, 0), sessions: 0, vessels: 0 };
+        assert_eq!((small, large), (none(), none()), "nothing ended is held, watched: {watched}");
+    }
 }

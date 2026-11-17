@@ -10,15 +10,15 @@
 //! reading the journal registers a [`JoinsReader`] and tells it the sequence it has composed
 //! through; a launch is kept until every reader has composed its last change. Beyond
 //! that, an ended launch is kept while a view could still compose from it:
-//! - a session launch while its Vessel launch serves a convoy view, and while it is its session's
-//!   newest launch at its home and not released, which the TerminalSession views list;
+//! - a session launch while its Vessel launch is live or serves a convoy view: the TerminalSession
+//!   views list an ended session until it is evicted, which the journal tells them;
 //! - a Vessel launch while it is its work's newest launch and its convoy has not ended, and while
 //!   any session launch held names it, whose holder it is;
 //! - the newest launch of a work or session at a home until no older one is held, so an older
 //!   launch never stands in for it.
 //!
 //! The Convoy views tell which convoys ended by releasing their Vessel launches once they have
-//! composed the ended convoy, and keep what they composed for each ended convoy's works.
+//! composed the ended convoy, and keep what they composed for its works while they hold it.
 
 use std::{
     collections::{BTreeMap, BTreeSet, VecDeque},
@@ -27,8 +27,6 @@ use std::{
         Arc, Mutex, MutexGuard, PoisonError,
     },
 };
-
-use flotilla_protocol::LifecycleReading;
 
 use crate::{
     lifecycle_reads::{ChangeCursor, LifecycleReads},
@@ -71,6 +69,8 @@ pub enum JoinChange {
     Vessel { name: String, home: String, convoy: String, convoy_home: String },
     /// Session launch `name` at `home` changed; it is held for `vessel`, if any.
     Terminal { name: String, home: String, vessel: Option<String> },
+    /// Ended session launch `name` at `home` is held no more: no view lists it.
+    TerminalEvicted { name: String, home: String },
 }
 
 /// What a view reads of the journal since its position.
@@ -438,8 +438,10 @@ impl Held {
                 .filter(|key| self.terminals.get(*key).is_some_and(|launch| composed(launch.changed) && !self.terminal_needed(launch)))
                 .cloned()
                 .collect();
-            for key in &terminals {
-                self.drop_terminal(key);
+            for key in terminals.iter().cloned() {
+                self.drop_terminal(&key);
+                let (name, home) = key;
+                self.journal(JoinChange::TerminalEvicted { name, home });
             }
             let vessels: Vec<Key> = self
                 .ended_vessels
@@ -471,12 +473,9 @@ impl Held {
         }
         let session = launched(&record.name);
         let mut others = self.session_launches(session, &record.home).filter(|other| other.name != record.name);
-        match others.clone().any(|other| other.launch_number() > record.launch_number()) {
-            // An older launch: nothing composes it in place of the newest.
-            true => false,
-            // The newest: listed until released, and kept until no older one is held.
-            false => record.reading != LifecycleReading::Released || others.next().is_some(),
-        }
+        // An older launch: nothing composes it in place of the newest. The newest, ended: kept
+        // until no older one is held.
+        !others.clone().any(|other| other.launch_number() > record.launch_number()) && others.next().is_some()
     }
 
     /// Whether a view could still compose from ended Vessel launch `launch`.

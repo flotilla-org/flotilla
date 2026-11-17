@@ -330,7 +330,8 @@ impl VesselViews {
         let shown = listing.shown();
         listing.works.clear();
         listing.names.clear();
-        for (work, entry) in entries {
+        // A launch listed no more is not held: a later launch of its work is newer.
+        for (work, entry) in entries.into_iter().filter(|(_, entry)| entry.view.is_some()) {
             listing.names.insert(entry.record.name.clone(), work.clone());
             listing.works.insert(work, entry);
         }
@@ -406,7 +407,15 @@ impl VesselViews {
                     listing.changed.record([replaced, entry.record.name.clone()]);
                 }
                 Some(held) if shown(held) == shown(&entry) => {}
+                None if entry.view.is_none() => {}
                 _ => drop(listing.changed.record([entry.record.name.clone()])),
+            }
+            if entry.view.is_none() {
+                // Listed no more, it is not held: a later launch of its work is newer.
+                if let Some(gone) = listing.works.remove(&work) {
+                    listing.names.remove(&gone.record.name);
+                }
+                continue;
             }
             listing.names.insert(entry.record.name.clone(), work.clone());
             listing.works.insert(work, entry);
@@ -448,6 +457,12 @@ impl VesselViews {
         }
         entries.extend(hidden.into_iter().map(|record| (work_of(&record), Entry { record, holder: None, view: None })));
         Ok(entries)
+    }
+
+    /// How many entries the listing holds, once it has read what changed: what grows with the
+    /// launches held.
+    pub async fn held(&self) -> Result<usize, ResourceError> {
+        self.listed_at(|listing| listing.works.len() + listing.names.len()).await.map(|(_, held)| held)
     }
 
     /// Launch `name` at this home, else at whichever home holds it.
