@@ -3,11 +3,11 @@
 
 use std::collections::BTreeMap;
 
-use flotilla_engine_messages_testkit::{designate_fleet, intent, party, EngineMessagesHome};
+use flotilla_engine_messages_testkit::{crewed_convoy, designate_fleet, intent, party, EngineMessagesHome};
 use flotilla_messaging::IntentReference;
 use flotilla_protocol::ResourceRef;
 use flotilla_resources::{
-    message_record_name, Convoy, ConvoySpec, InputMeta, MessageReference, MessageRelation, Selector, TerminalBrief, TerminalCrewContext,
+    message_record_name, ConvoySpec, InputMeta, MessageReference, MessageRelation, Selector, TerminalBrief, TerminalCrewContext,
     TerminalSession, TerminalSessionSource, TerminalSessionSpec, CONVOY_LABEL, ROLE_LABEL, VESSEL_LABEL,
 };
 use flotilla_store::ResourceBackend;
@@ -19,14 +19,8 @@ const NAMESPACE: &str = "flotilla";
 async fn a_capability_card_is_admitted_about_its_sessions_seat() {
     let backend = ResourceBackend::new(InMemoryBackend::default());
     designate_fleet(&backend, NAMESPACE).await;
-    backend
-        .using::<Convoy>(NAMESPACE)
-        .create(
-            &InputMeta::builder().name("crew".into()).build(),
-            &ConvoySpec::builder().workflow_ref("workflow".into()).role("crew".into()).build(),
-        )
-        .await
-        .expect("convoy");
+    let spec = ConvoySpec::builder().workflow_ref("workflow".into()).role("crew".into()).build();
+    crewed_convoy(&backend, NAMESPACE, "crew", &spec, &["coder"]).await;
     backend
         .using::<TerminalSession>(NAMESPACE)
         .create(

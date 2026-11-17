@@ -6,10 +6,10 @@ use std::collections::BTreeMap;
 
 use flotilla_address::Revision;
 use flotilla_engine_messages::{view::turn_header, OldStoreRecords};
-use flotilla_engine_messages_testkit::{designate_fleet, intent, EngineMessagesHome};
+use flotilla_engine_messages_testkit::{crewed_convoy, designate_fleet, intent, EngineMessagesHome};
 use flotilla_messaging::{IntentExpectation, IntentReference};
 use flotilla_resources::{
-    convoy::engine::convoy_reference_address, Convoy, ConvoySpec, InputMeta, MessageRelation, Selector, TerminalBrief, TerminalCrewContext,
+    convoy::engine::convoy_reference_address, ConvoySpec, InputMeta, MessageRelation, Selector, TerminalBrief, TerminalCrewContext,
     TerminalSession, TerminalSessionSource, TerminalSessionSpec, CONVOY_LABEL, ROLE_LABEL, VESSEL_LABEL,
 };
 use flotilla_store::ResourceBackend;
@@ -52,11 +52,8 @@ fn session(role: &str) -> (InputMeta, TerminalSessionSpec) {
 async fn a_turn_header_frames_as_the_old_view_did() {
     let backend = ResourceBackend::new(InMemoryBackend::default());
     designate_fleet(&backend, NAMESPACE).await;
-    backend
-        .using::<Convoy>(NAMESPACE)
-        .create(&InputMeta::builder().name("crew".into()).build(), &ConvoySpec::builder().workflow_ref("workflow".into()).build())
-        .await
-        .expect("convoy");
+    let spec = ConvoySpec::builder().workflow_ref("workflow".into()).build();
+    crewed_convoy(&backend, NAMESPACE, "crew", &spec, &["coder", "reviewer"]).await;
     for role in ["coder", "reviewer"] {
         let (meta, spec) = session(role);
         backend.using::<TerminalSession>(NAMESPACE).create(&meta, &spec).await.expect("session");

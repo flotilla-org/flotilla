@@ -8,8 +8,9 @@ use flotilla_engine_messages::{records::MessageRecords, roles::FleetRoles, Messa
 use flotilla_inbox::InboxBackend;
 use flotilla_messaging::{EngineMessages, Intent};
 use flotilla_resources::{
-    attentions::Attentions, Clock, FleetDesignation, FleetDesignationSpec, InputMeta, Message as OldMessage, MessageRelation, Project,
-    ProjectSpec, ReadResourceObject, ResourceError, SystemClock, FLEET_DESIGNATION_NAME,
+    attentions::Attentions, Clock, Convoy, ConvoySpec, ConvoyStatus, CrewSource, CrewSpec, FleetDesignation, FleetDesignationSpec,
+    InputMeta, Message as OldMessage, MessageRelation, Project, ProjectSpec, ReadResourceObject, ResourceError, Selector, SystemClock,
+    VesselRequirement, WorkflowSnapshot, FLEET_DESIGNATION_NAME,
 };
 use flotilla_schema::{Address, Timestamp};
 use flotilla_schema_sqlite::stream::Service;
@@ -161,6 +162,35 @@ pub fn party(party: &str) -> Address {
 /// expecting nothing.
 pub fn intent(sender: &str, receiver: &str, relation: MessageRelation, body: impl Into<String>) -> Intent {
     Intent::new(party(sender), party(receiver), relation, body)
+}
+
+/// Creates convoy `name` with `spec` in `namespace`, its frozen workflow one vessel, `work`,
+/// crewed by an agent seat for each of `roles`: the snapshot every engine convoy holds from its
+/// admission, through which a seat's vessel is spelled.
+pub async fn crewed_convoy(backend: &ResourceBackend, namespace: &str, name: &str, spec: &ConvoySpec, roles: &[&str]) {
+    let convoys = backend.using::<Convoy>(namespace);
+    let convoy = convoys.create(&InputMeta::builder().name(name.into()).build(), spec).await.expect("convoy");
+    let crew = roles
+        .iter()
+        .map(|role| {
+            CrewSpec::builder()
+                .role((*role).to_owned())
+                .source(CrewSource::Agent { selector: Selector::for_capability("code"), prompt: None, brief_template: None })
+                .build()
+        })
+        .collect();
+    let status = ConvoyStatus {
+        workflow_snapshot: Some(WorkflowSnapshot {
+            cascade: None,
+            vessels: vec![VesselRequirement::builder().name("work".to_owned()).crew(crew).build()],
+            exit: None,
+            turn_delivery: Default::default(),
+            stall_nudges: Default::default(),
+            supervision: None,
+        }),
+        ..ConvoyStatus::default()
+    };
+    convoys.update_status(name, &convoy.metadata.resource_version, &status).await.expect("convoy snapshot");
 }
 
 /// Declares Project `fleet` in `namespace` and designates it, so the fleet roles the system

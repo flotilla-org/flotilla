@@ -1,12 +1,12 @@
 //! Spelling a message in the old shape reads, by key, the records that message names (#3108):
-//! its convoy role's convoy and the sessions labelled with that role when the convoy names no
-//! vessel for it. Unrelated convoys, sessions, artifacts, repositories and projects change no
+//! its convoy role's convoy, whose snapshot names the role's vessel. Unrelated convoys, sessions,
+//! artifacts, repositories and projects change no
 //! read, and no request lists a kind whole. Each size runs on a fresh backend and Message path,
 //! so nothing a read holds is warm.
 
 use std::collections::BTreeMap;
 
-use flotilla_engine_messages_testkit::{designate_fleet, EngineMessagesHome};
+use flotilla_engine_messages_testkit::{crewed_convoy, designate_fleet, EngineMessagesHome};
 use flotilla_resources::{
     artifact::blob_digest_of, Artifact, ArtifactSpec, Convoy, ConvoySpec, InputMeta, MessageRelation, Project, ProjectSpec, Repository,
     RepositorySpec, Selector, TerminalBrief, TerminalCrewContext, TerminalSession, TerminalSessionSource, TerminalSessionSpec,
@@ -17,10 +17,8 @@ use flotilla_store_memory::InMemoryBackend;
 use flotilla_store_testkit::{assert_flat_reads, ReadCountsBackendExt, ReadOperation, ReadSnapshot};
 
 const NAMESPACE: &str = "flotilla";
-/// A role in a convoy held here, whose snapshot names no vessel for it.
+/// A role in a convoy held here, whose snapshot names its vessel.
 const HELD: &str = "flotilla/crew/work/coder";
-/// A role in a convoy this home holds no copy of.
-const ELSEWHERE: &str = "flotilla/remote/work/coder";
 
 /// A crew session holding `role` in `convoy`'s work `vessel`, labelled as the vessel reconciler labels it.
 fn session(convoy: &str, vessel: &str, role: &str) -> (InputMeta, TerminalSessionSpec) {
@@ -67,9 +65,9 @@ async fn terminal(backend: &ResourceBackend, convoy: &str, vessel: &str, role: &
 async fn open_read(unrelated: usize) -> ReadSnapshot {
     let backend = InMemoryBackend::default().with_read_counts();
     designate_fleet(&backend, NAMESPACE).await;
-    convoy(&backend, "crew").await;
+    let spec = ConvoySpec::builder().workflow_ref("workflow".into()).role("crew".into()).build();
+    crewed_convoy(&backend, NAMESPACE, "crew", &spec, &["coder"]).await;
     terminal(&backend, "crew", "work", "coder").await;
-    terminal(&backend, "remote", "work", "coder").await;
     for n in 0..unrelated {
         convoy(&backend, &format!("other-{n}")).await;
         terminal(&backend, &format!("other-{n}"), "work", "coder").await;
@@ -107,21 +105,14 @@ async fn open_read(unrelated: usize) -> ReadSnapshot {
     }
     let home = EngineMessagesHome::open("home", NAMESPACE, &backend);
     let primitives = home.primitives();
-    for (name, receiver) in [("to-crew", HELD), ("to-remote", ELSEWHERE)] {
-        let intent = flotilla_engine_messages_testkit::intent("system:turn-rules", receiver, MessageRelation::System, name);
-        primitives.admit(name, &intent).await.expect("admit");
-    }
+    let intent = flotilla_engine_messages_testkit::intent("system:turn-rules", HELD, MessageRelation::System, "to-crew");
+    primitives.admit("to-crew", &intent).await.expect("admit");
 
     let before = backend.read_snapshot();
-    let open = primitives.seat_messages(NAMESPACE, &[HELD.to_owned(), ELSEWHERE.to_owned()], &[]).await.expect("open read");
+    let open = primitives.seat_messages(NAMESPACE, &[HELD.to_owned()], &[]).await.expect("open read");
     let reads = backend.read_snapshot().since(&before);
-    let mut spelled = open.iter().map(|read| (read.object.metadata.name.clone(), read.object.spec.receiver.clone())).collect::<Vec<_>>();
-    spelled.sort();
-    assert_eq!(
-        spelled,
-        [("to-crew".to_owned(), HELD.to_owned()), ("to-remote".to_owned(), ELSEWHERE.to_owned())],
-        "each message is spelled to its role's vessel: from its convoy, or from a session's labels where the convoy is not held"
-    );
+    let spelled = open.iter().map(|read| (read.object.metadata.name.clone(), read.object.spec.receiver.clone())).collect::<Vec<_>>();
+    assert_eq!(spelled, [("to-crew".to_owned(), HELD.to_owned())], "the message is spelled to its role's vessel, from its convoy");
     reads
 }
 

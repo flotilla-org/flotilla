@@ -238,6 +238,37 @@ async fn explaining_a_standing_launch_lists_its_crews_messages() {
     assert_eq!(explained.messages.iter().map(|message| message.name.as_str()).collect::<Vec<_>>(), ["to-the-seat"]);
 }
 
+// A finite launch's seat is spelled from its convoy's snapshot alone: the standing record its
+// address might also name is missed by key, and no session is searched for by its labels.
+#[tokio::test]
+async fn a_finite_launchs_seat_is_spelled_without_a_label_search() {
+    use flotilla_store::load_metrics::measure;
+    let temp = tempfile::tempdir().expect("config directory");
+    std::fs::write(temp.path().join("daemon.toml"), "machine_id = \"finite-seat-test\"\n").expect("machine identity");
+    let backend = engine_home_backend();
+    let daemon = InProcessDaemon::new_with_resource_backend(
+        Vec::new(),
+        Arc::new(ConfigStore::with_base(temp.path())),
+        fake_discovery(false),
+        HostName::new("local"),
+        backend.clone(),
+        Arc::new(flotilla_discovery_testkit::HostPeerOverlay::default()),
+    )
+    .await;
+    super::test_engine(&daemon);
+    designate_fleet(&backend).await;
+    let spec = ConvoySpec::builder().workflow_ref("workflow".into()).project_ref("flotilla".into()).build();
+    let launch = super::support::admit(&daemon, "finite", spec, flotilla_engine_convoys_testkit::single_agent("coder")).await;
+    let seat = flotilla_resources::crew_role_address("flotilla", &launch, "work", "coder");
+    let intent = flotilla_engine_messages_testkit::intent("system:turn-rules", &seat, flotilla_resources::MessageRelation::System, "work");
+    let primitives = install_engine_messages(&daemon);
+    primitives.admit("to-the-seat", &intent).await.expect("admit");
+    let (spelled, reads) = measure(primitives.seat_messages("flotilla", std::slice::from_ref(&seat), &[])).await;
+    let spelled = spelled.expect("seat messages");
+    assert_eq!(spelled.iter().map(|read| read.object.spec.receiver.as_str()).collect::<Vec<_>>(), [seat.as_str()]);
+    assert_eq!(reads.get("TerminalSession port").map_or(0, |counts| counts.index), 0, "no session label search: {reads:?}");
+}
+
 // #3045: sending a message is an interactive request: routing it to the
 // receiver's home and admitting it at that home read the same objects however
 // many unrelated convoys, holders and messages share the namespace. Daemon

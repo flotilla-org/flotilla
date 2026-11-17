@@ -11,7 +11,7 @@ use std::{
     },
 };
 
-use flotilla_engine_messages_testkit::{designate_fleet, EngineMessagesHome};
+use flotilla_engine_messages_testkit::{crewed_convoy, designate_fleet, EngineMessagesHome};
 use flotilla_protocol::{LifecycleReading, ResourceRef};
 use flotilla_provisioning_testkit::{EngineFixture, OtherHome, TerminalsFixture};
 use flotilla_resources::{
@@ -19,8 +19,8 @@ use flotilla_resources::{
     message_record_name,
     terminal_records::TerminalRecords,
     vessel_records::{VesselLaunchRequest, VesselRecord, VesselRecords, VesselStep},
-    Convoy, ConvoySpec, ConvoyStatus, CrewSource, CrewSpec, InputMeta, MessageReference, MessageRelation, Selector, TerminalBrief,
-    TerminalCrewContext, TerminalSession, TerminalSessionSource, TerminalSessionSpec, VesselRequirement, WorkflowSnapshot,
+    ConvoySpec, InputMeta, MessageReference, MessageRelation, Selector, TerminalBrief, TerminalCrewContext, TerminalSession,
+    TerminalSessionSource, TerminalSessionSpec,
 };
 use flotilla_store::ResourceBackend;
 use flotilla_store_memory::InMemoryBackend;
@@ -59,30 +59,8 @@ async fn seat_spelled(others: usize) -> VesselReads {
     let backend = ResourceBackend::new(InMemoryBackend::default());
     designate_fleet(&backend, NAMESPACE).await;
     // The convoy, held here, names vessel `work` for the role.
-    let convoys = backend.using::<Convoy>(NAMESPACE);
-    let convoy = convoys
-        .create(
-            &InputMeta::builder().name("crew".into()).build(),
-            &ConvoySpec::builder().workflow_ref("workflow".into()).role("crew".into()).build(),
-        )
-        .await
-        .expect("convoy");
-    let crew = CrewSpec::builder()
-        .role("coder".to_owned())
-        .source(CrewSource::Agent { selector: Selector::for_capability("code"), prompt: None, brief_template: None })
-        .build();
-    let status = ConvoyStatus {
-        workflow_snapshot: Some(WorkflowSnapshot {
-            cascade: None,
-            vessels: vec![VesselRequirement::builder().name("work".to_owned()).crew(vec![crew]).build()],
-            exit: None,
-            turn_delivery: Default::default(),
-            stall_nudges: Default::default(),
-            supervision: None,
-        }),
-        ..ConvoyStatus::default()
-    };
-    convoys.update_status("crew", &convoy.metadata.resource_version, &status).await.expect("convoy snapshot");
+    let spec = ConvoySpec::builder().workflow_ref("workflow".into()).role("crew".into()).build();
+    crewed_convoy(&backend, NAMESPACE, "crew", &spec, &["coder"]).await;
 
     // The vessel and its session are launched at `third`, whose log arrives here.
     let here = OtherHome::open("home");

@@ -683,7 +683,7 @@ impl MessagePrimitives {
                 records.projects.insert(name.clone(), project);
             }
         }
-        let mut labelled = asked.labelled.clone();
+        let mut labelled = BTreeSet::new();
         for (convoy, role) in &asked.seats {
             let seat = match (records.convoys.get(convoy), records.convoy_homes.get(convoy)) {
                 (Some(held), Some(home)) => keyed.seat_sessions(held, home, role).await,
@@ -707,7 +707,6 @@ impl MessagePrimitives {
                 records.terminals.insert(terminal.metadata.name.clone(), terminal);
             }
         }
-        asked.labelled.extend(labelled);
         records.read.absorb(asked);
         Ok(())
     }
@@ -2147,8 +2146,6 @@ pub struct Wanted {
     projects: BTreeSet<String>,
     /// (convoy, role): the sessions holding a convoy role, read through its vessel.
     seats: BTreeSet<(String, String)>,
-    /// (convoy, role): the sessions labelled with a convoy role whose convoy names no vessel for it.
-    labelled: BTreeSet<(String, String)>,
 }
 
 impl Wanted {
@@ -2165,7 +2162,6 @@ impl Wanted {
         self.repositories.extend(other.repositories);
         self.projects.extend(other.projects);
         self.seats.extend(other.seats);
-        self.labelled.extend(other.labelled);
     }
 }
 
@@ -2469,26 +2465,9 @@ impl ViewLookups for OldStoreRecords {
     fn principal_of(&self, project: &str, role: &str) -> Option<String> {
         self.principal_backed(project).find(|(declared, _)| *declared == role).map(|(_, principal)| principal.to_owned())
     }
-    /// From the convoy's snapshot; where it names no vessel for the role (the convoy is not held
-    /// here, or its snapshot lacks the role), from the labels of a session holding the role.
+    /// From the convoy's snapshot, which every engine convoy freezes at admission.
     fn vessel(&self, convoy: &str, role: &str) -> Option<String> {
-        if let Some(vessel) = self.convoy(convoy).and_then(|held| keyed_reads::snapshot_work(held, role)) {
-            return Some(vessel);
-        }
-        let labelled = self.terminals.values().find_map(|terminal| {
-            let labels = &terminal.metadata.labels;
-            (labels.get(flotilla_resources::CONVOY_LABEL).map(String::as_str) == Some(convoy)
-                && labels.get(flotilla_resources::ROLE_LABEL).map(String::as_str) == Some(role))
-            .then(|| labels.get(flotilla_resources::VESSEL_LABEL).cloned())
-            .flatten()
-        });
-        let key = (convoy.to_owned(), role.to_owned());
-        if labelled.is_none() && self.read.convoys.contains(convoy) && !self.read.labelled.contains(&key) {
-            self.ask(|asked| {
-                asked.labelled.insert(key);
-            });
-        }
-        labelled
+        self.convoy(convoy).and_then(|held| keyed_reads::snapshot_work(held, role))
     }
     /// A receiver names its launch, read from the session's view only while it shows that launch.
     fn session(&self, receiver: &Receiver) -> Option<(String, String)> {
