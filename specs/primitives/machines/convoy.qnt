@@ -48,8 +48,13 @@ module convoy {
   type Work = { spec: ConvoySpec, promises: PromiseId -> PromiseRecord, seats: Seat -> SeatRecord, retired: Set[DutyId],
     quota: VesselClass -> int, retiredSeats: Set[Seat], subjects: Set[str] }
   // The work beside its phase, not inside each phase: three copies of Work in
-  // the State type push the scenario IR past Apalache's input limit.
-  type Phase = Open | Delivered(str) | Abandoned({ cause: AbandonCause, reason: str })
+  // the State type push the scenario IR past Apalache's input limit. Retired is
+  // the only end: an ended convoy retires once nothing holds it, and keeps no
+  // quota and no retired duties.
+  type Phase = Open | Delivered(str) | Abandoned({ cause: AbandonCause, reason: str }) | Retired
+  // What holds an ended convoy, read from its dependents' own records and named
+  // by kind and record; Unread when they were not read, which is not empty.
+  type Holds = Unread | Read(Set[str])
   type State = { work: Work, phase: Phase }
   // Observed: the kind's keeping observation, naming the submission it saw.
   // Verdict: an attributed decision with a reason, from Pending or Submitted.
@@ -73,10 +78,12 @@ module convoy {
     | Unlink({ subject: str, authorised: bool })
     | Deliver({ disposition: str }) | Abandon({ authorised: bool, cause: AbandonCause, reason: str })
     | Readmit({ quota: VesselClass -> int, authorised: bool })
+    | Retire(Holds)
   type Refusal = NoObligations | UnknownProject | InvalidQuota | NotOpen | UnknownPromise | PromiseSettled
     | PromisesOutstanding(Set[PromiseId]) | Unauthorised | QuotaNotIncrease | PromiseExists | NotOwner | NotDurable
     | NotSubmitted | StaleEvidence | UnknownDuty | DutyHolds(Set[DutyId]) | UnknownSeat | SeatExists | SeatCycle
     | SeatRetired | SeatsFull | ReplacementsExhausted | SeatFailed | SubjectLinked | UnknownSubject
+    | NotEnded | Held(Set[str]) | HoldsUnread
   type Next = Moved(State) | Refused(Refusal)
   pure def opened(w: Work): Next = Moved({ work: w, phase: Open })
   pure def validQuota(q: VesselClass -> int): bool = q.keys().forall(c => q.get(c) >= 0)
@@ -238,8 +245,20 @@ module convoy {
     else if (not(validQuota(a.quota))) Refused(InvalidQuota)
     else if (a.quota.keys() != w.quota.keys() or not(a.quota.keys().forall(c => a.quota.get(c) >= w.quota.get(c)))) Refused(QuotaNotIncrease)
     else opened({ ...w, quota: a.quota })
-  // Only an open convoy takes an edge.
-  pure def step(s: State, e: Event): Next = if (not(isOpen(s))) Refused(NotOpen) else {
+  // An ended convoy takes only Retire, and a retired one nothing. The move
+  // clears the quota and the retired duties: a retired convoy holds neither.
+  // Phase and work are passed apart, and the rule is one definition: each
+  // State-typed expression adds a copy of the State type to the IR, which
+  // Apalache bounds.
+  pure def endedStep(p: Phase, w: Work, e: Event): Next = match e {
+    | Retire(h) => if (p == Retired) Refused(NotOpen) else match h {
+        | Unread => Refused(HoldsUnread)
+        | Read(held) => if (held.size() > 0) Refused(Held(held)) else Moved({ work: { ...w, quota: Map(), retired: Set() }, phase: Retired })
+      }
+    | _ => Refused(NotOpen)
+  }
+  // Only an open convoy takes a work edge.
+  pure def step(s: State, e: Event): Next = if (not(isOpen(s))) endedStep(s.phase, s.work, e) else {
     val w = s.work
     match e {
     | Declare(d) => declareRule(w, d)
@@ -259,6 +278,7 @@ module convoy {
     | Deliver(d) => deliverRule(w, d)
     | Abandon(a) => abandonRule(w, a)
     | Readmit(a) => readmitRule(w, a)
+    | Retire(_) => Refused(NotEnded)
     }
   }
 
@@ -311,5 +331,6 @@ module convoy {
   action abandon(id: int, auth: bool, cause: AbandonCause, reason: str): bool =
     fire(id, Abandon({ authorised: auth, cause: cause, reason: reason }))
   action readmit(id: int, quota: VesselClass -> int, auth: bool): bool = fire(id, Readmit({ quota: quota, authorised: auth }))
+  action retire(id: int, holds: Holds): bool = fire(id, Retire(holds))
 
 }

@@ -843,8 +843,9 @@ fn convoy_name(home: &Home<Convoy>, id: i64) -> String {
 
 /// From the reached state: an Open convoy delivers only with nothing open
 /// and no lifetime duty holding (`deliveredSettled`), and an operator never
-/// re-settles a settled promise (`settledPromisesFinal`); an ended convoy
-/// refuses everything.
+/// re-settles a settled promise (`settledPromisesFinal`); a delivered or
+/// abandoned convoy refuses every work edge, and a retired one everything
+/// (`retiredFinal`).
 fn probe_convoys(home: &mut Home<Convoy>, state: &Value, now: Timestamp, step: &Step, tally: &mut Tally) {
     let world = convoy_world(true, true);
     let operator = SeatName::new("operator", "");
@@ -862,14 +863,22 @@ fn probe_convoys(home: &mut Home<Convoy>, state: &Value, now: Timestamp, step: &
             reason: "decision".into(),
         };
         if !convoy_open(model) {
-            let probes = vec![
+            let probes: Vec<ConvoyEdge> = vec![
                 verdict(PromiseId(0)).into(),
                 retract(PromiseId(0)).into(),
                 delivered().into(),
                 abandon("decision").into(),
                 convoy::Readmit { quota: current, by: by(), authority: owner() }.into(),
             ];
-            assert_end_refuses(home, &name, probes, &world, now, step, tally);
+            if tag(&model["phase"]) == "Retired" {
+                assert_end_refuses(home, &name, probes, &world, now, step, tally);
+            } else {
+                // Delivered or abandoned, it waits to retire and takes no work edge.
+                for edge in probes {
+                    let kind = edge.kind();
+                    assert!(!would_accept(home, &name, edge, &world, now, tally), "{step}: ended convoy {id} accepted {kind:?}");
+                }
+            }
             continue;
         }
         // The negative picks: without authority nothing is abandoned or
@@ -1008,6 +1017,14 @@ fn convoy_deliver(trace: &Trace, tally: &mut Tally) {
             "readmit" => {
                 let quota = BTreeMap::from([(class(0), 2), (class(1), 1)]);
                 accept(&mut home, &name, convoy::Readmit { quota, by: by(), authority: owner() }, &world, now, &step, tally);
+            }
+            // Unread holds are absent from the world.
+            "retire" => {
+                let (mut world, holds, picked) = (world, Ref::new("holds"), step.pick("holds"));
+                if tag(picked) == "Read" {
+                    world.holds.put(&holds, set(payload(picked)).iter().map(|hold| text(hold).to_owned()).collect());
+                }
+                accept(&mut home, &name, convoy::Retire { holds }, &world, now, &step, tally);
             }
             "unchanged" => {}
             other => panic!("{step}: convoy_deliver operation {other}"),

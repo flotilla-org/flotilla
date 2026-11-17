@@ -22,7 +22,8 @@
 // AddSeat under it. Subject "cr" is linked, unlinked and relinked in "y",
 // and its refusals are probed in every convoy. An Abandon's cause is not
 // checked, and each cause is its own ended state, so the work-failed cause is
-// probed in "f" only.
+// probed in "f" only. Retire is probed in every state with its holds unread,
+// read empty and read naming one dependent.
 module convoy_conformance {
   import convoy(IDS = Set(), SEAT_LIMIT = 4, REPLACEMENT_LIMIT = 1) as C from "../machines/convoy"
   type Probe = Admitted({ request: C::ConvoyRequest, result: C::Next })
@@ -32,7 +33,7 @@ module convoy_conformance {
     | Absent => Unadmitted
     | Present(state) => AdmittedQuota(C::work(state).quota)
   }
-  type QuotaStep = Admission | Readmission | Other
+  type QuotaStep = Admission | Readmission | Retirement | Other
   var quotaStep: QuotaStep
   var previousQuota: QuotaObservation
   var slot: C::Slot
@@ -66,6 +67,8 @@ module convoy_conformance {
   pure def deciders(a: C::Authority): Set[C::Seat] = if (a == C::Owner) Set("a", "b") else Set("s")
   pure def reasons(a: C::Authority): Set[str] = if (a == C::Operator) Set("", "decision") else Set("decision")
   pure val ids = Set(0, 1)
+  // Holds unread, read empty, and read naming one dependent.
+  pure val holdings = Set(C::Unread, C::Read(Set()), C::Read(Set("message:m")))
   pure def bound(r: C::PromiseRecord): int = if (r.source == C::Crew) 2 else 1
   pure def submittable(w: C::Work, p: int): bool = not(w.promises.keys().contains(p)) or w.promises.get(p).submissions.length() < bound(w.promises.get(p))
   pure def events(w: C::Work): Set[C::Event] =
@@ -108,6 +111,7 @@ module convoy_conformance {
     .union(if (failProbe(w)) Set(C::Abandon({ authorised: true, cause: C::WorkFailed, reason: "decision" })) else Set())
     .union((if (w.promises.keys().size() == 0) quotas.union(Set(increase)) else quotas).map(q =>
       Set(true, false).map(a => C::Readmit({ quota: q, authorised: a }))).flatten())
+    .union(holdings.map(h => C::Retire(h)))
   action init = {
     nondet r = requests.oneOf()
     val n = C::admit(r)
@@ -118,14 +122,16 @@ module convoy_conformance {
     | Present(s) => {
         nondet e = events(C::work(s)).oneOf()
         val n = C::step(s, e)
-        all { quotaStep' = (match e { | Readmit(_) => Readmission | _ => Other }), previousQuota' = quotaOf(slot), slot' = C::target(n, slot), probe' = Stepped({ from: s, event: e, result: n }) }
+        all { quotaStep' = (match e { | Readmit(_) => Readmission | Retire(_) => Retirement | _ => Other }), previousQuota' = quotaOf(slot), slot' = C::target(n, slot), probe' = Stepped({ from: s, event: e, result: n }) }
       }
   }
   // The placement abstraction may observe only an unchanged quota, admission,
-  // or an authorised readmission that raises counts over the same class keys.
+  // an authorised readmission that raises counts over the same class keys, or
+  // retirement, which releases the whole quota.
   val currentQuota = quotaOf(slot)
   val quotaRefinesPlacement = currentQuota == previousQuota or
     (quotaStep == Admission and previousQuota == Unadmitted) or
+    (quotaStep == Retirement and currentQuota == AdmittedQuota(Map())) or
     (quotaStep == Readmission and match previousQuota {
       | Unadmitted => false
       | AdmittedQuota(before) => match currentQuota {

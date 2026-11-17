@@ -1,0 +1,11 @@
+--- a/machines/convoy.qnt
++++ b/machines/convoy.qnt
+@@ -251,7 +251,7 @@
+   // State-typed expression adds a copy of the State type to the IR, which
+   // Apalache bounds.
+   pure def endedStep(p: Phase, w: Work, e: Event): Next = match e {
+-    | Retire(h) => if (p == Retired) Refused(NotOpen) else match h {
++    | Retire(h) => if (false) Refused(NotOpen) else match h {
+         | Unread => Refused(HoldsUnread)
+         | Read(held) => if (held.size() > 0) Refused(Held(held)) else Moved({ work: { ...w, quota: Map(), retired: Set() }, phase: Retired })
+       }

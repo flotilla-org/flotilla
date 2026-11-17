@@ -63,6 +63,7 @@ module convoy_deliver {
       all { C::deliver(1, "merged"), keepWorld },
       all { C::abandon(1, auth, C::OperatorDecision, reason), keepWorld },
       all { C::readmit(1, Map(0 -> 2, 1 -> 1), auth), keepWorld },
+      { nondet holds = Set(C::Unread, C::Read(Set()), C::Read(Set("message:m"))).oneOf() all { C::retire(1, holds), keepWorld } },
       all { C::unchanged, tick },
     }
   }
@@ -93,6 +94,13 @@ module convoy_deliver {
     ).forall(e => not(C::moved(C::step(s, e))))
   })
   val settledPromisesFinal = everyState(s => settledFinal(s))
+  // A retired convoy holds no quota and no retired duties, and takes no edge,
+  // Retire included.
+  val retiredFinal = everyState(s => s.phase != C::Retired or and {
+    C::work(s).quota == Map(), C::work(s).retired == Set(),
+    Set(C::Retire(C::Read(Set())), C::Deliver({ disposition: "merged" }), C::Abandon({ authorised: true, cause: C::OperatorDecision, reason: "decision" }))
+      .forall(e => not(C::moved(C::step(s, e)))),
+  })
   // A Submitted promise has a current submission.
   val submittedHasSubmission = everyState(s => C::work(s).promises.keys().forall(p =>
     C::work(s).promises.get(p).state != C::Submitted or C::work(s).promises.get(p).submissions.length() > 0))
@@ -112,13 +120,14 @@ module convoy_deliver {
   val seatTreeAcyclic = everyState(s => C::acyclic(C::work(s).seats))
   // A generation's seats, retired ones included, stay within the cap.
   val seatsWithinLimit = everyState(s => C::work(s).seats.keys().size() <= C::SEAT_LIMIT)
-  // A retired seat is a seat that owns no open promise and holds no duty.
-  val retiredSeatsHoldNothing = everyState(s => C::work(s).retiredSeats.forall(seat =>
+  // A retired seat is a seat that owns no open promise and holds no duty. A
+  // retired convoy keeps no retired duties: its duties all ended with it.
+  val retiredSeatsHoldNothing = everyState(s => s.phase == C::Retired or C::work(s).retiredSeats.forall(seat =>
     C::work(s).seats.keys().contains(seat) and C::seatPromises(C::work(s), seat).size() == 0 and C::seatDuties(C::work(s), seat).size() == 0))
   // Replacement counts stay within the limit, and seat "a" carries every replacement granted to it.
   val replacementsWithinLimit = everyState(s => C::work(s).seats.keys().forall(seat => C::work(s).seats.get(seat).replacements <= C::REPLACEMENT_LIMIT))
   val replacementsCarried = everyState(s => not(C::work(s).seats.keys().contains("a")) or C::work(s).seats.get("a").replacements == replacedA)
-  val safety = replacementsWithinLimit and replacementsCarried and seatsWithinLimit and retiredSeatsHoldNothing and ownersAreSeats and seatTreeClosed and seatTreeAcyclic and everyConvoyObliged and deliveredSettled and settledPromisesFinal and submittedHasSubmission and ownerRetractsOnlyUnsubmitted
+  val safety = replacementsWithinLimit and replacementsCarried and seatsWithinLimit and retiredSeatsHoldNothing and ownersAreSeats and seatTreeClosed and seatTreeAcyclic and everyConvoyObliged and deliveredSettled and settledPromisesFinal and retiredFinal and submittedHasSubmission and ownerRetractsOnlyUnsubmitted
   // No inductive invariant: a universe of every owned-promise shape is beyond
   // Apalache in a crew's memory, and the fast tier exhausts this scenario's
   // complete finite graph, which covers every depth at its bounds.

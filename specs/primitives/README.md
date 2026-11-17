@@ -81,9 +81,14 @@ kept. A convoy-lifetime duty refuses `Deliver` (`DutyHolds`) until an
 authorised `RetireDuty`; a duty while some promises are open has no edges and
 ends with them, and a breach of terms is a message, not an edge. `Deliver` is
 refused while any promise is Pending or Submitted, or while a lifetime duty
-holds. Terminal variants retain the work record so delivery and finality remain
-state properties. A demo promise delivers a running demo plus a recipe to
-reactivate it.
+holds. Delivered and Abandoned retain the work record so delivery and finality
+remain state properties, and take no work edge. Retired is the only end:
+`Retire` moves a delivered or abandoned convoy there once nothing holds it. Its
+holds are read from its dependents' own records, each named by kind and
+record; a non-empty set refuses (`Held`), and holds not read refuse too
+(`HoldsUnread`), since absent is not empty. A retired convoy keeps no quota and
+no retired duties, and refuses every edge. A demo promise delivers a running
+demo plus a recipe to reactivate it.
 
 AwaitingReply is the sender's half of a Reply or Outcome exchange (#3587
 awaiting-reply ruling), homed at the sender's home and written in the send's

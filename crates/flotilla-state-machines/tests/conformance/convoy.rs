@@ -12,6 +12,8 @@
 //!   `Link`, `Unlink`, `Abandon` and `Readmit`: those edges, their authority
 //!   reading `authorised`.
 //! - `Deliver`: the `deliver` edge, with its disposition.
+//! - `Retire(holds)`: the `retire` edge; `Read(set)` puts the set in the
+//!   world, and `Unread` leaves it absent.
 //!
 //! Value mapping:
 //! - A seat is the [`SeatName`] whose role is the spec's text and whose
@@ -32,7 +34,8 @@
 //! and quota, and the subjects linked now (the spec keeps no unlinked rows).
 //! The state is `{work, phase}`: `Open { .. }` is phase `Open`,
 //! `Delivered { disposition, .. }` is `Delivered(disposition)` and
-//! `Abandoned { cause, reason, .. }` is `Abandoned({cause, reason})`. The
+//! `Abandoned { cause, reason, .. }` is `Abandoned({cause, reason})`, and
+//! `Retired` is `Retired`, its quota and retired duties empty. The
 //! frozen promise kinds, each link's source and each row's stamps and times
 //! are not in the spec.
 
@@ -41,8 +44,8 @@ use flotilla_state_machines::{
     machines::convoy::{
         Abandon, AbandonCause, AddSeat, AdmittedPromise, Authority, Convoy, ConvoyRefusal, ConvoyRequest, ConvoySpec, ConvoyState, Declare,
         Deliver, Duty, DutyId, DutyScope, FailSeat, Keep, Link, LinkSource, MemoryConvoyWorld, Priority, Progress, PromiseId, PromiseKinds,
-        PromiseSource, Quota, Readmit, Reassign, Reject, ReplaceSeat, Resupervise, RetireDuty, RetireSeat, Retract, Seat, SeatName, Submit,
-        Terms, Unlink, VesselClass,
+        PromiseSource, Quota, Readmit, Reassign, Reject, ReplaceSeat, Resupervise, Retire, RetireDuty, RetireSeat, Retract, Seat, SeatName,
+        Submit, Terms, Unlink, VesselClass,
     },
     Home, Ref, Resource, WriteError,
 };
@@ -459,6 +462,14 @@ impl Conformance for ConvoyConformance {
                 outcome(home.apply(&name, abandon, &world, at))
             }
             "Readmit" => outcome(home.apply(&name, Readmit { quota: quota_of(&o["quota"]), by, authority }, &world, at)),
+            "Retire" => {
+                // Unread holds are absent from the world.
+                let holds = Ref::new("holds");
+                if tag(o) == "Read" {
+                    world.holds.put(&holds, set(payload(o)).iter().map(|hold| text(hold).to_owned()).collect());
+                }
+                outcome(home.apply(&name, Retire { holds }, &world, at))
+            }
             other => panic!("convoy event {other}"),
         }
     }
