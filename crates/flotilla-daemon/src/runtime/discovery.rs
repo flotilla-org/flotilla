@@ -381,7 +381,6 @@ pub(super) async fn apply_ssh_host_observation(
             (AGENT_ADAPTERS_CAPABILITY.to_string(), json!(profile.available_agent_adapters)),
             (HELD_CREDENTIALS_CAPABILITY.to_string(), json!(held_credentials)),
             (CREDENTIAL_EXPIRY_CAPABILITY.to_string(), json!(credential_expiry)),
-            ("terminal_pools".to_string(), json!(profile.available_pools)),
             (SSH_HOST_CAPABILITY.to_string(), json!(true)),
             (TRANSPORT_CAPABILITY.to_string(), json!("ssh")),
             (PLACEMENT_CAPABILITY.to_string(), json!("host_direct_only")),
@@ -396,8 +395,8 @@ pub(super) async fn apply_ssh_host_observation(
         heartbeat_at: probe_succeeded.then(Utc::now),
         ready,
         sleeping_until: host.status.as_ref().and_then(|status| status.sleeping_until),
-        disk_free_bytes: free_bytes,
-        admission_free_space_floor_bytes: Some(daemon.admission_free_space_floor_bytes()?),
+        // The figures themselves change with every reading; only the judgement is the Host's.
+        below_free_space_floor: super::health::below_floor(free_bytes, daemon.admission_free_space_floor_bytes()?),
         conditions,
         ..HostStatus::default()
     };

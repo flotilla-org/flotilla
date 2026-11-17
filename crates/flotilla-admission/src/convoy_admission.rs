@@ -1888,9 +1888,7 @@ impl AdmissionReadContext<'_> {
         }
 
         let owns_target_identity = self.runtime.local_host.as_ref().is_some_and(|host_id| host_id == &target_host.reference);
-        let knows = |status: &&flotilla_resources::HostStatus| {
-            status.below_free_space_floor.is_some() || status.admission_free_space_floor_bytes.is_some()
-        };
+        let knows = |status: &&flotilla_resources::HostStatus| status.below_free_space_floor.is_some();
         let status = if owns_target_identity {
             matching_sources
                 .iter()

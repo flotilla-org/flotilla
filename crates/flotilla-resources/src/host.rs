@@ -668,18 +668,6 @@ impl CredentialExpiry {
     }
 }
 
-/// Latest periodic observations a heartbeat carries into its single write,
-/// so their observers do not each commit the Host object.
-#[derive(Debug, Clone, Default, PartialEq, Eq)]
-pub struct FoldedHostObservations {
-    /// Latest blob sync observation. `None` leaves the stored value unchanged.
-    pub blob_sync: Option<flotilla_protocol::BlobSyncStatus>,
-    /// Latest fulfilment observations. The heartbeat only advances the stored
-    /// `observed_at` of facts whose content is unchanged; changed facts are
-    /// published by the fulfilment writer itself.
-    pub fulfilment_refresh: BTreeMap<String, FulfilmentFacts>,
-}
-
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum HostStatusPatch {
     FulfilmentFacts {
@@ -693,14 +681,11 @@ pub enum HostStatusPatch {
         ready: bool,
         daemon_generation: Option<String>,
         protocol_fingerprint: Option<String>,
-        daemon_version: Option<String>,
-        daemon_started_at: Option<DateTime<Utc>>,
-        disk_free_bytes: Option<u64>,
-        admission_free_space_floor_bytes: Option<u64>,
+        /// Whether the free disk is below the admission floor, as the observer judged it: the
+        /// figures themselves change with every reading and are the daemon's metrics.
+        below_free_space_floor: Option<bool>,
         agent_adapter_baseline: Option<BTreeSet<String>>,
         conditions: Vec<HostCondition>,
-        /// Periodic observations folded into the heartbeat's write (#3154).
-        folded: Box<FoldedHostObservations>,
     },
     SleepInhibition {
         health: SleepInhibitionHealth,
@@ -739,13 +724,9 @@ impl StatusPatch<HostStatus> for HostStatusPatch {
                 ready,
                 daemon_generation,
                 protocol_fingerprint,
-                daemon_version,
-                daemon_started_at,
-                disk_free_bytes,
-                admission_free_space_floor_bytes,
+                below_free_space_floor,
                 agent_adapter_baseline,
                 conditions,
-                folded,
             } => {
                 // Image inventory is observed independently of heartbeat gathering.
                 // Preserve its latest value atomically when heartbeat has no update.
@@ -776,21 +757,10 @@ impl StatusPatch<HostStatus> for HostStatusPatch {
                 status.ready = *ready && !status.readiness_blocked();
                 status.daemon_generation.clone_from(daemon_generation);
                 status.protocol_fingerprint.clone_from(protocol_fingerprint);
-                status.daemon_version.clone_from(daemon_version);
-                status.daemon_started_at = *daemon_started_at;
-                status.disk_free_bytes = *disk_free_bytes;
-                status.admission_free_space_floor_bytes = *admission_free_space_floor_bytes;
+                status.below_free_space_floor = *below_free_space_floor;
+                status.disk_free_bytes = None;
+                status.admission_free_space_floor_bytes = None;
                 status.agent_adapter_baseline.clone_from(agent_adapter_baseline);
-                if let Some(blob_sync) = &folded.blob_sync {
-                    status.blob_sync = Some(blob_sync.clone());
-                }
-                for (kind, observed) in &folded.fulfilment_refresh {
-                    if let Some(stored) = status.fulfilment_facts.get_mut(kind) {
-                        if stored.observed_at < observed.observed_at && stored.same_observation(observed) {
-                            stored.observed_at = observed.observed_at;
-                        }
-                    }
-                }
             }
             Self::SleepInhibition { health, observed_at } => {
                 status.sleep_inhibition.clone_from(health);

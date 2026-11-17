@@ -176,12 +176,12 @@ pub use flotilla_protocol::{PrincipalRef, ResourceRef};
 pub use forge::{Forge, ForgeKind, ForgeSpec};
 pub use fulfilment_kind::{FulfilmentCostClass, FulfilmentGrant, FulfilmentKind, FulfilmentKindSpec, FulfilmentRealisation};
 pub use host::{
-    acting_daemon_ref, canonical_host_id, remote_condition_type, CachedModelProbe, CredentialExpiry, FoldedHostObservations,
-    FulfilmentFacts, FulfilmentImage, HarnessFacts, Host, HostCondition, HostConnection, HostSpec, HostStatus, HostStatusPatch, ModelFact,
-    ModelFactSource, ModelProbeState, AGENT_ADAPTERS_CAPABILITY, AMBIENT_CLAUDE_CREDENTIAL_SCOPE, CODEX_CENTRAL_LOGIN_CAPABILITY,
-    CREDENTIAL_EXPIRY_CAPABILITY, ENVIRONMENT_PROVIDERS_CAPABILITY, HEARTBEAT_READY_TTL_SECS, HEARTBEAT_REFRESH_SECS,
-    HELD_CREDENTIALS_CAPABILITY, LOCAL_ROWS_MISSING_REASON, OWNING_DAEMON_CAPABILITY, PLACEMENT_CAPABILITY, PROJECTION_PARITY_CONDITION,
-    REMOTE_CONDITION_PREFIX, SLEEP_INHIBITION_CONDITION_TYPE, SSH_HOST_CAPABILITY, TERMINAL_POOLS_CAPABILITY, TRANSPORT_CAPABILITY,
+    acting_daemon_ref, canonical_host_id, remote_condition_type, CachedModelProbe, CredentialExpiry, FulfilmentFacts, FulfilmentImage,
+    HarnessFacts, Host, HostCondition, HostConnection, HostSpec, HostStatus, HostStatusPatch, ModelFact, ModelFactSource, ModelProbeState,
+    AGENT_ADAPTERS_CAPABILITY, AMBIENT_CLAUDE_CREDENTIAL_SCOPE, CODEX_CENTRAL_LOGIN_CAPABILITY, CREDENTIAL_EXPIRY_CAPABILITY,
+    ENVIRONMENT_PROVIDERS_CAPABILITY, HEARTBEAT_READY_TTL_SECS, HEARTBEAT_REFRESH_SECS, HELD_CREDENTIALS_CAPABILITY,
+    LOCAL_ROWS_MISSING_REASON, OWNING_DAEMON_CAPABILITY, PLACEMENT_CAPABILITY, PROJECTION_PARITY_CONDITION, REMOTE_CONDITION_PREFIX,
+    SLEEP_INHIBITION_CONDITION_TYPE, SSH_HOST_CAPABILITY, TERMINAL_POOLS_CAPABILITY, TRANSPORT_CAPABILITY,
 };
 pub use issue::{Issue, IssueSpec, IssueStatus, IssueStatusPatch, ObservedIssueState};
 pub use labels::{

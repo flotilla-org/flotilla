@@ -215,19 +215,16 @@ pub fn unready_placement_refusal(
     Some(reason)
 }
 
-/// Whether the target host has room, from its status: the engine's judgement when it holds one
-/// (no figures, none invented), else the figures a status still carries. Unknown refuses.
+/// Whether the target host has room, from its status: whether its observer judged it below the
+/// free-space floor. Unknown refuses.
 pub fn check_placement_capacity(target_host: &PlacementTargetHost, status: Option<&HostStatus>) -> Result<(), String> {
     let host = &target_host.display_name;
-    let unavailable = || format!("placement refused on host `{host}`: free space is unavailable");
-    let Some(status) = status else { return Err(unavailable()) };
-    match (status.below_free_space_floor, status.admission_free_space_floor_bytes, status.disk_free_bytes) {
-        (Some(false), _, _) | (None, Some(0), _) => Ok(()),
-        (Some(true), _, _) => Err(format!(
+    match status.and_then(|status| status.below_free_space_floor) {
+        Some(false) => Ok(()),
+        Some(true) => Err(format!(
             "placement refused on host `{host}`: free space is below the admission floor; reap settled convoys, run scripts/prune-target.sh, or pick another host"
         )),
-        (None, Some(floor_bytes), Some(free_bytes)) => crate::admission::check_measured_free_space(host, free_bytes, floor_bytes),
-        (None, _, _) => Err(unavailable()),
+        None => Err(format!("placement refused on host `{host}`: free space is unavailable")),
     }
 }
 

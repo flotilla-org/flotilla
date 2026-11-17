@@ -553,6 +553,25 @@ impl SyncInventory {
     fn status(&self) -> BlobSyncStatus {
         BlobSyncStatus { pending_count: self.pending.values().map(HashSet::len).sum(), last_error: self.last_error.clone() }
     }
+
+    /// Records how the last pass ended. The error text is unbounded, so it is logged when it
+    /// changes rather than carried by a metric.
+    fn set_last_error(&mut self, error: Option<String>) {
+        if error != self.last_error {
+            match &error {
+                Some(error) => tracing::warn!(%error, "blob fleet sync failing"),
+                None => tracing::info!("blob fleet sync recovered"),
+            }
+        }
+        self.last_error = error;
+    }
+}
+
+#[async_trait]
+impl flotilla_core::in_process::local_host::BlobSyncReading for TieredBlobStore {
+    async fn blob_sync(&self) -> BlobSyncStatus {
+        self.status().await
+    }
 }
 
 struct FleetTarget {
@@ -759,7 +778,7 @@ impl TieredBlobStore {
             }
         }
         let mut inventory = self.inventory.lock().await;
-        inventory.last_error = last_error;
+        inventory.set_last_error(last_error);
         Ok(inventory.status())
     }
     async fn mark_synced(&self, digest: &BlobDigest, target: &str) {
@@ -781,7 +800,7 @@ impl TieredBlobStore {
                 Ok(status) if status.last_error.is_none() => false,
                 Ok(_) => true,
                 Err(error) => {
-                    self.inventory.lock().await.last_error = Some(error);
+                    self.inventory.lock().await.set_last_error(Some(error));
                     true
                 }
             };

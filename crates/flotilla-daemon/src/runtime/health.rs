@@ -13,13 +13,14 @@ use flotilla_projections::aggregator_projection::AggregatorProjectionState;
 use flotilla_projections::IssuePollingHealth;
 
 use flotilla_credentials::CredentialStore;
-use flotilla_protocol::{BlobSyncStatus, HostSummary, Rows};
+use flotilla_protocol::{HostSummary, Rows};
+use flotilla_resources::ResourceError;
 use flotilla_resources::{
-    ConditionValue, Convoy, CredentialExpiry, FoldedHostObservations, Forge, FulfilmentFacts, Host, HostCondition, HostStatus,
-    HostStatusPatch, ResourceObject, SystemClock, AGENT_ADAPTERS_CAPABILITY, CREDENTIAL_EXPIRY_CAPABILITY, HELD_CREDENTIALS_CAPABILITY,
-    LOCAL_ROWS_MISSING_REASON, PROJECTION_PARITY_CONDITION,
+    ConditionValue, Convoy, CredentialExpiry, Forge, FulfilmentFacts, Host, HostCondition, HostStatus, HostStatusPatch, ResourceObject,
+    SystemClock, AGENT_ADAPTERS_CAPABILITY, CREDENTIAL_EXPIRY_CAPABILITY, HELD_CREDENTIALS_CAPABILITY, LOCAL_ROWS_MISSING_REASON,
+    PROJECTION_PARITY_CONDITION,
 };
-use flotilla_store::ResourceBackend;
+use flotilla_store::{Listed, ResourceBackend, TypedResolver};
 use serde_json::json;
 use tokio::task::JoinHandle;
 use tracing::{error, warn};
@@ -28,8 +29,7 @@ use super::discovery::LocalProvisioningProfile;
 use super::seed::{canonicalize_kinds_for, ensure_host_matches};
 use super::tasks::{spawn_periodic_task, PeriodicTaskStart, AGGREGATOR_CONTROLLER, CONVOY_ENSURE_CONDITION_TYPE};
 use crate::{
-    blob_store::TieredBlobStore, resource_limits::file_descriptor_pressure_condition, resource_manifest::manifest_root_name,
-    supervisor::RestartBudgetExhausted,
+    resource_limits::file_descriptor_pressure_condition, resource_manifest::manifest_root_name, supervisor::RestartBudgetExhausted,
 };
 
 const FLEET_DESIGNATION_CONDITION_TYPE: &str = "Message/FleetDesignation";
@@ -49,14 +49,16 @@ pub(super) struct RuntimeHealth {
     pub(super) host_observations: HostObservations,
     /// Wakes the heartbeat to publish a condition straight away, before its next tick.
     pub(super) heartbeat_now: Arc<tokio::sync::Notify>,
+    /// What the heartbeat last published, and the Hosts it last listed.
+    pub(super) heartbeat: Arc<tokio::sync::Mutex<HeartbeatMemory>>,
+    /// Where the heartbeat publishes; the store's, unless a test counts the calls.
+    pub(super) heartbeat_publish: HeartbeatPublish,
 }
 
-/// Latest periodic observations of the local Host, folded into the heartbeat's
-/// status write so each observer does not commit the Host object on its own
-/// cadence (#3154). Host status is "latest value only" (WORKLOAD.md).
+/// Latest periodic observations of the local Host that the heartbeat and the fulfilment probe
+/// share. Host status is "latest value only" (WORKLOAD.md).
 #[derive(Clone, Default)]
 pub(super) struct HostObservations {
-    blob_store: Option<Arc<TieredBlobStore>>,
     provider_advertisements: Arc<tokio::sync::RwLock<Option<ProviderObservation>>>,
     fulfilment_facts: Arc<tokio::sync::RwLock<Option<BTreeMap<String, FulfilmentFacts>>>>,
 }
@@ -69,23 +71,11 @@ struct ProviderObservation {
 
 impl std::fmt::Debug for HostObservations {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        formatter.debug_struct("HostObservations").field("blob_store", &self.blob_store.is_some()).finish_non_exhaustive()
+        formatter.debug_struct("HostObservations").finish_non_exhaustive()
     }
 }
 
 impl HostObservations {
-    pub(super) fn with_blob_store(mut self, blob_store: Arc<TieredBlobStore>) -> Self {
-        self.blob_store = Some(blob_store);
-        self
-    }
-
-    async fn blob_sync(&self) -> Option<BlobSyncStatus> {
-        match &self.blob_store {
-            Some(store) => Some(store.status().await),
-            None => None,
-        }
-    }
-
     pub(super) async fn record_provider_advertisements(&self, providers: Vec<flotilla_protocol::provider::ProviderAdvertisement>) {
         *self.provider_advertisements.write().await = Some(ProviderObservation { at: tokio::time::Instant::now(), providers });
     }
@@ -114,11 +104,6 @@ impl HostObservations {
 }
 
 impl RuntimeHealth {
-    pub(super) fn with_blob_store(mut self, blob_store: Arc<TieredBlobStore>) -> Self {
-        self.host_observations = self.host_observations.with_blob_store(blob_store);
-        self
-    }
-
     pub(super) fn report_capability_regression(&self, condition: HostCondition) {
         self.failures.lock().expect("runtime health lock poisoned").insert(condition.condition_type.clone(), condition);
     }
@@ -422,15 +407,21 @@ pub(super) async fn apply_host_heartbeat_with_credentials(
     daemon.set_admission_free_space_path(PathBuf::from(&profile.repo_default_dir));
     let backend = daemon.resource_backend();
     let hosts = backend.clone().using::<Host>(namespace);
-    // The tick's one read of the Hosts: this daemon's own, and those its kinds may name. It reads
-    // again only after bringing its own in line with the profile.
-    let mut listed = hosts.list().await.map_err(|err| err.to_string())?.items;
+    let mut memory = runtime_health.heartbeat.lock().await;
+    // This daemon's own Host, and those its kinds may name, listed again only once they moved:
+    // after bringing its own in line with the profile, among other writes.
+    let mut listed = memory.hosts.read(&hosts).await.map_err(|err| err.to_string())?;
     let own = |host: &&ResourceObject<Host>| host.metadata.name == profile.host_id;
     let existing = listed.iter().find(own);
     if ensure_host_matches(&hosts, existing, &profile.host_id, &profile.display_name, profile.max_vessels).await? {
-        listed = hosts.list().await.map_err(|err| err.to_string())?.items;
+        listed = memory.hosts.read(&hosts).await.map_err(|err| err.to_string())?;
+        // A Host made or remade holds none of what was published.
+        memory.published = None;
     }
     let host = listed.iter().find(own).ok_or_else(|| format!("host {} is not held", profile.host_id))?;
+    if host.status.is_none() {
+        memory.published = None;
+    }
     let adapter_assessment = assess_agent_adapter_capabilities(host.status.as_ref(), &profile.available_agent_adapters, health);
     if let Some(condition) = adapter_assessment.regression {
         runtime_health.report_capability_regression(condition);
@@ -444,7 +435,7 @@ pub(super) async fn apply_host_heartbeat_with_credentials(
         Ok(bytes) => (bytes, None),
         Err(error) => (None, Some(error)),
     };
-    let admission_free_space_floor_bytes = daemon.admission_free_space_floor_bytes()?;
+    let below_free_space_floor = below_floor(disk_free_bytes, daemon.admission_free_space_floor_bytes()?);
     canonicalize_kinds_for(&backend, namespace, &listed, &profile.host_id).await?;
     let mut conditions = runtime_health.conditions().await;
     conditions.extend(daemon.project_image_layer_conditions().await);
@@ -467,36 +458,148 @@ pub(super) async fn apply_host_heartbeat_with_credentials(
     if let Some(condition) = daemon_forgejo_credential_condition(daemon, namespace).await {
         conditions.push(condition);
     }
-    let mut capabilities = host_capabilities(&summary, profile, &held_credentials, &credential_expiry);
-    if let Some(providers) = runtime_health.host_observations.provider_advertisements().await {
-        capabilities.insert(flotilla_resources::ENVIRONMENT_PROVIDERS_CAPABILITY.into(), serde_json::json!(providers));
+    let report = HeartbeatReport {
+        description: summary,
+        providers: runtime_health
+            .host_observations
+            .provider_advertisements()
+            .await
+            .unwrap_or_else(|| profile.environment_providers.clone()),
+        held_credentials,
+        credential_expiry,
+        agent_adapter_baseline: adapter_assessment.baseline,
+        ready: !conditions.iter().any(HostCondition::blocks_readiness),
+        daemon_generation: health.generation.clone(),
+        below_free_space_floor,
+        conditions,
+    };
+    // Unchanged since the last publish: no patch is made, and nothing is read or written.
+    if memory.published.as_ref().is_some_and(|published| published.same_as(&report)) {
+        return Ok(());
     }
-    let ready = !conditions.iter().any(HostCondition::blocks_readiness);
-    flotilla_store::observe_status(
-        &hosts,
-        &profile.host_id,
-        &HostStatusPatch::Heartbeat {
-            description: Some(Box::new(summary)),
-            capabilities,
-            agent_adapter_baseline: Some(adapter_assessment.baseline),
-            heartbeat_at: daemon.clock().now(),
-            ready,
-            daemon_generation: health.generation.clone(),
-            protocol_fingerprint: Some(flotilla_protocol::PROTOCOL_FINGERPRINT.to_string()),
-            daemon_version: Some(health.version.clone()),
-            daemon_started_at: Some(health.started_at),
-            disk_free_bytes,
-            admission_free_space_floor_bytes: Some(admission_free_space_floor_bytes),
-            conditions,
-            folded: Box::new(FoldedHostObservations {
-                blob_sync: runtime_health.host_observations.blob_sync().await,
-                fulfilment_refresh: runtime_health.host_observations.fulfilment_facts().await.unwrap_or_default(),
-            }),
-        },
-    )
-    .await
-    .map_err(|err| err.to_string())?;
+    runtime_health
+        .heartbeat_publish
+        .0
+        .publish(&hosts, &profile.host_id, &report.patch(profile, daemon.clock().now()))
+        .await
+        .map_err(|err| err.to_string())?;
+    memory.published = Some(report);
     Ok(())
+}
+
+/// Where the heartbeat publishes its own Host's status.
+#[async_trait::async_trait]
+pub(super) trait HostStatusPublish: Send + Sync {
+    async fn publish(&self, hosts: &TypedResolver<Host>, name: &str, patch: &HostStatusPatch) -> Result<(), ResourceError>;
+}
+
+/// Publishes through the store, which writes only an observation that changed.
+struct StoreStatusPublish;
+
+#[async_trait::async_trait]
+impl HostStatusPublish for StoreStatusPublish {
+    async fn publish(&self, hosts: &TypedResolver<Host>, name: &str, patch: &HostStatusPatch) -> Result<(), ResourceError> {
+        flotilla_store::observe_status(hosts, name, patch).await
+    }
+}
+
+#[derive(Clone)]
+pub(super) struct HeartbeatPublish(pub(super) Arc<dyn HostStatusPublish>);
+
+impl Default for HeartbeatPublish {
+    fn default() -> Self {
+        Self(Arc::new(StoreStatusPublish))
+    }
+}
+
+impl std::fmt::Debug for HeartbeatPublish {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.debug_struct("HeartbeatPublish").finish_non_exhaustive()
+    }
+}
+
+/// What the heartbeat keeps between its ticks.
+#[derive(Default)]
+pub(super) struct HeartbeatMemory {
+    hosts: Listed<Host>,
+    /// The report last published, which an unchanged tick does not publish again.
+    published: Option<HeartbeatReport>,
+}
+
+impl std::fmt::Debug for HeartbeatMemory {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.debug_struct("HeartbeatMemory").field("published", &self.published.is_some()).finish_non_exhaustive()
+    }
+}
+
+/// Whether `free` bytes are below the admission `floor`: a floor of zero admits whatever is free,
+/// and an unread free figure is unknown.
+pub(super) fn below_floor(free: Option<u64>, floor: u64) -> Option<bool> {
+    if floor == 0 {
+        return Some(false);
+    }
+    free.map(|free| free < floor)
+}
+
+/// What one heartbeat observes of this daemon's own host, compared with the last one published
+/// before any patch is made of it.
+#[derive(Debug, Clone)]
+pub(super) struct HeartbeatReport {
+    description: HostSummary,
+    providers: Vec<flotilla_protocol::provider::ProviderAdvertisement>,
+    held_credentials: BTreeSet<String>,
+    credential_expiry: BTreeMap<String, CredentialExpiry>,
+    agent_adapter_baseline: BTreeSet<String>,
+    ready: bool,
+    daemon_generation: Option<String>,
+    below_free_space_floor: Option<bool>,
+    conditions: Vec<HostCondition>,
+}
+
+impl HeartbeatReport {
+    /// Whether `other` observes what this does: each condition's observation time aside.
+    fn same_as(&self, other: &Self) -> bool {
+        let Self {
+            description,
+            providers,
+            held_credentials,
+            credential_expiry,
+            agent_adapter_baseline,
+            ready,
+            daemon_generation,
+            below_free_space_floor,
+            conditions,
+        } = self;
+        *description == other.description
+            && *providers == other.providers
+            && *held_credentials == other.held_credentials
+            && *credential_expiry == other.credential_expiry
+            && *agent_adapter_baseline == other.agent_adapter_baseline
+            && *ready == other.ready
+            && *daemon_generation == other.daemon_generation
+            && *below_free_space_floor == other.below_free_space_floor
+            && conditions.len() == other.conditions.len()
+            && conditions.iter().zip(&other.conditions).all(|(left, right)| left.same_observation(right))
+    }
+
+    fn patch(&self, profile: &LocalProvisioningProfile, heartbeat_at: chrono::DateTime<Utc>) -> HostStatusPatch {
+        HostStatusPatch::Heartbeat {
+            description: Some(Box::new(self.description.clone())),
+            capabilities: BTreeMap::from([
+                (flotilla_resources::ENVIRONMENT_PROVIDERS_CAPABILITY.to_string(), json!(self.providers)),
+                (AGENT_ADAPTERS_CAPABILITY.to_string(), json!(profile.available_agent_adapters)),
+                (HELD_CREDENTIALS_CAPABILITY.to_string(), json!(self.held_credentials)),
+                (CREDENTIAL_EXPIRY_CAPABILITY.to_string(), json!(self.credential_expiry)),
+            ]),
+            agent_adapter_baseline: Some(self.agent_adapter_baseline.clone()),
+            heartbeat_at,
+            ready: self.ready,
+            daemon_generation: self.daemon_generation.clone(),
+            protocol_fingerprint: Some(flotilla_protocol::PROTOCOL_FINGERPRINT.to_string()),
+            below_free_space_floor: self.below_free_space_floor,
+            conditions: self.conditions.clone(),
+        }
+    }
 }
 
 /// Diagnose host-local intent against namespace-scoped declarations, never checkout observations.
@@ -566,23 +669,6 @@ pub(super) async fn resolve_daemon_forgejo_credential_condition(
         // An unresolved mapping is source-specific; providers report their own credential errors.
         .blocks_forge_observation(false)
         .build()))
-}
-
-pub(super) fn host_capabilities(
-    summary: &HostSummary,
-    profile: &LocalProvisioningProfile,
-    held_credentials: &BTreeSet<String>,
-    credential_expiry: &BTreeMap<String, CredentialExpiry>,
-) -> BTreeMap<String, serde_json::Value> {
-    BTreeMap::from([
-        (flotilla_resources::ENVIRONMENT_PROVIDERS_CAPABILITY.to_string(), json!(profile.environment_providers)),
-        (AGENT_ADAPTERS_CAPABILITY.to_string(), json!(profile.available_agent_adapters)),
-        (HELD_CREDENTIALS_CAPABILITY.to_string(), json!(held_credentials)),
-        (CREDENTIAL_EXPIRY_CAPABILITY.to_string(), json!(credential_expiry)),
-        ("docker".to_string(), json!(profile.docker_available)),
-        ("os".to_string(), json!(summary.system.os)),
-        ("terminal_pools".to_string(), json!(profile.available_pools)),
-    ])
 }
 
 #[cfg(test)]

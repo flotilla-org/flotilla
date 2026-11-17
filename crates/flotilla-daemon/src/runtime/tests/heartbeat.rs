@@ -1,4 +1,5 @@
 use super::*;
+use crate::runtime::health::{HeartbeatPublish, HostStatusPublish};
 use crate::runtime::tasks::LocalFulfilmentProbe;
 use crate::testkits::engine::{admit_convoy, engine};
 use flotilla_provisioning_testkit::EngineBackend;
@@ -829,6 +830,145 @@ async fn an_idle_heartbeat_reads_the_hosts_once_and_writes_nothing() {
     let ((), reads, written) = host_tick_cost(&daemon, async { heartbeat().await.expect("idle heartbeat") }).await;
     assert!(reads.total() <= 1, "an idle heartbeat read the Hosts more than once: {reads:?}");
     assert_eq!(written, 0, "an idle heartbeat wrote");
+}
+
+/// Counts the heartbeat's publishes, passing each on to the store.
+#[derive(Default)]
+struct CountedPublish(std::sync::atomic::AtomicUsize);
+
+#[async_trait]
+impl HostStatusPublish for CountedPublish {
+    async fn publish(
+        &self,
+        hosts: &flotilla_store::TypedResolver<Host>,
+        name: &str,
+        patch: &flotilla_resources::HostStatusPatch,
+    ) -> Result<(), flotilla_resources::ResourceError> {
+        self.0.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        flotilla_store::observe_status(hosts, name, patch).await
+    }
+}
+
+// Behaviour: heartbeat ticks that observe what was last published make no patch and publish
+// nothing, though the store would also write nothing for them.
+#[tokio::test]
+async fn unchanged_heartbeats_publish_nothing() {
+    let temp = TempDir::new().expect("tempdir");
+    fs::write(temp.path().join("daemon.toml"), "machine_id = \"unchanged-heartbeat-test\"\n").expect("daemon config");
+    let daemon = in_memory_daemon(Vec::new(), Arc::new(ConfigStore::with_base(temp.path()))).await;
+    let host_id = daemon.local_host_id().expect("local host id").to_string();
+    let profile = manual_profile(&host_id, false);
+    let publishes = Arc::new(CountedPublish::default());
+    let runtime_health = RuntimeHealth { heartbeat_publish: HeartbeatPublish(publishes.clone()), ..RuntimeHealth::default() };
+    let health = test_health_identity();
+    let count = || publishes.0.load(std::sync::atomic::Ordering::SeqCst);
+    apply_host_heartbeat_with_credentials(&daemon, NAMESPACE, &profile, None, &health, &runtime_health).await.expect("first heartbeat");
+    assert_eq!(count(), 1, "the first heartbeat publishes");
+    for tick in 0..5 {
+        apply_host_heartbeat_with_credentials(&daemon, NAMESPACE, &profile, None, &health, &runtime_health)
+            .await
+            .expect("unchanged heartbeat");
+        assert_eq!(count(), 1, "unchanged tick {tick} published");
+    }
+}
+
+// Behaviour: free disk crossing the admission floor publishes the Host's judgement once, and the
+// ticks after it, observing the same side of the floor, publish nothing.
+#[tokio::test]
+async fn a_floor_crossing_publishes_once() {
+    let temp = TempDir::new().expect("tempdir");
+    fs::write(temp.path().join("daemon.toml"), "machine_id = \"floor-crossing-test\"\n").expect("daemon config");
+    let daemon = in_memory_daemon(Vec::new(), Arc::new(ConfigStore::with_base(temp.path()))).await;
+    let host_id = daemon.local_host_id().expect("local host id").to_string();
+    let profile = manual_profile(&host_id, false);
+    let (health, runtime_health) = (test_health_identity(), RuntimeHealth::default());
+    let heartbeat = || apply_host_heartbeat_with_credentials(&daemon, NAMESPACE, &profile, None, &health, &runtime_health);
+    let below = || async {
+        daemon.resource_backend().using::<Host>(NAMESPACE).get(&host_id).await.expect("host").status.expect("status").below_free_space_floor
+    };
+    // The discovery fixture reads 100 GiB free, above the default 20 GiB floor.
+    heartbeat().await.expect("first heartbeat");
+    assert_eq!(below().await, Some(false));
+
+    fs::write(temp.path().join("daemon.toml"), "machine_id = \"floor-crossing-test\"\n[admission]\nfree_space_floor_gib = 200\n")
+        .expect("raise the floor");
+    let ((), _, written) = host_tick_cost(&daemon, async { heartbeat().await.expect("crossing heartbeat") }).await;
+    assert!(written > 0, "the crossing was not published");
+    assert_eq!(below().await, Some(true));
+
+    // The crossing's own write moved the Hosts, which the next tick lists once; after that an
+    // unchanged tick reads nothing.
+    let ((), reads, written) = host_tick_cost(&daemon, async { heartbeat().await.expect("heartbeat below the floor") }).await;
+    assert_eq!(written, 0, "a tick still below the floor published again");
+    assert!(reads.total() <= 1, "{reads:?}");
+    let ((), reads, written) = host_tick_cost(&daemon, async { heartbeat().await.expect("idle heartbeat") }).await;
+    assert_eq!((reads.total(), written), (0, 0), "an unchanged tick read or wrote: {reads:?}");
+}
+
+/// A fleet tier that refuses every request.
+struct UnreachableFleet;
+
+#[async_trait]
+impl crate::blob_store::BlobStore for UnreachableFleet {
+    async fn put(&self, _: &[u8]) -> Result<crate::blob_store::BlobDigest, String> {
+        Err("fleet unreachable".into())
+    }
+    async fn get(&self, _: &crate::blob_store::BlobDigest) -> Result<Option<Vec<u8>>, String> {
+        Err("fleet unreachable".into())
+    }
+    async fn has(&self, _: &crate::blob_store::BlobDigest) -> Result<bool, String> {
+        Err("fleet unreachable".into())
+    }
+    async fn delete(&self, _: &crate::blob_store::BlobDigest) -> Result<(), String> {
+        Err("fleet unreachable".into())
+    }
+}
+
+// Behaviour: the answering daemon's own fleet row shows its free disk, version, uptime and blob
+// sync as read in memory now, none of which the stored Host carries.
+#[tokio::test]
+async fn the_local_fleet_row_reads_its_figures_in_memory() {
+    use crate::blob_store::BlobStore as _;
+    let temp = TempDir::new().expect("tempdir");
+    fs::write(temp.path().join("daemon.toml"), "machine_id = \"local-row-test\"\n").expect("daemon config");
+    let daemon = in_memory_daemon(Vec::new(), Arc::new(ConfigStore::with_base(temp.path()))).await;
+    engine(&daemon);
+    let host_id = daemon.local_host_id().expect("local host id").to_string();
+    let blobs =
+        Arc::new(crate::blob_store::TieredBlobStore::new(&temp.path().join("blobs"), vec![("fleet".into(), Arc::new(UnreachableFleet))]));
+    blobs.put(b"written while the fleet is away").await.expect("local-first put");
+    blobs.sync_once().await.expect("sync pass");
+    let started_at = Utc::now() - chrono::Duration::minutes(5);
+    daemon
+        .install_local_host_identity(flotilla_core::in_process::local_host::LocalHostIdentity {
+            version: "local-row-version".into(),
+            started_at,
+            blob_sync: Some(blobs),
+        })
+        .expect("install identity");
+    apply_host_heartbeat_with_credentials(
+        &daemon,
+        NAMESPACE,
+        &manual_profile(&host_id, false),
+        None,
+        &test_health_identity(),
+        &RuntimeHealth::default(),
+    )
+    .await
+    .expect("heartbeat");
+
+    let fleet = daemon.fleet_health_internal().await.expect("fleet health");
+    let local = fleet.hosts.iter().find(|host| host.is_local).expect("local fleet row");
+    assert_eq!(local.disk_free_bytes, Some(100 * 1024 * 1024 * 1024));
+    assert_eq!(local.daemon_version.as_deref(), Some("local-row-version"));
+    assert!(local.daemon_uptime_seconds.is_some_and(|uptime| uptime >= 300), "{:?}", local.daemon_uptime_seconds);
+    let sync = local.blob_sync.as_ref().expect("blob sync");
+    assert_eq!(sync.pending_count, 1);
+    assert!(sync.last_error.as_deref().is_some_and(|error| error.contains("fleet unreachable")), "{sync:?}");
+    let hosts = daemon.list_hosts_internal().await.expect("host list");
+    let environment = hosts.hosts.iter().find(|host| host.is_local).and_then(|host| host.environment_id.clone()).expect("local host");
+    let status = daemon.get_host_status_internal(&environment).await.expect("host status");
+    assert_eq!(status.blob_sync, local.blob_sync);
 }
 
 // Behaviour: a fulfilment probe tick that observes the facts it published before reads the Hosts

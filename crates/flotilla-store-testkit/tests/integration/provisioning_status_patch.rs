@@ -23,13 +23,9 @@ fn host_status_patch_updates_heartbeat_snapshot() {
         ready: true,
         daemon_generation: None,
         protocol_fingerprint: Some("wire-fingerprint".to_string()),
-        daemon_version: None,
-        daemon_started_at: None,
-        disk_free_bytes: None,
-        admission_free_space_floor_bytes: None,
+        below_free_space_floor: None,
         agent_adapter_baseline: None,
         conditions: Vec::new(),
-        folded: Default::default(),
     }
     .apply(&mut status);
 
@@ -98,13 +94,9 @@ async fn heartbeat_patch_preserves_independent_status_after_another_writer_updat
         ready: true,
         daemon_generation: None,
         protocol_fingerprint: None,
-        daemon_version: None,
-        daemon_started_at: None,
-        disk_free_bytes: None,
-        admission_free_space_floor_bytes: None,
+        below_free_space_floor: None,
         agent_adapter_baseline: Some(["codex".to_string()].into()),
         conditions: vec![heartbeat_condition.clone()],
-        folded: Default::default(),
     };
     let status = flotilla_store::apply_status_patch(&hosts, "host-a", &patch)
         .await
@@ -276,13 +268,9 @@ fn heartbeat_description_has_one_availability_authority(tc: hegel::TestCase) {
         ready: true,
         daemon_generation: None,
         protocol_fingerprint: None,
-        daemon_version: None,
-        daemon_started_at: None,
-        disk_free_bytes: Some(u64::MAX),
-        admission_free_space_floor_bytes: None,
+        below_free_space_floor: Some(false),
         agent_adapter_baseline: None,
         conditions: vec![],
-        folded: Default::default(),
     };
     let mut status = HostStatus::default();
     patch.apply(&mut status);
@@ -307,7 +295,7 @@ fn heartbeat_description_has_one_availability_authority(tc: hegel::TestCase) {
     let previous: HostStatus = serde_json::from_value(previous).expect("previous generation still decodes");
     assert!(previous.description.is_none());
     assert_eq!(previous.capabilities, status.capabilities);
-    assert_eq!(previous.disk_free_bytes, status.disk_free_bytes);
+    assert_eq!(previous.below_free_space_floor, status.below_free_space_floor);
 }
 
 // ADR 0047: previous-generation statuses lack configured limits and must decode

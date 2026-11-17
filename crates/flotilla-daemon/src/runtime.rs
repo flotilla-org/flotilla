@@ -245,9 +245,12 @@ impl DaemonRuntime {
             daemon.set_local_placement_capabilities(&profile.available_agent_adapters, &profile.available_pools),
         )
         .await;
-        let runtime_health = RuntimeHealth::default()
-            .with_restart_history_dir(config.state_dir().as_path().to_path_buf())
-            .with_blob_store(Arc::clone(&blob_store));
+        daemon.install_local_host_identity(flotilla_core::in_process::local_host::LocalHostIdentity {
+            version: health.version.clone(),
+            started_at: health.started_at,
+            blob_sync: Some(Arc::clone(&blob_store) as Arc<dyn flotilla_core::in_process::local_host::BlobSyncReading>),
+        })?;
+        let runtime_health = RuntimeHealth::default().with_restart_history_dir(config.state_dir().as_path().to_path_buf());
         runtime_health.host_observations.record_provider_advertisements(profile.environment_providers.clone()).await;
 
         result_phase("quarantine_undecodable_stored_objects", async {

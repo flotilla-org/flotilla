@@ -363,8 +363,7 @@ pub(super) fn spawn_sleep_inhibitor_task(
 pub(super) const FULFILMENT_CHANGE_CHECK_INTERVAL: Duration = Duration::from_secs(5);
 
 /// Probe local fulfilment facts. Changed facts are published at once; a probe
-/// that only refreshes `observed_at` is kept in `observations` and folded into
-/// the next heartbeat write (#3154).
+/// that only refreshes `observed_at` is kept in `observations` and writes nothing.
 pub(super) fn spawn_local_fulfilment_probe_task(
     daemon: Arc<InProcessDaemon>,
     namespace: String,

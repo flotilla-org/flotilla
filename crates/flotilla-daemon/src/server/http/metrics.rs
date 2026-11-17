@@ -9,6 +9,7 @@ use axum::{
     http::StatusCode,
     response::{IntoResponse, Response},
 };
+use flotilla_core::in_process::local_host::LocalHostReading;
 use flotilla_store::load_metrics::{callers, ControllerMetricsRegistry, HistogramSnapshot, ReadCounts, ReplicationLoadMetrics};
 
 use super::RouterState;
@@ -28,7 +29,8 @@ pub(super) async fn handle(State(RouterState(state)): State<RouterState>) -> Res
     };
     // Serve only Prometheus 0.0.4 text, without OpenMetrics negotiation. Recheck
     // histogram-family and separate _max gauge names before changing formats.
-    let text = render(metrics, daemon);
+    let local = daemon.local_host_reading().await;
+    let text = render(metrics, daemon, &local);
     ([(axum::http::header::CONTENT_TYPE, "text/plain; version=0.0.4; charset=utf-8")], text).into_response()
 }
 
@@ -58,6 +60,12 @@ impl Exposition {
             "flotilla_dispatch_time_from_ready_seconds" => {
                 "Time from an issue entering the dispatch queue to its convoy's creation, in seconds."
             }
+            "flotilla_disk_free_bytes" => "Free bytes on the filesystem convoy admission measures.",
+            "flotilla_admission_free_space_floor_bytes" => "The free space below which this host admits no convoy, in bytes.",
+            "flotilla_daemon_info" => "This daemon's version, as a label; always 1.",
+            "flotilla_daemon_start_time_seconds" => "When this daemon started, in Unix seconds.",
+            "flotilla_blob_sync_pending" => "Blobs written locally that the fleet tiers do not hold yet.",
+            "flotilla_blob_sync_failing" => "1 while the last blob sync pass failed; the error is logged when it changes.",
             _ => "Daemon load instrumentation; counters are cumulative and peaks are high-water marks since startup.",
         };
         self.families.entry(self.current.clone()).or_insert_with(|| format!("# HELP {name} {help}\n# TYPE {name} {kind}\n"));
@@ -96,8 +104,25 @@ impl Exposition {
         }
     }
 }
-fn render(metrics: &LoadMetrics, daemon: &flotilla_core::in_process::InProcessDaemon) -> String {
+fn render(metrics: &LoadMetrics, daemon: &flotilla_core::in_process::InProcessDaemon, local: &LocalHostReading) -> String {
     let mut out = Exposition { current: String::new(), host: escaped(daemon.host_name().as_str()), families: Default::default() };
+    // This host's live figures: the stored Host carries only what remote readers decide on.
+    if let Some(bytes) = local.disk_free_bytes {
+        out.number("flotilla_disk_free_bytes", "gauge", "", bytes);
+    }
+    if let Some(bytes) = local.admission_free_space_floor_bytes {
+        out.number("flotilla_admission_free_space_floor_bytes", "gauge", "", bytes);
+    }
+    if let Some(version) = &local.daemon_version {
+        out.number("flotilla_daemon_info", "gauge", &format!(",version=\"{}\"", escaped(version)), 1);
+    }
+    if let Some(started_at) = local.daemon_started_at {
+        out.number("flotilla_daemon_start_time_seconds", "gauge", "", started_at.timestamp());
+    }
+    if let Some(sync) = &local.blob_sync {
+        out.number("flotilla_blob_sync_pending", "gauge", "", sync.pending_count);
+        out.number("flotilla_blob_sync_failing", "gauge", "", u8::from(sync.last_error.is_some()));
+    }
     // The decided store's waits and executions are its lock's holds.
     let decided = daemon.decided_store_metrics().snapshot();
     for (operation, wait, execution) in
@@ -431,6 +456,78 @@ mod tests {
             task.abort();
             let _ = task.await;
         }
+    }
+
+    /// A fleet tier that refuses every request.
+    struct UnreachableFleet;
+
+    #[async_trait::async_trait]
+    impl crate::blob_store::BlobStore for UnreachableFleet {
+        async fn put(&self, _: &[u8]) -> Result<crate::blob_store::BlobDigest, String> {
+            Err("fleet unreachable".into())
+        }
+        async fn get(&self, _: &crate::blob_store::BlobDigest) -> Result<Option<Vec<u8>>, String> {
+            Err("fleet unreachable".into())
+        }
+        async fn has(&self, _: &crate::blob_store::BlobDigest) -> Result<bool, String> {
+            Err("fleet unreachable".into())
+        }
+        async fn delete(&self, _: &crate::blob_store::BlobDigest) -> Result<(), String> {
+            Err("fleet unreachable".into())
+        }
+    }
+
+    // Behaviour: GET /metrics exports this host's free disk, admission floor, version, start time
+    // and blob sync, which the stored Host does not carry; remote readers take them from here.
+    #[tokio::test]
+    async fn metrics_export_the_local_host_figures() {
+        use crate::blob_store::BlobStore as _;
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("daemon.toml"), "machine_id = \"metrics-local\"\n").unwrap();
+        let config = Arc::new(flotilla_config::ConfigStore::with_base(dir.path().to_path_buf()));
+        let daemon = flotilla_core::in_process::InProcessDaemon::new_with_resource_backend(
+            vec![],
+            config,
+            flotilla_discovery_testkit::fake_discovery(false),
+            flotilla_protocol::HostName::new("metrics-local"),
+            crate::server::build_embedded_resource_backend(),
+            Arc::new(flotilla_discovery_testkit::HostPeerOverlay::default()),
+        )
+        .await;
+        let blobs = Arc::new(crate::blob_store::TieredBlobStore::new(
+            &dir.path().join("blobs"),
+            vec![("fleet".into(), Arc::new(UnreachableFleet))],
+        ));
+        blobs.put(b"written while the fleet is away").await.unwrap();
+        blobs.sync_once().await.unwrap();
+        let started_at = chrono::DateTime::from_timestamp(1_790_000_000, 0).unwrap();
+        daemon
+            .install_local_host_identity(flotilla_core::in_process::local_host::LocalHostIdentity {
+                version: "metrics-version".into(),
+                started_at,
+                blob_sync: Some(blobs),
+            })
+            .unwrap();
+        let logins = Arc::new(super::super::LoginStore::new(daemon.clock_for_scenarios()));
+        let router = HttpRouter::for_daemon(daemon.clone(), logins, Default::default())
+            .with_load_metrics(Arc::new(LoadMetrics::default()), true)
+            .into_router();
+        let response = router.oneshot(Request::builder().uri("/metrics").body(Body::empty()).unwrap()).await.unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let bytes = to_bytes(response.into_body(), 8_000_000).await.unwrap();
+        let text = std::str::from_utf8(&bytes).unwrap();
+        prometheus_parse::Scrape::parse(text.lines().map(|line| Ok(line.to_owned()))).unwrap();
+        for sample in [
+            format!("flotilla_disk_free_bytes{{host=\"metrics-local\"}} {}", 100u64 * 1024 * 1024 * 1024),
+            format!("flotilla_admission_free_space_floor_bytes{{host=\"metrics-local\"}} {}", 20u64 * 1024 * 1024 * 1024),
+            "flotilla_daemon_info{host=\"metrics-local\",version=\"metrics-version\"} 1".to_string(),
+            "flotilla_daemon_start_time_seconds{host=\"metrics-local\"} 1790000000".to_string(),
+            "flotilla_blob_sync_pending{host=\"metrics-local\"} 1".to_string(),
+            "flotilla_blob_sync_failing{host=\"metrics-local\"} 1".to_string(),
+        ] {
+            assert!(text.lines().any(|line| line == sample), "missing {sample}");
+        }
+        assert!(!text.contains("fleet unreachable"), "the sync error text is not a label");
     }
 
     // Behaviour: the largest internal microsecond bucket stays finite and

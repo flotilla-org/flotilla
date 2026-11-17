@@ -40,6 +40,7 @@ use flotilla_daemon_api::action_namespace;
 mod attach;
 mod checkout_providers;
 pub mod decided;
+pub mod local_host;
 mod resubscribe;
 use flotilla_executor::executor_actions;
 use flotilla_projections::projections_actions;
@@ -760,6 +761,8 @@ pub struct InProcessDaemon {
     discovery: Arc<DiscoveryRuntime>,
     issue_query_port: Arc<dyn IssueQueryPort>,
     forge_budgets: flotilla_forge_github::forge_budget::ForgeBudgets,
+    /// Set once by the daemon runtime: this daemon's version, start time and blob sync reading.
+    local_host_identity: std::sync::OnceLock<local_host::LocalHostIdentity>,
     dispatch_board_cache: dispatch_board::DispatchBoardCache,
     /// VCS capabilities are selected once for each checkout in its execution environment.
     checkout_providers: Arc<CheckoutProviders>,
@@ -1424,6 +1427,7 @@ impl InProcessDaemon {
             discovery: Arc::clone(&discovery),
             issue_query_port: Arc::clone(&issue_query_port),
             forge_budgets,
+            local_host_identity: std::sync::OnceLock::new(),
             checkout_providers: Arc::clone(&checkout_providers),
             checkout_namespace_changes: tokio::sync::watch::channel(()).0,
             repository_providers: Mutex::new(HashMap::new()),
@@ -2770,7 +2774,6 @@ impl InProcessDaemon {
                     EnvironmentId::host(HostId::new(name)),
                     HostQueryDetails::builder()
                         .maybe_visible_environments(status.description.as_ref().map(|description| description.environments.clone()))
-                        .maybe_blob_sync(status.blob_sync.clone())
                         .build(),
                 )
             })
@@ -4569,6 +4572,27 @@ impl InProcessDaemon {
         self.forge_budgets.rows(self.host_name().as_str())
     }
 
+    /// Set once, by the daemon runtime as it starts; refused a second time.
+    pub fn install_local_host_identity(&self, identity: local_host::LocalHostIdentity) -> Result<(), String> {
+        self.local_host_identity.set(identity).map_err(|_| "the local host identity is already installed".to_string())
+    }
+
+    /// This daemon's own host as read in memory now.
+    pub async fn local_host_reading(&self) -> local_host::LocalHostReading {
+        let identity = self.local_host_identity.get();
+        let blob_sync = match identity.and_then(|identity| identity.blob_sync.as_ref()) {
+            Some(reading) => Some(reading.blob_sync().await),
+            None => None,
+        };
+        local_host::LocalHostReading {
+            disk_free_bytes: self.admission_free_space_bytes().await.ok().flatten(),
+            admission_free_space_floor_bytes: self.admission_free_space_floor_bytes().ok(),
+            daemon_version: identity.map(|identity| identity.version.clone()),
+            daemon_started_at: identity.map(|identity| identity.started_at),
+            blob_sync,
+        }
+    }
+
     /// Current advisory project source refusals for the host heartbeat.
     pub async fn project_image_layer_conditions(&self) -> Vec<flotilla_resources::HostCondition> {
         self.image_layer_refresh.lock().await.conditions()
@@ -4586,6 +4610,15 @@ impl InProcessDaemon {
             .await?;
         response.forge_budgets.retain(|row| row.host != self.host_name().as_str());
         response.forge_budgets.extend(self.forge_budget_rows());
+        // The answering host's live figures, read in memory; other hosts' are in their metrics.
+        if let Some(row) = response.hosts.iter_mut().find(|row| row.is_local) {
+            let reading = self.local_host_reading().await;
+            row.disk_free_bytes = reading.disk_free_bytes;
+            row.daemon_version = reading.daemon_version;
+            row.daemon_uptime_seconds =
+                reading.daemon_started_at.map(|started_at| now.signed_duration_since(started_at).num_seconds().max(0) as u64);
+            row.blob_sync = reading.blob_sync;
+        }
         Ok(response)
     }
 
@@ -4804,7 +4837,12 @@ impl InProcessDaemon {
     pub async fn get_host_status_internal(&self, environment_id: &EnvironmentId) -> Result<HostStatusResponse, String> {
         self.refresh_resource_host_summaries().await?;
         let local_summary = self.host_registry.local_host_summary().await;
-        self.read_projections().get_host_status(environment_id, &self.local_host_counts().await, &local_summary).await
+        let mut response = self.read_projections().get_host_status(environment_id, &self.local_host_counts().await, &local_summary).await?;
+        // Blob sync is read in memory for the host answering; other hosts' is in their metrics.
+        if response.is_local {
+            response.blob_sync = self.local_host_reading().await.blob_sync;
+        }
+        Ok(response)
     }
 
     pub async fn get_host_providers_internal(&self, environment_id: &EnvironmentId) -> Result<HostProvidersResponse, String> {
