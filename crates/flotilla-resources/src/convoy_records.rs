@@ -254,8 +254,8 @@ impl ConvoyNotes {
         self.branch_subject_scan_at = status.branch_subject_scan_at;
         self.branch_subject_scan_error.clone_from(&status.branch_subject_scan_error);
         self.target_mismatches.clone_from(&status.target_mismatches);
-        let declared =
-            status.stalled.as_ref().filter(|stall| stall.source == crate::StallEvidenceSource::Crew).and_then(StalledCondition::seat);
+        // A stalled crew keeps its report while it stays stalled, though another crew's declaration
+        // has since replaced the convoy's condition.
         self.crew = status
             .crew_work
             .iter()
@@ -268,10 +268,7 @@ impl ConvoyNotes {
                             pending_follow_up: state.pending_follow_up.clone(),
                             resumed_at: state.resumed_at,
                             resume_brief_id: state.resume_brief_id.clone(),
-                            stall_report: state
-                                .message
-                                .clone()
-                                .filter(|_| state.phase == CrewWorkPhase::Stalled && declared == Some((work.as_str(), role.as_str()))),
+                            stall_report: state.message.clone().filter(|_| state.phase == CrewWorkPhase::Stalled),
                         };
                         (role.clone(), noted)
                     })

@@ -13,9 +13,8 @@ use flotilla_protocol::{
     SubjectKind,
 };
 use flotilla_resources::{
-    ChangeRequestStatus, Clock, Convoy as ResourceConvoy, ConvoyStatus, CrewWorkPhase, FulfilmentKind, FulfilmentRealisation,
-    HostStatus as ResourceHostStatus, Project, ReadResourceObject, ResourceProvenance, WorkPhase as ResourceWorkPhase, PROJECT_LABEL,
-    ROLE_LABEL,
+    ChangeRequestStatus, Clock, ConvoyStatus, CrewWorkPhase, FulfilmentKind, FulfilmentRealisation, HostStatus as ResourceHostStatus,
+    Project, ReadResourceObject, ResourceProvenance, WorkPhase as ResourceWorkPhase, PROJECT_LABEL, ROLE_LABEL,
 };
 use flotilla_store::ResourceBackend;
 
@@ -42,7 +41,6 @@ mod tests {
         DispatchQueueEntry, FulfilmentKindSpec, HostSpec, InputMeta, Observation, ObservedChangeRequestState, ObservedChecks,
         ObservedMergeability, ObservedReviewDecision, ProjectSpec, ProjectStatus, SystemClock,
     };
-    use flotilla_store_memory::InMemoryBackend;
     use hegel::generators as gs;
 
     use super::*;
@@ -190,35 +188,62 @@ mod tests {
     // #2498: a stalled crew remains listed after its visible condition is replaced or absent.
     #[tokio::test]
     async fn crew_stalls_retains_crew_without_current_condition() {
-        let backend = ResourceBackend::new(InMemoryBackend::default());
-        backend.install_attentions(Arc::new(flotilla_store_testkit::NoAttentions));
-        let convoys = backend.using::<ResourceConvoy>("other-namespace");
-        let convoy = convoys
-            .create(&InputMeta::builder().name("stalled".into()).build(), &ConvoySpec::builder().workflow_ref("scratch".into()).build())
-            .await
-            .expect("convoy");
-        convoys
-            .update_status(
+        let home = flotilla_engine_convoys_testkit::EngineHome::open("home-a");
+        let snapshot = flotilla_resources::WorkflowSnapshot {
+            cascade: None,
+            vessels: vec![flotilla_resources::VesselRequirement::builder()
+                .name("work".to_owned())
+                .crew(vec![flotilla_engine_convoys_testkit::agent("coder"), flotilla_engine_convoys_testkit::agent("reviewer")])
+                .build()],
+            exit: None,
+            turn_delivery: Default::default(),
+            stall_nudges: Default::default(),
+            supervision: None,
+        };
+        let launch = home
+            .admit(
                 "stalled",
-                &convoy.metadata.resource_version,
-                &ConvoyStatus {
-                    phase: ConvoyPhase::Active,
-                    crew_work: BTreeMap::from([(
-                        "work".into(),
-                        BTreeMap::from([
-                            ("coder".into(), CrewWorkState::builder().phase(CrewWorkPhase::Stalled).message("rate limit".into()).build()),
-                            ("reviewer".into(), CrewWorkState::builder().phase(CrewWorkPhase::Working).build()),
-                        ]),
-                    )]),
-                    ..Default::default()
-                },
+                ConvoySpec::builder().workflow_ref("scratch".into()).build(),
+                ConvoyStatus { workflow_snapshot: Some(snapshot), ..Default::default() },
             )
-            .await
-            .expect("status");
-        let response = ReadProjections::crew_stalls(&backend, false, Utc::now()).await.expect("stalls");
-        assert_eq!(response.rows.len(), 1);
-        let row = &response.rows[0];
-        assert_eq!(row.role, "coder");
+            .await;
+        let convoys = home.backend().using::<flotilla_resources::Convoy>("flotilla");
+        let path = home.convoys.path();
+        let declare = |role: &str, report: &str| {
+            flotilla_resources::external_patches::mark_crew_stalled(
+                launch.clone(),
+                "work".into(),
+                role.into(),
+                Utc::now(),
+                flotilla_protocol::StallReason::Infra,
+                None,
+                report.into(),
+            )
+        };
+        // The coder declares a stall, and its supervision opens the stall record about its seat.
+        flotilla_store::note_convoy(&path, &convoys, &launch, &declare("coder", "rate limit")).await.expect("the coder declares");
+        let project = flotilla_address::Address::project("flotilla").expect("project");
+        let seat = flotilla_resources::convoy::engine::seat_address(&project, &launch, "coder").expect("the coder's seat");
+        let records = flotilla_engine_messages::awaiting::AwaitingReplies::open("home-a", home.service()).expect("records");
+        records
+            .record(
+                flotilla_state_machines::machines::awaiting_reply::AwaitingReplySpec {
+                    message: flotilla_state_machines::machines::message::MessageRef::new("stall-report", "home-a"),
+                    sender: seat.clone(),
+                    recipient: "project:flotilla/role:governor".parse().expect("recipient"),
+                    subject: Some(seat),
+                    kind: flotilla_resources::STALL_KIND.into(),
+                    awaited: flotilla_state_machines::machines::awaiting_reply::Awaited::Reply,
+                    deadline: None,
+                },
+                flotilla_schema::Timestamp(0),
+            )
+            .expect("the stall record");
+        // The reviewer's declaration then replaces the convoy's stall condition.
+        flotilla_store::note_convoy(&path, &convoys, &launch, &declare("reviewer", "needs a review")).await.expect("the reviewer declares");
+        let response = ReadProjections::crew_stalls(home.backend(), false, Utc::now()).await.expect("stalls");
+        assert_eq!(response.rows.len(), 2, "{:?}", response.rows);
+        let row = response.rows.iter().find(|row| row.role == "coder").expect("the coder stays listed");
         assert_eq!(row.rung, None);
         assert_eq!(row.age_seconds, None);
         assert_eq!(row.evidence.as_deref(), Some("rate limit"));
