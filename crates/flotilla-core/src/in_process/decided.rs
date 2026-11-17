@@ -76,8 +76,16 @@ pub fn open(state_dir: &Path, identity: EngineIdentity) -> Result<ComposedEngine
         flotilla_schema_sqlite::stream::Service::open(&path, &home, registry)
             .map_err(|error| format!("open decided store {}: {error}{}", path.display(), remedy(&error)))?,
     );
-    let DecidedPorts { records, observations, observation_failures, change_request_branches, source_observers, accounts, manifest_roots } =
-        open_ports(&service, &own_host, identity.clock)?;
+    let DecidedPorts {
+        records,
+        observations,
+        observation_failures,
+        change_request_branches,
+        source_observers,
+        accounts,
+        manifest_roots,
+        standing_roles,
+    } = open_ports(&service, &own_host, identity.clock)?;
     Ok(ComposedEngine {
         service,
         records,
@@ -87,6 +95,7 @@ pub fn open(state_dir: &Path, identity: EngineIdentity) -> Result<ComposedEngine
         source_observers,
         accounts,
         manifest_roots,
+        standing_roles,
     })
 }
 

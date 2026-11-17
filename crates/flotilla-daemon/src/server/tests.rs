@@ -476,8 +476,10 @@ pub(super) async fn daemon_with_decided_store(
                 source_observers,
                 accounts,
                 manifest_roots,
+                standing_roles,
             } = open_ports(&store, &identity.host_id.to_string(), identity.clock)?;
             Ok(flotilla_core::in_process::ComposedEngine {
+                standing_roles,
                 service: store,
                 records,
                 observations,

@@ -13,6 +13,8 @@ mod old_store_accounts;
 pub use old_store_accounts::OldStoreAccounts;
 mod old_store_manifest_roots;
 pub use old_store_manifest_roots::OldStoreManifestRoots;
+mod standing_roles;
+pub use standing_roles::MemoryStandingRoles;
 
 /// Fresh logical store for API-crate tests without an upward adapter dependency.
 pub fn memory_backend() -> flotilla_store::ResourceBackend {

@@ -11,6 +11,7 @@
 //! | a live Vessel of its work | its convoy and work | Vessel `by_launch` |
 //! | an AccessDelivery to its crew | its access, a crew member's role address | AccessDelivery `by_access` |
 //! | an open AccountBinding of its crew | its requester, a seat's role address | AccountBinding `by_requester` |
+//! | a standing generation's end its role has not counted | its ensure, from its admission | StandingRole by name at its home |
 //!
 //! A linked change request with no record yet holds: absent is not closed. The holds name each
 //! dependent `kind:name`, the first a query finds, so a refusal says what it waits for.
@@ -22,6 +23,7 @@ use flotilla_provisioning::stored::{
     account::{AccountBinding, BindingLabel, BindingSpec},
     checkout::{Checkout, CheckoutRequest},
     forge_observation::{ChangeRequestRecord, ChangeRequestState},
+    standing_role::StandingRoleRecord,
     Holder,
 };
 use flotilla_resources::{
@@ -32,9 +34,9 @@ use flotilla_resources::{
         admission::AdmissionDocument,
         engine::{launch_address, seat_address, split_launch},
     },
-    vessel_resource_name, AccessDeliverySpec,
+    vessel_resource_name, AccessDeliverySpec, ENSURED_FROM_ANNOTATION,
 };
-use flotilla_schema::IndexQuery;
+use flotilla_schema::{IndexQuery, Kind};
 use flotilla_schema_sqlite::{Read, ResourceId, StoreError};
 use flotilla_state_machines::{
     machines::{
@@ -120,6 +122,18 @@ pub fn holds(read: &mut Read<'_>, convoy: &Resource<Convoy>, home: &str) -> Resu
         for crew in &work.crew {
             let access = access_key(project_name, name, &work.name, &crew.role);
             first(read, &AccessDeliverySpec::by_access(&access), &mut holds, "access-delivery")?;
+        }
+    }
+
+    // A standing generation's end is its role's next strike or reset: it holds until the role's
+    // record at its home has counted it.
+    if let Some(ensure) = admission.ensure_admission.as_ref().and(admission.provenance.get(ENSURED_FROM_ANNOTATION)) {
+        let counted = match read.resolve(StandingRoleRecord::CODE, ensure, home)? {
+            Some(id) => read.load::<StandingRoleRecord>(id)?.and_then(|role| role.value.counted),
+            None => None,
+        };
+        if counted.is_none_or(|counted| counted < spec.launch) {
+            holds.insert(format!("standing-role:{ensure}"));
         }
     }
 

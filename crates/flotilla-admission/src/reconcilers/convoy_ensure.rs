@@ -12,7 +12,7 @@ use crate::convoy_ensure::ConvoyEnsureAdmission;
 use crate::convoy_ensure::ConvoyEnsureReconciler;
 use crate::convoy_ensure::StandingConvoyBackingInspector;
 use crate::ports::ConvoyTeardown;
-use crate::standing::{self, Decision, Ending, Generation, HoldAttention, StandingHold, StandingReading, StandingRole};
+use crate::standing::{self, Decision, Ending, GenerationEnd, HoldAttention, StandingHold, StandingReading, StandingRole};
 use async_trait::async_trait;
 use chrono::{DateTime, Utc};
 use flotilla_charter::ops_entry::{
@@ -21,7 +21,9 @@ use flotilla_charter::ops_entry::{
 };
 use flotilla_protocol::{PlacementTargetHost, PrincipalRef};
 use flotilla_resources::attentions::{Attention, Attentions, Fact, OpenAttention, Sender, Subject};
+use flotilla_resources::convoy::engine::{launch_of, standing_name};
 use flotilla_resources::definition_provenance::{MANIFEST_RECONCILER_ROOT_ANNOTATION, MANIFEST_SOURCE_ANNOTATION};
+use flotilla_resources::standing_roles::{RunningValues, StandingRoles};
 use flotilla_resources::{
     config_changes, Clock, ControllerRetry, ControllerRetryDisposition, Convoy as ResourceConvoy, ConvoyEnsure, ConvoyEnsureSpec,
     ConvoyPhase, FulfilmentKind, Host as ResourceHost, Project, ReadResourceObject, Repository, ResourceError, ResourceObject,
@@ -96,23 +98,33 @@ fn ended(convoy: &ResourceObject<ResourceConvoy>) -> bool {
     convoy.status.as_ref().is_some_and(|status| status.phase.is_terminal())
 }
 
-/// A generation as [`standing::derive`] reads it: admitted at its creation, under `declared` when
-/// its admitted configuration is the role's now, and ended as its phase says, at its finish (its
-/// admission when none was recorded).
-fn generation(convoy: &ResourceObject<ResourceConvoy>, declared: &ConvoyEnsureSpec) -> Generation {
-    let status = convoy.status.as_ref();
+/// An ended generation's end as [`standing::fold`] reads it: admitted at its creation under the
+/// configuration its admission recorded, and ended as its phase says, at its finish (its admission
+/// when none was recorded). `None` while it runs.
+fn generation_end(convoy: &ResourceObject<ResourceConvoy>) -> Result<Option<GenerationEnd>, String> {
+    let Some(status) = convoy.status.as_ref() else { return Ok(None) };
+    let ending = match status.phase {
+        ConvoyPhase::Failed => Ending::Failed,
+        ConvoyPhase::Abandoned => Ending::Operator,
+        ConvoyPhase::Landed => Ending::Delivered,
+        _ => return Ok(None),
+    };
     let admitted_at = convoy.metadata.creation_timestamp;
-    let ending = status.and_then(|status| match status.phase {
-        ConvoyPhase::Failed => Some(Ending::Failed),
-        ConvoyPhase::Abandoned => Some(Ending::Operator),
-        ConvoyPhase::Landed => Some(Ending::Delivered),
-        _ => None,
-    });
-    Generation {
+    // A generation whose admission recorded no configuration continues no run.
+    let config = status.ensure_admission.as_ref().map(ensure_config_hash).transpose()?.unwrap_or_default();
+    Ok(Some(GenerationEnd {
+        launch: convoy.spec.generation,
+        config,
         admitted_at,
-        current_config: status.and_then(|status| status.ensure_admission.as_ref()) == Some(declared),
-        ended: ending.map(|ending| (ending, status.and_then(|status| status.finished_at).unwrap_or(admitted_at))),
-    }
+        ending,
+        finished_at: status.finished_at.unwrap_or(admitted_at),
+        reason: status.message.clone(),
+    }))
+}
+
+/// The name of the role's launch `n`: what its hold attention is about.
+fn launch_name(ensure: &ResourceObject<ConvoyEnsure>, n: u64) -> Result<String, String> {
+    Ok(format!("{}#{n}", standing_name(&ensure.spec.project_ref, &ensure.spec.role)?))
 }
 
 fn ensure_config_hash(spec: &ConvoyEnsureSpec) -> Result<String, String> {
@@ -137,6 +149,8 @@ pub struct EnsureReconciler {
     next_due: StdMutex<HashMap<String, DateTime<Utc>>>,
     /// The daemon's ManifestRoots (#3824 layer 2c).
     manifest_roots: Arc<dyn flotilla_resources::manifest_roots::ManifestRoots>,
+    /// Each standing role's running values, which this home's passes fold its generations' ends into.
+    standing_roles: Arc<dyn StandingRoles>,
 }
 
 impl EnsureReconciler {
@@ -146,6 +160,7 @@ impl EnsureReconciler {
             .teardown(&self.teardown)
             .resource_backend(&self.resource_backend)
             .manifest_roots(Arc::clone(&self.manifest_roots))
+            .standing_roles(&*self.standing_roles)
             .clock(&self.clock)
             .ensure_admission_retries(&self.ensure_admission_retries)
             .ensure_reconciliation(&self.ensure_reconciliation)
@@ -182,6 +197,7 @@ struct EnsurePass<'a> {
     teardown: &'a Arc<dyn ConvoyTeardown>,
     resource_backend: &'a ResourceBackend,
     manifest_roots: Arc<dyn flotilla_resources::manifest_roots::ManifestRoots>,
+    standing_roles: &'a dyn StandingRoles,
     clock: &'a Arc<dyn Clock>,
     ensure_admission_retries: &'a Mutex<HashMap<(String, String), EnsureAdmissionRetry>>,
     ensure_reconciliation: &'a Mutex<()>,
@@ -245,27 +261,32 @@ impl EnsureReconciler {
     /// The standing role `ensure` declares, as every host reads it.
     async fn role_of(&self, namespace: &str, ensure: &ResourceObject<ConvoyEnsure>) -> Result<StandingRole, String> {
         let attentions = self.resource_backend.attentions();
-        // Every host reads the role from every home's generations.
-        let generations = newest_generations_first(&self.resource_backend, namespace, &ensure.metadata.name, true).await?;
+        // Every host reads the role from every home's generations and its admitting home's values;
+        // an end not folded in yet reads as folded.
+        let newest = newest_generation(&self.resource_backend, namespace, &ensure.metadata.name, true).await?;
+        let mut values = self.standing_roles.get(&ensure.metadata.name).await?.unwrap_or_default();
+        if let Some(end) = newest.as_ref().map(generation_end).transpose()?.flatten() {
+            values = standing::fold(&values, &end);
+        }
         let now = self.clock.now();
-        let (reading, attention) = standing_reading(&*attentions, namespace, ensure, &generations, now, false).await?;
-        let newest = generations.first();
-        let live = newest.filter(|convoy| !ended(convoy));
+        let (reading, attention, values) = standing_reading(&*attentions, namespace, ensure, newest.as_ref(), &values, now, false).await?;
+        let live = newest.as_ref().filter(|convoy| !ended(convoy));
         let hold = match reading.decision {
             Decision::Held { .. } => Some(StandingHold::RestartLimit),
             _ if live.is_none() && attention.open => Some(StandingHold::BackingUnverified),
             _ => None,
         };
-        let held_on = newest.filter(|_| hold.is_some());
+        // A hold is on the generation whose end it follows: the last counted.
+        let held_on = values.counted.filter(|_| hold.is_some()).map(|n| launch_name(ensure, n)).transpose()?;
         // Only the host that admits the role holds a refusal note.
         let note = self.ensure_admission_retries.lock().await.get(&(namespace.to_owned(), ensure.metadata.name.clone())).cloned();
         let next_attempt = match reading.decision {
             Decision::BackOff { until } => Some(until),
             _ => note.as_ref().and_then(|note| note.retry.next_attempt_at()),
         };
-        let backing = match (hold, held_on) {
+        let backing = match (hold, held_on.as_ref()) {
             (Some(StandingHold::BackingUnverified), Some(convoy)) => attentions
-                .open(namespace, Some(Sender::Standing), Some(&Subject::convoy(convoy.metadata.name.clone())))
+                .open(namespace, Some(Sender::Standing), Some(&Subject::convoy(convoy.clone())))
                 .await?
                 .into_iter()
                 .next()
@@ -285,7 +306,7 @@ impl EnsureReconciler {
             .or_else(|| matches!(reading.decision, Decision::BackOff { .. }).then(|| TERMINAL_FAILURE.to_owned()))
             .or_else(|| note.map(|note| note.failure));
         Ok(StandingRole {
-            convoy: live.or(held_on).map(|convoy| convoy.metadata.name.clone()),
+            convoy: live.map(|convoy| convoy.metadata.name.clone()).or(held_on),
             hold,
             strikes: reading.strikes,
             next_attempt,
@@ -491,18 +512,6 @@ impl EnsurePass<'_> {
             .map_err(|error| error.to_string())
     }
 
-    async fn ensured_convoy_generations(&self, namespace: &str, name: &str) -> Result<Vec<ResourceObject<ResourceConvoy>>, String> {
-        self.resource_backend
-            .using::<ResourceConvoy>(namespace)
-            .query_declared(&StoreQuery {
-                fields: BTreeMap::from([(format!("metadata.annotations.\"{ENSURED_FROM_ANNOTATION}\""), name.into())]),
-                ..Default::default()
-            })
-            .await
-            .map(|rows| rows.items.into_iter().map(|source| source.object).collect())
-            .map_err(|error| error.to_string())
-    }
-
     /// Explicitly retire a drifted running generation and admit its successor.
     /// Admission is prepared before abandonment so invalid declarations cannot
     /// interrupt the current crew. The ordinary lifecycle reclaims old backing.
@@ -663,10 +672,9 @@ impl EnsurePass<'_> {
             return Ok(None);
         }
 
-        let generations = self.newest_generations_first(namespace, ensure).await?;
+        let latest = self.newest_generation(namespace, ensure).await?;
         let now = self.clock.now();
-        let (reading, attention) = self.standing_reading(namespace, ensure, &generations, now, force_now).await?;
-        let latest = generations.first();
+        let (reading, attention, values) = self.standing_reading(namespace, ensure, latest.as_ref(), now, force_now).await?;
         let retry_key = (namespace.to_string(), ensure.metadata.name.clone());
         let config_hash = ensure_config_hash(&ensure.spec)?;
         let dependency_hash = self.ensure_admission_dependency_hash(namespace, ensure).await?;
@@ -674,16 +682,20 @@ impl EnsurePass<'_> {
             Decision::Running => return Ok(None),
             Decision::Held { raise } => {
                 if raise {
-                    let latest = latest.expect("strikes need a generation");
                     let failure = restart_limit_reason(reading.strikes);
-                    self.raise_ensure_attention(ensure, latest, &failure, latest.metadata.creation_timestamp).await?;
+                    // Raised from the held generation's admission while its record stays, else from its end.
+                    let began_at = latest.as_ref().map(|latest| latest.metadata.creation_timestamp).or(values.backoff_from).unwrap_or(now);
+                    self.raise_ensure_attention(ensure, &held_on(ensure, &values)?, &failure, began_at).await?;
                     return Ok(Some(format!("ConvoyEnsure/{} exhausted restart budget", ensure.metadata.name)));
                 }
                 return Ok(None);
             }
             Decision::BackOff { until } => {
-                // Automatic passes require positive death evidence before admitting a successor.
-                backing_inspector.verify_backing_dead(latest.expect("strikes need a generation")).await?;
+                // Automatic passes require positive death evidence before admitting a successor; a
+                // retired generation holds nothing.
+                if let Some(latest) = &latest {
+                    backing_inspector.verify_backing_dead(latest).await?;
+                }
                 self.due_at(namespace, until);
                 return Ok(None);
             }
@@ -691,12 +703,12 @@ impl EnsurePass<'_> {
         }
         // `reconcile-now` is the operator's explicit acknowledgement that any missing backing
         // records were deliberately wiped; a released hold admits at once.
-        let released = force_now || attention.acknowledged_at.is_some();
+        let released = force_now || attention.acknowledged;
         if attention.open {
-            self.clear_ensure_attention(namespace, &ensure.metadata.name).await?;
+            self.clear_ensure_attention(namespace, ensure).await?;
         }
-        if !released && reading.strikes > 0 {
-            backing_inspector.verify_backing_dead(latest.expect("strikes need a generation")).await?;
+        if let Some(latest) = latest.as_ref().filter(|_| !released && reading.strikes > 0) {
+            backing_inspector.verify_backing_dead(latest).await?;
         }
         if self.admission_waits(namespace, ensure, &retry_key, &config_hash, &dependency_hash, released, force_now).await? {
             return Ok(None);
@@ -717,22 +729,24 @@ impl EnsurePass<'_> {
     ) -> Result<Option<String>, String> {
         let now = self.clock.now();
         let config_hash = ensure_config_hash(&ensure.spec)?;
-        let generations = self.newest_generations_first(namespace, ensure).await?;
-        if let Some(convoy) = generations.first().filter(|convoy| !ended(convoy)) {
+        let newest = self.newest_generation(namespace, ensure).await?;
+        if let Some(convoy) = newest.as_ref().filter(|convoy| !ended(convoy)) {
             self.observe_ensure_config_drift(namespace, ensure, convoy).await?;
-            self.clear_ensure_attention(namespace, &ensure.metadata.name).await?;
+            self.clear_ensure_attention(namespace, ensure).await?;
             return Ok(None);
         }
 
         let retry_key = (namespace.to_string(), ensure.metadata.name.clone());
         let dependency_hash = self.ensure_admission_dependency_hash(namespace, ensure).await?;
-        let Some(latest) = generations.first() else {
+        let (reading, attention, values) = self.standing_reading(namespace, ensure, newest.as_ref(), now, force_now).await?;
+        // A role none of whose generations ended here has nothing to count or hold.
+        if values.counted.is_none() {
             if self.admission_waits(namespace, ensure, &retry_key, &config_hash, &dependency_hash, force_now, force_now).await? {
                 return Ok(None);
             }
             return self.restart_absent_ensured_convoy(namespace, ensure, now).await;
-        };
-        let (reading, attention) = self.standing_reading(namespace, ensure, &generations, now, force_now).await?;
+        }
+        let held_on = held_on(ensure, &values)?;
         match reading.decision {
             Decision::Running => return Ok(None),
             Decision::Held { raise } => {
@@ -740,31 +754,34 @@ impl EnsurePass<'_> {
                     return Ok(None);
                 }
                 // Raised once, as the hold begins; one on its backing earlier is another episode.
-                self.raise_ensure_attention(ensure, latest, &restart_limit_reason(reading.strikes), now).await?;
+                self.raise_ensure_attention(ensure, &held_on, &restart_limit_reason(reading.strikes), now).await?;
                 return Ok(Some(format!("ConvoyEnsure/{} exhausted restart budget", ensure.metadata.name)));
             }
             Decision::BackOff { .. } | Decision::Admit => {}
         }
 
-        let operator_forced = latest.status.as_ref().is_some_and(|status| status.phase == ConvoyPhase::Abandoned);
-        // A forced pass is the recovery boundary for recordless teardown: the
-        // operator has acknowledged that raw deletion destroyed the evidence.
-        if !operator_forced && !force_now {
-            if let Err(reason) = backing_inspector.verify_backing_dead(latest).await {
-                let failure = format!("standing convoy teardown held: {reason}");
-                warn!(ensure = %ensure.metadata.name, convoy = %latest.metadata.name, %failure, "standing convoy backing evidence refused");
-                // The hold on a generation begins as it ends.
-                let ended_at = generation(latest, &ensure.spec).ended.map_or(now, |(_, at)| at);
-                self.raise_ensure_attention(ensure, latest, &failure, ended_at).await?;
-                if attention.open {
-                    return Ok(None);
+        // A retired generation holds nothing: its backing is released.
+        if let Some(latest) = &newest {
+            let operator_forced = latest.status.as_ref().is_some_and(|status| status.phase == ConvoyPhase::Abandoned);
+            // A forced pass is the recovery boundary for recordless teardown: the
+            // operator has acknowledged that raw deletion destroyed the evidence.
+            if !operator_forced && !force_now {
+                if let Err(reason) = backing_inspector.verify_backing_dead(latest).await {
+                    let failure = format!("standing convoy teardown held: {reason}");
+                    warn!(ensure = %ensure.metadata.name, convoy = %latest.metadata.name, %failure, "standing convoy backing evidence refused");
+                    // The hold on a generation begins as it ends.
+                    let ended_at = generation_end(latest)?.map_or(now, |end| end.finished_at);
+                    self.raise_ensure_attention(ensure, &latest.metadata.name, &failure, ended_at).await?;
+                    if attention.open {
+                        return Ok(None);
+                    }
+                    return Ok(Some(format!("ConvoyEnsure/{} held for operator attention", ensure.metadata.name)));
                 }
-                return Ok(Some(format!("ConvoyEnsure/{} held for operator attention", ensure.metadata.name)));
             }
         }
         // The backing is verified dead: a hold on it is answered.
-        self.clear_ensure_attention(namespace, &ensure.metadata.name).await?;
-        self.clear_hold(namespace, &latest.metadata.name).await?;
+        self.clear_ensure_attention(namespace, ensure).await?;
+        self.clear_hold(namespace, &held_on).await?;
         if let Decision::BackOff { until } = reading.decision {
             self.due_at(namespace, until);
             return Ok(None);
@@ -772,8 +789,8 @@ impl EnsurePass<'_> {
         if self.admission_waits(namespace, ensure, &retry_key, &config_hash, &dependency_hash, force_now, force_now).await? {
             return Ok(None);
         }
-        // The ended generation remains as history. A successful restart admits the next
-        // generation under a fresh record name.
+        // The ended generation's end is folded in, and it retires once nothing holds it. A
+        // successful restart admits the next generation under a fresh record name.
         match self.start_ensured_convoy(namespace, ensure).await {
             Ok(_) => self.admitted(namespace, ensure, &retry_key).await,
             Err(error) => self.admission_refused(namespace, ensure, retry_key, config_hash, dependency_hash, now, error).await,
@@ -786,7 +803,7 @@ impl EnsurePass<'_> {
         ensure: &ResourceObject<ConvoyEnsure>,
         now: DateTime<Utc>,
     ) -> Result<Option<String>, String> {
-        self.clear_ensure_attention(namespace, &ensure.metadata.name).await?;
+        self.clear_ensure_attention(namespace, ensure).await?;
         let retry_key = (namespace.to_string(), ensure.metadata.name.clone());
         // With no running convoy, no admitted configuration can have drifted. While refusals
         // run, the role's attention is their own, which only an admission or a changed
@@ -895,24 +912,36 @@ impl EnsurePass<'_> {
         Ok(acknowledged.is_none())
     }
 
-    /// The role's generations homed here, newest first.
-    async fn newest_generations_first(
+    /// The role's newest generation homed here that has not retired.
+    async fn newest_generation(
         &self,
         namespace: &str,
         ensure: &ResourceObject<ConvoyEnsure>,
-    ) -> Result<Vec<ResourceObject<ResourceConvoy>>, String> {
-        newest_generations_first(self.resource_backend, namespace, &ensure.metadata.name, false).await
+    ) -> Result<Option<ResourceObject<ResourceConvoy>>, String> {
+        newest_generation(self.resource_backend, namespace, &ensure.metadata.name, false).await
     }
 
+    /// The role's reading, its hold attention and its running values, with the end of `newest`
+    /// folded in and a person's acknowledgement of the hold taken: each written once, here, where
+    /// the role is admitted. Folding the end releases the generation to retire.
     async fn standing_reading(
         &self,
         namespace: &str,
         ensure: &ResourceObject<ConvoyEnsure>,
-        generations: &[ResourceObject<ResourceConvoy>],
+        newest: Option<&ResourceObject<ResourceConvoy>>,
         now: DateTime<Utc>,
         forced: bool,
-    ) -> Result<(StandingReading, HoldAttention), String> {
-        standing_reading(&*self.attentions, namespace, ensure, generations, now, forced).await
+    ) -> Result<(StandingReading, HoldAttention, RunningValues), String> {
+        let stored = self.standing_roles.get(&ensure.metadata.name).await?;
+        let mut values = stored.clone().unwrap_or_default();
+        if let Some(end) = newest.map(generation_end).transpose()?.flatten() {
+            values = standing::fold(&values, &end);
+        }
+        let (reading, attention, values) = standing_reading(&*self.attentions, namespace, ensure, newest, &values, now, forced).await?;
+        if stored.as_ref() != Some(&values) && values != RunningValues::default() {
+            self.standing_roles.put(&ensure.metadata.name, &values).await?;
+        }
+        Ok((reading, attention, values))
     }
 
     /// Raises or clears the role's drift attention from how its declaration differs from the
@@ -949,12 +978,12 @@ impl EnsurePass<'_> {
     async fn raise_ensure_attention(
         &self,
         ensure: &ResourceObject<ConvoyEnsure>,
-        convoy: &ResourceObject<ResourceConvoy>,
+        convoy: &str,
         reason: &str,
         began_at: DateTime<Utc>,
     ) -> Result<(), String> {
-        let fact = Fact::Hold { ensure: ensure.metadata.name.clone(), convoy: convoy.metadata.name.clone() };
-        self.attentions.raise(&convoy.metadata.namespace, &Attention::new(fact, reason, began_at)).await
+        let fact = Fact::Hold { ensure: ensure.metadata.name.clone(), convoy: convoy.to_owned() };
+        self.attentions.raise(&ensure.metadata.namespace, &Attention::new(fact, reason, began_at)).await
     }
 
     /// Withdraws the hold on `convoy` if it is open.
@@ -962,17 +991,12 @@ impl EnsurePass<'_> {
         self.attentions.clear(namespace, Sender::Standing, &Subject::convoy(convoy)).await
     }
 
-    /// Clears the hold on any of the ensure's generations.
-    async fn clear_ensure_attention(&self, namespace: &str, ensure_name: &str) -> Result<(), String> {
-        let holds: Vec<_> =
-            self.attentions.open(namespace, Some(Sender::Standing), None).await?.into_iter().filter(OpenAttention::is_hold).collect();
-        if holds.is_empty() {
-            return Ok(());
-        }
-        let generations: HashSet<String> =
-            self.ensured_convoy_generations(namespace, ensure_name).await?.into_iter().map(|convoy| convoy.metadata.name).collect();
+    /// Clears the hold on any of the ensure's generations: each is a launch of the role's standing name.
+    async fn clear_ensure_attention(&self, namespace: &str, ensure: &ResourceObject<ConvoyEnsure>) -> Result<(), String> {
+        let standing = standing_name(&ensure.spec.project_ref, &ensure.spec.role)?;
+        let holds = self.attentions.open(namespace, Some(Sender::Standing), None).await?.into_iter().filter(OpenAttention::is_hold);
         for hold in holds {
-            if matches!(&hold.subject, Subject::Convoy { convoy } if generations.contains(convoy)) {
+            if matches!(&hold.subject, Subject::Convoy { convoy } if launch_of(convoy) == standing) {
                 self.attentions.clear(namespace, Sender::Standing, &hold.subject).await?;
             }
         }
@@ -986,19 +1010,17 @@ impl EnsurePass<'_> {
 
     async fn start_ensured_convoy(&self, namespace: &str, ensure: &ResourceObject<ConvoyEnsure>) -> Result<String, String> {
         let (ensure, admission) = self.admission.prepare(namespace, ensure).await?;
-        let latest = |generations: Vec<ResourceObject<ResourceConvoy>>| generations.into_iter().max_by_key(|convoy| convoy.spec.generation);
-        // A listing that fails here aborts the start before anything is admitted; the next pass retries.
-        let before = latest(self.ensured_convoy_generations(namespace, &ensure.metadata.name).await?).map(|convoy| convoy.spec.generation);
         match self.commit_ensured_convoy(namespace, &ensure, admission).await {
             Ok(name) => Ok(name),
             // A commit that fails after creating its convoy has still admitted a generation; the
             // caller records it, or its end would never count against the restart budget (#4310).
-            // A generation newer than `before` is this commit's: each reconciliation pass holds the ensure
-            // reconciliation lock, so no other pass admits for this ensure meanwhile.
-            Err(error) => match self.ensured_convoy_generations(namespace, &ensure.metadata.name).await {
-                // The listing failing too says nothing of the commit; its own error is the one to report.
-                Err(listing) => Err(format!("{error}; and the generations could not be listed after it: {listing}")),
-                Ok(generations) => match latest(generations).filter(|convoy| before.is_none_or(|before| convoy.spec.generation > before)) {
+            // A live generation homed here is this commit's: a role is admitted only with none live,
+            // and each reconciliation pass holds the ensure reconciliation lock, so no other pass
+            // admits for this ensure meanwhile.
+            Err(error) => match self.active_ensured_convoys(namespace, &ensure.metadata.name, EnsureConvoyScope::Local).await {
+                // The read failing too says nothing of the commit; its own error is the one to report.
+                Err(listing) => Err(format!("{error}; and the live generation could not be read after it: {listing}")),
+                Ok(live) => match live.into_iter().map(|source| source.object).max_by_key(|convoy| convoy.spec.generation) {
                     Some(admitted) => {
                         let (ensure, convoy) = (&ensure.metadata.name, &admitted.metadata.name);
                         warn!(%ensure, %convoy, %error, "standing convoy admitted, though its commit failed after");
@@ -1063,14 +1085,16 @@ async fn canonical_placement_host_ref(
     canonical_placement_host_ref_from_sources(&hosts.items, host_ref)
 }
 
-/// The role `ensure`'s generations homed here, or at every home with `everywhere`, newest first.
-async fn newest_generations_first(
+/// The role `ensure`'s newest generation homed here, or at every home with `everywhere`, that has
+/// not retired: the live one, or the last ended and still held. A retired generation's end is
+/// folded into the role's values, and it is read no more.
+async fn newest_generation(
     backend: &ResourceBackend,
     namespace: &str,
     ensure: &str,
     everywhere: bool,
-) -> Result<Vec<ResourceObject<ResourceConvoy>>, String> {
-    let mut generations = backend
+) -> Result<Option<ResourceObject<ResourceConvoy>>, String> {
+    backend
         .using::<ResourceConvoy>(namespace)
         .query_declared(&StoreQuery {
             fields: BTreeMap::from([(format!("metadata.annotations.\"{ENSURED_FROM_ANNOTATION}\""), ensure.into())]),
@@ -1078,41 +1102,45 @@ async fn newest_generations_first(
             ..Default::default()
         })
         .await
-        .map(|rows| rows.items.into_iter().map(|source| source.object).collect::<Vec<_>>())
-        .map_err(|error| error.to_string())?;
-    generations.sort_by_key(|convoy| std::cmp::Reverse(convoy.spec.generation));
-    Ok(generations)
+        .map(|rows| rows.items.into_iter().map(|source| source.object).max_by_key(|convoy| convoy.spec.generation))
+        .map_err(|error| error.to_string())
 }
 
-/// The role's strike run and decision ([`standing::derive`]) from `generations`, newest first,
-/// and the hold attention about them: whether one is open on the newest, and when the newest
-/// generation a person acknowledged a hold on was admitted. The acknowledgement ends the run, so
-/// the walk stops at the first generation that is no strike.
+/// The generation a held role's hold is on: its last counted, whose end the hold follows.
+fn held_on(ensure: &ResourceObject<ConvoyEnsure>, values: &RunningValues) -> Result<String, String> {
+    launch_name(ensure, values.counted.ok_or("a held role has counted a generation")?)
+}
+
+/// The role's strike run and decision ([`standing::derive`]) from its running `values`, whether
+/// `newest` is live, and the hold attention about its last counted generation: whether one is
+/// open, and whether a person acknowledged it since the last strike ended, which ends the run.
+/// Returns `values` as the acknowledgement leaves them.
 async fn standing_reading(
     attentions: &dyn Attentions,
     namespace: &str,
     ensure: &ResourceObject<ConvoyEnsure>,
-    generations: &[ResourceObject<ResourceConvoy>],
+    newest: Option<&ResourceObject<ResourceConvoy>>,
+    values: &RunningValues,
     now: DateTime<Utc>,
     forced: bool,
-) -> Result<(StandingReading, HoldAttention), String> {
-    let read: Vec<Generation> = generations.iter().map(|convoy| generation(convoy, &ensure.spec)).collect();
+) -> Result<(StandingReading, HoldAttention, RunningValues), String> {
     let mut attention = HoldAttention::default();
-    if let Some(newest) = generations.first() {
+    let mut values = values.clone();
+    if let Some(counted) = values.counted {
         // A standing role's attention about a convoy is its hold.
-        let subject = Subject::convoy(newest.metadata.name.clone());
+        let subject = Subject::convoy(launch_name(ensure, counted)?);
         attention.open = !attentions.open(namespace, Some(Sender::Standing), Some(&subject)).await?.is_empty();
-    }
-    for (convoy, generation) in generations.iter().zip(&read) {
-        let Some((Ending::Failed, finished_at)) = generation.ended.filter(|_| generation.current_config) else { break };
         // A hold on a generation begins once it has ended.
-        let subject = Subject::convoy(convoy.metadata.name.clone());
-        if attentions.acknowledged(namespace, Sender::Standing, &subject, finished_at).await?.is_some() {
-            attention.acknowledged_at = Some(generation.admitted_at);
-            break;
+        if let Some(since) = values.backoff_from.filter(|_| values.strikes > 0) {
+            attention.acknowledged = attentions.acknowledged(namespace, Sender::Standing, &subject, since).await?.is_some();
         }
     }
-    Ok((standing::derive(&read, attention, now, forced), attention))
+    if attention.acknowledged {
+        values = standing::acknowledge(&values);
+    }
+    let live = newest.is_some_and(|convoy| !ended(convoy));
+    let reading = standing::derive(&values, live, &ensure_config_hash(&ensure.spec)?, attention, now, forced);
+    Ok((reading, attention, values))
 }
 
 /// The refusal `ensure`'s project declaration carries, if any: its ensures are refused with it.
@@ -1295,6 +1323,7 @@ mod tests {
             .resource_backend(backend.clone())
             .clock(clock)
             .manifest_roots(Arc::clone(&home.engine.ports.manifest_roots))
+            .standing_roles(Arc::clone(&home.engine.ports.standing_roles))
             .build();
         for scope in [EnsureConvoyScope::Local, EnsureConvoyScope::IncludingReplicas] {
             let (rows, reads) = measure(controller.pass(&admission).active_ensured_convoys("test", "wanted", scope)).await;
@@ -1306,8 +1335,8 @@ mod tests {
             measure(controller.pass(&admission).active_ensured_convoys("test", "absent", EnsureConvoyScope::IncludingReplicas)).await;
         assert!(rows.expect("empty query").is_empty());
         assert_eq!(convoys_read(&reads), 0);
-        let (rows, reads) = measure(controller.pass(&admission).ensured_convoy_generations("test", "wanted")).await;
-        assert_eq!(rows.expect("local generations").len(), 3);
+        let (newest, reads) = measure(newest_generation(&backend, "test", "wanted", false)).await;
+        assert!(newest.expect("local generations").is_some());
         assert_eq!(convoys_read(&reads), 3);
     }
 
@@ -1359,6 +1388,7 @@ mod tests {
             .resource_backend(admission.backend.clone())
             .clock(clock.clone())
             .manifest_roots(Arc::clone(&admission.home().engine.ports.manifest_roots))
+            .standing_roles(Arc::clone(&admission.home().engine.ports.standing_roles))
             .build()
     }
 
@@ -1384,6 +1414,26 @@ mod tests {
         let convoy = admission.home().convoy(&current(admission)).await;
         let path = admission.home().convoys.path();
         path.get().expect("the Convoy path").fail(&convoy, "operator", "failed").await.expect("fixture operation succeeds");
+    }
+
+    // Behaviour (#3108 retirement): a standing generation's end holds it until its role's pass
+    // counts it; counted, it retires, and the role still backs off from its strike.
+    #[tokio::test]
+    async fn a_counted_generation_retires_and_its_strike_remains() {
+        let (controller, admission, clock) = fixture().await;
+        controller.reconcile_convoy_ensures_once_with_backing_inspector(&admission, "test", &Backing::Dead).await.expect("admit");
+        fail_current(&admission).await;
+        let failed = current(&admission);
+        let retire = || admission.home().convoys.convoys().retire(&failed, flotilla_schema::Timestamp::from_datetime(&clock.now()));
+        let held = format!("{:?}", retire());
+        assert!(held.contains("standing-role:standing"), "uncounted, the end holds its generation: {held}");
+
+        controller.reconcile_convoy_ensures_once_with_backing_inspector(&admission, "test", &Backing::Dead).await.expect("count");
+        assert_eq!(format!("{:?}", retire()), "Ok(Retired)");
+        let restarted = new_controller(&admission, &clock);
+        restarted.reconcile_convoy_ensures_once_with_backing_inspector(&admission, "test", &Backing::Dead).await.expect("back off");
+        assert_eq!(admission.commits.load(Ordering::SeqCst), 1, "the retired generation's strike still backs the role off");
+        assert_eq!(standing(&restarted).await.strikes, 1);
     }
 
     // #2875: a long-lived driver's generation must back off from its failure,

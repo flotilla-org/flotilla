@@ -192,6 +192,7 @@ async fn daemon_named_without_engine(host_name: &str, free_space_floor_gib: Opti
                 .resource_backend(daemon.resource_backend())
                 .clock(Arc::new(SystemClock))
                 .manifest_roots(daemon.manifest_roots())
+                .standing_roles(daemon.standing_roles())
                 .build(),
         ))
         .await;

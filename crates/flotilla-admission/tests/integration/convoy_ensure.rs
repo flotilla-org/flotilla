@@ -10,6 +10,7 @@ use flotilla_orchestration_testkit::EnsureScenarioController;
 use flotilla_resources::manifest_roots::ManifestRoots;
 use flotilla_resources::{Clock, ConvoyEnsure, ResourceObject};
 use flotilla_store::ResourceBackend;
+use flotilla_store_testkit::MemoryStandingRoles;
 
 /// The scenarios' manifest roots, over the backend each scenario gives.
 fn roots(backend: &ResourceBackend) -> Arc<dyn ManifestRoots> {
@@ -26,7 +27,13 @@ impl EnsureScenarioController for Controller {
         clock: Arc<dyn Clock>,
     ) -> Arc<dyn ConvoyEnsureReconciler> {
         Arc::new(
-            EnsureReconciler::builder().teardown(teardown).manifest_roots(roots(&backend)).resource_backend(backend).clock(clock).build(),
+            EnsureReconciler::builder()
+                .teardown(teardown)
+                .manifest_roots(roots(&backend))
+                .standing_roles(Arc::new(MemoryStandingRoles::default()))
+                .resource_backend(backend)
+                .clock(clock)
+                .build(),
         )
     }
     async fn dependency_hash(
@@ -41,6 +48,7 @@ impl EnsureScenarioController for Controller {
         EnsureReconciler::builder()
             .teardown(teardown)
             .manifest_roots(roots(&backend))
+            .standing_roles(Arc::new(MemoryStandingRoles::default()))
             .resource_backend(backend)
             .clock(clock)
             .build()
@@ -59,6 +67,7 @@ impl EnsureScenarioController for Controller {
         EnsureReconciler::builder()
             .teardown(teardown)
             .manifest_roots(roots(&backend))
+            .standing_roles(Arc::new(MemoryStandingRoles::default()))
             .resource_backend(backend)
             .clock(clock)
             .build()

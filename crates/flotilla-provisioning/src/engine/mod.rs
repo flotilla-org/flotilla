@@ -39,6 +39,7 @@ pub mod reads;
 pub mod repositories;
 pub mod repository_import;
 pub mod resume;
+pub mod standing_roles;
 pub mod terminal_actuator;
 pub mod terminals;
 #[cfg(test)]

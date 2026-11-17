@@ -43,6 +43,7 @@ pub mod manifest_root;
 pub mod placement;
 pub mod project;
 pub mod repository;
+pub mod standing_role;
 pub mod terminal_facts;
 pub mod terminal_session;
 
@@ -98,6 +99,7 @@ pub fn register(registry: &mut KindRegistry) -> Result<(), RegistryError> {
     account::register(registry)?;
     manifest_root::register(registry)?;
     definition::register(registry)?;
+    standing_role::register(registry)?;
     repository::register(registry)?;
     project::register(registry)?;
     artifact::register(registry)?;

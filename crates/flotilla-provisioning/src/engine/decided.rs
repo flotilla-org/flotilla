@@ -7,6 +7,7 @@ use flotilla_resources::{
     account_access::AccountRecords,
     engine_records::{ChangeRequestBranches, LateSourceObservers, ObservationFailures},
     manifest_roots::ManifestRoots,
+    standing_roles::StandingRoles,
     Clock,
 };
 use flotilla_schema_sqlite::stream::Service;
@@ -15,7 +16,7 @@ use flotilla_store::EnginePort;
 use super::{
     access_deliveries::EngineAccessDeliveries, account::EngineAccounts, artifacts::EngineArtifacts, definitions::EngineDefinitions,
     hosts::EngineHosts, kinds::EngineKinds, manifest_root::EngineManifestRoots, observations::EngineObservations, projects::EngineProjects,
-    repositories::EngineRepositories,
+    repositories::EngineRepositories, standing_roles::EngineStandingRoles,
 };
 
 /// The ports over one decided store, each also held as the reader its other consumers take.
@@ -32,6 +33,8 @@ pub struct DecidedPorts {
     pub source_observers: Arc<LateSourceObservers>,
     pub accounts: Arc<dyn AccountRecords>,
     pub manifest_roots: Arc<dyn ManifestRoots>,
+    /// Each standing role's running values, written by the home that admits it.
+    pub standing_roles: Arc<dyn StandingRoles>,
 }
 
 /// Opens the ports over `service`, whose own Host is `own_host`.
@@ -67,5 +70,6 @@ pub fn open_ports(service: &Arc<Service>, own_host: &str, clock: Arc<dyn Clock>)
         source_observers,
         accounts,
         manifest_roots,
+        standing_roles: Arc::new(EngineStandingRoles::open(Arc::clone(service), clock())),
     })
 }

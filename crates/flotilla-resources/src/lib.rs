@@ -100,6 +100,7 @@ pub mod resource;
 #[doc(hidden)]
 pub mod retention;
 mod review_bundle;
+pub mod standing_roles;
 mod status_patch;
 pub mod terminal_records;
 #[doc(hidden)]

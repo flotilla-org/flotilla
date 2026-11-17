@@ -8,7 +8,9 @@
 use std::{collections::BTreeSet, sync::Arc};
 
 use flotilla_engine_store::{follow::Followed, watch::EngineWatch};
-use flotilla_provisioning::stored::{account::AccountBinding, checkout::Checkout, forge_observation::ChangeRequestRecord};
+use flotilla_provisioning::stored::{
+    account::AccountBinding, checkout::Checkout, forge_observation::ChangeRequestRecord, standing_role::StandingRoleRecord,
+};
 use flotilla_resources::{
     access_delivery::convoy_of_access, account_access::requester_parts, address::subject_for, convoy::engine::convoy_records,
     AccessDeliverySpec, Clock,
@@ -28,8 +30,9 @@ use flotilla_state_machines::{
 use super::convoys::{Convoys, Retirement};
 
 /// The kinds whose writes can retire a convoy: the convoy's own, which ends it, and each hold's.
-fn followed_kinds() -> [KindCode; 8] {
+fn followed_kinds() -> [KindCode; 9] {
     [
+        <StandingRoleRecord as Kind>::CODE,
         <Resource<Convoy> as Kind>::CODE,
         <Resource<Message> as Kind>::CODE,
         <Resource<AwaitingReply> as Kind>::CODE,
@@ -186,6 +189,11 @@ fn candidates(read: &mut Read<'_>, followed: Vec<Followed>, home: &str, held: &B
             continue;
         }
         if held.is_empty() || found.every {
+            continue;
+        }
+        // A role's record names its ensure, not its generations; it is written once per end.
+        if identity.kind == <StandingRoleRecord as Kind>::CODE {
+            found.every |= identity.home == home;
             continue;
         }
         if identity.kind == <ChangeRequestRecord as Kind>::CODE {

@@ -7027,6 +7027,7 @@ async fn forge_identity_sweep_merges_split_repositories_and_project_members() {
                 .resource_backend(daemon.resource_backend())
                 .clock(Arc::new(flotilla_resources::SystemClock))
                 .manifest_roots(daemon.manifest_roots())
+                .standing_roles(daemon.standing_roles())
                 .build(),
         ))
         .await;

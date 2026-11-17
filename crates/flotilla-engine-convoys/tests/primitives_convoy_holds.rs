@@ -16,7 +16,7 @@ use flotilla_engine_messages::awaiting::{AwaitingReplies, OpenAwaiting, STALL};
 use flotilla_engine_store::{watch::EngineWatch, StoreLog};
 use flotilla_protocol::PrincipalRef;
 use flotilla_provisioning::{
-    engine::{account::binding_spec, LifecycleHome, Lifecycles, Step},
+    engine::{account::binding_spec, standing_roles::EngineStandingRoles, LifecycleHome, Lifecycles, Step},
     stored::{
         self,
         account::{AccountBinding, BindingState},
@@ -31,9 +31,10 @@ use flotilla_resources::{
     address::{stored_change_request_address, subject_for},
     convoy::{admission::AdmissionDocument, engine::seat_address},
     convoy_records::ConvoyRecords,
+    standing_roles::{RunningValues, StandingRoles},
     vessel_resource_name,
     workflow_template::single_agent_workflow_spec,
-    AccessDeliverySpec, SystemClock, WorkflowSnapshot,
+    AccessDeliverySpec, ConvoyEnsureSpec, SystemClock, WorkflowSnapshot, ENSURED_FROM_ANNOTATION,
 };
 use flotilla_schema::{Address, Frozen, Kind, NewChange, Records, State, Timestamp};
 use flotilla_schema_sqlite::stream::Service;
@@ -95,11 +96,11 @@ fn document() -> AdmissionDocument {
     }
 }
 
-fn request() -> ConvoyRequest {
+fn request(document: AdmissionDocument) -> ConvoyRequest {
     ConvoyRequest {
         launch_of: "fix-it".into(),
         workflow_ref: "single".into(),
-        admission: Frozen::new(AdmissionBytes::new(document().encode().expect("encode"))).expect("freeze"),
+        admission: Frozen::new(AdmissionBytes::new(document.encode().expect("encode"))).expect("freeze"),
         project: project(),
         promises: [(
             PromiseId(0),
@@ -136,6 +137,22 @@ struct Fixture {
 
 impl Fixture {
     fn new(dir: &tempfile::TempDir) -> Self {
+        Self::admitted(dir, document())
+    }
+
+    /// A generation of standing role `ensure`, as the ensure pass admits one.
+    fn standing(dir: &tempfile::TempDir, ensure: &str) -> Self {
+        let spec = ConvoyEnsureSpec::builder()
+            .project_ref("fleet".into())
+            .role("coder".into())
+            .workflow_ref("single".into())
+            .repositories(Vec::new())
+            .build();
+        let provenance = BTreeMap::from([(ENSURED_FROM_ANNOTATION.to_owned(), ensure.to_owned())]);
+        Self::admitted(dir, AdmissionDocument { ensure_admission: Some(spec), provenance, ..document() })
+    }
+
+    fn admitted(dir: &tempfile::TempDir, document: AdmissionDocument) -> Self {
         let registry = stored::decided_registry().expect("registry");
         let service = Arc::new(Service::open(&dir.path().join("decided.sqlite"), HOME, registry).expect("store"));
         let convoys = Arc::new(Convoys::open(HOME, &service).expect("open"));
@@ -144,7 +161,7 @@ impl Fixture {
             world.authority.put(&Ref::new("granted"), true);
         });
         let reserved = convoys.reserve("fix-it", Timestamp(1_000_000)).expect("reserved");
-        convoys.create_reserved(&reserved, request(), Timestamp(1_000_000)).expect("admitted");
+        convoys.create_reserved(&reserved, request(document), Timestamp(1_000_000)).expect("admitted");
         let launch = convoys.get("fix-it").expect("launch").name().to_owned();
         Fixture { service, convoys, launch }
     }
@@ -411,6 +428,30 @@ async fn the_home_retires_a_convoy_when_its_last_hold_releases() {
         }
     };
     tokio::time::timeout(std::time::Duration::from_secs(30), retired).await.expect("retired once its checkout released");
+    follower.abort();
+}
+
+// Behaviour: a standing generation's end holds it until its role's record has counted it; the
+// home retires it when the role's pass writes the count.
+#[tokio::test]
+async fn the_home_retires_a_standing_generation_once_its_role_counts_it() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let fixture = Fixture::standing(&dir, "ensure-coder");
+    fixture.abandon();
+    assert_eq!(fixture.holds(), BTreeSet::from(["standing-role:ensure-coder".to_owned()]));
+    let mut convoy_writes = EngineWatch::start(Arc::clone(&fixture.service), [<Resource<Convoy> as Kind>::CODE]).expect("watch");
+    let follower = retire::follow(Arc::clone(&fixture.convoys), Arc::new(SystemClock)).expect("follow");
+    assert_eq!(fixture.label(), ConvoyLabel::Abandoned);
+
+    let launch = fixture.convoys.launch(&fixture.launch).expect("launch").spec().launch;
+    let roles = EngineStandingRoles::open(Arc::clone(&fixture.service), Arc::new(SystemClock));
+    roles.put("ensure-coder", &RunningValues { counted: Some(launch), ..Default::default() }).await.expect("counted");
+    let retired = async {
+        while fixture.label() != ConvoyLabel::Retired {
+            convoy_writes.next(|_, _| Ok(())).await.expect("a convoy write");
+        }
+    };
+    tokio::time::timeout(std::time::Duration::from_secs(30), retired).await.expect("retired once its role counted it");
     follower.abort();
 }
 

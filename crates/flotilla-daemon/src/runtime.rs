@@ -483,6 +483,7 @@ impl DaemonRuntime {
                     .resource_backend(daemon.resource_backend())
                     .clock(daemon.clock_for_scenarios())
                     .manifest_roots(daemon.manifest_roots())
+                    .standing_roles(daemon.standing_roles())
                     .build(),
             ))
             .await;

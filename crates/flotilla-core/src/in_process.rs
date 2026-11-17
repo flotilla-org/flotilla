@@ -737,6 +737,7 @@ pub struct InProcessDaemon {
     /// installed behind `[primitives]`.
     accounts: Arc<dyn flotilla_resources::account_access::AccountRecords>,
     manifest_roots: Arc<dyn flotilla_resources::manifest_roots::ManifestRoots>,
+    standing_roles: Arc<dyn flotilla_resources::standing_roles::StandingRoles>,
     /// The forge observers, which the engine's observation records switch to observer-only writes.
     change_request_observer: flotilla_observation::change_request_observer::ChangeRequestRefresher,
     issue_observer: flotilla_observation::issue_observer::IssueRefresher,
@@ -860,6 +861,7 @@ pub struct ComposedEngine {
     pub source_observers: Arc<flotilla_resources::engine_records::LateSourceObservers>,
     pub accounts: Arc<dyn flotilla_resources::account_access::AccountRecords>,
     pub manifest_roots: Arc<dyn flotilla_resources::manifest_roots::ManifestRoots>,
+    pub standing_roles: Arc<dyn flotilla_resources::standing_roles::StandingRoles>,
 }
 
 /// Opens the decided store once the daemon's identity is resolved; the composition root supplies it.
@@ -1367,6 +1369,7 @@ impl InProcessDaemon {
         let observed_checkout_reconciliation = Arc::new(Mutex::new(()));
         let accounts = Arc::clone(&engine.accounts);
         let manifest_roots = Arc::clone(&engine.manifest_roots);
+        let standing_roles = Arc::clone(&engine.standing_roles);
         let checkout_providers = Arc::new(
             CheckoutProviders::builder()
                 .lifecycle_reads(lifecycle_reads.clone() as Arc<dyn flotilla_resources::lifecycle_reads::LifecycleReads>)
@@ -1481,6 +1484,7 @@ impl InProcessDaemon {
             convoy_views: Default::default(),
             accounts,
             manifest_roots,
+            standing_roles,
             change_request_observer,
             issue_observer,
             resource_backend: resource_backend.clone(),
@@ -2421,6 +2425,11 @@ impl InProcessDaemon {
     /// The ManifestRoots: the engine's.
     pub fn manifest_roots(&self) -> Arc<dyn flotilla_resources::manifest_roots::ManifestRoots> {
         self.manifest_roots.clone()
+    }
+
+    /// Each standing role's running values: the engine's.
+    pub fn standing_roles(&self) -> Arc<dyn flotilla_resources::standing_roles::StandingRoles> {
+        Arc::clone(&self.standing_roles)
     }
 
     /// Refuse engine-enabled startup until its lifecycle read port is installed.
