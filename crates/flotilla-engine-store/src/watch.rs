@@ -13,7 +13,7 @@ use std::{
 use crate::follow::{Followed, Follower};
 use flotilla_schema::{reads::carry, KindCode};
 use flotilla_schema_sqlite::{
-    stream::{CommitListener, Committed, Service},
+    stream::{CommitListener, Committed, HeardListener, Service},
     Read, StoreError,
 };
 use tokio::sync::Notify;
@@ -24,8 +24,9 @@ pub struct EngineWatch {
     follower: Follower,
     wake: Arc<Notify>,
     resets: Arc<AtomicBool>,
-    // The store holds the listener weakly: it lapses with this watch.
+    // The store holds the listeners weakly: they lapse with this watch.
     _listener: Arc<CommitListener>,
+    _hearing: Option<Arc<HeardListener>>,
 }
 
 impl EngineWatch {
@@ -36,8 +37,8 @@ impl EngineWatch {
         Self::start_waking(service, kinds, false)
     }
 
-    /// As [`EngineWatch::start`], also woken when another home is heard from, keepalives
-    /// included, for a reader of each home's heard time.
+    /// As [`EngineWatch::start`], also woken when another home is heard from, a keepalive that
+    /// writes nothing included, for a reader of each home's heard time.
     pub fn start_hearing(service: Arc<Service>, kinds: impl IntoIterator<Item = KindCode>) -> Result<Self, StoreError> {
         Self::start_waking(service, kinds, true)
     }
@@ -58,10 +59,16 @@ impl EngineWatch {
             })
         };
         service.on_commit(Arc::downgrade(&listener));
+        let hearing = hearing.then(|| {
+            let wake = Arc::clone(&wake);
+            let heard: Arc<HeardListener> = Arc::new(move |_: &str| wake.notify_one());
+            service.on_heard(Arc::downgrade(&heard));
+            heard
+        });
         let mut follower = Follower::new(kinds);
         let homes = service.homes();
         service.with_store(|store| follower.start(&mut store.read()?, &homes))?;
-        Ok(Self { service, follower, wake, resets, _listener: listener })
+        Ok(Self { service, follower, wake, resets, _listener: listener, _hearing: hearing })
     }
 
     /// Waits for the next commit, then passes over the log and hands what it found to `read`,

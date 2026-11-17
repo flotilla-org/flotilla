@@ -46,6 +46,9 @@ pub struct SweepReport {
     /// deadline or unbound threshold passes: when a sweep next has work
     /// that no change wakes.
     pub next_due: Option<Timestamp>,
+    /// The homes an expiry waits to hear from: a message past its deadline whose consumer's
+    /// stream lags it expires once that home is heard from past the deadline.
+    pub awaiting_heard: BTreeSet<String>,
 }
 
 impl SweepReport {
@@ -351,6 +354,9 @@ impl MessagePrimitives {
                 }
                 // Refused while the consumer's stream lags the deadline; counted so a lasting refusal shows.
                 index.refused(&name, "drop(expired)");
+                if let Some(receiver) = state.receiver().filter(|receiver| receiver.host != self.home()) {
+                    report.awaiting_heard.insert(receiver.host.clone());
+                }
             }
             // A bound inbox refuses this every pass by design, so it is not counted.
             if state == MessageState::Pending

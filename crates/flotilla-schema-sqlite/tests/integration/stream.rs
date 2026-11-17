@@ -141,7 +141,51 @@ fn stalled_stream_and_invalid_watermarks_do_not_advance() {
     }
     assert_eq!(b.applied_watermark("a").applied_through, Timestamp(12), "rolled-back marks never reach resident gate inputs");
     let b = Store::open(b.into_connection(), "b", registry()).expect("restart");
-    assert_eq!(b.applied_watermark("a").applied_through, Timestamp(12), "startup rebuilds committed resident inputs");
+    // A keepalive alone is heard in memory only: a restart reads the heard time of the last
+    // round that wrote, the snapshot's.
+    assert_eq!(b.applied_watermark("a").applied_through, Timestamp(10), "startup rebuilds committed resident inputs");
+}
+
+// A round that only hears from a home (a keepalive moving no sequence) writes and commits
+// nothing: the heard time moves in memory, and the heard listeners are told once it moves.
+#[test]
+fn a_keepalive_alone_is_heard_without_a_commit() {
+    use std::sync::{
+        atomic::{AtomicUsize, Ordering},
+        Arc,
+    };
+    let mut a = store("a");
+    let mut b = store("b");
+    insert(&mut a, "m");
+    sync(&mut a, &mut b, None, 10).expect("snapshot");
+    let commits = Arc::new(AtomicUsize::new(0));
+    let heard = Arc::new(AtomicUsize::new(0));
+    let committed: Arc<stream::CommitListener> = {
+        let commits = Arc::clone(&commits);
+        Arc::new(move |_: &stream::Committed<'_>| {
+            commits.fetch_add(1, Ordering::SeqCst);
+        })
+    };
+    let hearing: Arc<stream::HeardListener> = {
+        let heard = Arc::clone(&heard);
+        Arc::new(move |home: &str| {
+            assert_eq!(home, "a");
+            heard.fetch_add(1, Ordering::SeqCst);
+        })
+    };
+    b.on_commit(Arc::downgrade(&committed));
+    b.on_heard(Arc::downgrade(&hearing));
+    sync(&mut a, &mut b, Some(2), 12).expect("keepalive");
+    assert_eq!(b.applied_watermark("a").applied_through, Timestamp(12));
+    assert_eq!((commits.load(Ordering::SeqCst), heard.load(Ordering::SeqCst)), (0, 1), "heard, not committed");
+    sync(&mut a, &mut b, Some(2), 12).expect("the same keepalive");
+    assert_eq!((commits.load(Ordering::SeqCst), heard.load(Ordering::SeqCst)), (0, 1), "nothing new heard");
+    insert(&mut a, "n");
+    sync(&mut a, &mut b, Some(2), 13).expect("tail");
+    assert_eq!(b.applied_watermark("a").applied_through, Timestamp(13));
+    assert_eq!((commits.load(Ordering::SeqCst), heard.load(Ordering::SeqCst)), (1, 1), "a round that writes commits its heard time");
+    let b = Store::open(b.into_connection(), "b", registry()).expect("restart");
+    assert_eq!(b.applied_watermark("a"), Watermark { home_seq: 4, applied_through: Timestamp(13) }, "a written round persists both");
 }
 
 // The reserved code is supplied explicitly for writes and preserved on apply and CBOR replay.

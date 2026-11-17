@@ -17,8 +17,8 @@
 //! every message is a turn; the backend sends dead letters as Notify.
 //!
 //! A pass runs on events, never on a timer (#3108): a commit to the engine
-//! store of a kind delivery reads, or a home heard from (its watermark gates
-//! expiry); a change to an old-store record routing or conditions read; a
+//! store of a kind delivery reads, or a home heard from while an expiry
+//! waits on it (its watermark gates expiry); a change to an old-store record routing or conditions read; a
 //! turn finishing; and one deadline wake at the earliest of a held turn's
 //! hold, an open message's deadline or unbound threshold, and an awaiting
 //! reply's deadline. A failed pass retries at a backoff, a finite number of
@@ -110,6 +110,8 @@ pub(super) struct MessageDelivery {
     open: OpenMessages,
     /// Wakes a pass: every event source notifies it.
     wake: Arc<tokio::sync::Notify>,
+    /// The homes the last sweep's expiries wait to hear from: only hearing from one wakes a pass.
+    awaiting_heard: Arc<std::sync::Mutex<BTreeSet<String>>>,
 }
 
 impl MessageDelivery {
@@ -133,6 +135,7 @@ impl MessageDelivery {
             showing_held: BTreeSet::new(),
             open: OpenMessages::default(),
             wake: Arc::new(tokio::sync::Notify::new()),
+            awaiting_heard: Arc::default(),
         }
     }
 
@@ -141,16 +144,26 @@ impl MessageDelivery {
     pub(super) async fn run(mut self, metrics: Arc<flotilla_store::load_metrics::ControllerLoadMetrics>) {
         let wake = Arc::clone(&self.wake);
         let listener: Arc<flotilla_schema_sqlite::stream::CommitListener> = {
-            let wake = Arc::clone(&wake);
+            let (wake, awaiting) = (Arc::clone(&wake), Arc::clone(&self.awaiting_heard));
             let kinds = delivery_kinds();
             Arc::new(move |committed: &flotilla_schema_sqlite::stream::Committed<'_>| {
-                if committed.touches(&kinds) || !committed.heard.is_empty() {
+                if committed.touches(&kinds) || committed.heard.iter().any(|home| awaited(&awaiting, home)) {
                     wake.notify_one();
                 }
             })
         };
-        // The store holds the listener weakly; it lives as long as this loop.
+        // A home heard from without a write wakes a pass only while an expiry waits on it.
+        let heard: Arc<flotilla_schema_sqlite::stream::HeardListener> = {
+            let (wake, awaiting) = (Arc::clone(&wake), Arc::clone(&self.awaiting_heard));
+            Arc::new(move |home: &str| {
+                if awaited(&awaiting, home) {
+                    wake.notify_one();
+                }
+            })
+        };
+        // The store holds the listeners weakly; they live as long as this loop.
         self.primitives.service().on_commit(Arc::downgrade(&listener));
+        self.primitives.service().on_heard(Arc::downgrade(&heard));
         // A held turn is confirmed by a tool call or prompt submit, which only this daemon's memory
         // holds: they wake a pass while a turn is held.
         let evidence: Arc<flotilla_resources::agent_activity::ProgressListener> = {
@@ -245,6 +258,7 @@ impl MessageDelivery {
             }
         }
         let report = self.primitives.sweep(&self.namespace, now, &mut self.open).await?;
+        self.awaiting_heard.lock().unwrap_or_else(std::sync::PoisonError::into_inner).clone_from(&report.awaiting_heard);
         if report.acted() {
             debug!(namespace = %self.namespace, ?report, "engine message sweep");
         }
@@ -734,6 +748,11 @@ impl Drop for FinishedTurn {
     fn drop(&mut self) {
         self.0.notify_one();
     }
+}
+
+/// Whether an expiry waits to hear from `home`.
+fn awaited(awaiting: &std::sync::Mutex<BTreeSet<String>>, home: &str) -> bool {
+    awaiting.lock().unwrap_or_else(std::sync::PoisonError::into_inner).contains(home)
 }
 
 /// The engine kinds whose commits delivery reads: messages, the consumer

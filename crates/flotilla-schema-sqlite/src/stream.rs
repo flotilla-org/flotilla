@@ -12,7 +12,7 @@ use std::{
     sync::{Arc, Mutex, OnceLock, RwLock},
 };
 
-use crate::{Snapshot, Store, StoreError, StoreHandle, StreamResourceLimit, MAX_PAGE};
+use crate::{Snapshot, Store, StoreError, StoreHandle, StreamResourceLimit, Write, MAX_PAGE};
 
 /// Local gate input. Missing metadata means zero/epoch, never proof of freshness.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -290,7 +290,9 @@ pub struct Received {
 }
 
 /// Receiver for one home. Dropping it rolls back an incomplete snapshot. Each delivery round
-/// commits state and sequence together; only an applied keepalive moves the time watermark.
+/// commits state and sequence together; only an applied keepalive moves the time watermark. A
+/// round with nothing but a keepalive writes nothing: the heard time is held in memory and persisted
+/// only with a round that writes, so after a restart a home reads as heard no later than it was.
 pub struct Follower<'a> {
     store: &'a mut Store,
     relayed: bool,
@@ -314,12 +316,13 @@ impl<'a> Follower<'a> {
         deliver: impl FnOnce(&mut dyn FnMut(&[u8]) -> Result<(), StoreError>) -> Result<(), StoreError>,
     ) -> Result<Received, StoreError> {
         let relayed = self.relayed;
-        let mut write = self.store.write()?;
+        let mut cursor = self.store.applied_watermark(home);
+        let mut round = Some(RoundWrite::Idle(&mut *self.store));
         let mut received = Received::default();
         let mut snapshot = None;
         let mut chunks: Option<Snapshot> = None;
         let mut chunk_bytes = 0usize;
-        let mut cursor = write.stream_watermark(home)?;
+        let mut heard = false;
         deliver(&mut |bytes| {
             match Frame::decode(bytes)? {
                 Frame::Failure { message } => return Err(StoreError::Stream(message)),
@@ -329,12 +332,12 @@ impl<'a> Follower<'a> {
                     if relayed && home_seq < cursor.home_seq {
                         return Err(StoreError::Stream("snapshot cut is behind this store".into()));
                     }
-                    write.reset_replica(home)?;
+                    writing(&mut round)?.reset_replica(home)?;
                     snapshot = Some(home_seq);
                     cursor.home_seq = 0;
                 }
                 Frame::Resource(value) if chunks.is_none() && value.home == home && snapshot.is_some_and(|cut| value.version <= cut) => {
-                    write.restore(&value)?;
+                    writing(&mut round)?.restore(&value)?;
                 }
                 Frame::ResourceChunk { value, last } if value.home == home && snapshot.is_some_and(|cut| value.version <= cut) => {
                     chunk_bytes = chunk_bytes.saturating_add(bytes.len());
@@ -358,16 +361,17 @@ impl<'a> Follower<'a> {
                         }
                     }
                     if last {
-                        write.restore(&chunks.take().expect("chunk resource"))?;
+                        writing(&mut round)?.restore(&chunks.take().expect("chunk resource"))?;
                         chunk_bytes = 0;
                     }
                 }
                 Frame::Tombstone { identity, home_seq }
                     if chunks.is_none() && identity.home == home && snapshot.is_some_and(|cut| home_seq <= cut) =>
                 {
-                    write.restore_identity(&identity, home_seq)?;
+                    writing(&mut round)?.restore_identity(&identity, home_seq)?;
                 }
                 Frame::End { home: from, home_seq } if chunks.is_none() && from == home && snapshot == Some(home_seq) => {
+                    let write = writing(&mut round)?;
                     write.finish_snapshot(home, home_seq)?;
                     cursor.home_seq = home_seq;
                     write.advance_watermark(home, cursor)?;
@@ -380,6 +384,7 @@ impl<'a> Follower<'a> {
                     if change.seq > cursor.home_seq + 1 {
                         return Err(StoreError::Stream("tail is not the next home prefix".into()));
                     }
+                    let write = writing(&mut round)?;
                     write.record_change(&change)?;
                     if change.seq == cursor.home_seq + 1 {
                         cursor.home_seq = change.seq;
@@ -394,17 +399,19 @@ impl<'a> Follower<'a> {
                     if event.home_seq != cursor.home_seq + 1 {
                         return Err(StoreError::Stream("tail is not the next home prefix".into()));
                     }
+                    let write = writing(&mut round)?;
                     write.apply(&event)?;
                     cursor.home_seq = event.home_seq;
                     write.advance_watermark(home, cursor)?;
                     received.applied += 1;
                 }
-                // At or behind the cursor: another round may have gone further meanwhile.
+                // At or behind the cursor: another round may have gone further meanwhile. It
+                // moves only the heard time, settled once the round is in.
                 Frame::Keepalive { home: from, watermark, .. }
                     if from == home && snapshot.is_none() && watermark.home_seq <= cursor.home_seq =>
                 {
                     cursor.applied_through = cursor.applied_through.max(watermark.applied_through);
-                    write.advance_watermark(home, cursor)?;
+                    heard = true;
                 }
                 _ => return Err(StoreError::Stream("frame does not belong to this stream phase or home".into())),
             }
@@ -413,8 +420,43 @@ impl<'a> Follower<'a> {
         if snapshot.is_some() {
             return Err(StoreError::Stream("snapshot ended before its cut was installed".into()));
         }
-        write.commit()?;
+        match round {
+            Some(RoundWrite::Writing(mut write)) => {
+                if heard {
+                    write.advance_watermark(home, cursor)?;
+                }
+                (*write).commit()?;
+            }
+            // Nothing to write: a keepalive is heard in memory only, unless the home is not held
+            // here yet, which its first watermark row records.
+            Some(RoundWrite::Idle(store)) => {
+                if heard && !store.hear(home, cursor) {
+                    let mut write = store.write()?;
+                    write.advance_watermark(home, cursor)?;
+                    write.commit()?;
+                }
+            }
+            None => return Err(StoreError::Stream("the round's write could not begin".into())),
+        }
         Ok(received)
+    }
+}
+
+/// A delivery round's write, begun only once a frame has something to write.
+enum RoundWrite<'s> {
+    Idle(&'s mut Store),
+    Writing(Box<Write<'s>>),
+}
+
+/// The round's write, begun now if it has not been; none after a write failed to begin.
+fn writing<'w, 's>(round: &'w mut Option<RoundWrite<'s>>) -> Result<&'w mut Write<'s>, StoreError> {
+    *round = match round.take() {
+        Some(RoundWrite::Idle(store)) => Some(RoundWrite::Writing(Box::new(store.write()?))),
+        other => other,
+    };
+    match round {
+        Some(RoundWrite::Writing(write)) => Ok(&mut **write),
+        _ => Err(StoreError::Stream("the round's write could not begin".into())),
     }
 }
 
@@ -459,6 +501,7 @@ pub struct Service {
     watermarks: Watermarks,
     applied: AppliedListeners,
     commits: Commits,
+    heards: Heards,
     serve_observer: OnceLock<Arc<ServeObserver>>,
     /// The edges each kind's snapshots carry, shared with the readers that serve them.
     carriers: crate::store::Carriers,
@@ -528,6 +571,35 @@ impl CommitSignal {
     }
 }
 
+/// Called with a home this store heard from without a write (a keepalive alone moves only the
+/// heard time, held in memory); listeners must not block. A round that writes tells its heard time
+/// with its commit instead, as [`Committed::heard`].
+pub type HeardListener = dyn Fn(&str) + Send + Sync;
+
+/// The homes heard from without a write, told to each listener.
+#[derive(Default)]
+pub struct HeardSignal {
+    listeners: Mutex<Vec<std::sync::Weak<HeardListener>>>,
+}
+pub(crate) type Heards = std::sync::Arc<HeardSignal>;
+
+impl HeardSignal {
+    pub(crate) fn heard(&self, home: &str) {
+        let mut listeners = self.listeners.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        listeners.retain(|listener| match listener.upgrade() {
+            Some(listener) => {
+                listener(home);
+                true
+            }
+            None => false,
+        });
+    }
+
+    pub(crate) fn listen(&self, listener: std::sync::Weak<HeardListener>) {
+        self.listeners.lock().unwrap_or_else(std::sync::PoisonError::into_inner).push(listener);
+    }
+}
+
 /// Synchronous observation after a serving attempt; callbacks must not block.
 pub type ServeObserver = dyn Fn(&Result<ServedRound, StoreError>) + Send + Sync;
 
@@ -547,6 +619,11 @@ impl Service {
     /// Calls `listener` after each commit to this store, while the caller keeps it alive.
     pub fn on_commit(&self, listener: std::sync::Weak<CommitListener>) {
         self.commits.listen(listener);
+    }
+    /// Calls `listener` with each home heard from without a write, while the caller keeps it
+    /// alive: with [`Service::on_commit`]'s [`Committed::heard`], every time a home is heard from.
+    pub fn on_heard(&self, listener: std::sync::Weak<HeardListener>) {
+        self.heards.listen(listener);
     }
     /// Whether a complete round has committed, including an empty snapshot at zero.
     pub fn has_watermark(&self, home: &str) -> bool {
@@ -583,12 +660,14 @@ impl Service {
         let applied = store.applied_listeners();
         let commits = store.commits();
         let carriers = store.carriers();
+        let heards = store.heards();
         Ok(Self {
             store: std::sync::Arc::new(StoreHandle::new(store)),
             source,
             watermarks,
             applied,
             commits,
+            heards,
             serve_observer: OnceLock::new(),
             carriers,
         })

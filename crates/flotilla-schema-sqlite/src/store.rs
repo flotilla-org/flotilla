@@ -184,6 +184,7 @@ struct Runtime {
     watermarks: crate::stream::Watermarks,
     applied: crate::stream::AppliedListeners,
     commits: crate::stream::Commits,
+    heards: crate::stream::Heards,
     home: String,
     kinds: KindRegistry,
     sql: BTreeMap<KindCode, KindSql>,
@@ -349,6 +350,7 @@ impl Store {
             watermarks: std::sync::Arc::new(std::sync::RwLock::new(watermarks)),
             applied: Default::default(),
             commits: Default::default(),
+            heards: Default::default(),
             home: home.to_owned(),
             kinds,
             sql,
@@ -391,6 +393,36 @@ impl Store {
     /// [`crate::stream::Service::on_commit`] does.
     pub fn on_commit(&self, listener: std::sync::Weak<crate::stream::CommitListener>) {
         self.runtime.commits.listen(listener);
+    }
+
+    pub(crate) fn heards(&self) -> crate::stream::Heards {
+        std::sync::Arc::clone(&self.runtime.heards)
+    }
+
+    /// Calls `listener` with each home heard from without a write, while the caller keeps it
+    /// alive, as [`crate::stream::Service::on_heard`] does.
+    pub fn on_heard(&self, listener: std::sync::Weak<crate::stream::HeardListener>) {
+        self.runtime.heards.listen(listener);
+    }
+
+    /// Hears from `home` without a write: raises the heard time of its held watermark in memory,
+    /// where every reader of it looks, and tells the heard listeners when it moved. False where
+    /// `home` is this one, is not held here yet, or `mark` moves its sequence: those are written.
+    pub(crate) fn hear(&mut self, home: &str, mark: crate::stream::Watermark) -> bool {
+        if home == self.runtime.home {
+            return false;
+        }
+        let moved = {
+            let mut marks = self.runtime.watermarks.write().unwrap_or_else(std::sync::PoisonError::into_inner);
+            let Some(held) = marks.get_mut(home).filter(|held| held.home_seq == mark.home_seq) else { return false };
+            let moved = mark.applied_through > held.applied_through;
+            held.applied_through = held.applied_through.max(mark.applied_through);
+            moved
+        };
+        if moved {
+            self.runtime.heards.heard(home);
+        }
+        true
     }
 
     /// Committed local gate input, independent of the store transaction lock.
@@ -745,10 +777,6 @@ pub struct Write<'s> {
 }
 
 impl Write<'_> {
-    pub(crate) fn stream_watermark(&mut self, home: &str) -> Result<crate::stream::Watermark, StoreError> {
-        self.ctx().watermark(home)
-    }
-
     /// Advances only a completely applied prefix; regression and progress ahead of rows fail.
     pub fn advance_watermark(&mut self, home: &str, mark: crate::stream::Watermark) -> Result<(), StoreError> {
         self.guarded(|ctx| {
