@@ -9,7 +9,7 @@ Crew messages begin with a sender header. `[flotilla · …]` is an automated su
 
 ## Crew
 
-{% block crew %}{% for member in members %}- `{{ member.role }}`: {{ member.state }}
+{% block crew %}{% for member in members %}- `{{ member.role }}`{% if member.vessel %} (vessel `{{ member.vessel }}`){% endif %}: {{ member.state }}
 {% endfor %}{% endblock %}
 {% block operating_instructions %}Run `flotilla crew list` for current crew state and the live Project repository charter (repositories, aliases, roles, subpaths, branches, and remotes). Governors begin every orientation sweep with this command and govern the membership it returns. The Project is the current island charter; Work context records admission and delivery inputs.
 Only this top-level crew session may run `flotilla crew` or `flotilla convoy` verbs. Background delegates and sub-agents must never run those verbs. {% if is_standing %}After all delegated work has returned, record any decisions on the relevant issue and yield at the turn boundary; this standing convoy remains active.{% else %}After all delegated work has returned, this top-level session follows the settlement order in `## Decision ledger`.{% endif %}

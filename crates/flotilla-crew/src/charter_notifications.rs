@@ -62,8 +62,13 @@ impl CharterBriefRenderer for LiveCharterBriefRenderer {
                     role: process.role.clone(),
                     state: if requirement.starts_eagerly(index) { "active" } else { "latent" }.into(),
                     is_agent: matches!(process.source, CrewSource::Agent { .. }),
+                    vessel: None,
                 })
             })
+            .chain(flotilla_agent::adapter::other_vessel_members(
+                convoy.status.as_ref().and_then(|status| status.workflow_snapshot.as_ref()).map_or(&[][..], |workflow| &workflow.vessels),
+                vessel,
+            ))
             .collect::<Vec<_>>();
         let assignment = match prompt {
             Some(prompt) => CrewAssignment::Prompt(prompt),

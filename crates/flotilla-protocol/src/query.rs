@@ -228,6 +228,9 @@ pub struct CrewListMember {
     pub role: String,
     pub kind: String,
     pub state: String,
+    /// The vessel holding this member, when it is not the listed vessel.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub vessel: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub reason: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]

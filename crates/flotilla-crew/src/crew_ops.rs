@@ -250,8 +250,9 @@ fn handoff_crew_brief(
             .iter()
             .map(|member| flotilla_agent::adapter::CrewBriefMember {
                 role: member.role.clone(),
-                state: if member.role == target { "active".to_string() } else { member.state.clone() },
+                state: if member.role == target && member.vessel.is_none() { "active".to_string() } else { member.state.clone() },
                 is_agent: member.kind == "agent",
+                vessel: member.vessel.clone(),
             })
             .collect::<Vec<_>>(),
         render_options,
@@ -882,7 +883,7 @@ impl CrewService {
                 Err(ResourceError::NotFound { .. }) => None,
                 Err(error) => return Err(error.to_string()),
             };
-        let members = task
+        let mut members = task
             .crew
             .iter()
             .map(|process| {
@@ -935,7 +936,20 @@ impl CrewService {
                     .maybe_stance(crew.map(|crew| crew.stance.clone()))
                     .build()
             })
-            .collect();
+            .collect::<Vec<_>>();
+        // The other vessels' crew, with their work's phase.
+        let vessels =
+            convoy.status.as_ref().and_then(|status| status.workflow_snapshot.as_ref()).map_or(&[][..], |workflow| &workflow.vessels);
+        members.extend(flotilla_agent::adapter::other_vessel_members(vessels, &context.vessel).into_iter().map(|member| {
+            let vessel = member.vessel.clone().expect("another vessel's member names its vessel");
+            let work = convoy.status.as_ref().and_then(|status| status.crew_work.get(&vessel)).and_then(|crew| crew.get(&member.role));
+            CrewListMember::builder()
+                .role(member.role)
+                .kind(if member.is_agent { "agent" } else { "tool" }.to_string())
+                .state(work.map_or(member.state, |work| format!("{:?}", work.phase).to_lowercase()))
+                .vessel(vessel)
+                .build()
+        }));
         Ok(CrewListResponse::builder()
             .convoy(context.convoy.clone())
             .vessel_ref(context.vessel_ref.clone())

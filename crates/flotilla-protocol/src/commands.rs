@@ -2150,6 +2150,7 @@ mod tests {
                     role: "coder".into(),
                     kind: "agent".into(),
                     state: "active".into(),
+                    vessel: None,
                     reason: None,
                     attention: None,
                     adapter: Some("codex".into()),

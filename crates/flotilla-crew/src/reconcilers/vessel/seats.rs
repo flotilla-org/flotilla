@@ -147,7 +147,16 @@ impl VesselPlanning {
                                     role: member.role.clone(),
                                     state: if starts_active(index, member) { "active" } else { "latent" }.to_string(),
                                     is_agent: matches!(member.source, CrewSource::Agent { .. }),
+                                    vessel: None,
                                 })
+                                .chain(flotilla_agent::adapter::other_vessel_members(
+                                    convoy
+                                        .status
+                                        .as_ref()
+                                        .and_then(|status| status.workflow_snapshot.as_ref())
+                                        .map_or(&[][..], |workflow| &workflow.vessels),
+                                    &obj.spec.vessel_name,
+                                ))
                                 .collect::<Vec<_>>();
                             let assignment = match prompt.as_deref() {
                                 Some(prompt) => CrewAssignment::Prompt(prompt),

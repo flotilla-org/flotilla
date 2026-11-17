@@ -1264,7 +1264,9 @@ impl ConvoyAdmission {
                     role: member.role.clone(),
                     state: if requirement.starts_eagerly(index) { "active" } else { "latent" }.to_string(),
                     is_agent: matches!(member.source, CrewSource::Agent { .. }),
+                    vessel: None,
                 })
+                .chain(flotilla_agent::adapter::other_vessel_members(&workflow.vessels, &requirement.name))
                 .collect::<Vec<_>>();
             for process in &requirement.crew {
                 let CrewSource::Agent { prompt, brief_template, .. } = &process.source else { continue };

@@ -872,10 +872,11 @@ fn format_fleet_list_human(response: &FleetListResponse) -> String {
 fn format_crew_list_human(response: &CrewListResponse) -> String {
     let mut table = Table::new();
     table.load_preset(UTF8_FULL_CONDENSED);
-    table.set_header(vec!["Role", "Kind", "State", "Attention", "Adapter", "Model", "Stance", "Reason"]);
+    table.set_header(vec!["Role", "Vessel", "Kind", "State", "Attention", "Adapter", "Model", "Stance", "Reason"]);
     for member in &response.members {
         table.add_row(vec![
             Cell::new(&member.role),
+            Cell::new(member.vessel.as_deref().unwrap_or(&response.vessel)),
             Cell::new(&member.kind),
             Cell::new(&member.state),
             Cell::new(member.attention.map_or_else(|| "-".to_string(), |attention| attention.to_string())),

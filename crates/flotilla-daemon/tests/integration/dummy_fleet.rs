@@ -193,6 +193,35 @@ async fn a_long_runner_exchanges_its_turns_before_landing() {
     assert_no_old_messages(&fleet).await;
 }
 
+// A long runner's governor and aide sit in separate vessels: `crew list` shows the governor the
+// aide with its vessel, beside its own crew. (The brief's rendering of the same members is
+// covered in flotilla-agent; the dummy environment holds the written brief out of reach.)
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_crew_sees_the_convoys_other_vessels_crew() {
+    let fleet = TestDaemon::builder().agent("turn_delay_ms = 600000").start().await;
+    let name = fleet.dispatch(CrewMix::LongRunner, DUMMY_FULFILMENT_KIND).await;
+    let session = fleet
+        .wait("the governor's session", |session: &ResourceObject<TerminalSession>| {
+            session.spec.role == "governor" && session.metadata.labels.get("flotilla.work/convoy") == Some(&name)
+        })
+        .await;
+    let flotilla_resources::TerminalSessionSource::Agent { context: session_context, .. } = session.spec.source else { panic!("agent") };
+    let vessels = fleet.get::<Convoy>(&name).await.expect("convoy").status.expect("status").workflow_snapshot.expect("workflow").vessels;
+    let aide = vessels.iter().find(|vessel| vessel.crew.iter().any(|crew| crew.role == "aide")).expect("the aide's vessel").name.clone();
+    let governor = vessels.iter().find(|vessel| vessel.crew.iter().any(|crew| crew.role == "governor")).expect("governor's").name.clone();
+    assert_ne!(aide, governor, "the aide sits in another vessel");
+    let context = flotilla_protocol::query::CrewCommandContext {
+        namespace: Some(NAMESPACE.into()),
+        convoy: Some(name.clone()),
+        vessel_ref: Some(session_context.vessel_ref),
+        role: Some("governor".into()),
+        ..Default::default()
+    };
+    let CommandValue::CrewList(list) = fleet.execute(CommandAction::QueryCrewList { context }).await else { panic!("a crew list") };
+    let members = list.members.iter().map(|member| (member.role.as_str(), member.vessel.as_deref())).collect::<Vec<_>>();
+    assert_eq!(members, [("governor", None), ("aide", Some(aide.as_str()))]);
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn an_environment_that_fails_to_realise_fails_its_convoy() {
     let fleet = TestDaemon::builder().environment("failure_rate = 1.0").start().await;
