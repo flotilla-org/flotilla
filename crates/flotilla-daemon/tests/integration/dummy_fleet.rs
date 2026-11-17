@@ -739,6 +739,39 @@ async fn a_process_restart_mid_review_acts_on_each_turn_once_and_lands() {
     assert_eq!(fleet.counts().environments_provisioned, 1, "the vendor's backing is adopted, not replaced");
 }
 
+// Behaviour: a crew relaunched into a role that has kept promises is told what its role
+// delivered, and does not deliver it again. The coder's process ends after its change request is
+// kept, while it waits on its review; its relaunch, briefed with the kept change request, opens
+// no second one and asks for no second review, and the convoy lands on the reviewer's answer.
+// The dummy forge opens one change request per branch, so the review turns tell the two apart.
+#[tokio::test(start_paused = true)]
+async fn a_coder_relaunched_after_its_change_request_is_kept_does_not_deliver_it_again() {
+    use flotilla_resources::promises::{PromiseKind, PromiseState};
+
+    let fleet = TestDaemon::builder().agent("turn_delay_ms = 10000").start().await;
+    let name = fleet.dispatch(CrewMix::CoderReviewer, DUMMY_FULFILMENT_KIND).await;
+    let kept = async {
+        loop {
+            let prs = promises(&fleet, &name, "coder", "coder").await;
+            if prs.iter().any(|promise| promise.kind == PromiseKind::Pr && promise.state == PromiseState::Kept) {
+                return;
+            }
+            tokio::time::sleep(Duration::from_millis(200)).await;
+        }
+    };
+    tokio::time::timeout(Duration::from_secs(600), kept).await.expect("the coder's change request is kept");
+    assert_eq!(fleet.counts().crews_completed, 0, "the review is not yet answered: {:?}", fleet.counts());
+    assert!(fleet.end_crew(&name, "coder"), "the coder's process ends");
+    fleet.wait("Landed", in_phase(&name, ConvoyPhase::Landed)).await;
+    let counts = fleet.counts();
+    assert_eq!(
+        (counts.change_requests_opened, counts.sessions_launched, counts.turns_received),
+        (1, 3, 2),
+        "one change request, the coder relaunched once, one review request and its answer: {counts:?}"
+    );
+    assert_eq!(counts.command_errors, 0, "{counts:?}: {:?}", fleet.command_error_samples());
+}
+
 async fn mid_review(fleet: &TestDaemon, name: &str) {
     fleet
         .wait("the coder's change request, before the review is answered", |found: &ResourceObject<Convoy>| {

@@ -283,6 +283,14 @@ impl DummyFleet {
     }
 
     /// The environment vendors, as a test acts as them.
+    /// End the process of `role`'s crew in convoy `convoy`, as a harness that exits or crashes
+    /// does: its session is gone from the pool. False when no such crew runs.
+    pub fn end_crew(&self, convoy: &str, role: &str) -> bool {
+        let Some(name) = self.sessions.end_crew(convoy, role) else { return false };
+        self.record(&Event::Killed { session: name });
+        true
+    }
+
     pub fn vendor(&self) -> &DummyVendor {
         &self.vendor
     }

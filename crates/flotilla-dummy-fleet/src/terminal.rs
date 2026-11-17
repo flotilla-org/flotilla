@@ -228,6 +228,21 @@ impl DummySessions {
     pub(crate) fn get(&self, name: &str) -> Option<Arc<DummySession>> {
         self.lock().get(name).cloned()
     }
+
+    /// End and remove the session of `role`'s crew in convoy `convoy`, a convoy's record name or
+    /// one of its launches, returning its name.
+    pub(crate) fn end_crew(&self, convoy: &str, role: &str) -> Option<String> {
+        let mut sessions = self.lock();
+        let name = sessions
+            .iter()
+            .find(|(_, session)| {
+                session.role == role
+                    && session.convoy.as_deref().is_some_and(|crew| crew == convoy || flotilla_resources::convoy::launch_of(crew) == convoy)
+            })
+            .map(|(name, _)| name.clone())?;
+        sessions.remove(&name)?.stop();
+        Some(name)
+    }
 }
 
 pub struct DummyTerminalPool {
@@ -610,8 +625,8 @@ mod tests {
 
     fn crew_follows_its_script(tc: hegel::TestCase) {
         let script = match tc.draw(gs::integers::<usize>().min_value(0).max_value(3)) {
-            0 => CrewScript::Coder { reviewer: None, repository: "dummy/fleet".into() },
-            1 => CrewScript::Coder { reviewer: Some("reviewer".into()), repository: "dummy/fleet".into() },
+            0 => CrewScript::coder(None, "dummy/fleet".into()),
+            1 => CrewScript::coder(Some("reviewer".into()), "dummy/fleet".into()),
             2 => CrewScript::Responder { reply_to: "coder".into() },
             _ => CrewScript::Governor { aide: "aide".into(), turns: tc.draw(gs::integers::<u32>().min_value(1).max_value(4)) },
         };
@@ -745,7 +760,7 @@ mod tests {
         });
         fleet.attach(Arc::clone(&port) as Arc<dyn CrewCommandPort>).expect("attach");
         let pool = DummyTerminalPool { fleet: Arc::clone(&fleet), environment: "env-a".into() };
-        let script = CrewScript::Coder { reviewer: None, repository: "flotilla-org/flotilla".into() };
+        let script = CrewScript::coder(None, "flotilla-org/flotilla".into());
         pool.ensure_session(
             SESSION,
             "flotilla-dummy-crew",
@@ -799,7 +814,7 @@ mod tests {
         async fn next(recorded: &mut mpsc::UnboundedReceiver<String>) -> String {
             tokio::time::timeout(Duration::from_secs(600), recorded.recv()).await.expect("crew acts").expect("port open")
         }
-        let script = CrewScript::Coder { reviewer: Some("reviewer".into()), repository: "dummy/fleet".into() };
+        let script = CrewScript::coder(Some("reviewer".into()), "dummy/fleet".into());
 
         let fleet = DummyFleet::open(config.clone(), state.path()).expect("open");
         let (first, mut recorded) = port();

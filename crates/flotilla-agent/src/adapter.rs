@@ -22,6 +22,9 @@ mod fleet_canary;
 
 /// Shared delimiter for the appended card and oversized-brief fallback.
 pub const CAPABILITIES_HEADING: &str = "\n\n## Your capabilities";
+/// Heads a launch brief's list of the promises the crew's role has kept: one line per promise,
+/// "- `<id>` (<kind>): <reference of its last submission>".
+pub const KEPT_PROMISES_HEADING: &str = "## Promises your role has kept";
 pub const TRUSTED_IMPLICIT_STANCE: &str = "trusted-implicit";
 pub const DEFAULT_CREW_BRIEF_TEMPLATE: &str = "crew.md";
 const BUILTIN_CREW_BRIEF_TEMPLATE: &str = include_str!("adapter/templates/crew.md");

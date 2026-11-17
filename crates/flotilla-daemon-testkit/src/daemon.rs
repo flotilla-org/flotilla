@@ -682,6 +682,12 @@ impl TestDaemon {
         self.fleet.vendor()
     }
 
+    /// End the process of `role`'s crew in convoy `convoy`, as a crashed harness's ends. False
+    /// when no such crew runs.
+    pub fn end_crew(&self, convoy: &str, role: &str) -> bool {
+        self.fleet.end_crew(convoy, role)
+    }
+
     /// What the fakes counted.
     pub fn counts(&self) -> DummyFleetSnapshot {
         self.fleet.snapshot()

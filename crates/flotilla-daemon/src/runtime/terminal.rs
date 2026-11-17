@@ -489,6 +489,25 @@ impl TerminalControllerRuntime {
                     materialized_brief.content.push_str("\n\n");
                     materialized_brief.content.push_str(&card);
                 }
+                // A crew relaunched into a role that has kept promises is told what it delivered,
+                // so it does not deliver them again.
+                let kept = flotilla_crew::crew_capabilities::kept_promises(
+                    &self.state.daemon.resource_backend(),
+                    &self.state.daemon.convoy_engine_path(),
+                    &context.namespace,
+                    &context.convoy,
+                    &context.vessel_ref,
+                    &spec.role,
+                )
+                .await;
+                match kept {
+                    Ok(Some(kept)) => {
+                        materialized_brief.content.push_str("\n\n");
+                        materialized_brief.content.push_str(&kept);
+                    }
+                    Ok(None) => {}
+                    Err(error) => warn!(session = %name, %error, "failed to read the promises this crew's role has kept"),
+                }
                 // Claude Code delivers hooks over HTTP: host-direct while flotillad listens on
                 // loopback TCP, and in a Docker vessel through its agent's forward. SSH host
                 // and cloud vessels keep command hooks. The token binds the hooks to this terminal.

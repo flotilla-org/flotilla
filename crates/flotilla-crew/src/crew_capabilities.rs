@@ -5,9 +5,11 @@ use std::{
     sync::Arc,
 };
 
-use flotilla_agent::adapter::CAPABILITIES_HEADING;
+use flotilla_agent::adapter::{CAPABILITIES_HEADING, KEPT_PROMISES_HEADING};
 use flotilla_capability_contract::{credential_card, CredentialCapability, SessionCapabilitySource};
 use flotilla_resources::account_access::AccountRecords;
+use flotilla_resources::convoy::engine::{viewed_read, EngineConvoyPath};
+use flotilla_resources::convoy::promises::{self, PromiseState};
 use flotilla_resources::lifecycle_reads::LifecycleReads;
 use flotilla_resources::terminal_records::{newest_launches, TerminalRecord};
 use flotilla_resources::vessel_records::VesselRecord;
@@ -61,6 +63,36 @@ pub async fn session_card(
     };
     let card = CardRead { backend, namespace, convoy: &convoy, work: work.as_deref() };
     render_card(&card, spec, credentials, endpoints, reads, accounts).await
+}
+
+/// What a crew launched into `role` on vessel `vessel_ref` is told its role has already
+/// delivered: each promise the role has kept in convoy `convoy_name`, read as the engine holds
+/// them, with its last submission's reference. A relaunched crew does not deliver them again.
+/// `None` when the role has kept none.
+pub async fn kept_promises(
+    backend: &ResourceBackend,
+    engine: &EngineConvoyPath,
+    namespace: &str,
+    convoy_name: &str,
+    vessel_ref: &str,
+    role: &str,
+) -> Result<Option<String>, String> {
+    let read = backend.including_replicas::<Convoy>(namespace).get(convoy_name).await.map_err(|error| error.to_string())?;
+    let convoy = viewed_read(engine, &read)?;
+    let work =
+        backend.including_replicas::<Vessel>(namespace).get(vessel_ref).await.map_err(|error| error.to_string())?.object.spec.vessel_name;
+    let kept = convoy
+        .status
+        .iter()
+        .flat_map(|status| promises::owned(status, &work, role))
+        .filter(|promise| promise.state == PromiseState::Kept)
+        .map(|promise| {
+            let reference = promise.submissions.last().map_or("", |submission| submission.reference.as_str());
+            format!("- `{}` ({}): {reference}\n", promise.id, promise.kind.as_str())
+        })
+        .collect::<String>();
+    Ok((!kept.is_empty())
+        .then(|| format!("{KEPT_PROMISES_HEADING}\n\nA crew in your role kept these before you. Do not deliver them again.\n\n{kept}")))
 }
 
 /// What a card is read from besides its session: the session's convoy and, for a crew, the work

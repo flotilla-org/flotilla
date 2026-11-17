@@ -77,15 +77,15 @@ impl CrewMix {
     pub fn workflow(self, long_runner_turns: u32) -> WorkflowTemplateSpec {
         let repository = DUMMY_REPOSITORY.to_string();
         let roles = match self {
-            Self::Coder => vec![worker("coder", CrewScript::Coder { reviewer: None, repository })],
+            Self::Coder => vec![worker("coder", CrewScript::coder(None, repository))],
             Self::CoderReviewer => vec![
-                worker("coder", CrewScript::Coder { reviewer: Some("reviewer".into()), repository }),
+                worker("coder", CrewScript::coder(Some("reviewer".into()), repository)),
                 worker("reviewer", CrewScript::Responder { reply_to: "coder".into() }),
             ],
             // The governor comes first, so its vessel launches it eagerly.
             Self::CoderSupervisor => vec![
                 crew("governor", CrewScript::Responder { reply_to: "coder".into() }),
-                worker("coder", CrewScript::Coder { reviewer: Some("governor".into()), repository }),
+                worker("coder", CrewScript::coder(Some("governor".into()), repository)),
             ],
             Self::LongRunner => vec![
                 crew("governor", CrewScript::Governor { aide: "aide".into(), turns: long_runner_turns }),

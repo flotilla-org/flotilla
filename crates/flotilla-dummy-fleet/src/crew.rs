@@ -5,10 +5,12 @@
 //!
 //! A brief selects its script with a line `dummy-script: <script> [key=value]…`:
 //!
-//! - `coder [review=<role>] [repo=<owner/name>]` promises a change request,
-//!   opens one on the dummy forge (or on the configured shared forge) and
-//!   submits it, optionally asks a peer to review it and waits for the reply,
-//!   then completes.
+//! - `coder [review=<role>] [repo=<owner/name>] [kept-<kind>=<reference>]…`
+//!   promises a change request, opens one on the dummy forge (or on the
+//!   configured shared forge) and submits it, optionally asks a peer to review
+//!   it and waits for the reply, then completes. A kind its role has kept, which
+//!   the adapter reads from the brief's [`KEPT_PROMISES_HEADING`] list, it
+//!   skips: a kept `pr` with its review, a kept `decision-ledger` submission.
 //! - `responder reply=<role>` answers every turn with a handoff to `reply`,
 //!   and completes after answering a turn marked [`LAST_TURN_MARKER`].
 //! - `governor aide=<role> [turns=<n>]` is a long runner: it hands its aide
@@ -25,6 +27,7 @@ use std::{
     time::Duration,
 };
 
+use flotilla_agent::adapter::KEPT_PROMISES_HEADING;
 use flotilla_environment::environment::dummy::dummy_draw;
 use flotilla_protocol::{
     commands::{CommandValue, CrewPromiseOperation, CrewSupervisionAction, StallProposedDisposition, StallReason},
@@ -54,6 +57,8 @@ pub enum CrewScript {
     Coder {
         reviewer: Option<String>,
         repository: String,
+        /// The reference of each promise kind its role has kept, by kind.
+        kept: BTreeMap<String, String>,
     },
     Responder {
         reply_to: String,
@@ -68,12 +73,22 @@ pub enum CrewScript {
 }
 
 impl CrewScript {
-    /// The script named in a brief, or a lone coder.
+    /// The script named in a brief, or a lone coder; a coder also takes the promises its role
+    /// has kept, as the brief lists them.
     pub fn from_brief(brief: &str, default_turns: u32) -> Result<Self, String> {
-        match brief.lines().find_map(|line| line.trim().strip_prefix(SCRIPT_LINE_PREFIX)) {
-            Some(line) => Self::parse(line, default_turns),
-            None => Ok(Self::Coder { reviewer: None, repository: DEFAULT_REPOSITORY.into() }),
+        let mut script = match brief.lines().find_map(|line| line.trim().strip_prefix(SCRIPT_LINE_PREFIX)) {
+            Some(line) => Self::parse(line, default_turns)?,
+            None => Self::coder(None, DEFAULT_REPOSITORY.into()),
+        };
+        if let Self::Coder { kept, .. } = &mut script {
+            kept.extend(kept_in_brief(brief));
         }
+        Ok(script)
+    }
+
+    /// A coder whose role has kept nothing.
+    pub fn coder(reviewer: Option<String>, repository: String) -> Self {
+        Self::Coder { reviewer, repository, kept: BTreeMap::new() }
     }
 
     pub fn parse(line: &str, default_turns: u32) -> Result<Self, String> {
@@ -89,6 +104,13 @@ impl CrewScript {
             "coder" => Self::Coder {
                 reviewer: take(&mut parameters, "review"),
                 repository: take(&mut parameters, "repo").unwrap_or_else(|| DEFAULT_REPOSITORY.into()),
+                kept: {
+                    let kinds = parameters.keys().filter_map(|key| key.strip_prefix(KEPT_PREFIX)).map(str::to_owned).collect::<Vec<_>>();
+                    kinds
+                        .into_iter()
+                        .filter_map(|kind| Some((kind.clone(), take(&mut parameters, &format!("{KEPT_PREFIX}{kind}"))?)))
+                        .collect()
+                },
             },
             "responder" => Self::Responder { reply_to: take(&mut parameters, "reply").ok_or("responder script needs reply=<role>")? },
             "governor" => Self::Governor {
@@ -109,13 +131,41 @@ impl CrewScript {
 
     pub fn render(&self) -> String {
         match self {
-            Self::Coder { reviewer: Some(reviewer), repository } => format!("coder review={reviewer} repo={repository}"),
-            Self::Coder { reviewer: None, repository } => format!("coder repo={repository}"),
+            Self::Coder { reviewer, repository, kept } => {
+                let mut line = "coder".to_string();
+                if let Some(reviewer) = reviewer {
+                    line.push_str(&format!(" review={reviewer}"));
+                }
+                line.push_str(&format!(" repo={repository}"));
+                for (kind, reference) in kept {
+                    line.push_str(&format!(" {KEPT_PREFIX}{kind}={reference}"));
+                }
+                line
+            }
             Self::Responder { reply_to } => format!("responder reply={reply_to}"),
             Self::Governor { aide, turns } => format!("governor aide={aide} turns={turns}"),
             Self::Supervisor => "supervisor".into(),
         }
     }
+}
+
+/// Prefixes a coder's parameter naming a promise kind its role has kept.
+const KEPT_PREFIX: &str = "kept-";
+
+/// The promises a brief lists under [`KEPT_PROMISES_HEADING`], as kind and reference: lines
+/// "- `<id>` (<kind>): <reference>", up to the next heading.
+fn kept_in_brief(brief: &str) -> BTreeMap<String, String> {
+    let Some((_, listed)) = brief.split_once(KEPT_PROMISES_HEADING) else { return BTreeMap::new() };
+    listed
+        .lines()
+        .skip(1)
+        .take_while(|line| !line.starts_with('#'))
+        .filter_map(|line| {
+            let (_, rest) = line.strip_prefix("- `")?.split_once("` (")?;
+            let (kind, reference) = rest.split_once("): ")?;
+            Some((kind.to_owned(), reference.trim().to_owned()))
+        })
+        .collect()
 }
 
 /// Who a crew is, from the environment its terminal session was launched with.
@@ -271,7 +321,7 @@ impl Crew {
         let ending = match self.begin().await {
             Some(ending) => Some(ending),
             None => match script {
-                CrewScript::Coder { reviewer, repository } => self.code(reviewer, &repository).await,
+                CrewScript::Coder { reviewer, repository, kept } => self.code(reviewer, &repository, &kept).await,
                 CrewScript::Responder { reply_to } => self.respond(&reply_to).await,
                 CrewScript::Governor { aide, turns } => self.govern(&aide, turns).await,
                 CrewScript::Supervisor => self.supervise().await,
@@ -357,7 +407,15 @@ impl Crew {
         None
     }
 
-    async fn code(&mut self, reviewer: Option<String>, repository: &str) -> Option<Ending> {
+    async fn code(&mut self, reviewer: Option<String>, repository: &str, kept: &BTreeMap<String, String>) -> Option<Ending> {
+        // A ledger its role has kept is not submitted again.
+        if kept.contains_key("decision-ledger") {
+            self.script_finished = true;
+        }
+        // A change request its role has kept is merged: it is not opened, submitted or reviewed again.
+        if kept.contains_key(PROMISE_KIND) {
+            return self.settle_promises().await;
+        }
         // One branch per convoy launch and role: every launch of the role's crew works on the same
         // change request, and a standing convoy's next launch on a new one.
         let convoy = &self.identity.convoy;
@@ -698,8 +756,13 @@ mod tests {
     #[test]
     fn scripts_round_trip_through_their_brief_line() {
         for script in [
-            CrewScript::Coder { reviewer: None, repository: "dummy/fleet".into() },
-            CrewScript::Coder { reviewer: Some("reviewer".into()), repository: "acme/app".into() },
+            CrewScript::coder(None, "dummy/fleet".into()),
+            CrewScript::coder(Some("reviewer".into()), "acme/app".into()),
+            CrewScript::Coder {
+                reviewer: Some("reviewer".into()),
+                repository: "acme/app".into(),
+                kept: [("pr".into(), "https://forge/acme/app/pulls/1".into()), ("decision-ledger".into(), "ledger-1".into())].into(),
+            },
             CrewScript::Responder { reply_to: "coder".into() },
             CrewScript::Governor { aide: "aide".into(), turns: 7 },
             CrewScript::Supervisor,
@@ -710,11 +773,24 @@ mod tests {
     }
 
     #[test]
-    fn a_brief_without_a_script_is_a_lone_coder_and_defaults_apply() {
-        assert_eq!(
-            CrewScript::from_brief("Implement the thing.", 3),
-            Ok(CrewScript::Coder { reviewer: None, repository: DEFAULT_REPOSITORY.into() })
+    fn a_coder_takes_the_promises_its_brief_lists_as_kept() {
+        let brief = format!(
+            "{SCRIPT_LINE_PREFIX} coder review=reviewer\n\n{KEPT_PROMISES_HEADING}\n\nProse.\n\n\
+             - `template/pr` (pr): https://forge/dummy/fleet/pulls/3\n- `script-ledger-coder` (decision-ledger): ledger-1\n\n## Next\n- `x` (y): z\n"
         );
+        let CrewScript::Coder { kept, .. } = CrewScript::from_brief(&brief, 3).expect("a coder") else { panic!("a coder") };
+        assert_eq!(
+            kept,
+            BTreeMap::from([
+                ("decision-ledger".to_string(), "ledger-1".to_string()),
+                ("pr".to_string(), "https://forge/dummy/fleet/pulls/3".to_string()),
+            ])
+        );
+    }
+
+    #[test]
+    fn a_brief_without_a_script_is_a_lone_coder_and_defaults_apply() {
+        assert_eq!(CrewScript::from_brief("Implement the thing.", 3), Ok(CrewScript::coder(None, DEFAULT_REPOSITORY.into())));
         assert_eq!(CrewScript::parse("governor aide=aide", 4), Ok(CrewScript::Governor { aide: "aide".into(), turns: 4 }));
     }
 
