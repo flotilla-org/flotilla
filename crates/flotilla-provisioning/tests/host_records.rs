@@ -3,7 +3,7 @@
 //! reads back with the judgements its readers expect.
 
 use std::{
-    collections::BTreeMap,
+    collections::{BTreeMap, BTreeSet},
     sync::{
         atomic::{AtomicBool, Ordering},
         Arc,
@@ -14,12 +14,13 @@ use chrono::{DateTime, TimeZone, Utc};
 use flotilla_protocol::provider::{EnvironmentClass, ProviderAdvertisement, ProviderKind, ProviderReadiness};
 use flotilla_provisioning::{
     engine::hosts::{self, EngineHosts},
+    image_inventory::{ImageInventoryIo, ImageInventoryPublisher},
     stored::host::{HostObservation, HostRecord},
 };
 use flotilla_resources::{
     engine_records::{KindRecords, LogPosition, PatchStatus, Record, Since, StatusWriteError, Ticks},
     Clock, ConditionValue, FulfilmentFacts, Host, HostCondition, HostConnection, HostSpec, HostStatus, InputMeta, ResourceError,
-    SystemClock,
+    ResourceObject, SystemClock, IMAGE_DIGESTS_CAPABILITY,
 };
 use flotilla_schema::{Kind, KindCode};
 use flotilla_schema_sqlite::stream::Service;
@@ -258,8 +259,8 @@ async fn the_daemons_blocking_conditions_hold_readiness() {
 }
 
 /// Host's port with a second writer that patches a fulfilment fact in once armed: after the first
-/// read of the Host, or before its first status write, whichever comes first. That is between a
-/// writer's read and its write.
+/// read of the Host, or before its first status write or patch, whichever comes first. That is
+/// between a writer's read and its write.
 #[derive(Debug)]
 struct SecondWriter {
     inner: Arc<EngineHosts>,
@@ -329,6 +330,9 @@ impl KindRecords<Host> for SecondWriter {
         self.inner.set_status(name, version, status).await
     }
     async fn patch_status(&self, name: &str, patch: &PatchStatus<'_, HostStatus>) -> Option<Result<bool, String>> {
+        if let Err(error) = self.interleave(name).await {
+            return Some(Err(error));
+        }
         self.inner.patch_status(name, patch).await
     }
     async fn delete(&self, name: &str) -> Result<(), String> {
@@ -339,22 +343,29 @@ impl KindRecords<Host> for SecondWriter {
     }
 }
 
-// Behaviour (two Host writers): a writer that reads a Host and writes its whole status back, as the
-// image inventory did, loses nothing another writer patched in between. The version it read is
-// checked in the port's own order of writes: its write is refused as stale, and the patch stands.
-#[tokio::test]
-async fn a_status_written_back_over_another_writers_patch_is_refused() {
-    let directory = tempfile::tempdir().expect("temp dir");
+/// Host `kiwi`, observed once, behind a [`SecondWriter`] not yet armed.
+async fn observed_with_second_writer(directory: &std::path::Path) -> (Arc<SecondWriter>, ResourceBackend, ResourceObject<Host>) {
     let mut kinds = flotilla_schema::KindRegistry::new();
     flotilla_provisioning::stored::host::register(&mut kinds).expect("register");
-    let service = Arc::new(Service::open(&directory.path().join("decided.sqlite"), "alpha", kinds).expect("store"));
-    let inner = Arc::new(EngineHosts::open(Arc::clone(&service), "kiwi".into(), Arc::new(SystemClock) as Arc<dyn Clock>).expect("open"));
+    let service = Arc::new(Service::open(&directory.join("decided.sqlite"), "alpha", kinds).expect("store"));
+    let inner = Arc::new(EngineHosts::open(service, "kiwi".into(), Arc::new(SystemClock) as Arc<dyn Clock>).expect("open"));
     let port = Arc::new(SecondWriter { inner, armed: AtomicBool::new(false) });
     let backend = ResourceBackend::new(InMemoryBackend::default());
     backend.install_engine_kind::<Host>(port.clone());
     let hosts = backend.using::<Host>(NS);
     let host = hosts.create(&InputMeta { name: "kiwi".into(), ..Default::default() }, &HostSpec::default()).await.expect("create");
     let first = hosts.update_status("kiwi", &host.metadata.resource_version, &observed(at(0), "12 GB free")).await.expect("first");
+    (port, backend, first)
+}
+
+// Behaviour (two Host writers): a writer that reads a Host and writes its whole status back, as the
+// image inventory did, loses nothing another writer patched in between. The version it read is
+// checked in the port's own order of writes: its write is refused as stale, and the patch stands.
+#[tokio::test]
+async fn a_status_written_back_over_another_writers_patch_is_refused() {
+    let directory = tempfile::tempdir().expect("temp dir");
+    let (port, backend, first) = observed_with_second_writer(directory.path()).await;
+    let hosts = backend.using::<Host>(NS);
 
     let mut edited = first.status.clone().expect("status");
     edited.capabilities.insert("image_digests".to_owned(), json!({"docker": ["sha256:b"]}));
@@ -364,4 +375,40 @@ async fn a_status_written_back_over_another_writers_patch_is_refused() {
     assert!(matches!(written, Err(ResourceError::Conflict { .. })), "the first writer's stale status is refused: {written:?}");
     let facts = hosts.get("kiwi").await.expect("read").status.expect("status").fulfilment_facts;
     assert!(facts.contains_key("dummy-crews"), "the second writer's patch stands: {:?}", facts.keys().collect::<Vec<_>>());
+}
+
+/// One image cache holding `held`.
+struct Cache(BTreeSet<String>);
+
+#[async_trait::async_trait]
+impl ImageInventoryIo for Cache {
+    async fn inventory(&self) -> Result<BTreeSet<String>, String> {
+        Ok(self.0.clone())
+    }
+}
+
+// Behaviour (two Host writers): the image inventory and the fulfilment probe each write only their
+// own part of the Host, against it as its port holds it: both stand, whichever writes first.
+#[tokio::test]
+async fn the_image_inventory_and_a_fulfilment_fact_written_together_both_stand() {
+    let directory = tempfile::tempdir().expect("temp dir");
+    let (port, backend, _) = observed_with_second_writer(directory.path()).await;
+    let inventory = ImageInventoryPublisher::builder()
+        .io(Arc::new(Cache(BTreeSet::from(["sha256:c".to_owned()]))))
+        .backend(backend.clone())
+        .namespace(NS.into())
+        .host("kiwi".into())
+        .provider_instance("cache-a".into())
+        .registered_instances(BTreeSet::from(["cache-a".to_owned()]))
+        .build();
+    port.armed.store(true, Ordering::SeqCst);
+    inventory.refresh().await.expect("the inventory is written");
+    assert!(!port.armed.load(Ordering::SeqCst), "the fulfilment fact was written as the inventory was");
+    let status = backend.using::<Host>(NS).get("kiwi").await.expect("read").status.expect("status");
+    assert!(
+        status.fulfilment_facts.contains_key("dummy-crews"),
+        "the fact stands: {:?}",
+        status.fulfilment_facts.keys().collect::<Vec<_>>()
+    );
+    assert_eq!(status.capabilities[IMAGE_DIGESTS_CAPABILITY], json!({"cache-a": ["sha256:c"]}), "the inventory stands");
 }

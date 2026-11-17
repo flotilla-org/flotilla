@@ -686,6 +686,35 @@ pub enum HostStatusPatch {
         health: SleepInhibitionHealth,
         observed_at: DateTime<Utc>,
     },
+    /// The local image caches' inventories: only the `registered` caches' are kept, and
+    /// `observed`, when given, is one cache's held image IDs. With none observed, a Host that holds
+    /// no inventory is left without one.
+    ImageInventory {
+        registered: BTreeSet<String>,
+        observed: Option<(String, BTreeSet<String>)>,
+    },
+    /// An SSH host's observation by its owning daemon, the whole status but for the sleep it
+    /// keeps and the fulfilment facts its probe writes.
+    SshHost {
+        capabilities: BTreeMap<String, serde_json::Value>,
+        /// The facts the owning daemon's probe last wrote, which restore them once a pass the host
+        /// did not answer cleared them; `None` for such a pass.
+        probed_facts: Option<BTreeMap<String, FulfilmentFacts>>,
+        /// The vessel slots free under the host's cap, when it has one.
+        vessel_slots: Option<SshVesselSlots>,
+        heartbeat_at: Option<DateTime<Utc>>,
+        ready: bool,
+        below_free_space_floor: Option<bool>,
+        conditions: Vec<HostCondition>,
+    },
+}
+
+/// The vessel slots free on an SSH host under its cap: each fulfilment kind has `free`, but a kind
+/// whose terminal pool a probe found missing, which stays full.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SshVesselSlots {
+    pub free: u32,
+    pub pool_missing: BTreeSet<String>,
 }
 
 impl StatusPatch<HostStatus> for HostStatusPatch {
@@ -702,7 +731,13 @@ impl StatusPatch<HostStatus> for HostStatusPatch {
                 *heartbeat_at < previous
                     || heartbeat_at.signed_duration_since(previous) >= chrono::Duration::seconds(HEARTBEAT_REFRESH_SECS)
             }),
-            Self::FulfilmentFacts { .. } | Self::SleepInhibition { .. } => false,
+            // The owning daemon's last successful probe stands in for an SSH host's heartbeat.
+            Self::SshHost { heartbeat_at: Some(heartbeat_at), .. } => before.heartbeat_at.is_none_or(|previous| {
+                *heartbeat_at < previous
+                    || heartbeat_at.signed_duration_since(previous) >= chrono::Duration::seconds(HEARTBEAT_REFRESH_SECS)
+            }),
+            Self::SshHost { heartbeat_at: None, .. } => before.heartbeat_at.is_some(),
+            Self::FulfilmentFacts { .. } | Self::SleepInhibition { .. } | Self::ImageInventory { .. } => false,
         }
     }
 
@@ -779,6 +814,59 @@ impl StatusPatch<HostStatus> for HostStatusPatch {
                     }
                     SleepInhibitionHealth::Acquiring { .. } => {}
                 }
+            }
+            Self::ImageInventory { registered, observed } => {
+                let held = status.capabilities.get(crate::IMAGE_DIGESTS_CAPABILITY);
+                if held.is_none() && observed.is_none() {
+                    return;
+                }
+                let mut inventory = match held.map(|held| serde_json::from_value::<crate::LocalImageInventories>(held.clone())).transpose()
+                {
+                    Ok(inventory) => inventory.unwrap_or_default(),
+                    Err(error) => {
+                        tracing::warn!(%error, "invalid image inventory; replacing it with fresh cache observations");
+                        crate::LocalImageInventories::default()
+                    }
+                };
+                inventory.0.retain(|instance, _| registered.contains(instance));
+                if let Some((instance, held)) = observed {
+                    inventory.0.insert(instance.clone(), held.clone());
+                }
+                match serde_json::to_value(&inventory) {
+                    Ok(value) => {
+                        status.capabilities.insert(crate::IMAGE_DIGESTS_CAPABILITY.into(), value);
+                    }
+                    Err(error) => tracing::warn!(%error, "image inventory does not encode; left as it was"),
+                }
+            }
+            Self::SshHost { capabilities, probed_facts, vessel_slots, heartbeat_at, ready, below_free_space_floor, conditions } => {
+                // The probe writes the facts; the ones held are its latest. A pass the host did not
+                // answer clears them, and the probe's last restores them.
+                let mut fulfilment_facts = match probed_facts {
+                    None => BTreeMap::new(),
+                    Some(probed) if status.fulfilment_facts.is_empty() => probed.clone(),
+                    Some(_) => std::mem::take(&mut status.fulfilment_facts),
+                };
+                for facts in fulfilment_facts.values_mut() {
+                    for harness in facts.harnesses.values_mut() {
+                        harness.models.clear();
+                    }
+                }
+                if let Some(slots) = vessel_slots {
+                    for (kind, facts) in &mut fulfilment_facts {
+                        facts.free_vessel_slots = Some(if slots.pool_missing.contains(kind) { 0 } else { slots.free });
+                    }
+                }
+                *status = HostStatus {
+                    capabilities: capabilities.clone(),
+                    fulfilment_facts,
+                    heartbeat_at: *heartbeat_at,
+                    ready: *ready,
+                    sleeping_until: status.sleeping_until,
+                    below_free_space_floor: *below_free_space_floor,
+                    conditions: conditions.clone(),
+                    ..HostStatus::default()
+                };
             }
         }
     }
@@ -910,5 +998,31 @@ mod tests {
 
         assert_eq!(CredentialExpiry::default().effective_expires_at(), None);
         assert_eq!(CredentialExpiry::default().expired_at(now), None);
+    }
+
+    // Behaviour (two Host writers): an SSH host's observation is patched against the facts its
+    // probe wrote, so facts written after its owning daemon last read them stand; a pass the host
+    // did not answer clears them, and the probe's last restores them.
+    #[test]
+    fn an_ssh_host_observation_keeps_the_probes_facts() {
+        let at = |seconds: i64| DateTime::from_timestamp(1_800_000_000 + seconds, 0).expect("time");
+        let facts = |seconds| BTreeMap::from([("kind".to_owned(), FulfilmentFacts { observed_at: at(seconds), ..Default::default() })]);
+        let observation = |probed_facts| HostStatusPatch::SshHost {
+            capabilities: BTreeMap::new(),
+            probed_facts,
+            vessel_slots: Some(SshVesselSlots { free: 2, pool_missing: BTreeSet::new() }),
+            heartbeat_at: Some(at(0)),
+            ready: true,
+            below_free_space_floor: None,
+            conditions: Vec::new(),
+        };
+        let mut status = HostStatus { fulfilment_facts: facts(20), ..HostStatus::default() };
+        observation(Some(facts(10))).apply(&mut status);
+        assert_eq!(status.fulfilment_facts["kind"].observed_at, at(20), "the probe's later facts stand");
+        assert_eq!(status.fulfilment_facts["kind"].free_vessel_slots, Some(2));
+        observation(None).apply(&mut status);
+        assert!(status.fulfilment_facts.is_empty(), "an unanswered pass clears them");
+        observation(Some(facts(30))).apply(&mut status);
+        assert_eq!(status.fulfilment_facts["kind"].observed_at, at(30), "the probe's last restores them");
     }
 }
