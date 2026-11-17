@@ -11,11 +11,13 @@ use flotilla_store_testkit::PausedClock;
 struct CountedMessages {
     inner: Arc<dyn EngineMessages>,
     calls: std::sync::Mutex<BTreeMap<&'static str, usize>>,
+    /// The seats each settling of stalls was asked about.
+    settled: std::sync::Mutex<Vec<Vec<String>>>,
 }
 
 impl CountedMessages {
     fn over(inner: Arc<dyn EngineMessages>) -> Arc<Self> {
-        Arc::new(Self { inner, calls: Default::default() })
+        Arc::new(Self { inner, calls: Default::default(), settled: Default::default() })
     }
 
     fn count(&self, call: &'static str) {
@@ -118,6 +120,7 @@ impl EngineMessages for CountedMessages {
     }
     async fn end_stalls(&self, namespace: &str, seats: &[String], stalled: &[String], reason: &str) -> Result<Vec<String>, String> {
         self.count("end_stalls");
+        self.settled.lock().expect("settled").push(seats.to_vec());
         self.inner.end_stalls(namespace, seats, stalled, reason).await
     }
     async fn delivery_held_until(&self, namespace: &str, receiver: &str) -> Result<Option<DateTime<Utc>>, String> {
@@ -280,4 +283,38 @@ async fn a_newly_named_turn_is_read() {
     .await;
     elapse(1, &loop_task).await;
     assert_eq!(messages.calls().get("seat_standings").copied(), Some(read + 1), "the newly named turn was not read");
+}
+
+// A change feed that lagged past a notice judges every live launch once, the ended ones passed
+// by, and the judge goes back to waking on changes and due times: a missed notice cannot leave a
+// seat unjudged.
+#[tokio::test(start_paused = true)]
+async fn a_lagged_feed_judges_every_live_launch_once() {
+    let case = idle_nudge_scenario().await;
+    for index in 0..2 {
+        let launch = create_convoy(&case.home, &format!("ended-{index}"), single_agent("coder")).await;
+        case.home.keep(&case.backend, &launch, "work", "coder").await;
+        case.home.end(&case.backend, &launch, ConvoyPhase::Landed).await;
+    }
+    let messages = CountedMessages::over(case.home.message_path().get().cloned().expect("the Message path"));
+    let (wake, clock) = paused_wake(&case.backend, &case.home, messages.path(), case.delivery.clone()).await;
+    let loop_task = run(&wake);
+    elapse(1, &loop_task).await;
+    let ended_settled = || {
+        let settled = messages.settled.lock().expect("settled");
+        settled.iter().filter(|seats| seats.iter().any(|seat| seat.contains("ended-"))).count()
+    };
+    assert_eq!(ended_settled(), 2, "the first pass settles each ended launch");
+    // The coder goes idle, and its notice is lost among more than the feed holds.
+    observe_agent(&case.home, "resumed-coder", TerminalAttentionState::Idle, TerminalAttentionSource::Hook, clock.now());
+    for index in 0..100 {
+        agents().observe(&format!("elsewhere-{index}"), flotilla_protocol::AgentActivity::Working, "hook", clock.now());
+    }
+    elapse(u64::from(DEFAULT_IDLE_GRACE_SECONDS) + 5, &loop_task).await;
+    assert_eq!(nudges(&case), 1, "the idle seat whose notice was lost was never judged");
+    assert_eq!(ended_settled(), 2, "the fallback judged the ended launches again");
+    // Back on changes and due times: nothing is judged before the next nudge is due.
+    let calls = messages.calls();
+    elapse(60, &loop_task).await;
+    assert_eq!(messages.calls(), calls, "the judge kept judging after the fallback");
 }

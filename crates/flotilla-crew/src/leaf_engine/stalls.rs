@@ -729,7 +729,11 @@ impl ReconcilerWake {
         now: DateTime<Utc>,
         schedule: &mut StallSchedule,
     ) -> Result<(), String> {
-        let pass = schedule.take(&convoys.keys().collect(), now);
+        let held = convoys
+            .iter()
+            .map(|(name, convoy)| (name, convoy.convoy().status.as_ref().is_some_and(|status| status.phase.is_terminal())))
+            .collect();
+        let pass = schedule.take(&held, now);
         if pass.is_empty() {
             return Ok(());
         }

@@ -38,7 +38,8 @@ struct Standings {
 /// What the judge holds between passes in one namespace.
 #[derive(Debug)]
 pub(super) struct StallSchedule {
-    /// Every convoy changed: the first pass, or a change that names none.
+    /// Every convoy changed: the first pass, or a change that names none, such as a feed that
+    /// lagged. An ended convoy already judged since it ended is not among them.
     every_changed: bool,
     /// The convoys whose inputs changed since they were last judged.
     changed: HashSet<String>,
@@ -58,6 +59,8 @@ pub(super) struct StallSchedule {
     charter: bool,
     /// The convoys judged since the schedule began.
     seen: HashSet<String>,
+    /// The ended convoys judged since they ended.
+    ended_judged: HashSet<String>,
 }
 
 impl Default for StallSchedule {
@@ -74,6 +77,7 @@ impl Default for StallSchedule {
             unheard: HashMap::new(),
             charter: true,
             seen: HashSet::new(),
+            ended_judged: HashSet::new(),
         }
     }
 }
@@ -127,19 +131,26 @@ impl StallSchedule {
 
     /// Takes the convoys of `held` to judge at `now`: those changed since they were last judged
     /// and those due. Whether the namespace's own steps are due goes with them.
-    pub(super) fn take(&mut self, held: &HashSet<&String>, now: DateTime<Utc>) -> Pass {
+    /// `held` maps each convoy held here to whether it has ended.
+    pub(super) fn take(&mut self, held: &HashMap<&String, bool>, now: DateTime<Utc>) -> Pass {
+        // A change that names no convoy passes by the ended ones already judged since they ended:
+        // their seats are gone, so nothing they hold can move.
+        let every = || held.iter().filter(|(name, ended)| !**ended || !self.ended_judged.contains(**name)).map(|(name, _)| (*name).clone());
         if std::mem::take(&mut self.every_changed) {
-            self.changed.extend(held.iter().map(|name| (*name).clone()));
+            let every: Vec<String> = every().collect();
+            self.changed.extend(every);
         }
         if std::mem::take(&mut self.every_unread) {
-            self.unread.extend(held.iter().map(|name| (*name).clone()));
+            let every: Vec<String> = every().collect();
+            self.unread.extend(every);
         }
         // A convoy no longer held here is judged no more.
-        self.changed.retain(|name| held.contains(name));
-        self.unread.retain(|name| held.contains(name));
-        self.standings.retain(|name, _| held.contains(name));
-        self.due.retain(|name, _| held.contains(name));
-        self.seen.retain(|name| held.contains(name));
+        self.changed.retain(|name| held.contains_key(name));
+        self.unread.retain(|name| held.contains_key(name));
+        self.standings.retain(|name, _| held.contains_key(name));
+        self.due.retain(|name, _| held.contains_key(name));
+        self.seen.retain(|name| held.contains_key(name));
+        self.ended_judged.retain(|name| held.get(name) == Some(&true));
         let due: Vec<String> = self.due.iter().filter(|(_, at)| **at <= now).map(|(name, _)| name.clone()).collect();
         for name in &due {
             self.due.remove(name);
@@ -151,13 +162,18 @@ impl StallSchedule {
             self.retry = None;
         }
         let first = judged.iter().filter(|name| self.seen.insert((*name).clone())).cloned().collect();
-        Pass { judged, first, charter: std::mem::take(&mut self.charter), retry }
+        let ended =
+            judged.iter().filter(|name| held.get(name) == Some(&true) && self.ended_judged.insert((*name).clone())).cloned().collect();
+        Pass { judged, first, ended, charter: std::mem::take(&mut self.charter), retry }
     }
 
     /// Puts back what `pass` took and did not finish, for the next pass.
     pub(super) fn put_back(&mut self, pass: Pass) {
         for name in &pass.first {
             self.seen.remove(name);
+        }
+        for name in &pass.ended {
+            self.ended_judged.remove(name);
         }
         self.changed.extend(pass.judged);
         self.charter |= pass.charter;
@@ -205,6 +221,8 @@ pub(super) struct Pass {
     pub(super) judged: HashSet<String>,
     /// Those of them judged for the first time since the schedule began.
     pub(super) first: HashSet<String>,
+    /// Those of them ended and judged for the first time since they ended.
+    ended: HashSet<String>,
     /// Whether the charter notifications are reconciled.
     pub(super) charter: bool,
     /// Whether the namespace's own steps are retried.
@@ -226,11 +244,16 @@ mod tests {
         names.iter().map(|name| (*name).to_owned()).collect()
     }
 
+    /// `names` held here, each live.
+    fn live(names: &HashSet<String>) -> HashMap<&String, bool> {
+        names.iter().map(|name| (name, false)).collect()
+    }
+
     #[test]
     fn a_pass_takes_the_changed_and_the_due_and_nothing_else() {
         let now = Utc::now();
         let held_names = names(&["a", "b", "c"]);
-        let held: HashSet<&String> = held_names.iter().collect();
+        let held = live(&held_names);
         let mut schedule = StallSchedule::default();
         // The first pass judges every convoy, once.
         assert_eq!(schedule.take(&held, now).judged, held_names);
@@ -247,7 +270,7 @@ mod tests {
     fn a_heard_home_judges_again_what_its_silence_left() {
         let now = Utc::now();
         let held_names = names(&["a", "b"]);
-        let held: HashSet<&String> = held_names.iter().collect();
+        let held = live(&held_names);
         let mut schedule = StallSchedule::default();
         schedule.take(&held, now);
         schedule.waits("a", Waits { due: None, unheard: BTreeSet::from(["other".to_owned()]) });
@@ -255,5 +278,25 @@ mod tests {
         assert!(schedule.take(&held, now).is_empty());
         schedule.heard("other");
         assert_eq!(schedule.take(&held, now).judged, names(&["a"]));
+    }
+
+    #[test]
+    fn a_change_naming_no_convoy_passes_by_the_ended_already_judged() {
+        let now = Utc::now();
+        let held_names = names(&["live", "ended", "ending"]);
+        let mut held: HashMap<&String, bool> = held_names.iter().map(|name| (name, name == "ended")).collect();
+        let mut schedule = StallSchedule::default();
+        assert_eq!(schedule.take(&held, now).judged, held_names, "the first pass judges every convoy");
+        schedule.changed(None);
+        assert_eq!(schedule.take(&held, now).judged, names(&["live", "ending"]));
+        // A convoy that ended while its change went unheard is judged once more, then passed by.
+        held.insert(held_names.get("ending").expect("held"), true);
+        schedule.changed(None);
+        assert_eq!(schedule.take(&held, now).judged, names(&["live", "ending"]));
+        schedule.changed(None);
+        assert_eq!(schedule.take(&held, now).judged, names(&["live"]));
+        // A change that names an ended convoy still judges it.
+        schedule.changed(Some(&names(&["ended"])));
+        assert_eq!(schedule.take(&held, now).judged, names(&["ended"]));
     }
 }
