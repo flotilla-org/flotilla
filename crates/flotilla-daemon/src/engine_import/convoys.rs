@@ -5,15 +5,20 @@
 use std::collections::BTreeMap;
 
 use flotilla_address::Address;
+use flotilla_admission::{reconcilers::convoy_ensure::generation_end, standing::fold};
 use flotilla_engine_convoys::convoy_import::{import_all, write_into, ConvoyImportWorld};
 use flotilla_engine_store::{Import, ImportTarget};
-use flotilla_provisioning::engine::import::{ImportRefusal, ImportReport};
-use flotilla_resources::{Convoy, Forge};
+use flotilla_provisioning::engine::{
+    import::{created, ImportRefusal, ImportReport},
+    standing_roles::record,
+};
+use flotilla_resources::{standing_roles::RunningValues, Convoy, Forge, ResourceObject, ENSURED_FROM_ANNOTATION};
 use flotilla_state_machines::machines::message::MessageRef;
 
 use super::{Carried, Source};
 
 const KIND: &str = "Convoy";
+const STANDING_ROLE: &str = "StandingRole";
 
 /// The engine messages the Message importer mapped, by old record name.
 struct Messages<'a> {
@@ -64,9 +69,46 @@ pub(super) fn convoys(source: &Source, target: &mut Import, carried: &mut Carrie
             for refusal in &mapped.refused {
                 report.refused.push(ImportRefusal { kind: KIND, record: refused_name(refusal), reason: refusal.to_string() });
             }
+            standing_roles(&convoys, &home, target, report);
         }
     }
     carried.convoys.extend(written_convoys);
+}
+
+/// Seeds each standing role homed at `home` with its generations' ends folded oldest first, as
+/// its ensure pass would have folded them: the strikes and backoff its dropped ended generations
+/// carried survive them.
+fn standing_roles(convoys: &[ResourceObject<Convoy>], home: &str, target: &mut Import, report: &mut ImportReport) {
+    let mut roles = BTreeMap::<&str, Vec<&ResourceObject<Convoy>>>::new();
+    for convoy in convoys {
+        if let Some(ensure) = convoy.metadata.annotations.get(ENSURED_FROM_ANNOTATION) {
+            roles.entry(ensure).or_default().push(convoy);
+        }
+    }
+    'roles: for (ensure, mut generations) in roles {
+        generations.sort_by_key(|convoy| convoy.spec.generation);
+        let mut values = RunningValues::default();
+        // The record is created as the last generation it counts was.
+        let mut counted = None;
+        for convoy in generations {
+            match generation_end(convoy) {
+                Ok(Some(end)) => {
+                    values = fold(&values, &end);
+                    counted = Some(convoy);
+                }
+                Ok(None) => {}
+                Err(reason) => {
+                    report.refused.push(ImportRefusal { kind: STANDING_ROLE, record: ensure.to_owned(), reason });
+                    continue 'roles;
+                }
+            }
+        }
+        let Some(counted) = counted else { continue };
+        match target.write(home, ensure, &created(counted), &record(&values)) {
+            Ok(()) => *report.imported.entry((STANDING_ROLE, "folded")).or_default() += 1,
+            Err(reason) => report.refused.push(ImportRefusal { kind: STANDING_ROLE, record: ensure.to_owned(), reason }),
+        }
+    }
 }
 
 fn refused_name(refusal: &flotilla_engine_convoys::convoy_import::ConvoyImportRefusal) -> String {

@@ -101,7 +101,7 @@ fn ended(convoy: &ResourceObject<ResourceConvoy>) -> bool {
 /// An ended generation's end as [`standing::fold`] reads it: admitted at its creation under the
 /// configuration its admission recorded, and ended as its phase says, at its finish (its admission
 /// when none was recorded). `None` while it runs.
-fn generation_end(convoy: &ResourceObject<ResourceConvoy>) -> Result<Option<GenerationEnd>, String> {
+pub fn generation_end(convoy: &ResourceObject<ResourceConvoy>) -> Result<Option<GenerationEnd>, String> {
     let Some(status) = convoy.status.as_ref() else { return Ok(None) };
     let ending = match status.phase {
         ConvoyPhase::Failed => Ending::Failed,

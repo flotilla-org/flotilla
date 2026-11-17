@@ -652,6 +652,45 @@ fn a_standing_convoys_generations_import_as_one_stable_identity() {
     }
 }
 
+// Behaviour (#3108 retirement): a standing role's ended generations, which the import drops, carry
+// on as its running values: three short failures under its configuration are three strikes,
+// backing off from the last one's end.
+#[test]
+fn a_standing_roles_dropped_generations_seed_its_strikes() {
+    use flotilla_provisioning::stored::standing_role::StandingRoleRecord;
+
+    let ensure = json!({"project_ref": "flotilla", "role": "governor", "repositories": []});
+    let mut documents: Vec<_> = (1..=3)
+        .map(|generation| {
+            let finished = format!("2026-10-19T00:0{generation}:00Z");
+            let mut convoy = document(
+                "Convoy",
+                &format!("governor-{generation}"),
+                json!({"workflow_ref": "w", "inputs": {}, "project_ref": "flotilla", "role": "governor", "generation": generation}),
+                json!({"phase": "Failed", "ensure_admission": ensure, "finished_at": finished, "message": "clone failed"}),
+            );
+            convoy["metadata"]["annotations"] = json!({"flotilla.work/ensured-from": "standing-governor"});
+            convoy
+        })
+        .collect();
+    documents.push(document("ConvoyEnsure", "standing-governor", ensure.clone(), Value::Null));
+    let dir = tempfile::tempdir().expect("tempdir");
+    let mut target =
+        Import::create(&dir.path().join(ENGINE_STORE), HERE, crate::runtime::decided_registry().expect("registry")).expect("target");
+    let summary = import(&rows(documents), &mut target);
+    drop(target);
+    assert!(summary.refusals.is_empty(), "{summary:?}");
+
+    let mut store = engine(dir.path());
+    let mut read = store.read().expect("read");
+    let id = read.resolve(StandingRoleRecord::CODE, "standing-governor", HERE).expect("resolve").expect("the role is seeded");
+    let role = read.load::<StandingRoleRecord>(id).expect("load").expect("held").value;
+    assert_eq!(role.strikes, 3);
+    assert_eq!(role.counted, Some(3));
+    assert_eq!(role.backoff_from, Some(Timestamp::from_datetime(&"2026-10-19T00:03:00Z".parse().expect("time"))));
+    assert_eq!(role.last_failure.as_deref(), Some("clone failed"));
+}
+
 #[test]
 fn another_hosts_records_are_read_beside_ours_but_neither_written_nor_counted() {
     let theirs = |mut document: Value| {

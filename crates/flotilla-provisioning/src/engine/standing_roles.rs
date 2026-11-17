@@ -36,7 +36,8 @@ fn values(record: StandingRoleRecord) -> RunningValues {
     }
 }
 
-fn record(values: &RunningValues) -> StandingRoleRecord {
+/// The record of a role's `values`: what its ensure pass writes, and the import seeds.
+pub fn record(values: &RunningValues) -> StandingRoleRecord {
     StandingRoleRecord {
         strikes: values.strikes,
         strike_config: values.strike_config.clone(),
