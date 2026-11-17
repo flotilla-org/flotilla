@@ -31,8 +31,8 @@ use flotilla_resources::{
     CheckoutWorktreeSpec as ResourceCheckoutWorktreeSpec, Convoy as ResourceConvoy, ConvoyRepositorySpec, ConvoySpec, CredentialConsumer,
     CredentialLifecycle, CredentialSource, CredentialSpec, CredentialSpecSpec, CrewSource, CrewSpec, FulfilmentGrant, FulfilmentKind,
     FulfilmentKindSpec, FulfilmentRealisation, ImageAcquisitionCost, InputMeta, ObservedChangeRequestState,
-    ObservedCheckoutSpec as ResourceObservedCheckoutSpec, Repository, RepositorySpec, ResourceObject, VesselRequirement, WorkflowTemplate,
-    WorkflowTemplateSpec,
+    ObservedCheckoutSpec as ResourceObservedCheckoutSpec, Repository, RepositorySpec, Resource, ResourceObject, ResourceProvenance,
+    VesselRequirement, WorkflowTemplate, WorkflowTemplateSpec,
 };
 use flotilla_store_testkit::cr_name;
 
@@ -334,6 +334,30 @@ async fn concurrent_duplicate_adopted_convoy_creates_leave_only_the_winning_chec
     assert!(discovered.iter().all(|checkout| owned.contains(&checkout.name)), "loser must not publish an orphan discovered checkout");
 }
 
+/// Every copy of snapshot `name` that `backend` holds: the home each came from, and its version.
+async fn snapshot_sources<T: Resource>(backend: &EngineBackend, name: &str) -> Vec<(String, String)> {
+    let sources = backend.including_replicas::<T>("flotilla").list_replica_sources().await.expect("read snapshot sources");
+    sources
+        .items
+        .into_iter()
+        .filter(|read| read.object.metadata.name == name)
+        .map(|read| {
+            let home = match read.provenance {
+                ResourceProvenance::Local => backend.home().to_owned(),
+                ResourceProvenance::Replica { origin_root, .. } => origin_root.as_str().to_owned(),
+            };
+            (home, read.object.metadata.resource_version)
+        })
+        .collect()
+}
+
+/// Asserts `before` is the snapshot-home's copy alone and `after` is that same copy: the driver
+/// wrote no snapshot of its own.
+fn assert_still_the_homes_copy(before: &[(String, String)], after: &[(String, String)]) {
+    assert!(matches!(before, [(home, _)] if home == "snapshot-home"), "the driver holds the home's snapshot alone: {before:?}");
+    assert_eq!(after, before, "the driver still holds only the home's copy, unchanged");
+}
+
 #[tokio::test]
 async fn prepared_workflow_snapshot_reuses_an_identical_replica() {
     let home = EngineBackend::open("snapshot-home");
@@ -343,9 +367,10 @@ async fn prepared_workflow_snapshot_reuses_an_identical_replica() {
 
     ensure_prepared_workflow_snapshot(&home, "flotilla", &name, &spec).await.expect("author snapshot on home");
     replicate_home(&home.service, home.home(), &driver.service);
+    let before = snapshot_sources::<WorkflowTemplate>(&driver, &name).await;
 
     ensure_prepared_workflow_snapshot(&driver, "flotilla", &name, &spec).await.expect("reuse identical replicated snapshot");
-    assert!(driver.using::<WorkflowTemplate>("flotilla").list().await.expect("driver local workflow log").items.is_empty());
+    assert_still_the_homes_copy(&before, &snapshot_sources::<WorkflowTemplate>(&driver, &name).await);
 }
 
 fn snapshot_kind(pool: &str) -> FulfilmentKindSpec {
@@ -361,9 +386,10 @@ async fn prepared_placement_snapshot_reuses_an_identical_replica() {
 
     ensure_prepared_placement_snapshot(&home, "flotilla", &name, "convoy", &spec).await.expect("author snapshot on home");
     replicate_home(&home.service, home.home(), &driver.service);
+    let before = snapshot_sources::<FulfilmentKind>(&driver, &name).await;
 
     ensure_prepared_placement_snapshot(&driver, "flotilla", &name, "convoy", &spec).await.expect("reuse identical replicated snapshot");
-    assert!(driver.using::<FulfilmentKind>("flotilla").list().await.expect("driver local placement log").items.is_empty());
+    assert_still_the_homes_copy(&before, &snapshot_sources::<FulfilmentKind>(&driver, &name).await);
 }
 
 #[tokio::test]
@@ -375,12 +401,13 @@ async fn prepared_placement_snapshot_rejects_a_different_replica_spec() {
     let requested = snapshot_kind("cleat");
     home.using::<FulfilmentKind>("flotilla").create(&test_meta(name), &authored).await.expect("author snapshot on home");
     replicate_home(&home.service, home.home(), &driver.service);
+    let before = snapshot_sources::<FulfilmentKind>(&driver, name).await;
 
     let error = ensure_prepared_placement_snapshot(&driver, "flotilla", name, "convoy", &requested)
         .await
         .expect_err("mismatched replica must be refused");
     assert_eq!(error, format!("prepared placement snapshot {name} already exists with different contents"));
-    assert!(driver.using::<FulfilmentKind>("flotilla").list().await.expect("driver local placement log").items.is_empty());
+    assert_still_the_homes_copy(&before, &snapshot_sources::<FulfilmentKind>(&driver, name).await);
 }
 
 /// Admits a launch of convoy `name` on `daemon`'s engine, which its checkouts are held for.
