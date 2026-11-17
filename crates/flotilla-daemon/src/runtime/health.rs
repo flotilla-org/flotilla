@@ -16,7 +16,7 @@ use flotilla_credentials::CredentialStore;
 use flotilla_protocol::{BlobSyncStatus, HostSummary, Rows};
 use flotilla_resources::{
     ConditionValue, Convoy, CredentialExpiry, FoldedHostObservations, Forge, FulfilmentFacts, Host, HostCondition, HostStatus,
-    HostStatusPatch, SystemClock, AGENT_ADAPTERS_CAPABILITY, CREDENTIAL_EXPIRY_CAPABILITY, HELD_CREDENTIALS_CAPABILITY,
+    HostStatusPatch, ResourceObject, SystemClock, AGENT_ADAPTERS_CAPABILITY, CREDENTIAL_EXPIRY_CAPABILITY, HELD_CREDENTIALS_CAPABILITY,
     LOCAL_ROWS_MISSING_REASON, PROJECTION_PARITY_CONDITION,
 };
 use flotilla_store::ResourceBackend;
@@ -25,7 +25,7 @@ use tokio::task::JoinHandle;
 use tracing::{error, warn};
 
 use super::discovery::LocalProvisioningProfile;
-use super::seed::{canonicalize_kind_hosts, ensure_host_exists};
+use super::seed::{canonicalize_kinds_for, ensure_host_matches};
 use super::tasks::{spawn_periodic_task, PeriodicTaskStart, AGGREGATOR_CONTROLLER, CONVOY_ENSURE_CONDITION_TYPE};
 use crate::{
     blob_store::TieredBlobStore, resource_limits::file_descriptor_pressure_condition, resource_manifest::manifest_root_name,
@@ -420,10 +420,17 @@ pub(super) async fn apply_host_heartbeat_with_credentials(
     runtime_health: &RuntimeHealth,
 ) -> Result<(), String> {
     daemon.set_admission_free_space_path(PathBuf::from(&profile.repo_default_dir));
-    ensure_host_exists(&daemon.resource_backend(), namespace, &profile.host_id, &profile.display_name, profile.max_vessels).await?;
     let backend = daemon.resource_backend();
-    let hosts = backend.using::<Host>(namespace);
-    let host = hosts.get(&profile.host_id).await.map_err(|err| err.to_string())?;
+    let hosts = backend.clone().using::<Host>(namespace);
+    // The tick's one read of the Hosts: this daemon's own, and those its kinds may name. It reads
+    // again only after bringing its own in line with the profile.
+    let mut listed = hosts.list().await.map_err(|err| err.to_string())?.items;
+    let own = |host: &&ResourceObject<Host>| host.metadata.name == profile.host_id;
+    let existing = listed.iter().find(own);
+    if ensure_host_matches(&hosts, existing, &profile.host_id, &profile.display_name, profile.max_vessels).await? {
+        listed = hosts.list().await.map_err(|err| err.to_string())?.items;
+    }
+    let host = listed.iter().find(own).ok_or_else(|| format!("host {} is not held", profile.host_id))?;
     let adapter_assessment = assess_agent_adapter_capabilities(host.status.as_ref(), &profile.available_agent_adapters, health);
     if let Some(condition) = adapter_assessment.regression {
         runtime_health.report_capability_regression(condition);
@@ -438,7 +445,7 @@ pub(super) async fn apply_host_heartbeat_with_credentials(
         Err(error) => (None, Some(error)),
     };
     let admission_free_space_floor_bytes = daemon.admission_free_space_floor_bytes()?;
-    canonicalize_kind_hosts(&backend, namespace, &profile.host_id).await?;
+    canonicalize_kinds_for(&backend, namespace, &listed, &profile.host_id).await?;
     let mut conditions = runtime_health.conditions().await;
     conditions.extend(daemon.project_image_layer_conditions().await);
     conditions.extend(daemon.observation_credential_conditions().await);
@@ -464,12 +471,8 @@ pub(super) async fn apply_host_heartbeat_with_credentials(
     if let Some(providers) = runtime_health.host_observations.provider_advertisements().await {
         capabilities.insert(flotilla_resources::ENVIRONMENT_PROVIDERS_CAPABILITY.into(), serde_json::json!(providers));
     }
-    if let Some(snapshot) = crate::resource_limits::io_pressure_snapshot().await {
-        capabilities.insert("io_pressure".to_string(), snapshot);
-    }
-    capabilities.insert("forge_budgets".into(), serde_json::to_value(daemon.forge_budget_rows()).expect("forge budgets serialize"));
     let ready = !conditions.iter().any(HostCondition::blocks_readiness);
-    flotilla_store::apply_status_patch(
+    flotilla_store::observe_status(
         &hosts,
         &profile.host_id,
         &HostStatusPatch::Heartbeat {

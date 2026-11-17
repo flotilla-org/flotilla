@@ -1082,15 +1082,7 @@ impl ReadProjections<'_> {
         snapshot.insert::<FulfilmentKind>(kinds)?;
         let reads = snapshot.finish();
         let rows = self.fleet.rows_with_backend(&reads, namespace, self.host_registry, self.lifecycles).await?;
-        let mut response = self.with_backend(&reads).fleet_health(namespace, host_list, rows, local_host_id, now).await?;
-        for host in hosts.items {
-            if let Some(value) = host.object.status.and_then(|status| status.capabilities.get("forge_budgets").cloned()) {
-                if let Ok(rows) = serde_json::from_value::<Vec<flotilla_protocol::ForgeBudgetRow>>(value) {
-                    response.forge_budgets.extend(rows);
-                }
-            }
-        }
-        Ok(response)
+        self.with_backend(&reads).fleet_health(namespace, host_list, rows, local_host_id, now).await
     }
 
     pub async fn fleet_inventory(

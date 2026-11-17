@@ -1,4 +1,5 @@
 use super::*;
+use crate::runtime::tasks::LocalFulfilmentProbe;
 use flotilla_resources::FulfilmentGrant;
 use flotilla_store_memory::InMemoryBackend;
 
@@ -767,6 +768,90 @@ async fn unknown_observation_keeps_a_gui_grant() {
     assert!(!facts["host-direct-kiwi"].gui_session_logged_in, "the published fact is unknown");
     let kind = kinds.get("host-direct-kiwi").await.expect("kind");
     assert!(kind.spec.grants.contains(&FulfilmentGrant::gui_session()), "{:?}", kind.spec.grants);
+}
+
+/// What `tick` cost: its output, its reads of Hosts by kind, and the entries this home's log
+/// gained while it ran.
+async fn host_tick_cost<F: std::future::Future>(daemon: &InProcessDaemon, tick: F) -> (F::Output, HostReads, u64) {
+    let store = daemon.decided_store().expect("decided store");
+    let logged = || store.last_sequence(store.home()).expect("this home's sequence");
+    let before = logged();
+    // The Hosts' resident records read every earlier write first, so their catching up is not counted.
+    daemon.resource_backend().using::<Host>(NAMESPACE).list().await.expect("hosts");
+    let (output, reads) = flotilla_store::load_metrics::measure(tick).await;
+    let host_reads = reads
+        .into_iter()
+        .filter(|(kind, _)| kind.starts_with("Host"))
+        .map(|(kind, counts)| (kind, counts.keyed + counts.index + counts.whole_kind))
+        .filter(|(_, reads)| *reads > 0)
+        .collect();
+    (output, HostReads(host_reads), logged() - before)
+}
+
+/// Reads of the Host kinds, by kind: the port's, and the store's of each record kind.
+#[derive(Debug)]
+struct HostReads(BTreeMap<String, u64>);
+
+impl HostReads {
+    fn total(&self) -> u64 {
+        self.0.values().sum()
+    }
+}
+
+// Behaviour: a heartbeat tick that finds nothing changed since the tick before reads the Hosts
+// once and writes nothing.
+#[tokio::test]
+async fn an_idle_heartbeat_reads_the_hosts_once_and_writes_nothing() {
+    let temp = TempDir::new().expect("tempdir");
+    fs::write(temp.path().join("daemon.toml"), "machine_id = \"idle-heartbeat-test\"\n").expect("daemon config");
+    let daemon = in_memory_daemon(Vec::new(), Arc::new(ConfigStore::with_base(temp.path()))).await;
+    let host_id = daemon.local_host_id().expect("local host id").to_string();
+    let profile = manual_profile(&host_id, false);
+    let (health, runtime_health) = (test_health_identity(), RuntimeHealth::default());
+    let heartbeat = || apply_host_heartbeat_with_credentials(&daemon, NAMESPACE, &profile, None, &health, &runtime_health);
+    let ((), _, written) = host_tick_cost(&daemon, async { heartbeat().await.expect("first heartbeat") }).await;
+    assert!(written > 0, "the first heartbeat registers the Host and writes its observation");
+
+    let ((), reads, written) = host_tick_cost(&daemon, async { heartbeat().await.expect("idle heartbeat") }).await;
+    assert!(reads.total() <= 1, "an idle heartbeat read the Hosts more than once: {reads:?}");
+    assert_eq!(written, 0, "an idle heartbeat wrote");
+}
+
+// Behaviour: a fulfilment probe tick that observes the facts it published before reads the Hosts
+// once and writes nothing.
+#[tokio::test]
+async fn an_idle_fulfilment_probe_reads_the_hosts_once_and_writes_nothing() {
+    let temp = TempDir::new().expect("tempdir");
+    fs::write(temp.path().join("daemon.toml"), "machine_id = \"idle-probe-test\"\n").expect("daemon config");
+    let daemon = in_memory_daemon(Vec::new(), Arc::new(ConfigStore::with_base(temp.path()))).await;
+    let host_id = daemon.local_host_id().expect("local host id").to_string();
+    let profile = manual_profile(&host_id, false);
+    let runtime_health = RuntimeHealth::default();
+    apply_host_heartbeat_with_credentials(&daemon, NAMESPACE, &profile, None, &test_health_identity(), &runtime_health)
+        .await
+        .expect("heartbeat");
+    daemon
+        .resource_backend()
+        .using::<FulfilmentKind>(NAMESPACE)
+        .create(&empty_meta("host-direct-idle-probe"), &host_direct_kind_spec(&host_id, "linux"))
+        .await
+        .expect("fulfilment kind");
+    let probe = LocalFulfilmentProbe::new(
+        Arc::clone(&daemon),
+        NAMESPACE.to_string(),
+        profile,
+        detection_registry(daemon.discovery_runtime().runner.clone()),
+        temp.path().join("probe-cwd"),
+        runtime_health.host_observations.clone(),
+    );
+    let ((), _, written) = host_tick_cost(&daemon, probe.tick()).await;
+    assert!(written > 0, "the first probe publishes the kind's facts");
+    let status = daemon.resource_backend().using::<Host>(NAMESPACE).get(&host_id).await.expect("host").status.expect("status");
+    assert!(status.fulfilment_facts.contains_key("host-direct-idle-probe"), "{:?}", status.fulfilment_facts);
+
+    let ((), reads, written) = host_tick_cost(&daemon, probe.tick()).await;
+    assert!(reads.total() <= 1, "an idle probe read the Hosts more than once: {reads:?}");
+    assert_eq!(written, 0, "an idle probe wrote");
 }
 
 fn host_direct_kind_spec(host_id: &str, platform: &str) -> FulfilmentKindSpec {

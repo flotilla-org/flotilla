@@ -562,13 +562,33 @@ pub(super) struct FulfilmentProbeContext<'a> {
 
 /// The daemon's own host declares its environment through the daemon
 /// process: its probes take that `PATH` and locale as their base layer.
-pub(super) fn local_observation(discovery: &DiscoveryRuntime) -> Result<ObservationContext, String> {
-    let declared = std::iter::once("PATH").chain(LOCALE_VARIABLES.iter().copied());
-    let base = BaseLayer::declared(
-        declared.filter_map(|name| discovery.env.get(name).map(|value| (name.to_string(), value))),
-        &discovery.factories.account_variables(),
-    )?;
-    Ok(ObservationContext::new(base, &discovery.factories.account_variables()))
+/// The context is made again only when those variables change; the account
+/// variables come from the daemon's factories, fixed for its life.
+#[derive(Default)]
+pub(super) struct LocalObservation {
+    made: Option<(DeclaredVariables, Arc<ObservationContext>)>,
+}
+
+/// The variables the daemon's own host declares, by name.
+type DeclaredVariables = Vec<(&'static str, String)>;
+
+impl LocalObservation {
+    pub(super) fn current(&mut self, discovery: &DiscoveryRuntime) -> Result<Arc<ObservationContext>, String> {
+        let declared: DeclaredVariables = std::iter::once("PATH")
+            .chain(LOCALE_VARIABLES.iter().copied())
+            .filter_map(|name| discovery.env.get(name).map(|value| (name, value)))
+            .collect();
+        if let Some((made_from, context)) = &self.made {
+            if *made_from == declared {
+                return Ok(Arc::clone(context));
+            }
+        }
+        let accounts = discovery.factories.account_variables();
+        let base = BaseLayer::declared(declared.iter().map(|(name, value)| (name.to_string(), value.clone())), &accounts)?;
+        let context = Arc::new(ObservationContext::new(base, &accounts));
+        self.made = Some((declared, Arc::clone(&context)));
+        Ok(context)
+    }
 }
 
 pub(super) async fn observe_fulfilment_facts(

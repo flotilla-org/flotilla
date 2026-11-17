@@ -897,6 +897,20 @@ impl<T: Resource> TypedResolver<T> {
         self.backend.definitions::<T>(&self.namespace).refuse_write_elsewhere()
     }
 
+    /// `patch` applied to this home's engine record `name`'s status by its port, in the port's own
+    /// order of writes; whether it wrote. `None` when no port serving the kind keeps one.
+    pub(crate) async fn patch_engine_status(
+        &self,
+        name: &str,
+        patch: &flotilla_resources::engine_records::PatchStatus<'_, T::Status>,
+    ) -> Option<Result<bool, ResourceError>> {
+        let records = self.backend.engine_records::<T>()?;
+        if let Err(error) = self.refuse_engine_write_elsewhere() {
+            return Some(Err(error));
+        }
+        Some(records.patch_status(name, patch).await?.map_err(ResourceError::other))
+    }
+
     /// This home's own engine record `name`, if any.
     async fn engine_home_record(
         &self,

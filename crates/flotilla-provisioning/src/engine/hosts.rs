@@ -30,7 +30,7 @@ use flotilla_protocol::{
     EnvironmentId, HostSummary, NodeId, NodeInfo, SystemInfo,
 };
 use flotilla_resources::{
-    engine_records::{CommitMark, KindRecords, LogPosition, Record, Since, Ticks, UnloggedJournal},
+    engine_records::{CommitMark, KindRecords, LogPosition, PatchStatus, Record, Since, Ticks, UnloggedJournal},
     CredentialExpiry, FulfilmentFacts, HarnessFacts, Host, HostCondition, HostConnection, HostSpec, HostStatus, LocalImageInventories,
     AGENT_ADAPTERS_CAPABILITY, CODEX_CENTRAL_LOGIN_CAPABILITY, CREDENTIAL_EXPIRY_CAPABILITY, ENVIRONMENT_PROVIDERS_CAPABILITY,
     HELD_CREDENTIALS_CAPABILITY, IMAGE_DIGESTS_CAPABILITY, OWNING_DAEMON_CAPABILITY, PLACEMENT_CAPABILITY, SSH_HOST_CAPABILITY,
@@ -63,9 +63,21 @@ const OBSERVER: &str = "host-observer";
 /// One home's records of one Host, as the resident map holds them.
 #[derive(Clone, Debug)]
 struct Held {
-    /// The Host record, its version and when it was created.
-    host: Option<(HostRecord, u64, DateTime<Utc>)>,
+    /// The Host's spec, its record's version and when it was created.
+    host: Option<(HostSpec, u64, DateTime<Utc>)>,
     observation: Option<(HostObservation, u64)>,
+    /// The capability map the records rebuild, made once each time either is read.
+    capabilities: BTreeMap<String, Value>,
+}
+
+impl Held {
+    fn new(host: Option<(HostSpec, u64, DateTime<Utc>)>, observation: Option<(HostObservation, u64)>) -> Self {
+        let capabilities = match (&host, &observation) {
+            (Some((spec, _, _)), Some((observation, _))) => capabilities(&spec.connection, observation),
+            _ => BTreeMap::new(),
+        };
+        Self { host, observation, capabilities }
+    }
 }
 
 /// Every home's records, by name and home.
@@ -83,7 +95,7 @@ fn locked<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
 fn reload(read: &mut Read<'_>, records: &mut Records, name: &str, home: &str) -> Result<(), StoreError> {
     let host = match read.resolve(HOST, name, home)? {
         Some(id) => match read.load::<HostRecord>(id)? {
-            Some(loaded) => Some((loaded.value, loaded.version, created_at(read, id)?)),
+            Some(loaded) => Some((loaded.value.spec(), loaded.version, created_at(read, id)?)),
             None => None,
         },
         None => None,
@@ -96,7 +108,7 @@ fn reload(read: &mut Read<'_>, records: &mut Records, name: &str, home: &str) ->
     if host.is_none() && observation.is_none() {
         records.remove(&key);
     } else {
-        records.insert(key, Held { host, observation });
+        records.insert(key, Held::new(host, observation));
     }
     Ok(())
 }
@@ -168,6 +180,19 @@ pub fn status(
     heard: Option<DateTime<Utc>>,
     now: DateTime<Utc>,
 ) -> HostStatus {
+    judged(name, home, spec, observation, capabilities(&spec.connection, observation), heard, now)
+}
+
+/// [`status`], with the capability map the observation rebuilds already made.
+fn judged(
+    name: &str,
+    home: &str,
+    spec: &HostSpec,
+    observation: &HostObservation,
+    capabilities: BTreeMap<String, Value>,
+    heard: Option<DateTime<Utc>>,
+    now: DateTime<Utc>,
+) -> HostStatus {
     let observed_at = heard.unwrap_or(DateTime::UNIX_EPOCH);
     let conditions: Vec<HostCondition> = observation
         .conditions
@@ -196,7 +221,7 @@ pub fn status(
     });
     let mut status = HostStatus {
         description,
-        capabilities: capabilities(&spec.connection, observation),
+        capabilities,
         fulfilment_facts: observation
             .facts
             .iter()
@@ -400,9 +425,11 @@ impl EngineHosts {
 
     /// `held`, at `home`, as the resource; None for an observation whose Host is gone.
     fn object(&self, name: &str, home: &str, held: &Held) -> Option<Record<Host>> {
-        let (host, host_version, created_at) = held.host.as_ref()?;
-        let spec = host.spec();
-        let status = held.observation.as_ref().map(|(observation, _)| status(name, home, &spec, observation, self.heard(home), self.now()));
+        let (spec, host_version, created_at) = held.host.as_ref()?;
+        let status = held
+            .observation
+            .as_ref()
+            .map(|(observation, _)| judged(name, home, spec, observation, held.capabilities.clone(), self.heard(home), self.now()));
         Some(Record {
             name: name.to_owned(),
             home: home.to_owned(),
@@ -413,7 +440,7 @@ impl EngineHosts {
             created_at: *created_at,
             labels: BTreeMap::new(),
             annotations: BTreeMap::new(),
-            spec,
+            spec: spec.clone(),
             status,
         })
     }
@@ -425,16 +452,22 @@ impl EngineHosts {
         let host = match host {
             Some(host) => {
                 let created = self.log.created::<HostRecord>(name, &self.home).map_err(|error| error.to_string())?;
-                Some((host.spec, host.version, created.to_datetime()))
+                Some((host.spec.spec(), host.version, created.to_datetime()))
             }
             None => None,
         };
-        Ok(Held { host, observation: observation.map(|observation| (observation.spec, observation.version)) })
+        Ok(Held::new(host, observation.map(|observation| (observation.spec, observation.version))))
     }
 
+    /// This home's Host `name`, from the resident map: it follows every commit, this home's own
+    /// writes among them, so it holds what the store holds once refreshed.
     fn own_object(&self, name: &str) -> Result<Record<Host>, String> {
-        let held = self.own(name)?;
-        self.object(name, &self.home, &held).ok_or_else(|| format!("{KIND} {name} is not held at {}", self.home))
+        let resident = self.refresh()?;
+        resident
+            .records
+            .get(&(name.to_owned(), self.home.clone()))
+            .and_then(|held| self.object(name, &self.home, held))
+            .ok_or_else(|| format!("{KIND} {name} is not held at {}", self.home))
     }
 
     /// Refused unless a Host `spec` describes is homed here: this daemon's own, or an SSH host it owns.
@@ -469,19 +502,37 @@ impl EngineHosts {
         Err(format!("write {KIND} {name}: lost {WRITE_ATTEMPTS} races with concurrent writers"))
     }
 
-    /// Writes this home's observation of `name` from `status`, only where a value changed.
-    fn write_observation(&self, name: &str, spec: &HostSpec, status: &HostStatus) -> Result<(), String> {
+    /// Writes this home's observation of `name` from the status `patch` makes of the one held,
+    /// only where the observation it maps to differs from the resident map's: an unchanged
+    /// status reads nothing from the store and writes nothing. Whether it wrote.
+    fn write_status(&self, name: &str, patch: &PatchStatus<'_, HostStatus>) -> Result<bool, String> {
+        let key = (name.to_owned(), self.home.clone());
         for _ in 0..WRITE_ATTEMPTS {
-            let held = self.log.get::<HostObservation>(name, &self.home).map_err(|error| error.to_string())?;
-            let observation = observed(spec, status, held.as_ref().map(|held| &held.spec))?;
+            let (observation, version) = {
+                let resident = self.refresh()?;
+                let Some((held, spec)) = resident.records.get(&key).and_then(|held| Some((held, &held.host.as_ref()?.0))) else {
+                    return Err(format!("{KIND} {name} is not held at {}", self.home));
+                };
+                let mut status = match &held.observation {
+                    Some((observation, _)) => {
+                        judged(name, &self.home, spec, observation, held.capabilities.clone(), self.heard(&self.home), self.now())
+                    }
+                    None => HostStatus::default(),
+                };
+                patch(&mut status);
+                let observation = observed(spec, &status, held.observation.as_ref().map(|(held, _)| held))?;
+                match &held.observation {
+                    Some((current, _)) if *current == observation => return Ok(false),
+                    current => (observation, current.as_ref().map(|(_, version)| *version)),
+                }
+            };
             let change = self.change(OBSERVER);
-            let written = match held {
-                // An edit that changes nothing logs nothing and opens no change.
-                Some(current) => self.log.edit(name, current.version, &observation, &change),
+            let written = match version {
+                Some(version) => self.log.edit(name, version, &observation, &change),
                 None => self.log.create(name, &observation, &change),
             };
             match written {
-                Ok(_) => return Ok(()),
+                Ok(_) => return Ok(true),
                 Err(PlainError::Conflict { .. } | PlainError::Exists { .. } | PlainError::Missing { .. }) => continue,
                 Err(error) => return Err(format!("write {KIND} {name} observation: {error}")),
             }
@@ -591,11 +642,15 @@ impl KindRecords<Host> for EngineHosts {
 
     async fn set_status(&self, name: &str, status: &HostStatus) -> Result<Record<Host>, String> {
         let _writing = self.writing.lock().await;
-        let Some((host, _, _)) = self.own(name)?.host else {
-            return Err(format!("{KIND} {name} is not held at {}", self.home));
-        };
-        self.write_observation(name, &host.spec(), status)?;
+        self.write_status(name, &|held: &mut HostStatus| held.clone_from(status))?;
         self.own_object(name)
+    }
+
+    /// Patched under this port's write lock against the resident map, so an unchanged status
+    /// reads nothing from the store.
+    async fn patch_status(&self, name: &str, patch: &PatchStatus<'_, HostStatus>) -> Option<Result<bool, String>> {
+        let _writing = self.writing.lock().await;
+        Some(self.write_status(name, patch))
     }
 
     async fn delete(&self, name: &str) -> Result<(), String> {
@@ -626,7 +681,7 @@ mod tests {
     use crate::stored::host;
 
     fn observed_at(version: u64) -> Held {
-        Held { host: None, observation: Some((HostObservation::default(), version)) }
+        Held::new(None, Some((HostObservation::default(), version)))
     }
 
     // Behaviour (#3824 layer 4d): a Host several homes hold reads as this home's records, else

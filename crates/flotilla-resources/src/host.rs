@@ -395,25 +395,75 @@ impl HostStatus {
         self.conditions.iter().any(HostCondition::blocks_readiness)
     }
 
-    /// This status with every observation timestamp cleared, so two statuses
-    /// compare equal when they observed the same things at different times.
-    pub fn without_observation_times(&self) -> Self {
-        let mut status = self.clone();
-        status.heartbeat_at = None;
-        for condition in &mut status.conditions {
-            condition.observed_at = DateTime::UNIX_EPOCH;
-        }
-        for facts in status.fulfilment_facts.values_mut() {
-            facts.observed_at = DateTime::UNIX_EPOCH;
-        }
-        status
+    /// Whether two statuses observed the same things, whenever each was observed: the heartbeat
+    /// time and each condition's and fact's observation time are not compared.
+    pub fn same_observations_as(&self, other: &Self) -> bool {
+        let Self {
+            description,
+            capabilities,
+            fulfilment_facts,
+            model_probes,
+            agent_adapter_baseline,
+            heartbeat_at: _,
+            ready,
+            sleeping_until,
+            resource_store,
+            blob_sync,
+            daemon_generation,
+            protocol_fingerprint,
+            daemon_version,
+            daemon_started_at,
+            disk_free_bytes,
+            admission_free_space_floor_bytes,
+            below_free_space_floor,
+            conditions,
+            sleep_inhibition,
+        } = self;
+        *description == other.description
+            && *capabilities == other.capabilities
+            && FulfilmentFacts::same_observations(fulfilment_facts, &other.fulfilment_facts)
+            && *model_probes == other.model_probes
+            && *agent_adapter_baseline == other.agent_adapter_baseline
+            && *ready == other.ready
+            && *sleeping_until == other.sleeping_until
+            && *resource_store == other.resource_store
+            && *blob_sync == other.blob_sync
+            && *daemon_generation == other.daemon_generation
+            && *protocol_fingerprint == other.protocol_fingerprint
+            && *daemon_version == other.daemon_version
+            && *daemon_started_at == other.daemon_started_at
+            && *disk_free_bytes == other.disk_free_bytes
+            && *admission_free_space_floor_bytes == other.admission_free_space_floor_bytes
+            && *below_free_space_floor == other.below_free_space_floor
+            && conditions.len() == other.conditions.len()
+            && conditions.iter().zip(&other.conditions).all(|(left, right)| left.same_observation(right))
+            && *sleep_inhibition == other.sleep_inhibition
+    }
+}
+
+impl HostCondition {
+    /// Whether two conditions report the same thing, whenever each was observed.
+    pub fn same_observation(&self, other: &Self) -> bool {
+        let Self { condition_type, value, reason, message, observed_at: _, blocks_readiness, blocks_forge_observation } = self;
+        *condition_type == other.condition_type
+            && *value == other.value
+            && *reason == other.reason
+            && *message == other.message
+            && *blocks_readiness == other.blocks_readiness
+            && *blocks_forge_observation == other.blocks_forge_observation
     }
 }
 
 impl FulfilmentFacts {
     /// Whether two observations report the same facts, whenever they were made.
     pub fn same_observation(&self, other: &Self) -> bool {
-        Self { observed_at: other.observed_at, ..self.clone() } == *other
+        let Self { harnesses, toolchains, gui_session_logged_in, free_vessel_slots, image, image_present, observed_at: _ } = self;
+        *harnesses == other.harnesses
+            && *toolchains == other.toolchains
+            && *gui_session_logged_in == other.gui_session_logged_in
+            && *free_vessel_slots == other.free_vessel_slots
+            && *image == other.image
+            && *image_present == other.image_present
     }
 
     /// Whether two fulfilment maps report the same facts per kind, whenever
@@ -663,7 +713,7 @@ impl StatusPatch<HostStatus> for HostStatusPatch {
     /// observation; fold timestamp-only refreshes into the heartbeat, which
     /// still commits often enough to keep `heartbeat_at` fresh.
     fn requires_write(&self, before: &HostStatus, after: &HostStatus) -> bool {
-        if before.without_observation_times() != after.without_observation_times() {
+        if !before.same_observations_as(after) {
             return true;
         }
         match self {

@@ -269,6 +269,9 @@ impl IndexCover {
     }
 }
 
+/// A patch to a status, as [`KindRecords::patch_status`] applies it.
+pub type PatchStatus<'patch, S> = dyn for<'status> Fn(&'status mut S) + Sync + 'patch;
+
 /// An engine port serving resource kind `R`. A name several homes hold reads as this home's
 /// record, else the lexically first home's; writes are this home's alone.
 #[async_trait::async_trait]
@@ -348,6 +351,13 @@ pub trait KindRecords<R: crate::Resource>: Send + Sync + std::fmt::Debug {
     ) -> Result<Record<R>, String>;
     /// Replaces this home's record's status; refused for a kind with none.
     async fn set_status(&self, name: &str, status: &R::Status) -> Result<Record<R>, String>;
+    /// Applies `patch` to this home's record `name`'s status, in the port's own order of writes
+    /// and against what it holds, writing only where that changes; whether it wrote. `None` when
+    /// the port keeps no order of its own, and the writer reads, patches and sets the status
+    /// with a version check instead.
+    async fn patch_status(&self, _name: &str, _patch: &PatchStatus<'_, R::Status>) -> Option<Result<bool, String>> {
+        None
+    }
     /// Deletes this home's record `name`; absent is done. Another home's copy still reads.
     async fn delete(&self, name: &str) -> Result<(), String>;
     /// A tick for each pass that found any home's records changed since the pass before, from

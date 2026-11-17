@@ -12,7 +12,7 @@ use flotilla_resources::{
     FulfilmentKind, FulfilmentKindSpec, FulfilmentRealisation, Host, HostDirectEnvironmentSpec, HostSpec, InputMeta, PlacementImageSource,
     Platform, Repository, ResourceError, ResourceObject, MANAGED_BY_LABEL, PLACEMENT_SNAPSHOT_KIND,
 };
-use flotilla_store::ResourceBackend;
+use flotilla_store::{ResourceBackend, TypedResolver};
 use tracing::warn;
 
 use super::discovery::{LocalProvisioningProfile, DEFAULT_DOCKER_IMAGE};
@@ -44,42 +44,55 @@ pub(super) async fn ensure_host_exists(
     max_vessels: Option<u32>,
 ) -> Result<(), String> {
     let hosts = backend.clone().using::<Host>(namespace);
-    match hosts.get(host_name).await {
-        Ok(existing) if existing.spec.display_name == display_name && existing.spec.max_vessels == max_vessels => return Ok(()),
-        Ok(existing) => {
-            return hosts
-                .update(
-                    &InputMeta::from(&existing.metadata),
-                    &existing.metadata.resource_version,
-                    &HostSpec {
-                        display_name: display_name.to_string(),
-                        connection: Default::default(),
-                        expected_concurrent_rust_crews: existing.spec.expected_concurrent_rust_crews,
-                        image_build_capacity: existing.spec.image_build_capacity.clone(),
-                        // This path seeds the local daemon Host only, whose cap
-                        // bounds its Docker placements and which is never a
-                        // single-tenant SSH host box (#4002). SSH hosts,
-                        // their cap and tenancy are written by
-                        // `register_ssh_host_resources`.
-                        max_vessels,
-                        single_tenant: false,
-                    },
-                )
-                .await
-                .map(|_| ())
-                .map_err(|err| err.to_string());
-        }
-        Err(ResourceError::NotFound { .. }) => {}
+    let existing = match hosts.get(host_name).await {
+        Ok(existing) => Some(existing),
+        Err(ResourceError::NotFound { .. }) => None,
         Err(err) => return Err(format!("check host {host_name}: {err}")),
+    };
+    ensure_host_matches(&hosts, existing.as_ref(), host_name, display_name, max_vessels).await.map(|_| ())
+}
+
+/// Brings this daemon's Host, `existing` as its caller last read it, in line with its profile;
+/// whether it wrote.
+pub(super) async fn ensure_host_matches(
+    hosts: &TypedResolver<Host>,
+    existing: Option<&ResourceObject<Host>>,
+    host_name: &str,
+    display_name: &str,
+    max_vessels: Option<u32>,
+) -> Result<bool, String> {
+    match existing {
+        Some(existing) if existing.spec.display_name == display_name && existing.spec.max_vessels == max_vessels => Ok(false),
+        Some(existing) => hosts
+            .update(
+                &InputMeta::from(&existing.metadata),
+                &existing.metadata.resource_version,
+                &HostSpec {
+                    display_name: display_name.to_string(),
+                    connection: Default::default(),
+                    expected_concurrent_rust_crews: existing.spec.expected_concurrent_rust_crews,
+                    image_build_capacity: existing.spec.image_build_capacity.clone(),
+                    // This path seeds the local daemon Host only, whose cap
+                    // bounds its Docker placements and which is never a
+                    // single-tenant SSH host box (#4002). SSH hosts,
+                    // their cap and tenancy are written by
+                    // `register_ssh_host_resources`.
+                    max_vessels,
+                    single_tenant: false,
+                },
+            )
+            .await
+            .map(|_| true)
+            .map_err(|err| err.to_string()),
+        None => hosts
+            .create(
+                &empty_meta(host_name),
+                &HostSpec { display_name: display_name.to_string(), connection: Default::default(), max_vessels, ..HostSpec::default() },
+            )
+            .await
+            .map(|_| true)
+            .map_err(|err| err.to_string()),
     }
-    hosts
-        .create(
-            &empty_meta(host_name),
-            &HostSpec { display_name: display_name.to_string(), connection: Default::default(), max_vessels, ..HostSpec::default() },
-        )
-        .await
-        .map(|_| ())
-        .map_err(|err| err.to_string())
 }
 
 /// Requests the host's direct environment from the engine, once: one already held is left as it is.
@@ -251,6 +264,16 @@ pub(super) fn kind_belongs_to_host(
 /// Repairs this host's kinds whose host ref names it other than by its Host's name.
 pub(super) async fn canonicalize_kind_hosts(backend: &ResourceBackend, namespace: &str, host_ref: &str) -> Result<(), String> {
     let hosts = backend.clone().using::<Host>(namespace).list().await.map_err(|error| error.to_string())?.items;
+    canonicalize_kinds_for(backend, namespace, &hosts, host_ref).await
+}
+
+/// [`canonicalize_kind_hosts`], with the Hosts its caller has read.
+pub(super) async fn canonicalize_kinds_for(
+    backend: &ResourceBackend,
+    namespace: &str,
+    hosts: &[ResourceObject<Host>],
+    host_ref: &str,
+) -> Result<(), String> {
     let kinds = backend.clone().using::<FulfilmentKind>(namespace);
     // Idempotent: after the first successful pass the stored ref is the Host's name.
     for kind in kinds.list().await.map_err(|error| error.to_string())?.items {
@@ -260,7 +283,7 @@ pub(super) async fn canonicalize_kind_hosts(backend: &ResourceBackend, namespace
         {
             continue;
         }
-        if kind_belongs_to_host(&hosts, &kind, host_ref, "kind canonicalization") {
+        if kind_belongs_to_host(hosts, &kind, host_ref, "kind canonicalization") {
             let mut spec = kind.spec.clone();
             spec.host_ref = host_ref.to_string();
             kinds
