@@ -57,9 +57,9 @@ mod tests {
 
     use flotilla_protocol_testkit::event_sink::RecordingEventSink;
 
-    // #2498: every distinct stalled actor is visible across namespaces and replica stores.
-    // Generate empty through multi-convoy fleets, duplicate leaves, all rungs, shared and distinct
-    // evidence, future timestamps, and terminal convoys. No transport interleavings affect this read.
+    // #2498: every distinct stalled actor is visible. Generate empty through multi-convoy fleets,
+    // duplicate leaves, all rungs, shared and distinct evidence, future timestamps, and landed
+    // launches. No transport interleavings affect this read.
     #[hegel::test]
     fn crew_stalls_cover_each_obligation(tc: hegel::TestCase) {
         let count = tc.draw(gs::integers::<usize>().min_value(0).max_value(4));
@@ -67,43 +67,33 @@ mod tests {
         let unrecognized = tc.draw(gs::booleans());
         let shared = tc.draw(gs::booleans());
         let future = tc.draw(gs::booleans());
-        let replicated = tc.draw(gs::booleans());
         let rung = tc.draw(gs::integers::<usize>().min_value(0).max_value(4));
         let runtime = tokio::runtime::Builder::new_current_thread().enable_all().build().expect("runtime");
         runtime.block_on(async {
-            let backend = ResourceBackend::new(InMemoryBackend::default());
-            backend.install_attentions(Arc::new(flotilla_store_testkit::NoAttentions));
-            let author = if replicated { ResourceBackend::new(InMemoryBackend::default()) } else { backend.clone() };
+            let home = flotilla_engine_convoys_testkit::EngineHome::open("home");
+            let backend = home.backend().clone();
+            let path = home.convoys.path();
             let now = Utc::now();
             let began_at = now + ChronoDuration::seconds(if future { 10 } else { -300 });
+            backend
+                .using::<Project>("flotilla")
+                .create(
+                    &InputMeta::builder().name("project".into()).build(),
+                    &ProjectSpec::builder().display_name("Project display".into()).default_workflow_ref("scratch".into()).build(),
+                )
+                .await
+                .expect("project");
+            let mut stalled_launches = BTreeSet::new();
             for index in 0..count {
-                let namespace = format!("namespace-{index}");
-                backend
-                    .using::<Project>(&namespace)
-                    .create(
-                        &InputMeta::builder().name("project".into()).build(),
-                        &ProjectSpec::builder().display_name("Project display".into()).default_workflow_ref("scratch".into()).build(),
-                    )
-                    .await
-                    .expect("project");
-                let convoys = author.using::<ResourceConvoy>(&namespace);
                 for terminal in [false, true] {
-                    let convoy = convoys
-                        .create(
-                            &InputMeta::builder().name(if terminal { "terminal" } else { "stalled" }.into()).build(),
-                            &ConvoySpec::builder()
-                                .workflow_ref("scratch".into())
-                                .role("implement".into())
-                                .generation(2)
-                                .project_ref("project".into())
-                                .build(),
-                        )
-                        .await
-                        .expect("convoy");
+                    let name = format!("{}-{index}", if terminal { "terminal" } else { "stalled" });
+                    let spec =
+                        ConvoySpec::builder().workflow_ref("scratch".into()).role("implement".into()).project_ref("project".into()).build();
+                    let launch = home.admit(&name, spec, flotilla_engine_convoys_testkit::single_agent("coder")).await;
                     let leaves: Vec<_> = (0..roles)
                         .flat_map(|role| {
                             let leaf = flotilla_protocol::Leaf {
-                                address: flotilla_protocol::LeafAddress::Work { convoy: convoy.metadata.name.clone(), work: "work".into() },
+                                address: flotilla_protocol::LeafAddress::Work { convoy: launch.clone(), work: "work".into() },
                                 field_path: if unrecognized { ".phase".into() } else { format!(".crew.role-{role}.phase") },
                                 operator: flotilla_protocol::LeafOperator::Equal,
                                 literal: "Done".into(),
@@ -111,58 +101,53 @@ mod tests {
                             [leaf.clone(), leaf]
                         })
                         .collect();
-                    convoys
-                        .update_status(
-                            &convoy.metadata.name,
-                            &convoy.metadata.resource_version,
-                            &ConvoyStatus {
-                                phase: if terminal { ConvoyPhase::Landed } else { ConvoyPhase::Active },
-                                stalled: Some(flotilla_resources::StalledCondition {
-                                    leaves,
-                                    maker: None,
-                                    evidence: if shared {
-                                        if index % 2 == 0 {
-                                            "rate limit".into()
-                                        } else {
-                                            " rate\n limit ".into()
-                                        }
+                    flotilla_resources::convoy::engine::set_notes(
+                        &path,
+                        &launch,
+                        &ConvoyStatus {
+                            stalled: Some(flotilla_resources::StalledCondition {
+                                leaves,
+                                maker: None,
+                                evidence: if shared {
+                                    if index % 2 == 0 {
+                                        "rate limit".into()
                                     } else {
-                                        format!("cause {index}")
-                                    },
-                                    source: flotilla_resources::StallEvidenceSource::Crew,
-                                    cause: None,
-                                    began_at,
-                                    rung: [
-                                        flotilla_resources::StallRung::Nudge,
-                                        flotilla_resources::StallRung::Supervisor,
-                                        flotilla_resources::StallRung::Bosun,
-                                        flotilla_resources::StallRung::Governor,
-                                        flotilla_resources::StallRung::Operator,
-                                    ][rung],
-                                    supervisor: (rung != 4).then(|| flotilla_resources::StallSupervisor {
-                                        convoy: "governor".into(),
-                                        vessel: "control".into(),
-                                        role: "governor".into(),
-                                    }),
-                                    supervision_message: None,
-                                    supervision_index: None,
-                                    supervision_exhausted: false,
-                                    reason: Some(flotilla_protocol::StallReason::Infra),
-                                    proposed_disposition: Some(flotilla_protocol::StallProposedDisposition::Resume),
-                                    nudge_history: vec![],
+                                        " rate\n limit ".into()
+                                    }
+                                } else {
+                                    format!("cause {index}")
+                                },
+                                source: flotilla_resources::StallEvidenceSource::Crew,
+                                cause: None,
+                                began_at,
+                                rung: [
+                                    flotilla_resources::StallRung::Nudge,
+                                    flotilla_resources::StallRung::Supervisor,
+                                    flotilla_resources::StallRung::Bosun,
+                                    flotilla_resources::StallRung::Governor,
+                                    flotilla_resources::StallRung::Operator,
+                                ][rung],
+                                supervisor: (rung != 4).then(|| flotilla_resources::StallSupervisor {
+                                    convoy: "governor".into(),
+                                    vessel: "control".into(),
+                                    role: "governor".into(),
                                 }),
-                                ..Default::default()
-                            },
-                        )
-                        .await
-                        .expect("stalled status");
-                }
-                if replicated {
-                    backend
-                        .replica_writer::<ResourceConvoy>(NodeId::new("remote"), &namespace)
-                        .replace(&convoys.list().await.expect("remote convoys"), now)
-                        .await
-                        .expect("replicate");
+                                supervision_message: None,
+                                supervision_index: None,
+                                supervision_exhausted: false,
+                                reason: Some(flotilla_protocol::StallReason::Infra),
+                                proposed_disposition: Some(flotilla_protocol::StallProposedDisposition::Resume),
+                                nudge_history: vec![],
+                            }),
+                            ..Default::default()
+                        },
+                    )
+                    .expect("stalled note");
+                    if terminal {
+                        flotilla_engine_convoys_testkit::land(&path, &home.convoy(&launch).await).await;
+                    } else {
+                        stalled_launches.insert(launch);
+                    }
                 }
             }
             for full in [false, true] {
@@ -173,9 +158,11 @@ mod tests {
                 let encoded = serde_json::to_value(&response).expect("JSON");
                 assert_eq!(encoded["rows"].as_array().expect("rows").len(), count * obligations_per_convoy);
                 for row in response.rows {
-                    assert_eq!(row.convoy, "stalled");
+                    assert!(stalled_launches.contains(&row.convoy), "{} is a stalled launch", row.convoy);
                     assert_eq!(row.project_display_name.as_deref(), Some("Project display"));
-                    assert_eq!(row.convoy_display_name, "implement #2");
+                    // A launch is shown by its role and launch number.
+                    let (_, number) = flotilla_resources::convoy::engine::split_launch(&row.convoy).expect("a launch");
+                    assert_eq!(row.convoy_display_name, format!("implement #{number}"));
                     assert_eq!(row.age_seconds, Some(if future { 0 } else { 300 }));
                     assert_eq!(row.vessel.is_none(), unrecognized);
                     assert_eq!(row.role.is_empty(), unrecognized);
