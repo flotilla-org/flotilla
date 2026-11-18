@@ -1,3 +1,3 @@
 # Source pins for the old/additive and new/declared launch contracts.
 CLEAT_OLD_REVISION=00c072b207dc943f6c93fe3b6b09abaa257695a6
-CLEAT_NEW_REVISION=c79dd7b20202643615df9e0d43f5b957972a6ae9
+CLEAT_NEW_REVISION=dbdee9dc38bde4ac4760f23bb9ed91f228f4fdcf
