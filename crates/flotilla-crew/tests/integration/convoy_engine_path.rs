@@ -289,6 +289,46 @@ async fn a_pass_reads_only_its_change_requests() {
     assert_eq!(verdicts, [(true, "forge".to_string(), "PR merged".to_string())]);
 }
 
+// Behaviour (#3108 ruling 1): an abandoned convoy's submitted PR still resolves by the world. Its
+// pass reads that change request, noting it so the change request's changes wake the convoy, and
+// the merge becomes the observer's accepting verdict.
+#[tokio::test]
+async fn an_abandoned_convoys_merged_pr_is_the_observers_verdict() {
+    let backend = ResourceBackend::new(InMemoryBackend::default());
+    let mut convoy = ledger_convoy(&backend).await;
+    let status = convoy.status.as_mut().expect("status");
+    status.promises.clear();
+    let submit = PromiseOperation::Submit {
+        id: "pr".into(),
+        kind: PromiseKind::Pr,
+        source: PromiseSource::Crew,
+        submission: Submission {
+            reference: "cr/github.com/org/repo/1".into(),
+            metadata: BTreeMap::new(),
+            submitted_at: chrono::Utc::now(),
+            verdict: None,
+        },
+    };
+    promises::apply(status, "work", "coder", &submit);
+    status.phase = ConvoyPhase::Abandoned;
+    status.finished_at = Some(chrono::Utc::now());
+    publish_merged_change_request(&backend, 1).await;
+    let engine = Arc::new(Recording { holds: true, ..Default::default() });
+    let reconciler = reconciler(&backend, Arc::clone(&engine))
+        .with_change_requests(backend.including_replicas::<ChangeRequest>(NAMESPACE), std::time::Duration::from_secs(180));
+    reconciler.prepare(&convoy).await.expect("prepare");
+    let name = record_name(&stored_change_request_address("github.com", "org/repo", 1, &[]).expect("address")).expect("record name");
+    assert_eq!(engine.memory.reading(<ChangeRequest as flotilla_resources::Resource>::API_PATHS.kind, &name), ["c"]);
+    let calls = engine.promises.lock().expect("promises").clone();
+    assert_eq!(calls.len(), 1, "{calls:?}");
+    let (vessel, role, operation, actor) = &calls[0];
+    assert_eq!((vessel.as_str(), role.as_str(), actor), ("work", "coder", &Actor::Observer));
+    assert!(
+        matches!(operation, PromiseOperation::Verdict { id, verdict, .. } if id == "pr" && verdict.accepted && verdict.who == "forge"),
+        "{operation:?}"
+    );
+}
+
 fn reconciler(backend: &ResourceBackend, engine: Arc<Recording>) -> ConvoyReconciler {
     reconciler_reading(backend, engine, flotilla_provisioning_testkit::CheckoutFixture::default().reads)
 }

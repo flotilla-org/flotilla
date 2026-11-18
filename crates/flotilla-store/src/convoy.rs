@@ -19,6 +19,17 @@ pub fn live_convoys_query() -> crate::StoreQuery {
     }
 }
 
+/// The abandoned convoys still held, failed ones included: the views hold a launch until it
+/// retires. Only these can hold a submitted PR (#3108 ruling 1); a landed one delivered with
+/// nothing open.
+pub fn abandoned_convoys_query() -> crate::StoreQuery {
+    crate::StoreQuery {
+        field_values: BTreeMap::from([("status.phase".into(), ["Failed", "Abandoned"].map(String::from).to_vec())]),
+        include_replicas: true,
+        ..Default::default()
+    }
+}
+
 /// Each named standing role's current generation: its newest live convoy, by the ConvoyEnsure name
 /// the convoy was ensured from. A role with no live generation is absent. Every host reads the same
 /// generations, so the answer needs no status of the ensure's own (#3108).

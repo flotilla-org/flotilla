@@ -441,6 +441,73 @@ impl ConvoyReconciler {
         engine.memory().forget(&obj.metadata.name);
         Ok(())
     }
+
+    /// An ended convoy's submitted PRs still resolve by the world (#3108 ruling 1): the change
+    /// requests its Submitted pr promises name are noted, so their changes wake it, and read, and
+    /// one merge or close a pass is the engine's edge. Nothing else of an ended convoy is read.
+    async fn resolve_ended_submissions(
+        &self,
+        engine: &dyn EngineConvoys,
+        obj: &ResourceObject<Convoy>,
+        status: &flotilla_resources::ConvoyStatus,
+    ) -> Result<(), ResourceError> {
+        if self.change_requests.is_none() {
+            return Ok(());
+        }
+        let forges = self.forge_specs().await?;
+        let names: BTreeSet<String> =
+            flotilla_resources::convoy::promises::ended_submissions(status, &forges).iter().filter_map(record_name).collect();
+        engine.memory().note_evidence(&obj.metadata.name, ChangeRequest::API_PATHS.kind, names.clone());
+        if names.is_empty() {
+            return Ok(());
+        }
+        let change_requests = self.read_change_requests(names, &forges).await?;
+        // Evidence is aged against a clock read after it is read, as an open pass ages it.
+        let now = self.clock.now();
+        if let Some(ConvoyStatusPatch::ObservePromise { vessel, role, operation }) =
+            flotilla_resources::convoy::promises::next_ended_observation(
+                status,
+                &change_requests,
+                &forges,
+                now,
+                self.change_request_stale_after,
+            )
+        {
+            if let Err(error) = engine.promise(obj, &vessel, &role, &operation, Actor::Observer).await {
+                tracing::info!(convoy = %obj.metadata.name, %vessel, %role, %error, "the engine refused an ended convoy's observed promise edge");
+            }
+        }
+        Ok(())
+    }
+
+    /// The declared forges' specs, or none without a Forge reader.
+    async fn forge_specs(&self) -> Result<Vec<flotilla_resources::ForgeSpec>, ResourceError> {
+        Ok(match &self.forges {
+            Some(forges) => forges.list().await?.into_iter().map(|forge| forge.spec).collect(),
+            None => Vec::new(),
+        })
+    }
+
+    /// The change requests `names` names, each by its record name: every home's copy of it,
+    /// selected as the listing selected them. None without a ChangeRequest reader.
+    async fn read_change_requests(
+        &self,
+        names: BTreeSet<String>,
+        forges: &[flotilla_resources::ForgeSpec],
+    ) -> Result<BTreeMap<String, ResourceObject<ChangeRequest>>, ResourceError> {
+        let Some(change_requests) = &self.change_requests else { return Ok(BTreeMap::new()) };
+        let mut sources = Vec::new();
+        for name in names {
+            sources.extend(change_requests.get_all(&name).await?.items);
+        }
+        Ok(select_change_requests(sources.iter().map(|source| &source.object))
+            .into_values()
+            .filter_map(|record| {
+                let name = record.spec.address(forges).ok().and_then(|address| record_name(&address))?;
+                Some((name, record))
+            })
+            .collect())
+    }
 }
 
 /// The capacity a convoy waits for: why, when a sleeping host it waits on wakes, and the
@@ -791,7 +858,8 @@ impl Reconciler for ConvoyReconciler {
         let Some(status) = obj.status.as_ref() else { return Ok(ConvoyPass::default()) };
         let now = self.clock.now();
         if status.phase.is_terminal() {
-            // An ended convoy reads no evidence and waits on no host, so no change of either wakes it.
+            // An ended convoy waits on no host, and of its evidence reads only the change requests
+            // its submitted PRs name, so no other change wakes it.
             engine.memory().drop_evidence(&obj.metadata.name);
             if status.finished_at.is_none() {
                 // The view derived the failure from a failed work; the launch has not ended yet.
@@ -800,6 +868,7 @@ impl Reconciler for ConvoyReconciler {
                 return Ok(ConvoyPass::default());
             }
             self.tear_down(engine.as_ref(), obj).await?;
+            self.resolve_ended_submissions(engine.as_ref(), obj, status).await?;
             return Ok(ConvoyPass::default());
         }
 
@@ -845,10 +914,7 @@ impl Reconciler for ConvoyReconciler {
         }
 
         let checkouts = self.held_checkouts(obj).await?;
-        let forges = match &self.forges {
-            Some(forges) => forges.list().await?.into_iter().map(|forge| forge.spec).collect::<Vec<_>>(),
-            None => Vec::new(),
-        };
+        let forges = self.forge_specs().await?;
         let is_landing = status.phase == ConvoyPhase::Landing;
         // A checkout's inspection names the change request its branch is associated with; what
         // that request came to is the forge observation's.
@@ -862,24 +928,7 @@ impl Reconciler for ConvoyReconciler {
             _ => BTreeSet::new(),
         };
         engine.memory().note_evidence(&obj.metadata.name, ChangeRequest::API_PATHS.kind, change_request_names.clone());
-        let change_requests = match &self.change_requests {
-            // Only the change requests the pass looks up, each by its record name: every home's
-            // copy of it, selected as the listing selected them.
-            Some(change_requests) if needs_pr => {
-                let mut sources = Vec::new();
-                for name in change_request_names {
-                    sources.extend(change_requests.get_all(&name).await?.items);
-                }
-                select_change_requests(sources.iter().map(|source| &source.object))
-                    .into_values()
-                    .filter_map(|record| {
-                        let name = record.spec.address(&forges).ok().and_then(|address| record_name(&address))?;
-                        Some((name, record))
-                    })
-                    .collect()
-            }
-            _ => BTreeMap::new(),
-        };
+        let change_requests = if needs_pr { self.read_change_requests(change_request_names, &forges).await? } else { BTreeMap::new() };
         // Evidence is aged against a clock read after it is read: a change request this home
         // observes is confirmed as it is read, and must not appear to come from the future.
         let now = self.clock.now();

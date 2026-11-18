@@ -712,6 +712,48 @@ pub fn next_observation(
     None
 }
 
+/// The change requests an ended convoy's Submitted pr promises name, each its current submission's
+/// (#3108 ruling 1): the world still resolves them, and until it does they hold the convoy. None
+/// for a convoy still open, whose observations [`next_observation`] makes.
+pub fn ended_submissions(status: &ConvoyStatus, forges: &[crate::ForgeSpec]) -> BTreeSet<Address> {
+    if !status.phase.is_terminal() {
+        return BTreeSet::new();
+    }
+    status
+        .promises
+        .values()
+        .flat_map(BTreeMap::values)
+        .flatten()
+        .filter(|promise| promise.kind == PromiseKind::Pr && promise.state == PromiseState::Submitted)
+        .filter_map(|promise| promise.submissions.last()?.subject_address(forges).ok())
+        .filter(|address| address.kind() == AddressKind::ChangeRequest)
+        .collect()
+}
+
+/// An ended convoy's next resolution by the world (#3108 ruling 1): a Submitted pr promise whose
+/// change request merged is kept, and one whose change request closed is rejected, the convoy
+/// staying ended. Nothing else is observed of an ended convoy.
+pub fn next_ended_observation(
+    status: &ConvoyStatus,
+    change_requests: &BTreeMap<String, crate::ResourceObject<crate::ChangeRequest>>,
+    forges: &[crate::ForgeSpec],
+    now: DateTime<Utc>,
+    stale_after: std::time::Duration,
+) -> Option<super::ConvoyStatusPatch> {
+    if !status.phase.is_terminal() {
+        return None;
+    }
+    let artifacts = BTreeMap::new();
+    status.promises.iter().find_map(|(vessel, crew)| {
+        crew.iter().find_map(|(role, promises)| {
+            promises.iter().filter(|promise| promise.kind == PromiseKind::Pr).find_map(|promise| {
+                let operation = observed_verdict(promise, role, change_requests, &artifacts, forges, now, stale_after)?;
+                Some(super::ConvoyStatusPatch::ObservePromise { vessel: vessel.clone(), role: role.clone(), operation })
+            })
+        })
+    })
+}
+
 /// The artifacts [`next_observation`] reads for `convoy`'s decision ledger promises: each open
 /// promise's ledger slot, and each submitted one's submitted artifact.
 pub fn ledger_artifact_names(status: &ConvoyStatus, convoy: &str) -> BTreeSet<String> {

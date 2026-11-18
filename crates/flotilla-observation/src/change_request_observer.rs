@@ -231,6 +231,7 @@ impl ChangeRequestRefresher {
             branches.extend(unproduced_branches(&copy.object, &forges));
         }
         self.reconcile_branch_probes(namespace, branches).await?;
+        let mut addresses = Vec::new();
         for copy in convoys.items {
             for row in convoy_subject_rows(&copy.object, &ReferenceContext::default()) {
                 if row.subject.kind != ConvoySubjectKind::ChangeRequest {
@@ -238,33 +239,48 @@ impl ChangeRequestRefresher {
                 }
                 // Debug, not warn: this re-runs on every convoy, project and
                 // Forge change, so an undeclared host would repeat each pass.
-                let address = match subject_address(&row.subject, &forges) {
-                    Ok(address) => address,
+                match subject_address(&row.subject, &forges) {
+                    Ok(address) => addresses.push((copy.object.metadata.name.clone(), address)),
                     Err(error) => {
                         tracing::debug!(convoy = %copy.object.metadata.name, %error, "convoy change request subject has no address; not observed");
-                        continue;
                     }
-                };
-                let subject = match ChangeRequestKey::new(namespace, address) {
-                    Ok(subject) => subject,
-                    Err(error) => {
-                        tracing::debug!(convoy = %copy.object.metadata.name, %error, "convoy change request subject has no observation key");
-                        continue;
-                    }
-                };
-                let source = stored_source(&subject);
-                let owned = if let Some(owned) = owners.get(&source) {
-                    *owned
-                } else {
-                    let owned = crate::forge_observation::source_owner(&self.inner.backend, namespace, &source)
-                        .await?
-                        .is_some_and(|owner| owner.to_string() == self.inner.authority);
-                    owners.insert(source, owned);
-                    owned
-                };
-                if owned {
-                    wanted.insert(subject);
                 }
+            }
+        }
+        // An abandoned convoy still held is observed only for the change requests its Submitted pr
+        // promises name, until each resolves (#3108 ruling 1): the resolution releases the demand.
+        let ended = self
+            .inner
+            .backend
+            .query_declared::<Convoy>(namespace, &flotilla_store::abandoned_convoys_query())
+            .await
+            .map_err(|error| error.to_string())?;
+        for copy in ended.items {
+            let Some(status) = &copy.object.status else { continue };
+            for address in flotilla_resources::convoy::promises::ended_submissions(status, &forges) {
+                addresses.push((copy.object.metadata.name.clone(), address));
+            }
+        }
+        for (convoy, address) in addresses {
+            let subject = match ChangeRequestKey::new(namespace, address) {
+                Ok(subject) => subject,
+                Err(error) => {
+                    tracing::debug!(%convoy, %error, "convoy change request subject has no observation key");
+                    continue;
+                }
+            };
+            let source = stored_source(&subject);
+            let owned = if let Some(owned) = owners.get(&source) {
+                *owned
+            } else {
+                let owned = crate::forge_observation::source_owner(&self.inner.backend, namespace, &source)
+                    .await?
+                    .is_some_and(|owner| owner.to_string() == self.inner.authority);
+                owners.insert(source, owned);
+                owned
+            };
+            if owned {
+                wanted.insert(subject);
             }
         }
         for subject in &wanted {
@@ -1254,6 +1270,65 @@ mod tests {
         let (result, reads) = measure_reads(refresher.reconcile_convoy_demands("flotilla", &mut HashMap::new())).await;
         result.expect("reconcile");
         assert_eq!(reads.of(&backend).objects_by_kind().get("Convoy"), Some(&10));
+    }
+
+    // #3108 ruling 1: an abandoned convoy that something still holds is observed only for the
+    // change request its Submitted pr promise names, until the promise resolves; the resolution
+    // releases the demand. A landed convoy, which delivered with nothing open, demands nothing.
+    #[tokio::test]
+    async fn an_abandoned_convoys_submitted_pr_is_demanded_until_it_resolves() {
+        use flotilla_resources::{
+            promises::{Promise, PromiseKind, PromiseSource, PromiseState, Submission},
+            ConvoyPhase, ConvoySpec, ConvoyStatus, Host, HostSpec, HostStatus,
+        };
+        let backend = ResourceBackend::new(InMemoryBackend::default()).with_local_root(flotilla_protocol::NodeId::new("node"));
+        let hosts = backend.using::<Host>("ops");
+        let host = hosts.create(&InputMeta::builder().name("node-host".into()).build(), &HostSpec::default()).await.expect("host");
+        let ready = HostStatus { ready: true, heartbeat_at: Some(Utc::now()), ..Default::default() };
+        hosts.update_status("node-host", &host.metadata.resource_version, &ready).await.expect("heartbeat");
+        let refresher = ChangeRequestRefresher::new(
+            backend.clone(),
+            "node".into(),
+            Arc::new(UnavailableSource),
+            ChangeRequestRefreshCadence::default(),
+        );
+        let promise = |number: u64, state: PromiseState| Promise {
+            id: "template/pr".into(),
+            vessel: "work".into(),
+            role: "coder".into(),
+            source: PromiseSource::Template,
+            kind: PromiseKind::Pr,
+            state,
+            retraction_reason: None,
+            submissions: vec![Submission {
+                reference: format!("cr/github.com/org/repo/{number}"),
+                metadata: BTreeMap::new(),
+                submitted_at: Utc::now(),
+                verdict: None,
+            }],
+        };
+        let convoys = backend.using::<Convoy>("ops");
+        for (name, phase, number) in [("abandoned", ConvoyPhase::Abandoned, 42), ("landed", ConvoyPhase::Landed, 43)] {
+            let spec = ConvoySpec::builder().workflow_ref("dev".into()).role("coder".into()).build();
+            let convoy = convoys.create(&InputMeta::builder().name(name.into()).build(), &spec).await.expect("convoy");
+            let mut status = ConvoyStatus { phase, ..Default::default() };
+            status.promises.entry("work".into()).or_default().insert("coder".into(), vec![promise(number, PromiseState::Submitted)]);
+            convoys.update_status(name, &convoy.metadata.resource_version, &status).await.expect("status");
+        }
+        let mut demands = HashMap::new();
+        refresher.reconcile_convoy_demands("ops", &mut demands).await.expect("reconcile");
+        let demanded: Vec<String> = demands.keys().map(ChangeRequestKey::record_name).collect();
+        assert_eq!(demanded, [cr_name("github.com", "org/repo", 42)]);
+
+        let convoy = convoys.get("abandoned").await.expect("abandoned");
+        let mut status = convoy.status.expect("status");
+        status.promises.get_mut("work").expect("work").insert("coder".into(), vec![promise(42, PromiseState::Kept)]);
+        convoys.update_status("abandoned", &convoy.metadata.resource_version, &status).await.expect("kept");
+        refresher.reconcile_convoy_demands("ops", &mut demands).await.expect("reconcile");
+        assert!(demands.is_empty(), "the merge released the demand: {demands:?}");
+        for (_, refresh) in refresher.inner.active.lock().await.drain() {
+            refresh.task.abort();
+        }
     }
 
     struct UnavailableSource;
