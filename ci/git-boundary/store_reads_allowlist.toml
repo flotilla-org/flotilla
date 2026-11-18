@@ -7,7 +7,7 @@
 
 [[allow]]
 path = "crates/flotilla-core/src/in_process.rs"
-function = "new_composed"
+function = "compose"
 count = 2
 reason = """Daemon construction only. The startup loop reads the Repository catalog once per configured \
 observation root with a live remote, and repository discovery in the same iteration may author the \
