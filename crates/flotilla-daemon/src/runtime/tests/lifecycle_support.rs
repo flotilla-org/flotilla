@@ -6,11 +6,12 @@ pub(super) enum CompletionAction {
     Delete,
     /// An operator deletes the convoy while its work is still running.
     DeleteLive,
-    /// The work commits on its branch without pushing, leaving an untracked file when `untracked`,
-    /// and completes naming change request 884, which the forge observer then reads in `state` at
-    /// the checkout's head.
+    /// The work commits on its branch, pushes it when `pushed`, leaves an untracked file when
+    /// `untracked`, and completes naming change request 884, which the forge observer then reads in
+    /// `state` at the checkout's head.
     ChangeRequest {
         state: flotilla_resources::ObservedChangeRequestState,
+        pushed: bool,
         untracked: bool,
     },
 }
@@ -23,6 +24,10 @@ pub(super) struct ReleaseSeen {
     /// Its recorded inspection's `landed`, and why.
     pub(super) landed: Option<bool>,
     pub(super) landed_details: Vec<String>,
+    /// Its recorded inspection's `pushed`.
+    pub(super) pushed: Option<bool>,
+    /// The work's branch is still in the clone.
+    pub(super) branch_kept: bool,
     /// The worktree is still on disk.
     pub(super) on_disk: bool,
     /// Archives saved under the test's directory.
@@ -269,8 +274,8 @@ pub(super) async fn run_stage4a_flow_reaches_running_and_completes_convoy(
         tokio::time::sleep(Duration::from_millis(200)).await;
     }
 
-    if let CompletionAction::ChangeRequest { state: request_state, untracked } = completion_action {
-        let seen = release_after_change_request(&daemon, &convoy_name, &launch, &repo_default_dir, request_state, untracked).await;
+    if let CompletionAction::ChangeRequest { state: request_state, pushed, untracked } = completion_action {
+        let seen = release_after_change_request(&daemon, &convoy_name, &launch, &repo_default_dir, request_state, pushed, untracked).await;
         for handle in controller_handles {
             handle.abort();
             let _ = handle.await;
@@ -353,9 +358,10 @@ pub(super) async fn run_stage4a_flow_reaches_running_and_completes_convoy(
             .find(|checkout| !checkout.ended())
             .expect("convoy checkout should exist");
         let checkout_path = checkout.ready_path().expect("checkout should be ready under its path").to_owned();
+        // Merged into main, and pushed: origin holds the branch at its head.
         for args in [
             ["update-ref", "refs/remotes/origin/main", "HEAD"].as_slice(),
-            ["branch", "--set-upstream-to", "origin/main", "stage4a-work"].as_slice(),
+            ["update-ref", "refs/remotes/origin/stage4a-work", "HEAD"].as_slice(),
         ] {
             let status = ProcessCommand::new("git").arg("-C").arg(&checkout_path).args(args).status().expect("prepare pushed state");
             assert!(status.success());
@@ -456,6 +462,7 @@ async fn release_after_change_request(
     vessel: &str,
     repo_default_dir: &Path,
     state: flotilla_resources::ObservedChangeRequestState,
+    pushed: bool,
     untracked: bool,
 ) -> ReleaseSeen {
     let backend = daemon.resource_backend();
@@ -469,7 +476,7 @@ async fn release_after_change_request(
     let launch = checkout.name.clone();
     let checkout_path = checkout.ready_path().expect("checkout should be ready under its path").to_owned();
 
-    // The work commits on its branch and does not push it.
+    // The work commits on its branch.
     fs::write(Path::new(&checkout_path).join("work.txt"), "the work\n").expect("write work");
     let git = |args: &[&str]| {
         let output = ProcessCommand::new("git")
@@ -485,6 +492,12 @@ async fn release_after_change_request(
     git(&["add", "work.txt"]);
     git(&["commit", "-m", "the work"]);
     let head = git(&["rev-parse", "HEAD"]);
+    let branch = git(&["symbolic-ref", "--short", "HEAD"]);
+    let clone = git(&["rev-parse", "--path-format=absolute", "--git-common-dir"]);
+    if pushed {
+        // Origin holds the branch at its head, as a push to origin records it.
+        git(&["update-ref", &format!("refs/remotes/origin/{branch}"), "HEAD"]);
+    }
     if untracked {
         fs::write(Path::new(&checkout_path).join("left-over.pyc"), "test run output\n").expect("write untracked file");
     }
@@ -550,6 +563,13 @@ async fn release_after_change_request(
         reading: checkout.reading.clone(),
         landed: inspection.and_then(|inspection| inspection.landed),
         landed_details: inspection.map(|inspection| inspection.landed_details.clone()).unwrap_or_default(),
+        pushed: inspection.and_then(|inspection| inspection.pushed),
+        branch_kept: ProcessCommand::new("git")
+            .arg(format!("--git-dir={clone}"))
+            .args(["show-ref", "--verify", "--quiet", &format!("refs/heads/{branch}")])
+            .status()
+            .expect("run git")
+            .success(),
         on_disk: Path::new(&checkout_path).exists(),
         // Archives are saved beside the clone a worktree is of, which may sit beside the
         // repositories' directory rather than in it.

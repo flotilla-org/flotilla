@@ -764,7 +764,8 @@ mod tests {
 
     #[tokio::test]
     async fn commit_after_squash_merged_head_remains_unpushed() {
-        let runner = Arc::new(MockRunner::new(vec![Err("not an ancestor".into()), Ok("origin/feature\n".into()), Ok("1\n".into())]));
+        let runner =
+            Arc::new(MockRunner::new(vec![Err("not an ancestor".into()), Ok("feature\n".into()), Ok(String::new()), Ok("1\n".into())]));
         let vcs = test_vcs(runner.clone());
         let change_request = merged_change_request("merged-head");
 
@@ -775,8 +776,8 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn squash_merged_branch_without_upstream_is_pushed_when_remote_ref_contains_head() {
-        let runner = Arc::new(MockRunner::new(vec![Err("no upstream configured".into()), Ok("  origin/feature\n".into())]));
+    async fn detached_head_is_pushed_when_a_remote_ref_contains_it() {
+        let runner = Arc::new(MockRunner::new(vec![Err("not a symbolic ref".into()), Ok("  origin/feature\n".into())]));
         let vcs = test_vcs(runner.clone());
 
         let pushed = inspect_pushed(&vcs, None, "2026-08-04T12:00:00Z").await;
@@ -786,8 +787,8 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn branch_without_upstream_or_containing_remote_reports_unpushed_commit_count() {
-        let runner = Arc::new(MockRunner::new(vec![Err("no upstream configured".into()), Ok(String::new()), Ok("2\n".into())]));
+    async fn detached_head_without_containing_remote_reports_unpushed_commit_count() {
+        let runner = Arc::new(MockRunner::new(vec![Err("not a symbolic ref".into()), Ok(String::new()), Ok("2\n".into())]));
         let vcs = test_vcs(runner.clone());
 
         let pushed = inspect_pushed(&vcs, None, "2026-08-04T12:00:00Z").await;
@@ -798,8 +799,8 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn branch_pushed_between_no_upstream_probes_reports_pushed() {
-        let runner = Arc::new(MockRunner::new(vec![Err("no upstream configured".into()), Ok(String::new()), Ok("0\n".into())]));
+    async fn detached_head_pushed_between_probes_reports_pushed() {
+        let runner = Arc::new(MockRunner::new(vec![Err("not a symbolic ref".into()), Ok(String::new()), Ok("0\n".into())]));
         let vcs = test_vcs(runner.clone());
 
         let pushed = inspect_pushed(&vcs, None, "2026-08-04T12:00:00Z").await;
@@ -807,15 +808,31 @@ mod tests {
         assert_eq!(pushed.value, ConditionValue::True);
     }
 
+    // A branch is pushed when its own name on origin holds HEAD, whatever upstream it tracks: a
+    // branch made from origin/main is not judged against main.
     #[tokio::test]
-    async fn checkout_without_change_request_keeps_upstream_pushed_probe() {
-        let runner = Arc::new(MockRunner::new(vec![Ok("origin/feature\n".into()), Ok("0\n".into())]));
+    async fn checkout_without_change_request_compares_head_with_its_branch_on_origin() {
+        let runner = Arc::new(MockRunner::new(vec![Ok("feature\n".into()), Ok(String::new()), Ok("0\n".into())]));
         let vcs = test_vcs(runner.clone());
 
         let pushed = inspect_pushed(&vcs, None, "2026-08-04T12:00:00Z").await;
 
         assert_eq!(pushed.value, ConditionValue::True);
-        assert_eq!(runner.calls()[0].1, vec!["rev-parse", "--abbrev-ref", "@{upstream}"]);
+        assert_eq!(runner.calls()[0].1, vec!["symbolic-ref", "--quiet", "--short", "HEAD"]);
+        assert_eq!(runner.calls()[1].1, vec!["show-ref", "--verify", "--quiet", "refs/remotes/origin/feature"]);
+        assert_eq!(runner.calls()[2].1, vec!["rev-list", "--count", "origin/feature..HEAD"]);
+    }
+
+    #[tokio::test]
+    async fn branch_absent_from_origin_is_not_pushed() {
+        let runner = Arc::new(MockRunner::new(vec![Ok("feature\n".into()), Err("not a valid ref".into())]));
+        let vcs = test_vcs(runner.clone());
+
+        let pushed = inspect_pushed(&vcs, None, "2026-08-04T12:00:00Z").await;
+
+        assert_eq!(pushed.value, ConditionValue::False);
+        assert_eq!(pushed.details, vec!["origin/feature does not exist: the branch is not pushed"]);
+        assert_eq!(runner.calls().len(), 2);
     }
 
     #[tokio::test]

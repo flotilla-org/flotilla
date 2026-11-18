@@ -109,14 +109,14 @@ rounds:
     - --lock
     - --reason
     - 'flotilla-managed: convoy/new'
+    - --no-track
     - -b
     - convoy/new
     - '{root}/convoy-new'
     - origin/main
     cwd: /
     stdout: |
-      branch 'convoy/new' set up to track 'origin/main'.
-      HEAD is now at a17f51f initial
+      HEAD is now at 7166f5f initial
     exit_code: 0
   - channel: command
     cmd: git
@@ -128,7 +128,7 @@ rounds:
     - HEAD
     cwd: /
     stdout: |
-      a17f51fc42007eaae38e6b637c569e284de7f152
+      7166f5f9e5986dbf0be502ec301c6f85e6683993
     exit_code: 0
   - channel: command
     cmd: git
@@ -137,7 +137,7 @@ rounds:
     - '{root}/repo'
     - update-ref
     - refs/flotilla/bootstrap/convoy/new
-    - a17f51fc42007eaae38e6b637c569e284de7f152
+    - 7166f5f9e5986dbf0be502ec301c6f85e6683993
     cwd: /
     stdout: ''
     exit_code: 0
@@ -151,7 +151,7 @@ rounds:
     - --porcelain
     - -z
     cwd: /
-    stdout: "worktree {root}/repo\0HEAD a17f51fc42007eaae38e6b637c569e284de7f152\0branch refs/heads/main\0\0worktree {root}/convoy-new\0HEAD a17f51fc42007eaae38e6b637c569e284de7f152\0branch refs/heads/convoy/new\0locked flotilla-managed: convoy/new\0\0"
+    stdout: "worktree {root}/repo\0HEAD 7166f5f9e5986dbf0be502ec301c6f85e6683993\0branch refs/heads/main\0\0worktree {root}/convoy-new\0HEAD 7166f5f9e5986dbf0be502ec301c6f85e6683993\0branch refs/heads/convoy/new\0locked flotilla-managed: convoy/new\0\0"
     exit_code: 0
   - channel: command
     cmd: git
@@ -174,7 +174,7 @@ rounds:
     - --porcelain
     - -z
     cwd: /
-    stdout: "worktree {root}/repo\0HEAD a17f51fc42007eaae38e6b637c569e284de7f152\0branch refs/heads/main\0\0worktree {root}/convoy-new\0HEAD a17f51fc42007eaae38e6b637c569e284de7f152\0branch refs/heads/convoy/new\0locked flotilla-managed: convoy/new\0\0"
+    stdout: "worktree {root}/repo\0HEAD 7166f5f9e5986dbf0be502ec301c6f85e6683993\0branch refs/heads/main\0\0worktree {root}/convoy-new\0HEAD 7166f5f9e5986dbf0be502ec301c6f85e6683993\0branch refs/heads/convoy/new\0locked flotilla-managed: convoy/new\0\0"
     exit_code: 0
   - channel: command
     cmd: git
@@ -252,7 +252,7 @@ rounds:
     - --porcelain
     - -z
     cwd: /
-    stdout: "worktree {root}/repo\0HEAD a17f51fc42007eaae38e6b637c569e284de7f152\0branch refs/heads/main\0\0worktree {root}/convoy-new\0HEAD a17f51fc42007eaae38e6b637c569e284de7f152\0branch refs/heads/convoy/new\0locked flotilla-managed: convoy/new\0\0"
+    stdout: "worktree {root}/repo\0HEAD 7166f5f9e5986dbf0be502ec301c6f85e6683993\0branch refs/heads/main\0\0worktree {root}/convoy-new\0HEAD 7166f5f9e5986dbf0be502ec301c6f85e6683993\0branch refs/heads/convoy/new\0locked flotilla-managed: convoy/new\0\0"
     exit_code: 0
   - channel: command
     cmd: git
@@ -264,7 +264,7 @@ rounds:
     - --porcelain
     - -z
     cwd: /
-    stdout: "worktree {root}/repo\0HEAD a17f51fc42007eaae38e6b637c569e284de7f152\0branch refs/heads/main\0\0worktree {root}/convoy-new\0HEAD a17f51fc42007eaae38e6b637c569e284de7f152\0branch refs/heads/convoy/new\0locked flotilla-managed: convoy/new\0\0"
+    stdout: "worktree {root}/repo\0HEAD 7166f5f9e5986dbf0be502ec301c6f85e6683993\0branch refs/heads/main\0\0worktree {root}/convoy-new\0HEAD 7166f5f9e5986dbf0be502ec301c6f85e6683993\0branch refs/heads/convoy/new\0locked flotilla-managed: convoy/new\0\0"
     exit_code: 0
   - channel: command
     cmd: git
@@ -310,7 +310,7 @@ rounds:
     - refs/heads/convoy/new
     cwd: /
     stdout: |
-      a17f51fc42007eaae38e6b637c569e284de7f152
+      7166f5f9e5986dbf0be502ec301c6f85e6683993
     stderr: ''
     exit_code: 0
   - channel: command
@@ -323,7 +323,7 @@ rounds:
     - refs/flotilla/bootstrap/convoy/new
     cwd: /
     stdout: |
-      a17f51fc42007eaae38e6b637c569e284de7f152
+      7166f5f9e5986dbf0be502ec301c6f85e6683993
     stderr: ''
     exit_code: 0
   - channel: command
@@ -337,7 +337,7 @@ rounds:
     cwd: /
     stdout: |+
       worktree {root}/repo
-      HEAD a17f51fc42007eaae38e6b637c569e284de7f152
+      HEAD 7166f5f9e5986dbf0be502ec301c6f85e6683993
       branch refs/heads/main
 
     exit_code: 0
@@ -352,7 +352,7 @@ rounds:
     - convoy/new
     cwd: /
     stdout: |
-      Deleted branch convoy/new (was a17f51f).
+      Deleted branch convoy/new (was 7166f5f).
     exit_code: 0
   - channel: command
     cmd: git

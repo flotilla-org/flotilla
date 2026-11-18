@@ -1496,12 +1496,17 @@ impl Vcs for FlotillaVcs {
             }
         }
 
-        let upstream = self.cli().head_upstream().await;
-        let upstream = match upstream {
-            Ok(output) if output.success() && !output.stdout.trim().is_empty() => output.stdout.trim().to_string(),
+        // Pushed means pushed to the branch's own name on origin, whatever upstream the branch
+        // tracks: a branch made from origin/main tracking it is not pushed by being behind it.
+        let branch = match self.cli().current_branch().await {
+            Ok(branch) if !branch.trim().is_empty() => branch.trim().to_string(),
             _ => return self.unpushed_without_upstream().await,
         };
-        self.parse_unpushed_count(self.cli().unpushed_count(Some(&upstream)).await)
+        let remote = format!("origin/{branch}");
+        if !self.cli().ref_exists(&format!("refs/remotes/{remote}")).await {
+            return VcsCheck::False(vec![format!("{remote} does not exist: the branch is not pushed")]);
+        }
+        self.parse_unpushed_count(self.cli().unpushed_count(Some(&remote)).await)
     }
 
     async fn head_in_history_of(&self, revision: &str) -> Result<bool, String> {
@@ -2393,7 +2398,20 @@ impl VcsBackend for GitCliBackend<'_> {
             }
             let resolved_base_ref =
                 if self.ref_exists(&remote_base_ref).await { format!("origin/{base_ref}") } else { base_ref.to_string() };
-            self.run(&["worktree", "add", "--lock", "--reason", registration_reason, "-b", branch, target, &resolved_base_ref]).await?;
+            // The new branch tracks nothing: its base is where it starts, not where it is pushed.
+            self.run(&[
+                "worktree",
+                "add",
+                "--lock",
+                "--reason",
+                registration_reason,
+                "--no-track",
+                "-b",
+                branch,
+                target,
+                &resolved_base_ref,
+            ])
+            .await?;
         } else {
             self.run(&["worktree", "add", "--lock", "--reason", registration_reason, "--detach", target, branch]).await?;
         }
@@ -4175,7 +4193,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn unpushed_contract_preserves_upstream_fallback_and_merged_head() {
+    async fn unpushed_contract_judges_the_branch_on_origin_and_merged_head() {
         let live = if replay::is_live() {
             let dir = tempfile::tempdir().expect("tempdir");
             let root = dir.path().to_path_buf();
@@ -4218,6 +4236,23 @@ mod tests {
             VcsCheck::True(details) => assert_eq!(details.len(), 1),
             other => panic!("merged head must short-circuit upstream state: {other:?}"),
         }
+        // A branch made from origin/main and tracking it is judged against its own name on
+        // origin: unpushed while that is absent, pushed once it holds the head, though the head
+        // stays ahead of the main it tracks.
+        if live.is_some() {
+            git(&repo, &["switch", "--track", "-c", "feature", "origin/main"]);
+            std::fs::write(repo.join("feature.txt"), "feature\n").expect("feature file");
+            git(&repo, &["add", "feature.txt"]);
+            git(&repo, &["commit", "-m", "feature"]);
+        }
+        assert_eq!(
+            vcs.unpushed_commits(None).await,
+            VcsCheck::False(vec!["origin/feature does not exist: the branch is not pushed".to_string()])
+        );
+        if live.is_some() {
+            git(&repo, &["push", "origin", "feature"]);
+        }
+        assert_eq!(vcs.unpushed_commits(None).await, VcsCheck::True(Vec::new()));
         session.finish();
     }
 

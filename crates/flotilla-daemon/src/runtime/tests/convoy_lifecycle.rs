@@ -769,8 +769,12 @@ async fn passing_teardown_gate_removes_the_managed_worktree_path() {
 }
 
 /// A convoy whose work completes naming change request 884, read by the forge observer in
-/// `state`: what became of its checkout.
-async fn checkout_release_after_change_request(state: flotilla_resources::ObservedChangeRequestState, untracked: bool) -> ReleaseSeen {
+/// `state`, its branch pushed when `pushed`: what became of its checkout.
+async fn checkout_release_after_change_request(
+    state: flotilla_resources::ObservedChangeRequestState,
+    pushed: bool,
+    untracked: bool,
+) -> ReleaseSeen {
     let temp = TempDir::new().expect("tempdir");
     let repo_default_dir = temp.path().join("flotilla-repos");
     let git_repo =
@@ -793,7 +797,7 @@ async fn checkout_release_after_change_request(state: flotilla_resources::Observ
         daemon,
         config,
         repo_default_dir,
-        CompletionAction::ChangeRequest { state, untracked },
+        CompletionAction::ChangeRequest { state, pushed, untracked },
     )
     .await
     .expect("what became of the checkout")
@@ -804,7 +808,7 @@ async fn checkout_release_after_change_request(state: flotilla_resources::Observ
 // so without the change request it would be archived as forced removal.
 #[tokio::test]
 async fn a_merged_change_request_releases_its_checkout_as_landed() {
-    let seen = checkout_release_after_change_request(flotilla_resources::ObservedChangeRequestState::Merged, false).await;
+    let seen = checkout_release_after_change_request(flotilla_resources::ObservedChangeRequestState::Merged, false, false).await;
     assert_eq!(seen.convoy, Some(ConvoyPhase::Landed), "{seen:?}");
     assert_eq!(seen.landed, Some(true), "{seen:?}");
     assert!(matches!(seen.reading, LifecycleReading::Released), "{seen:?}");
@@ -816,13 +820,29 @@ async fn a_merged_change_request_releases_its_checkout_as_landed() {
 // never removed as landed.
 #[tokio::test]
 async fn a_change_request_closed_unmerged_archives_its_checkout() {
-    let seen = checkout_release_after_change_request(flotilla_resources::ObservedChangeRequestState::Closed, false).await;
+    let seen = checkout_release_after_change_request(flotilla_resources::ObservedChangeRequestState::Closed, false, false).await;
     assert_eq!(seen.convoy, Some(ConvoyPhase::Landed), "{seen:?}");
     assert_eq!(seen.landed, Some(false), "{seen:?}");
     assert!(seen.landed_details.iter().any(|detail| detail.contains("#884")), "the change request was read: {seen:?}");
+    assert_eq!(seen.pushed, Some(false), "{seen:?}");
     assert!(matches!(seen.reading, LifecycleReading::Released), "{seen:?}");
     assert!(!seen.on_disk, "{seen:?}");
     assert_eq!(seen.archives, 1, "{seen:?}");
+}
+
+// An unmerged branch pushed to origin under its own name is pushed, though it is ahead of the
+// origin/main it was made from: its clean checkout is removed as clean and pushed, keeping the
+// branch, and nothing is archived.
+#[tokio::test]
+async fn an_unmerged_pushed_clean_branch_is_removed_as_pushed_not_archived() {
+    let seen = checkout_release_after_change_request(flotilla_resources::ObservedChangeRequestState::Closed, true, false).await;
+    assert_eq!(seen.convoy, Some(ConvoyPhase::Landed), "{seen:?}");
+    assert_eq!(seen.landed, Some(false), "{seen:?}");
+    assert_eq!(seen.pushed, Some(true), "{seen:?}");
+    assert!(matches!(seen.reading, LifecycleReading::Released), "{seen:?}");
+    assert!(!seen.on_disk, "{seen:?}");
+    assert!(seen.branch_kept, "{seen:?}");
+    assert_eq!(seen.archives, 0, "a pushed checkout is not archived: {seen:?}");
 }
 
 // CURRENT BEHAVIOUR, pending Robert's ruling (run 3's trial-a): a merged change request's
@@ -831,7 +851,7 @@ async fn a_change_request_closed_unmerged_archives_its_checkout() {
 // host's observation changing: the launch stays Ready and on disk, with nothing archived.
 #[tokio::test]
 async fn a_landed_checkout_with_an_untracked_file_stays_unreleased() {
-    let seen = checkout_release_after_change_request(flotilla_resources::ObservedChangeRequestState::Merged, true).await;
+    let seen = checkout_release_after_change_request(flotilla_resources::ObservedChangeRequestState::Merged, false, true).await;
     assert_eq!(seen.convoy, Some(ConvoyPhase::Landed), "{seen:?}");
     assert_eq!(seen.landed, Some(true), "{seen:?}");
     assert!(matches!(seen.reading, LifecycleReading::Ready { .. }), "{seen:?}");
