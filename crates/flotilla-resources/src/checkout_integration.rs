@@ -51,19 +51,6 @@ fn subject_change_request_id(
     }
 }
 
-/// The change request, by address, that a checkout of repository `repo_ref` held by `convoy` is
-/// judged against when it is released: the one [`convoy_change_request_id`] names, in the
-/// repository at the URL the convoy admitted it from.
-pub fn convoy_checkout_change_request(
-    convoy: &ResourceObject<Convoy>,
-    repo_ref: &crate::RepositoryKey,
-    forges: &[crate::ForgeSpec],
-) -> Option<flotilla_address::Address> {
-    let number = convoy_change_request_id(convoy, repo_ref, forges)?.parse::<u64>().ok()?;
-    let repository = convoy.spec.repositories.iter().find(|repository| repository.repo_ref == *repo_ref)?;
-    crate::address::remote_change_request_address(&repository.url, number, forges).ok()
-}
-
 /// Extract forge PR references carried by a crew claim or ledger text.
 /// Only repositories admitted to this convoy may become produced subjects.
 pub fn change_request_subjects_from_claim(

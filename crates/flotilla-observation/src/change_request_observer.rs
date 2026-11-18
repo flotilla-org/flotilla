@@ -1,5 +1,5 @@
 use std::{
-    collections::{hash_map::Entry, BTreeMap, BTreeSet, HashMap, HashSet},
+    collections::{hash_map::Entry, BTreeMap, HashMap, HashSet},
     sync::{Arc, Weak},
     time::Duration,
 };
@@ -11,12 +11,8 @@ use flotilla_protocol::{IssueSource, ReferenceContext, Relationship, SubjectKind
 use flotilla_provider_runtime::ObservationError;
 use flotilla_resources::{
     address::{stored_spelling_names, subject_address},
-    checkout_integration::convoy_checkout_change_request,
-    checkout_records::{CheckoutChange, CheckoutHolder, Launches},
-    convoy_subject_rows,
-    lifecycle_reads::LifecycleReads,
-    merge_change_request_history, retain_change_request, select_change_requests, ChangeRequest, ChangeRequestSpec, ChangeRequestStatus,
-    Convoy, Forge, ForgeSpec, InputMeta, ObservedChangeRequestState, ObservedChecks, RepositoryKey, ResourceError, ResourceObject,
+    convoy_subject_rows, merge_change_request_history, retain_change_request, select_change_requests, ChangeRequest, ChangeRequestSpec,
+    ChangeRequestStatus, Convoy, Forge, ForgeSpec, InputMeta, ObservedChangeRequestState, ObservedChecks, ResourceError, ResourceObject,
     ResourceProvenance,
 };
 use flotilla_store::{
@@ -77,119 +73,6 @@ pub trait BranchProbe: Send + Sync {
     async fn probe(&self, repository: &Address, branch: &str) -> Result<(), String>;
 }
 
-/// The checkouts held by a convoy launch and not yet released, at every home this one follows:
-/// each is judged against its holder's change request when it is released.
-pub trait UnreleasedCheckouts: Send + Sync {
-    /// Each one's holding launch and repository.
-    fn unreleased(&self) -> Result<Vec<(String, RepositoryKey)>, String>;
-    /// Their changes from now on; a closed channel where none are followed.
-    fn changes(&self) -> tokio::sync::broadcast::Receiver<CheckoutChange>;
-}
-
-/// What holds a change request's observation demand.
-#[derive(Clone, Copy, Debug)]
-enum DemandSource {
-    /// Live convoys, and abandoned ones for their Submitted pr promises.
-    Convoys,
-    /// Checkouts not yet released.
-    Checkouts,
-}
-
-impl std::fmt::Display for DemandSource {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.write_str(match self {
-            Self::Convoys => "convoy demand",
-            Self::Checkouts => "checkout demand",
-        })
-    }
-}
-
-type DemandEvents = futures::stream::SelectAll<futures::stream::BoxStream<'static, Result<(), ResourceError>>>;
-
-/// Waits for the next change, then collapses its burst into one pass without delaying an
-/// isolated change; the drain is bounded so a busy source cannot starve it. `false` when the
-/// events failed or ended, and are to be subscribed afresh.
-async fn next_burst(events: &mut DemandEvents, source: DemandSource) -> bool {
-    match events.next().await {
-        Some(Ok(())) => {
-            for _ in 0..64 {
-                match events.next().now_or_never() {
-                    Some(Some(Ok(()))) => {}
-                    Some(Some(Err(error))) => {
-                        tracing::warn!(%error, "change request {source} watch failed; relisting");
-                        return false;
-                    }
-                    _ => break,
-                }
-            }
-            true
-        }
-        Some(Err(error)) => {
-            tracing::warn!(%error, "change request {source} watch failed; relisting");
-            false
-        }
-        None => false,
-    }
-}
-
-/// Keeps the unreleased checkouts' demand in `namespace` as they and their convoys change, while
-/// the observer lives. Its demands are kept across resubscriptions: only a successful re-list can
-/// show a checkout was released.
-async fn run_checkout_demands(inner: Weak<ChangeRequestRefresherInner>, namespace: String) {
-    let observer = || inner.upgrade().map(|inner| ChangeRequestRefresher { inner });
-    let mut demands = HashMap::new();
-    let mut retry_delay = Duration::from_secs(1);
-    loop {
-        let Some(refresher) = observer() else { return };
-        let events = refresher.demand_events(&namespace, DemandSource::Checkouts).await;
-        drop(refresher);
-        match events {
-            Err(error) => tracing::warn!(%error, "change request checkout demand watch subscription failed"),
-            Ok(mut events) => loop {
-                let Some(refresher) = observer() else { return };
-                let reconciled = refresher.reconcile_checkout_demands(&namespace, &mut demands).await;
-                drop(refresher);
-                if let Err(error) = reconciled {
-                    tracing::warn!(%error, "change request checkout demand reconciliation failed");
-                    break;
-                }
-                retry_delay = Duration::from_secs(1);
-                if !next_burst(&mut events, DemandSource::Checkouts).await {
-                    break;
-                }
-            },
-        }
-        tokio::time::sleep(retry_delay).await;
-        retry_delay = retry_delay.saturating_mul(2).min(Duration::from_secs(30));
-    }
-}
-
-/// The engine's checkouts, as the lifecycle reads serve them.
-pub struct EngineUnreleasedCheckouts(pub Arc<dyn LifecycleReads>);
-
-impl UnreleasedCheckouts for EngineUnreleasedCheckouts {
-    fn unreleased(&self) -> Result<Vec<(String, RepositoryKey)>, String> {
-        Ok(self
-            .0
-            .checkouts()?
-            .launches(Launches::Every)?
-            .into_iter()
-            .filter(|checkout| !checkout.ended())
-            .filter_map(|checkout| match checkout.holder {
-                Some(CheckoutHolder::Convoy(launch)) => Some((launch, checkout.spec.repo_ref().clone())),
-                None => None,
-            })
-            .collect())
-    }
-
-    fn changes(&self) -> tokio::sync::broadcast::Receiver<CheckoutChange> {
-        match self.0.checkouts() {
-            Ok(checkouts) => checkouts.changes(),
-            Err(_) => tokio::sync::broadcast::channel(1).1,
-        }
-    }
-}
-
 struct ActiveRefresh {
     demands: HashMap<uuid::Uuid, Option<DateTime<Utc>>>,
     wake: Arc<Notify>,
@@ -216,11 +99,6 @@ struct ChangeRequestRefresherInner {
     grace_schedule_reads: std::sync::atomic::AtomicUsize,
     engine: EngineObservers,
     branch_probe: std::sync::OnceLock<Arc<dyn BranchProbe>>,
-    /// The checkouts still to be released, each of which needs the change request it is judged
-    /// against; none are read until installed.
-    checkouts: std::sync::OnceLock<Arc<dyn UnreleasedCheckouts>>,
-    /// The one task that keeps the unreleased checkouts' demand; it ends with the observer.
-    checkout_demands: std::sync::OnceLock<tokio_util::task::AbortOnDropHandle<()>>,
     /// The convoy branches this observer looks up, each with when its next lookup is due.
     branch_schedule: std::sync::Mutex<HashMap<(Address, String), tokio::time::Instant>>,
     /// Wakes the branch scheduler when a branch is added.
@@ -250,8 +128,6 @@ impl ChangeRequestRefresher {
                 grace_schedule_reads: Default::default(),
                 engine: EngineObservers::default(),
                 branch_probe: std::sync::OnceLock::new(),
-                checkouts: std::sync::OnceLock::new(),
-                checkout_demands: std::sync::OnceLock::new(),
                 branch_schedule: std::sync::Mutex::new(HashMap::new()),
                 branch_wake: Arc::new(Notify::new()),
                 branch_scheduler: std::sync::OnceLock::new(),
@@ -270,18 +146,6 @@ impl ChangeRequestRefresher {
         Ok(())
     }
 
-    /// Installs the checkouts still to be released, once the lifecycle reads that serve them are:
-    /// each in `namespace` demands the change request it is judged against until it is released.
-    pub fn install_checkouts(&self, checkouts: Arc<dyn UnreleasedCheckouts>, namespace: &str) -> Result<(), String> {
-        self.inner.checkouts.set(checkouts).map_err(|_| "the unreleased checkouts are already installed".to_owned())?;
-        let demands = tokio::spawn(attributed(
-            caller("change request checkout demands"),
-            run_checkout_demands(Arc::downgrade(&self.inner), namespace.to_owned()),
-        ));
-        let _ = self.inner.checkout_demands.set(tokio_util::task::AbortOnDropHandle::new(demands));
-        Ok(())
-    }
-
     /// Convoys are durable observation demand, including those homed on peers.
     /// Subscribe before listing so startup and watch recovery cannot lose demand.
     /// Only the source owner arms refreshes; forge reads stay in the ordinary
@@ -292,75 +156,60 @@ impl ChangeRequestRefresher {
         let mut demands = HashMap::new();
         let mut retry_delay = Duration::from_secs(1);
         loop {
-            match self.demand_events(namespace, DemandSource::Convoys).await {
-                Err(error) => tracing::warn!(%error, "change request convoy demand watch subscription failed"),
-                Ok(mut events) => loop {
+            let mut streams = Vec::new();
+            let mut subscription_error = None;
+            for kind in ["Convoy", "Project", "Repository", "Host", "Forge"] {
+                match watch_resource_kind_including_replicas(&self.inner.backend, namespace, kind).await {
+                    Ok(watch) => streams.push(
+                        watch
+                            .stream
+                            .chain(futures::stream::once(
+                                async move { Err(ResourceError::other(format!("{kind} convoy demand watch closed"))) },
+                            ))
+                            .boxed(),
+                    ),
+                    Err(error) => {
+                        subscription_error = Some(error);
+                        break;
+                    }
+                }
+            }
+            if let Some(error) = subscription_error {
+                tracing::warn!(%error, "change request convoy demand watch subscription failed");
+            } else {
+                let mut events = futures::stream::select_all(streams);
+                'reconcile: loop {
                     if let Err(error) = self.reconcile_convoy_demands(namespace, &mut demands).await {
                         tracing::warn!(%error, "change request convoy demand reconciliation failed");
                         break;
                     }
                     retry_delay = Duration::from_secs(1);
-                    if !next_burst(&mut events, DemandSource::Convoys).await {
-                        break;
+                    match events.next().await {
+                        Some(Ok(_)) => {
+                            // Collapse bursts into one re-list without delaying isolated
+                            // changes. Bound the drain so a busy source cannot starve it.
+                            for _ in 0..64 {
+                                match events.next().now_or_never() {
+                                    Some(Some(Ok(_))) => {}
+                                    Some(Some(Err(error))) => {
+                                        tracing::warn!(%error, "change request convoy demand watch failed; relisting");
+                                        break 'reconcile;
+                                    }
+                                    _ => break,
+                                }
+                            }
+                        }
+                        Some(Err(error)) => {
+                            tracing::warn!(%error, "change request convoy demand watch failed; relisting");
+                            break;
+                        }
+                        None => break,
                     }
-                },
+                }
             }
             tokio::time::sleep(retry_delay).await;
             retry_delay = retry_delay.saturating_mul(2).min(Duration::from_secs(30));
         }
-    }
-
-    /// The changes that can move `source`'s demand, subscribed before any listing. The resource
-    /// watches fail when they close; the checkouts' changes, where none are followed, just end.
-    async fn demand_events(&self, namespace: &str, source: DemandSource) -> Result<DemandEvents, ResourceError> {
-        let mut streams = Vec::new();
-        for kind in ["Convoy", "Project", "Repository", "Host", "Forge"] {
-            let watch = watch_resource_kind_including_replicas(&self.inner.backend, namespace, kind).await?;
-            streams.push(
-                watch
-                    .stream
-                    .map(|event| event.map(|_| ()))
-                    .chain(futures::stream::once(async move { Err(ResourceError::other(format!("{kind} {source} watch closed"))) }))
-                    .boxed(),
-            );
-        }
-        if let (DemandSource::Checkouts, Some(checkouts)) = (source, self.inner.checkouts.get()) {
-            streams.push(
-                futures::stream::unfold(checkouts.changes(), |mut changes| async move {
-                    match changes.recv().await {
-                        Ok(_) | Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => Some((Ok(()), changes)),
-                        Err(tokio::sync::broadcast::error::RecvError::Closed) => None,
-                    }
-                })
-                .boxed(),
-            );
-        }
-        Ok(futures::stream::select_all(streams))
-    }
-
-    /// Each checkout not yet released demands the change request it is judged against when it is
-    /// released, which follows its convoy's end, so the convoy's own demand cannot cover it.
-    /// Like the convoys' demand, only the source owner arms it.
-    async fn reconcile_checkout_demands(&self, namespace: &str, demands: &mut HashMap<ChangeRequestKey, uuid::Uuid>) -> Result<(), String> {
-        let Some(checkouts) = self.inner.checkouts.get().cloned() else { return Ok(()) };
-        let unreleased = tokio::task::spawn_blocking(move || checkouts.unreleased())
-            .await
-            .map_err(|error| format!("read the unreleased checkouts: {error}"))??;
-        let forges = self.forges(namespace).await?;
-        let convoys = self.inner.backend.including_replicas::<Convoy>(namespace);
-        let mut addresses = Vec::new();
-        for (launch, repo_ref) in unreleased.into_iter().collect::<BTreeSet<_>>() {
-            // The holder is a launch, and the Convoy views are named by their launch.
-            let convoy = match convoys.get(&launch).await {
-                Ok(convoy) => convoy.object,
-                Err(ResourceError::NotFound { .. }) => continue,
-                Err(error) => return Err(format!("read convoy {launch}: {error}")),
-            };
-            if let Some(address) = convoy_checkout_change_request(&convoy, &repo_ref, &forges) {
-                addresses.push((launch, address));
-            }
-        }
-        self.apply_demands(namespace, addresses, demands).await
     }
 
     async fn reconcile_convoy_demands(&self, namespace: &str, demands: &mut HashMap<ChangeRequestKey, uuid::Uuid>) -> Result<(), String> {
@@ -375,6 +224,8 @@ impl ChangeRequestRefresher {
             .await
             .map_err(|error| error.to_string())?;
         let forges = self.forges(namespace).await?;
+        let mut wanted = HashSet::new();
+        let mut owners = HashMap::new();
         let mut branches = HashSet::new();
         for copy in &convoys.items {
             branches.extend(unproduced_branches(&copy.object, &forges));
@@ -410,21 +261,6 @@ impl ChangeRequestRefresher {
                 addresses.push((copy.object.metadata.name.clone(), address));
             }
         }
-        self.apply_demands(namespace, addresses, demands).await?;
-        // Complete independent demand updates before retrying failed cleanup.
-        cleanup_result
-    }
-
-    /// Demands the change requests at `addresses` that this observer's authority owns, each
-    /// named with the holder that wants it, and releases the rest of `demands`.
-    async fn apply_demands(
-        &self,
-        namespace: &str,
-        addresses: Vec<(String, Address)>,
-        demands: &mut HashMap<ChangeRequestKey, uuid::Uuid>,
-    ) -> Result<(), String> {
-        let mut wanted = HashSet::new();
-        let mut owners = HashMap::new();
         for (convoy, address) in addresses {
             let subject = match ChangeRequestKey::new(namespace, address) {
                 Ok(subject) => subject,
@@ -460,7 +296,8 @@ impl ChangeRequestRefresher {
                 self.release(id).await;
             }
         }
-        Ok(())
+        // Complete independent demand updates before retrying failed cleanup.
+        cleanup_result
     }
 
     /// Schedules each wanted branch whose repository this observer observes, a new one due at once,
@@ -1489,127 +1326,6 @@ mod tests {
         convoys.update_status("abandoned", &convoy.metadata.resource_version, &status).await.expect("kept");
         refresher.reconcile_convoy_demands("ops", &mut demands).await.expect("reconcile");
         assert!(demands.is_empty(), "the merge released the demand: {demands:?}");
-        for (_, refresh) in refresher.inner.active.lock().await.drain() {
-            refresh.task.abort();
-        }
-    }
-
-    struct HeldCheckouts(std::sync::Mutex<Vec<(String, RepositoryKey)>>);
-
-    impl UnreleasedCheckouts for HeldCheckouts {
-        fn unreleased(&self) -> Result<Vec<(String, RepositoryKey)>, String> {
-            Ok(self.0.lock().expect("checkouts").clone())
-        }
-
-        fn changes(&self) -> tokio::sync::broadcast::Receiver<CheckoutChange> {
-            tokio::sync::broadcast::channel(1).1
-        }
-    }
-
-    // A checkout is released after its convoy ends, and its release judges it against the change
-    // request its convoy names: landed when merged, kept when closed. The convoy's end makes the
-    // change request's demand due for release, and its release collects the observation. A
-    // checkout still to be released demands it too, so the release reads it after the convoy has
-    // landed; the checkout's release ends that demand and the observation is collected.
-    #[tokio::test]
-    async fn a_landed_convoys_change_request_is_observed_until_its_checkout_is_released() {
-        for state in [ObservedChangeRequestState::Merged, ObservedChangeRequestState::Closed] {
-            a_landed_convoys_change_request_is_observed_until_its_checkout_is_released_when(state).await;
-        }
-    }
-
-    async fn a_landed_convoys_change_request_is_observed_until_its_checkout_is_released_when(state: ObservedChangeRequestState) {
-        use flotilla_resources::{
-            BoundChangeRequest, ConvoyPhase, ConvoyRepositorySpec, ConvoySpec, ConvoyStatus, Host, HostSpec, HostStatus,
-        };
-        let backend = ResourceBackend::new(InMemoryBackend::default()).with_local_root(flotilla_protocol::NodeId::new("node"));
-        let hosts = backend.using::<Host>("ops");
-        let host = hosts.create(&InputMeta::builder().name("node-host".into()).build(), &HostSpec::default()).await.expect("host");
-        let ready = HostStatus { ready: true, heartbeat_at: Some(Utc::now()), ..Default::default() };
-        hosts.update_status("node-host", &host.metadata.resource_version, &ready).await.expect("heartbeat");
-        let refresher = ChangeRequestRefresher::new(
-            backend.clone(),
-            "node".into(),
-            Arc::new(UnavailableSource),
-            ChangeRequestRefreshCadence::default(),
-        );
-        let repo_ref = RepositoryKey("repo".into());
-        let launch = "coder#1";
-        let checkouts = Arc::new(HeldCheckouts(std::sync::Mutex::new(vec![(launch.to_owned(), repo_ref.clone())])));
-        // Passes are driven here, one at a time, rather than by the observer's own watch.
-        assert!(refresher.inner.checkouts.set(checkouts.clone()).is_ok());
-
-        let repository = ConvoyRepositorySpec {
-            url: "https://github.com/org/repo".into(),
-            repo_ref: repo_ref.clone(),
-            source_ref: "main".into(),
-            target_ref: "main".into(),
-            workspace_slug: "repo".into(),
-            subpaths: Vec::new(),
-        };
-        let spec = ConvoySpec::builder()
-            .workflow_ref("dev".into())
-            .project_ref("flotilla".into())
-            .role("coder".into())
-            .repositories(vec![repository])
-            .change_request(BoundChangeRequest { id: "42".into(), repository_ref: repo_ref, title: "the work".into() })
-            .build();
-        let convoys = backend.using::<Convoy>("ops");
-        let convoy = convoys.create(&InputMeta::builder().name(launch.into()).build(), &spec).await.expect("convoy");
-        let convoy = convoys
-            .update_status(launch, &convoy.metadata.resource_version, &ConvoyStatus { phase: ConvoyPhase::Active, ..Default::default() })
-            .await
-            .expect("active");
-
-        // The change request is observed, merged or closed.
-        let name = cr_name("github.com", "org/repo", 42);
-        let records = backend.using::<ChangeRequest>("ops");
-        let record = records
-            .create(
-                &InputMeta::builder().name(name.clone()).build(),
-                &ChangeRequestSpec::builder()
-                    .service("github.com".into())
-                    .scope("org/repo".into())
-                    .number(42)
-                    .observing_authority("node".into())
-                    .build(),
-            )
-            .await
-            .expect("change request");
-        let mut status =
-            parse_gh_observation(r#"{"state":"OPEN","headRefOid":"head","statusCheckRollup":[]}"#, Utc::now()).expect("observation");
-        status.state = flotilla_resources::Observation::known(state, Utc::now());
-        records.update_status(&name, &record.metadata.resource_version, &status).await.expect("observed");
-        // As the checkout's release reads it.
-        let observed = || async {
-            let copies = backend.including_replicas::<ChangeRequest>("ops").get_all(&name).await.expect("read").items;
-            flotilla_resources::pick_replica_read(copies, |copy| (&copy.object, matches!(copy.provenance, ResourceProvenance::Local)))
-                .and_then(|copy| copy.object.status)
-                .and_then(|status| status.state.value)
-        };
-
-        let (mut convoy_demands, mut checkout_demands) = (HashMap::new(), HashMap::new());
-        refresher.reconcile_convoy_demands("ops", &mut convoy_demands).await.expect("reconcile");
-        refresher.reconcile_checkout_demands("ops", &mut checkout_demands).await.expect("reconcile");
-        for (demands, by) in [(&convoy_demands, "the live convoy"), (&checkout_demands, "the checkout")] {
-            let demanded: Vec<String> = demands.keys().map(ChangeRequestKey::record_name).collect();
-            assert_eq!(demanded, std::slice::from_ref(&name), "{by} demands it");
-        }
-
-        // The convoy lands: its demand is due for release, and only then is its checkout released.
-        convoys
-            .update_status(launch, &convoy.metadata.resource_version, &ConvoyStatus { phase: ConvoyPhase::Landed, ..Default::default() })
-            .await
-            .expect("landed");
-        refresher.reconcile_convoy_demands("ops", &mut convoy_demands).await.expect("reconcile");
-        assert!(convoy_demands.is_empty(), "the landed convoy released its demand: {convoy_demands:?}");
-        assert_eq!(observed().await, Some(state), "the checkout's release reads the change request its convoy named");
-
-        // Released, the checkout no longer needs it: the demand ends and the observation is collected.
-        checkouts.0.lock().expect("checkouts").clear();
-        refresher.reconcile_checkout_demands("ops", &mut checkout_demands).await.expect("reconcile");
-        assert!(checkout_demands.is_empty(), "the release ended the demand: {checkout_demands:?}");
-        assert_eq!(observed().await, None, "the observation is collected");
         for (_, refresh) in refresher.inner.active.lock().await.drain() {
             refresh.task.abort();
         }
