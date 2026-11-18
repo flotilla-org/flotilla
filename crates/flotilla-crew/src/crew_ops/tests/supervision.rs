@@ -1205,3 +1205,23 @@ async fn the_governor_resumes_a_stall_escalated_past_the_crew_rungs() {
     let accepted = crew.supervise(resume(&held.launch, &governor_crew)).await.expect("the governor's resume");
     assert_eq!(accepted, flotilla_protocol::CommandValue::Ok);
 }
+
+// d10's stuck long-runners: a peer's handoff to a stalled crew gives it work but no guidance, so
+// its stall stays for its supervisors to answer.
+#[tokio::test]
+async fn a_peer_handoff_leaves_its_receivers_stall_for_guidance() {
+    use flotilla_protocol::StallReason;
+    let (crew, backend, probe, held) = shaped_fixture(CrewWorkPhase::Working, |snapshot| with_member(snapshot, "aide")).await;
+    probe.fail.store(false, Ordering::SeqCst);
+    let context =
+        |role: &str| CrewCommandContext::builder().convoy(held.launch.clone()).vessel_ref(held.vessel.clone()).role(role.into()).build();
+    crew.stall(&context("coder"), StallReason::Other, None, "a command kept failing".into()).await.expect("the coder stalls");
+    let stall = |status: &flotilla_resources::ConvoyStatus| status.stalls.about(Some(("work", "coder"))).cloned();
+    let stalled = stall(&held.convoy(&backend).await.status.expect("status")).expect("the coder's stall");
+
+    crew.handoff(&context("aide"), &format!("{}/work/coder", held.launch), "Done.").await.expect("the aide's handoff");
+    let status = held.convoy(&backend).await.status.expect("status");
+    assert!(status.crew_work["work"]["coder"].task_assigned, "the handoff gives the coder its work");
+    assert_eq!(stall(&status), Some(stalled), "a peer's turn is not guidance: the stall stays as it was");
+    assert_eq!(status.crew_work["work"]["coder"].phase, CrewWorkPhase::Stalled);
+}

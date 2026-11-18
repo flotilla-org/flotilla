@@ -69,9 +69,14 @@ impl WorkCredentialReconciler for StagingProbe {
         assert_eq!(environment, "resume-env");
         let launch = self.launch.get().expect("the fixture's launch");
         let convoy = self.backend.using::<ResourceConvoy>(namespace).get(launch).await.expect("convoy");
-        // The coder's work is reopened first: its home notes the resume it is staging for.
+        // The coder's work is reopened first: its home notes the resume it is staging for. A
+        // stalled coder's seat reads as its stall, which a turn that is not guidance leaves, and
+        // staging for another seat in the environment finds it so.
         let coder = &convoy.status.expect("status").crew_work["work"]["coder"];
-        assert!(coder.task_assigned && coder.resume_brief_id.is_some(), "staging follows the noted reopen: {coder:?}");
+        assert!(
+            coder.phase == CrewWorkPhase::Stalled || (coder.task_assigned && coder.resume_brief_id.is_some()),
+            "staging follows the noted reopen: {coder:?}"
+        );
         self.calls.fetch_add(1, Ordering::SeqCst);
         if self.fail.swap(false, Ordering::SeqCst) {
             Err("staging unavailable".into())

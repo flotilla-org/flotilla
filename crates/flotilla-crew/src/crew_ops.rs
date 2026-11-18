@@ -104,6 +104,19 @@ fn awaiting_kind(
     }
 }
 
+/// How a delivered turn resumes its seat: guidance, a supervisor's or a person's turn that is not
+/// itself a stall's supervision request, reopens it and ends its stall; any other turn, such
+/// as a peer's handoff, reopens it and leaves the stall for guidance to end.
+fn turn_resume_intent(request: &CrewTurnIntent) -> ResumeIntent {
+    let guidance = request.stall_of.is_none()
+        && (request.relation == flotilla_resources::MessageRelation::Supervisor || matches!(request.sender, Party::Person(_)));
+    if guidance {
+        ResumeIntent::Reopen
+    } else {
+        ResumeIntent::Turn
+    }
+}
+
 /// The Message document the router admits at the receiver's home: `name`, its intent the spec.
 fn message_document(namespace: &str, name: &str, intent: &Intent) -> serde_json::Value {
     serde_json::json!({
@@ -3148,7 +3161,7 @@ impl CrewService {
                         self.clock.now(),
                         request.brief.clone(),
                         Some(name.clone()),
-                        ResumeIntent::Reopen,
+                        turn_resume_intent(request),
                     ),
                 )
                 .await

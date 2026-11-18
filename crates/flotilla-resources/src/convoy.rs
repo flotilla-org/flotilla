@@ -2202,6 +2202,10 @@ pub enum ConvoyStatusPatch {
 pub enum ResumeIntent {
     Reminder,
     Reopen,
+    /// New work from a turn that is not guidance, such as a peer's handoff: it reopens the
+    /// seat as [`Self::Reopen`] does, but the seat's stall stays. Only a supervisor's or the
+    /// operator's guidance, or the stalled crew's own progress, ends a stall.
+    Turn,
 }
 
 impl ConvoyStatus {
@@ -2803,8 +2807,11 @@ impl ConvoyStatusPatch {
                     state.decision_ledger_digest = None;
                     state.message = Some(prompt.clone());
                 }
-                // The resumed seat's stall ends, and the stall about no seat; another seat's stays.
-                status.stalls.retain(|stall| stall.seat().is_some() && !stall.names_seat(vessel, role));
+                // Guidance ends the resumed seat's stall, and the stall about no seat; another
+                // seat's stays, as does any stall under a turn that is not guidance.
+                if *intent != ResumeIntent::Turn {
+                    status.stalls.retain(|stall| stall.seat().is_some() && !stall.names_seat(vessel, role));
+                }
             }
             Self::QueueMessageFollowUp { vessel, role, message } => {
                 if let Some(state) = status.crew_work.get_mut(vessel).and_then(|crew| crew.get_mut(role)) {
