@@ -251,6 +251,12 @@ pub struct DummyTerminalPool {
 }
 
 impl DummyTerminalPool {
+    /// The session `name` as this pool's environment sees it: cleat inside one container
+    /// reaches only that container's sessions, so another environment's is absent here.
+    fn own(&self, name: &str) -> Option<Arc<DummySession>> {
+        self.fleet.sessions.get(name).filter(|session| session.environment == self.environment)
+    }
+
     fn launch(&self, name: &str, command: &str, cwd: &ExecutionEnvironmentPath, environment: &TerminalEnvVars) -> Result<(), String> {
         let identity = CrewIdentity::from_environment(environment);
         let script = environment.iter().rev().find(|(key, _)| key == DUMMY_SCRIPT_ENV).map(|(_, script)| script.as_str());
@@ -291,6 +297,7 @@ impl TerminalPool for DummyTerminalPool {
             .sessions
             .lock()
             .iter()
+            .filter(|(_, session)| session.environment == self.environment)
             .map(|(name, session)| {
                 TerminalSession::builder()
                     .session_name(name.clone())
@@ -311,7 +318,7 @@ impl TerminalPool for DummyTerminalPool {
         env_vars: &TerminalEnvVars,
         _tags: &[TerminalSessionTag],
     ) -> Result<(), String> {
-        if self.fleet.sessions.get(session_name).is_some() {
+        if self.own(session_name).is_some() {
             return Ok(());
         }
         self.launch(session_name, command, cwd, env_vars)
@@ -328,7 +335,13 @@ impl TerminalPool for DummyTerminalPool {
     }
 
     async fn kill_session(&self, session_name: &str) -> Result<(), String> {
-        let killed = self.fleet.sessions.lock().remove(session_name);
+        let killed = {
+            let mut sessions = self.fleet.sessions.lock();
+            match sessions.get(session_name) {
+                Some(session) if session.environment == self.environment => sessions.remove(session_name),
+                _ => None,
+            }
+        };
         if let Some(session) = killed {
             self.fleet.record(&Event::Killed { session: session_name.into() });
             session.stop();
@@ -337,7 +350,7 @@ impl TerminalPool for DummyTerminalPool {
     }
 
     async fn capture_screen(&self, session_name: &str) -> Result<Option<String>, String> {
-        Ok(self.fleet.sessions.get(session_name).map(|session| session.screen()))
+        Ok(self.own(session_name).map(|session| session.screen()))
     }
 
     async fn deliver(&self, session_name: &str, text: &str) -> Result<(), String> {
@@ -347,7 +360,7 @@ impl TerminalPool for DummyTerminalPool {
     /// A keyed send, as cleat's (cleat#411): a key the session already accepted writes nothing
     /// and answers when it was first accepted, across a restart of the daemon too.
     async fn guarded_deliver(&self, session_name: &str, text: &str, key: &str) -> Result<TerminalSubmission, String> {
-        if let Some(at_unix_ms) = self.fleet.sessions.get(session_name).and_then(|session| session.accepted(key)) {
+        if let Some(at_unix_ms) = self.own(session_name).and_then(|session| session.accepted(key)) {
             return Ok(TerminalSubmission::AlreadySubmitted { at_unix_ms });
         }
         self.accept(session_name, text, Some(key))?;
@@ -357,7 +370,7 @@ impl TerminalPool for DummyTerminalPool {
 
 impl DummyTerminalPool {
     fn accept(&self, session_name: &str, text: &str, key: Option<&str>) -> Result<(), String> {
-        let session = self.fleet.sessions.get(session_name).ok_or_else(|| format!("dummy session {session_name} is not running"))?;
+        let session = self.own(session_name).ok_or_else(|| format!("dummy session {session_name} is not running"))?;
         let turns = session.turns.as_ref().ok_or_else(|| format!("dummy session {session_name} hosts no crew"))?;
         if turns.is_closed() {
             return Err(format!("dummy crew in {session_name} has stopped"));
@@ -561,6 +574,40 @@ mod tests {
         assert_eq!(fleet.snapshot().live_sessions, 1);
         assert!(fleet.sessions.get("one-session").is_none());
         assert!(fleet.sessions.get("two-session").is_some());
+    }
+
+    // As cleat inside one container: a pool lists, captures, sends to and kills only its own
+    // environment's sessions; another environment's session is absent to it.
+    #[tokio::test]
+    async fn a_pool_reaches_only_its_own_environments_sessions() {
+        let fleet = DummyFleet::new(DummyFleetConfig::default());
+        fleet.attach(Arc::new(IdlePort) as Arc<dyn CrewCommandPort>).expect("attach");
+        let one = DummyTerminalPool { fleet: Arc::clone(&fleet), environment: "one".into() };
+        let two = DummyTerminalPool { fleet: Arc::clone(&fleet), environment: "two".into() };
+        let path = ExecutionEnvironmentPath::new("/workspace");
+        one.ensure_session("one-session", "shell", &path, &vec![], &[]).await.expect("one");
+        two.ensure_session(SESSION, "flotilla-dummy-crew", &path, &launch_environment(&CrewScript::Supervisor), &[]).await.expect("two");
+
+        let listed = |sessions: Vec<TerminalSession>| sessions.into_iter().map(|session| session.session_name).collect::<Vec<_>>();
+        assert_eq!(listed(one.list_sessions().await.expect("list one")), vec!["one-session".to_string()]);
+        assert_eq!(listed(two.list_sessions().await.expect("list two")), vec![SESSION.to_string()]);
+        assert_eq!(one.capture_screen(SESSION).await.expect("capture"), None);
+        assert!(one.deliver(SESSION, "turn").await.is_err(), "another environment's session is not running here");
+        assert!(one.guarded_deliver(SESSION, "turn", "key").await.is_err());
+        one.kill_session(SESSION).await.expect("kill finds nothing here");
+        assert!(two.capture_screen(SESSION).await.expect("capture").is_some(), "the other environment's session lives on");
+        assert_eq!(fleet.snapshot().turns_received, 0);
+        two.kill_session(SESSION).await.expect("kill");
+    }
+
+    /// A port that answers every crew command and report, for tests about the pool.
+    struct IdlePort;
+
+    #[async_trait]
+    impl CrewCommandPort for IdlePort {
+        async fn execute(&self, _action: CommandAction) -> Result<CommandValue, String> {
+            Ok(CommandValue::Ok)
+        }
     }
 
     fn launch_environment(script: &CrewScript) -> TerminalEnvVars {
