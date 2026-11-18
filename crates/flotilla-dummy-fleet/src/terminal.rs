@@ -15,7 +15,7 @@ use async_trait::async_trait;
 use flotilla_discovery_api::{
     provider_config::ProviderConfigView, EnvironmentBag, Factory, ProviderCategory, ProviderDescriptor, UnmetRequirement,
 };
-use flotilla_environment::environment::dummy::DUMMY_FLEET_ENV;
+use flotilla_environment::environment::dummy::{dummy_draw, DUMMY_FLEET_ENV};
 use flotilla_paths::path_context::ExecutionEnvironmentPath;
 use flotilla_protocol::{arg::Arg, TerminalStatus};
 use flotilla_provider_runtime::CommandRunner;
@@ -353,15 +353,23 @@ impl TerminalPool for DummyTerminalPool {
         Ok(self.own(session_name).map(|session| session.screen()))
     }
 
+    /// An unkeyed send: cleat's pool answers its refusal as an error.
     async fn deliver(&self, session_name: &str, text: &str) -> Result<(), String> {
+        if let Some(reason) = self.refusal() {
+            return Err(reason);
+        }
         self.accept(session_name, text, None)
     }
 
     /// A keyed send, as cleat's (cleat#411): a key the session already accepted writes nothing
-    /// and answers when it was first accepted, across a restart of the daemon too.
+    /// and answers when it was first accepted, across a restart of the daemon too; a refused
+    /// send writes nothing.
     async fn guarded_deliver(&self, session_name: &str, text: &str, key: &str) -> Result<TerminalSubmission, String> {
         if let Some(at_unix_ms) = self.own(session_name).and_then(|session| session.accepted(key)) {
             return Ok(TerminalSubmission::AlreadySubmitted { at_unix_ms });
+        }
+        if let Some(reason) = self.refusal() {
+            return Ok(TerminalSubmission::Refused(reason));
         }
         self.accept(session_name, text, Some(key))?;
         Ok(TerminalSubmission::Submitted { keyed: true })
@@ -369,6 +377,21 @@ impl TerminalPool for DummyTerminalPool {
 }
 
 impl DummyTerminalPool {
+    /// Cleat's pre-write refusal of this submission, at the configured rate: the composer held
+    /// text when the send looked. Every attempt draws anew.
+    fn refusal(&self) -> Option<String> {
+        let rate = self.fleet.config.terminal.refusal_rate;
+        if rate <= 0.0 {
+            return None;
+        }
+        let attempt = self.fleet.submissions.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        if dummy_draw(self.fleet.config.seed, "delivery-refusal", &attempt.to_string()) >= rate {
+            return None;
+        }
+        self.fleet.count(Counter::SubmissionsRefused);
+        Some("not-matched: composer[value=''] did not match\n".into())
+    }
+
     fn accept(&self, session_name: &str, text: &str, key: Option<&str>) -> Result<(), String> {
         let session = self.own(session_name).ok_or_else(|| format!("dummy session {session_name} is not running"))?;
         let turns = session.turns.as_ref().ok_or_else(|| format!("dummy session {session_name} hosts no crew"))?;
@@ -598,6 +621,52 @@ mod tests {
         assert!(two.capture_screen(SESSION).await.expect("capture").is_some(), "the other environment's session lives on");
         assert_eq!(fleet.snapshot().turns_received, 0);
         two.kill_session(SESSION).await.expect("kill");
+    }
+
+    // At the configured rate the pool refuses a submission as cleat does, before writing: a keyed
+    // send answers `Refused` and an unkeyed one an error, the crew receives nothing and the key is
+    // not taken, so the same key's retry is submitted once.
+    #[tokio::test]
+    async fn the_pool_refuses_submissions_at_the_configured_rate_without_writing() {
+        let mut config = DummyFleetConfig::default();
+        config.terminal.refusal_rate = 1.0;
+        let fleet = DummyFleet::new(config);
+        fleet.attach(Arc::new(IdlePort) as Arc<dyn CrewCommandPort>).expect("attach");
+        let pool = DummyTerminalPool { fleet: Arc::clone(&fleet), environment: "env-a".into() };
+        let path = ExecutionEnvironmentPath::new("/workspace");
+        pool.ensure_session(SESSION, "flotilla-dummy-crew", &path, &launch_environment(&CrewScript::Supervisor), &[])
+            .await
+            .expect("launch");
+
+        let refused = pool.guarded_deliver(SESSION, "turn", "key-1").await.expect("answered");
+        assert!(matches!(&refused, TerminalSubmission::Refused(reason) if reason.starts_with("not-matched:")), "{refused:?}");
+        assert!(pool.deliver(SESSION, "turn").await.is_err(), "an unkeyed refusal is an error, as cleat's pool reports it");
+        assert_eq!((fleet.snapshot().turns_received, fleet.snapshot().submissions_refused), (0, 2));
+        pool.kill_session(SESSION).await.expect("kill");
+
+        // At a partial rate each attempt draws anew: retrying one key is refused some times,
+        // then submitted once, and is already submitted after that.
+        let mut config = DummyFleetConfig::default();
+        config.terminal.refusal_rate = 0.5;
+        let fleet = DummyFleet::new(config);
+        fleet.attach(Arc::new(IdlePort) as Arc<dyn CrewCommandPort>).expect("attach");
+        let pool = DummyTerminalPool { fleet: Arc::clone(&fleet), environment: "env-a".into() };
+        pool.ensure_session(SESSION, "flotilla-dummy-crew", &path, &launch_environment(&CrewScript::Supervisor), &[])
+            .await
+            .expect("launch");
+        let mut attempts = 0;
+        loop {
+            attempts += 1;
+            match pool.guarded_deliver(SESSION, "turn", "key-1").await.expect("answered") {
+                TerminalSubmission::Refused(_) => assert!(attempts < 64, "a retry goes through"),
+                TerminalSubmission::Submitted { keyed: true } => break,
+                other => panic!("{other:?}"),
+            }
+        }
+        assert!(matches!(pool.guarded_deliver(SESSION, "turn", "key-1").await, Ok(TerminalSubmission::AlreadySubmitted { .. })));
+        let snapshot = fleet.snapshot();
+        assert_eq!((snapshot.turns_received, snapshot.submissions_refused), (1, attempts - 1));
+        pool.kill_session(SESSION).await.expect("kill");
     }
 
     /// A port that answers every crew command and report, for tests about the pool.

@@ -64,6 +64,8 @@ pub struct DummyFleet {
     counters: Counters,
     vessel_names: BTreeSet<String>,
     command_error_samples: Mutex<Vec<String>>,
+    /// Submissions the pools were asked for, numbering each attempt's refusal draw.
+    pub(crate) submissions: AtomicU64,
 }
 
 impl DummyFleet {
@@ -137,6 +139,7 @@ impl DummyFleet {
                 port: OnceLock::new(),
                 counters: Counters::default(),
                 command_error_samples: Mutex::default(),
+                submissions: AtomicU64::new(0),
             }
         })
     }
@@ -320,6 +323,7 @@ impl DummyFleet {
             crews_stalled: read(Counter::CrewsStalled),
             change_requests_opened: read(Counter::ChangeRequestsOpened),
             command_errors: read(Counter::CommandErrors),
+            submissions_refused: read(Counter::SubmissionsRefused),
             live_sessions: self.sessions.len() as u64,
         }
     }
@@ -335,10 +339,11 @@ pub(crate) enum Counter {
     CrewsStalled,
     ChangeRequestsOpened,
     CommandErrors,
+    SubmissionsRefused,
 }
 
 impl Counter {
-    const ALL: [Self; 7] = [
+    const ALL: [Self; 8] = [
         Self::SessionsLaunched,
         Self::TurnsReceived,
         Self::CrewsCompleted,
@@ -346,11 +351,12 @@ impl Counter {
         Self::CrewsStalled,
         Self::ChangeRequestsOpened,
         Self::CommandErrors,
+        Self::SubmissionsRefused,
     ];
 }
 
 #[derive(Default)]
-struct Counters([AtomicU64; 7]);
+struct Counters([AtomicU64; 8]);
 
 impl Counters {
     fn get(&self, counter: Counter) -> &AtomicU64 {
@@ -368,6 +374,8 @@ pub struct DummyFleetSnapshot {
     pub crews_stalled: u64,
     pub change_requests_opened: u64,
     pub command_errors: u64,
+    /// Submissions the pools refused before writing, as cleat refuses one.
+    pub submissions_refused: u64,
     pub live_sessions: u64,
     /// Backings the environment vendors realised.
     pub environments_provisioned: u64,

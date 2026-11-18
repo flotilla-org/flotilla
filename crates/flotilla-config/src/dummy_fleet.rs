@@ -32,6 +32,8 @@ pub struct DummyFleetConfig {
     pub agent: DummyAgentConfig,
     #[serde(default)]
     pub change_request: DummyChangeRequestConfig,
+    #[serde(default)]
+    pub terminal: DummyTerminalConfig,
     /// A forge shared by every host of a rehearsal fleet (#3374). When set,
     /// dummy coders open their change requests there over the Forgejo API,
     /// so change-request numbers are unique across hosts, instead of on this
@@ -48,6 +50,7 @@ impl Default for DummyFleetConfig {
             environment: DummyEnvironmentConfig::default(),
             agent: DummyAgentConfig::default(),
             change_request: DummyChangeRequestConfig::default(),
+            terminal: DummyTerminalConfig::default(),
             shared_forge: None,
         }
     }
@@ -55,6 +58,16 @@ impl Default for DummyFleetConfig {
 
 fn default_forge_service_url() -> String {
     DEFAULT_DUMMY_FORGE_SERVICE_URL.to_string()
+}
+
+/// How the dummy terminal pool answers, standing in for cleat's.
+#[derive(Debug, Clone, Default, PartialEq, Deserialize, Serialize)]
+pub struct DummyTerminalConfig {
+    /// Probability that a submission is refused before anything is written, as cleat refuses
+    /// one while the composer holds text or a controller is typing. Each attempt draws anew, so
+    /// a retried delivery goes through.
+    #[serde(default, deserialize_with = "deserialize_rate")]
+    pub refusal_rate: f64,
 }
 
 /// How dummy environments are realised.
