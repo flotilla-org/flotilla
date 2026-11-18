@@ -1,8 +1,8 @@
 //! Checkouts inside a dummy environment, and a host's clones and worktrees of
 //! repositories on the dummy forge. Materialising a clone or worktree
 //! succeeds at once with a revision derived from the target path; the work is
-//! always clean and pushed, and its head is in the history of any merged
-//! request. A checkout holds no commits beyond its base: a crew's work lives
+//! clean and pushed but for the configured shares, which removal refuses as Git
+//! does, and its head is in the history of any merged request. A checkout holds no commits beyond its base: a crew's work lives
 //! in the change request it opens on the dummy forge. Nothing is read from or
 //! written to disk beyond the empty directory each clone or checkout is.
 
@@ -23,8 +23,8 @@ use flotilla_protocol::{Checkout, CheckoutIntent};
 use flotilla_provider_runtime::{ChannelLabel, CommandRunner};
 use flotilla_resources::CheckoutBranchProvenance;
 use flotilla_vcs::vcs::{
-    CheckoutMaterialisation, CheckoutMaterialisationError, CheckoutRemoval, EnumeratedCheckout, RepositoryRead, Vcs, VcsCheck,
-    WorktreeMetadata,
+    CheckoutMaterialisation, CheckoutMaterialisationError, CheckoutPreservationReason, CheckoutRemoval, EnumeratedCheckout, RepositoryRead,
+    Vcs, VcsCheck, WorktreeMetadata,
 };
 
 pub struct DummyVcs {
@@ -70,6 +70,18 @@ impl DummyVcs {
         let (environment, path) = (self.environment.clone(), PathBuf::from(target));
         self.fleet.record(&Event::Checkout { environment: environment.clone(), path: path.clone(), branch: branch.into() });
         self.fleet.checkouts.lock().insert((environment, path), branch.to_string());
+        Ok(())
+    }
+
+    /// Whether a checkout is recorded at `path` here.
+    fn recorded(&self, path: &Path) -> bool {
+        self.fleet.checkouts.lock().contains_key(&(self.environment.clone(), path.to_path_buf()))
+    }
+
+    async fn remove(&self, target: &str) -> Result<(), String> {
+        self.run(&["rm", "-rf", "--", target]).await?;
+        self.fleet.record(&Event::CheckoutRemoved { environment: self.environment.clone(), path: target.into() });
+        self.fleet.checkouts.lock().remove(&(self.environment.clone(), PathBuf::from(target)));
         Ok(())
     }
 
@@ -204,15 +216,36 @@ impl Vcs for DummyVcs {
         Ok(Self::materialised(target, CheckoutBranchProvenance::CreatedForConvoy))
     }
 
-    async fn remove_materialised_checkout(&self, _branch: &str, target: &str) -> Result<CheckoutRemoval, String> {
-        self.run(&["rm", "-rf", "--", target]).await?;
-        self.fleet.record(&Event::CheckoutRemoved { environment: self.environment.clone(), path: target.into() });
-        self.fleet.checkouts.lock().remove(&(self.environment.clone(), PathBuf::from(target)));
-        Ok(CheckoutRemoval::Removed)
+    /// As the Git worktree provider removes one: a checkout with uncommitted changes stays,
+    /// and a branch with commits past its base outlives its removed checkout.
+    async fn remove_materialised_checkout(&self, branch: &str, target: &str) -> Result<CheckoutRemoval, String> {
+        let path = Path::new(target);
+        if self.recorded(path) && self.dirty(path) {
+            return Ok(CheckoutRemoval::PreservedCheckout { path: target.into(), reason: CheckoutPreservationReason::DirtyCheckout });
+        }
+        let advanced = self.recorded(path) && self.unpushed(path);
+        self.remove(target).await?;
+        Ok(match advanced {
+            true => CheckoutRemoval::PreservedBranch { branch: branch.into(), reason: CheckoutPreservationReason::CommitsPastBase },
+            false => CheckoutRemoval::Removed,
+        })
     }
 
+    /// As the Git worktree provider forces one: a checkout still there is archived first, and
+    /// a branch with commits past its base outlives it.
     async fn force_remove_materialised_checkout(&self, branch: &str, target: &str) -> Result<CheckoutRemoval, String> {
-        self.remove_materialised_checkout(branch, target).await
+        let path = Path::new(target);
+        if !self.recorded(path) {
+            return self.remove_materialised_checkout(branch, target).await;
+        }
+        let advanced = self.unpushed(path);
+        let name = path.file_name().map(|name| name.to_string_lossy().into_owned()).unwrap_or_default();
+        let archive = path.parent().unwrap_or(path).join(".flotilla-archives").join(format!("{name}-dummy"));
+        self.remove(target).await?;
+        Ok(CheckoutRemoval::ArchivedAndRemoved {
+            archive_path: archive.to_string_lossy().into_owned(),
+            preserved_branch: advanced.then(|| (branch.to_owned(), CheckoutPreservationReason::CommitsPastBase)),
+        })
     }
 
     async fn is_clean(&self) -> VcsCheck {
@@ -485,6 +518,25 @@ mod host_tests {
             assert_eq!(check(vcs.unpushed_commits(Some("abc123")).await), Some(true));
             assert_eq!(check(vcs.local_clone_is_clean("/workspace/fleet").await), Some(clean));
             assert_eq!(vcs.verify_local_clone_reclaimable("/workspace/fleet").await.is_ok(), clean);
+
+            // Removal refuses as `git worktree remove` and `git branch -d` do; forcing archives.
+            let (branch, target) = ("dummy/convoy/aide", "/workspace/aide");
+            vcs.materialise_checkout(branch, Some("main"), target, "test").await.expect("worktree");
+            let removed = vcs.remove_materialised_checkout(branch, target).await.expect("removal");
+            if clean {
+                assert_eq!(removed, CheckoutRemoval::Removed);
+                continue;
+            }
+            let dirty = CheckoutRemoval::PreservedCheckout { path: target.into(), reason: CheckoutPreservationReason::DirtyCheckout };
+            assert_eq!(removed, dirty);
+            assert_eq!(vcs.remove_materialised_checkout(branch, target).await.expect("removal"), dirty, "it stays dirty");
+            let CheckoutRemoval::ArchivedAndRemoved { preserved_branch, .. } =
+                vcs.force_remove_materialised_checkout(branch, target).await.expect("forced")
+            else {
+                panic!("a forced removal archives the checkout")
+            };
+            assert_eq!(preserved_branch, Some((branch.into(), CheckoutPreservationReason::CommitsPastBase)));
+            assert_eq!(vcs.remove_materialised_checkout(branch, target).await.expect("removal"), CheckoutRemoval::Removed);
         }
     }
 }
