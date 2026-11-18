@@ -198,7 +198,9 @@ impl ConvoyRecords for EngineConvoyRecords {
                             continue;
                         }
                         let admitted = read.creation_time(id)?.to_datetime();
-                        if newest.as_ref().is_none_or(|(at, _)| admitted > *at) {
+                        // A home's launches scan in the order written: of two admitted at one
+                        // instant, the later written is the newer.
+                        if newest.as_ref().is_none_or(|(at, _)| admitted >= *at) {
                             newest = Some((admitted, id));
                         }
                     }

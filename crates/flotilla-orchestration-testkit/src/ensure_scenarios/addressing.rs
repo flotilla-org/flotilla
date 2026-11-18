@@ -114,8 +114,8 @@ pub async fn convoy_explain_refuses_multiple_terminal_generations(factory: &dyn 
 }
 
 // #3108 retirement: a role address selects among live and ended-but-unretired holders, as a
-// listing does. Once every generation has retired the role names none, and each is reached by its
-// record name, which reports how it ended.
+// listing does. Once every generation has retired, the plain name names the newest, and each is
+// reached by its record name, which reports how it ended.
 pub async fn convoy_explain_names_retired_generations_by_record_only(factory: &dyn EnsureScenarioController) {
     let (daemon, backend, _clock, _temp) = standing_ensure_fixture(factory).await;
     let mut watch = backend.including_replicas::<ResourceConvoy>("flotilla").watch().await.expect("watch");
@@ -137,10 +137,10 @@ pub async fn convoy_explain_names_retired_generations_by_record_only(factory: &d
     }
     assert_eq!(retired, BTreeSet::from([one.clone(), two.clone()]));
 
-    assert_eq!(
-        daemon.explain_convoy_internal(None, "reviewer@flotilla").await.map(|explanation| explanation.convoy),
-        Err("no convoy matches `reviewer@flotilla`".to_string())
-    );
+    // `name@project` is a plain name: once every launch has retired it names the newest (#3108).
+    assert_eq!(flotilla_store::resolve_convoy_record(&backend, "flotilla", "reviewer@flotilla").await, Ok(two.clone()));
+    let newest = daemon.explain_convoy_internal(None, "reviewer@flotilla").await.expect("the newest explains by the plain name");
+    assert_eq!(newest.phase, "Landed");
     for record in [&one, &two] {
         let explanation = daemon.explain_convoy_internal(None, record).await.expect("a retired generation explains by its record");
         assert_eq!(explanation.phase, "Landed", "{record}");
