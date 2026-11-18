@@ -269,8 +269,9 @@ fn resource_record_matches_name(record: &ResourceReadRecord, name: Option<&str>)
     })
 }
 
-/// A checkout's inspected judgement as the explanation shows it: confirmed when its home last
-/// confirmed its inspection (#3108).
+/// A checkout's inspected judgement as the explanation shows it: observed when it was last
+/// inspected, and fresh only while that inspection is, so a checkout nothing has re-inspected
+/// since its files changed reads stale rather than fresh at every read (#3108, run 4 R4-3).
 pub fn explain_judgement(
     judged: Option<bool>,
     details: &[String],
@@ -285,8 +286,8 @@ pub fn explain_judgement(
             None => "unknown",
         }
         .to_string(),
-        observed_at: Some(integration.confirmed_at.to_rfc3339()),
-        freshness: if integration.confirmed_within(now, ttl) { EvidenceFreshness::Fresh } else { EvidenceFreshness::Stale },
+        observed_at: Some(integration.inspected_at.to_rfc3339()),
+        freshness: if integration.inspected_within(now, ttl) { EvidenceFreshness::Fresh } else { EvidenceFreshness::Stale },
         details: details.to_vec(),
     }
 }

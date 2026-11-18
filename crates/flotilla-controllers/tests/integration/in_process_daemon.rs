@@ -4987,6 +4987,7 @@ async fn landed_convoy_teardown_accepts_clean_squash_merge_after_branch_deletion
                 ..Default::default()
             },
             confirmed_at: now,
+            inspected_at: now,
             failing_since: None,
         }),
     };

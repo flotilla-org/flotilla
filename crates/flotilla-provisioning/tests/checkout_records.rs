@@ -148,6 +148,35 @@ fn an_inspection_is_written_only_when_it_changes_and_a_landing_latches() {
     assert_eq!(fixture.record(&held).integration.expect("inspected").inspection, dirty);
 }
 
+// Run 4 R4-3: a checkout's integration reads back with when it was inspected, not when it is read,
+// so a checkout nothing has re-inspected ages. An inspection that changes nothing writes nothing,
+// yet still counts as an inspection.
+#[test]
+fn an_integration_reads_back_with_its_inspections_time_not_the_reads() {
+    let fixture = CheckoutFixture::default();
+    let held = fixture.put_ready("co", &worktree("feature"), None);
+    let clean = Inspection { clean: Some(true), ..Inspection::default() };
+    let before = chrono::Utc::now();
+    assert!(fixture.checkouts.inspected(&held, clean.clone()).expect("written"));
+    let first = fixture.record(&held).integration.expect("inspected").inspected_at;
+    assert!(first >= before && first <= chrono::Utc::now(), "inspected at {first}");
+
+    std::thread::sleep(std::time::Duration::from_millis(20));
+    let read_later = fixture.record(&held).integration.expect("inspected");
+    assert_eq!(read_later.inspected_at, first, "a later read is no newer inspection");
+    assert!(read_later.confirmed_at > first, "this home's values still read as confirmed now");
+    assert!(!read_later.inspected_within(chrono::Utc::now(), std::time::Duration::from_millis(10)));
+
+    // The same values inspected again write nothing, but are inspected afresh.
+    assert!(!fixture.checkouts.inspected(&held, clean).expect("unchanged"));
+    let again = fixture.record(&held).integration.expect("inspected").inspected_at;
+    assert!(again > first, "re-inspected at {again}, first at {first}");
+
+    // A failing inspection inspects nothing: the last success stands.
+    fixture.checkouts.inspection_failed(&held).expect("failed");
+    assert_eq!(fixture.record(&held).integration.expect("inspected").inspected_at, again);
+}
+
 #[test]
 fn a_failing_inspection_keeps_its_values_confirmed_when_it_started_to_fail() {
     let fixture = CheckoutFixture::default();

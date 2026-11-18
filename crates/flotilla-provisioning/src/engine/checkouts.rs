@@ -218,6 +218,11 @@ pub struct EngineCheckouts {
     inputs: StagedFacts<Vec<ChangeItem>>,
     homes: Arc<dyn Fn() -> Vec<String> + Send + Sync>,
     changes: tokio::sync::broadcast::Sender<CheckoutChange>,
+    /// When this home last inspected each launch successfully, by launch: an inspection that
+    /// changes nothing writes nothing, so its time is kept here, in memory only. One entry per
+    /// launch this daemon inspected; a restart forgets them and readers fall back on the record's
+    /// last write.
+    inspections: std::sync::Mutex<std::collections::HashMap<String, Timestamp>>,
 }
 
 /// How many changes a slow follower may fall behind by; one that lags rereads everything.
@@ -242,6 +247,7 @@ impl EngineCheckouts {
             inputs,
             homes: Arc::new(homes),
             changes: tokio::sync::broadcast::channel(CHANGES).0,
+            inspections: Default::default(),
         }
     }
 
@@ -292,7 +298,7 @@ impl EngineCheckouts {
     fn record(&self, read: &mut Read<'_>, view: View<CheckoutKind>) -> Result<CheckoutRecord, ReadError> {
         let integration = match read.resolve(CheckoutIntegration::CODE, &view.name, &view.home)? {
             Some(id) => match read.load::<CheckoutIntegration>(id)? {
-                Some(loaded) => Some(self.integration(read, &view.home, &loaded.value)?),
+                Some(loaded) => Some(self.integration(read, &view.name, &view.home, &loaded)?),
                 None => None,
             },
             None => None,
@@ -318,17 +324,32 @@ impl EngineCheckouts {
         })
     }
 
-    /// `integration` homed at `home`, with when its values were last confirmed: since its home's
-    /// inspections started failing, else when its home was last heard, which for this home is now.
-    fn integration(&self, read: &mut Read<'_>, home: &str, integration: &CheckoutIntegration) -> Result<Integration, ReadError> {
+    /// Launch `name`'s `loaded` integration homed at `home`, with when its values were last
+    /// confirmed (since its home's inspections started failing, else when its home was last
+    /// heard, which for this home is now) and when they were last inspected (this home's last
+    /// successful inspection, else since they started failing, else the record's last write).
+    fn integration(
+        &self,
+        read: &mut Read<'_>,
+        name: &str,
+        home: &str,
+        loaded: &flotilla_schema_sqlite::Loaded<CheckoutIntegration>,
+    ) -> Result<Integration, ReadError> {
+        let integration = &loaded.value;
         let confirmed = match integration.failing_since {
             Some(since) => since,
             None if home == self.home() => Self::now(),
             None => read.watermark(home)?.applied_through,
         };
+        let inspected_here = (home == self.home()).then(|| self.inspections.lock().expect("inspections lock").get(name).copied()).flatten();
+        let inspected = match inspected_here.or(integration.failing_since) {
+            Some(at) => at,
+            None => read.last_change(loaded.id)?.map_or(confirmed, |change| change.at),
+        };
         Ok(Integration {
             inspection: inspection_of(integration),
             confirmed_at: time(confirmed).unwrap_or(DateTime::UNIX_EPOCH),
+            inspected_at: time(inspected).unwrap_or(DateTime::UNIX_EPOCH),
             failing_since: integration.failing_since.and_then(time),
         })
     }
@@ -496,17 +517,21 @@ impl CheckoutRecords for EngineCheckouts {
     }
 
     fn inspected(&self, launch: &str, inspection: Inspection) -> Result<bool, String> {
+        let inspected_at = Self::now();
         let written = match self.held_integration(launch)? {
             Some((version, held)) => {
                 let next = stored_integration(inspection.latched(&inspection_of(&held)), None);
                 if next == held {
+                    self.inspections.lock().expect("inspections lock").insert(launch.to_owned(), inspected_at);
                     return Ok(false);
                 }
                 self.log.edit(launch, version, &next, &Self::change())
             }
             None => self.log.create(launch, &stored_integration(inspection, None), &Self::change()),
         };
-        written.map(|_| true).map_err(|error| format!("write the inspection of checkout {launch}: {error}"))
+        written.map_err(|error| format!("write the inspection of checkout {launch}: {error}"))?;
+        self.inspections.lock().expect("inspections lock").insert(launch.to_owned(), inspected_at);
+        Ok(true)
     }
 
     fn inspection_failed(&self, launch: &str) -> Result<(), String> {

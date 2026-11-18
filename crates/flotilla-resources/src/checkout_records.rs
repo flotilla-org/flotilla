@@ -284,6 +284,10 @@ pub struct Integration {
     /// When its values were last confirmed: since its home's inspections started failing, else
     /// when its home was last heard, which for this home is now.
     pub confirmed_at: DateTime<Utc>,
+    /// When its values were last inspected: this home's latest successful inspection of it,
+    /// whether or not it changed them, else since its inspections started failing, else when an
+    /// inspection last wrote them. Never the time it is read; explain shows this.
+    pub inspected_at: DateTime<Utc>,
     /// Since when its home's inspections have failed.
     pub failing_since: Option<DateTime<Utc>>,
 }
@@ -293,6 +297,11 @@ impl Integration {
     /// home's are confirmed as they are read) is as fresh as one at `now`.
     pub fn confirmed_within(&self, now: DateTime<Utc>, lifetime: std::time::Duration) -> bool {
         chrono::Duration::from_std(lifetime).is_ok_and(|lifetime| now.signed_duration_since(self.confirmed_at) < lifetime)
+    }
+
+    /// Its values were inspected within `lifetime` of `now`.
+    pub fn inspected_within(&self, now: DateTime<Utc>, lifetime: std::time::Duration) -> bool {
+        chrono::Duration::from_std(lifetime).is_ok_and(|lifetime| now.signed_duration_since(self.inspected_at) < lifetime)
     }
 }
 
