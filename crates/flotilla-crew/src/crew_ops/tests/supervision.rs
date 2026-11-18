@@ -98,7 +98,7 @@ async fn cross_vessel_handoff_case(remote: bool, publication_fails: bool, receiv
     };
     // What the handoff carries, typed: the convoy at its revision, which the view spells as `carry`.
     let carried = flotilla_address::Reference {
-        address: flotilla_resources::convoy::engine::convoy_reference_address(&launch, Some("flotilla")).expect("convoy address"),
+        address: flotilla_resources::convoy::engine::convoy_reference_address(&launch, "flotilla").expect("convoy address"),
         revision: flotilla_address::Revision::new(convoy.metadata.resource_version.clone()).expect("revision"),
     };
     let reviewer = held.receiver("review", "reviewer");
@@ -301,7 +301,7 @@ fn governor_rulings_reply_to_the_source_escalation(tc: hegel::TestCase) {
         );
         escalation.expectation = flotilla_messaging::IntentExpectation::Reply;
         escalation.references = vec![flotilla_messaging::IntentReference::new(
-            flotilla_resources::convoy::engine::convoy_reference_address(&held.launch, Some("flotilla")).expect("the convoy's address"),
+            flotilla_resources::convoy::engine::convoy_reference_address(&held.launch, "flotilla").expect("the convoy's address"),
             flotilla_address::Revision::new(convoy.metadata.resource_version).expect("revision"),
         )];
         let messages = held.messages().messages();

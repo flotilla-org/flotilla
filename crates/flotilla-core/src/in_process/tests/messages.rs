@@ -12,7 +12,7 @@ use crate::testkits::discovery::fake_discovery;
 
 /// The inbox of the coder of launch `launch` in project `flotilla`.
 fn coder_inbox(launch: &str) -> String {
-    let convoy = flotilla_resources::convoy::engine::convoy_reference_address(launch, Some("flotilla")).expect("launch address");
+    let convoy = flotilla_resources::convoy::engine::convoy_reference_address(launch, "flotilla").expect("launch address");
     convoy.child(flotilla_address::Kind::Role, "coder").expect("coder inbox").to_string()
 }
 

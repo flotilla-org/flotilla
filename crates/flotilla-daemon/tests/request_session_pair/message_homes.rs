@@ -117,7 +117,7 @@ fn crew_session(convoy: &str, vessel: &str) -> TerminalSessionSpec {
 
 /// Convoy `name` of project NS, as the message's subject at revision 1.
 fn convoy_ref(name: &str) -> IntentReference {
-    let address = flotilla_resources::convoy::engine::convoy_reference_address(name, Some(NS)).expect("the convoy's address");
+    let address = flotilla_resources::convoy::engine::convoy_reference_address(name, NS).expect("the convoy's address");
     IntentReference::subject(address, flotilla_address::Revision::new("1".to_owned()).expect("revision"))
 }
 

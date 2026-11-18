@@ -3,12 +3,15 @@
 //! whose reason changed; clearing withdraws it on its subject's authority; a person's receipt
 //! settles it, and answers every raise of an episode that began before.
 
+use std::collections::{BTreeMap, BTreeSet};
+
 use async_trait::async_trait;
 use chrono::{DateTime, Utc};
 use flotilla_address::{Address, Kind};
 use flotilla_inbox::InboxBackend;
 use flotilla_resources::{
     attentions::{self, Attentions, Fact, OpenAttention, Sender, Subject},
+    convoy::engine::{split_launch, standing_name},
     Convoy, ConvoyEnsure, Project, ResourceError, ResourceObject,
 };
 use flotilla_schema::Timestamp;
@@ -62,16 +65,30 @@ impl Held {
     }
 }
 
-/// The old-shaped subject an engine address names.
-fn subject_of(address: &Address) -> Option<Subject> {
+/// The old-shaped subject an engine address names, its convoy named by the record `records` gives
+/// for the convoy's address, else by its segment.
+fn subject_of(address: &Address, records: &BTreeMap<Address, String>) -> Option<Subject> {
     let name = address.name().to_owned();
+    let convoy = || {
+        let at = convoy_of(address)?;
+        Some(records.get(&at).cloned().unwrap_or_else(|| at.name().to_owned()))
+    };
     match (address.kind(), address.get(Kind::Convoy)) {
-        (Kind::Convoy, _) => Some(Subject::Convoy { convoy: name }),
-        (Kind::Vessel, Some(convoy)) => Some(Subject::Vessel { convoy: convoy.to_owned(), vessel: name }),
-        (Kind::Role, Some(convoy)) => Some(Subject::ConvoyRole { convoy: convoy.to_owned(), role: name }),
+        (Kind::Convoy, _) => Some(Subject::Convoy { convoy: convoy()? }),
+        (Kind::Vessel, Some(_)) => Some(Subject::Vessel { convoy: convoy()?, vessel: name }),
+        (Kind::Role, Some(_)) => Some(Subject::ConvoyRole { convoy: convoy()?, role: name }),
         (Kind::Role, None) => Some(Subject::StandingRole { project: address.get(Kind::Project)?.to_owned(), role: name }),
         _ => None,
     }
+}
+
+/// The convoy `address` is in, or is.
+fn convoy_of(address: &Address) -> Option<Address> {
+    let mut at = address.clone();
+    while at.kind() != Kind::Convoy {
+        at = at.parent()?;
+    }
+    Some(at)
 }
 
 fn child(parent: &Address, kind: Kind, name: &str) -> Result<Address, String> {
@@ -93,7 +110,7 @@ impl MessagePrimitives {
                 messages.extend(self.settled_since(&inbox, Timestamp::from_datetime(&since))?);
             }
         }
-        Ok(attentions_among(&roles, messages.into_iter()))
+        self.attentions_among(namespace, &roles, messages.into_iter()).await
     }
 
     /// The open attentions about `scope`: for a subject in a convoy, only the pending messages
@@ -108,7 +125,7 @@ impl MessagePrimitives {
         let Some(inbox) = self.convoy_attention_inbox(namespace, convoy, &roles).await? else {
             return self.held(namespace, None).await;
         };
-        Ok(attentions_among(&roles, self.pending_in(&inbox)?.into_iter()))
+        self.attentions_among(namespace, &roles, self.pending_in(&inbox)?.into_iter()).await
     }
 
     /// The person inbox a convoy's attentions are sent to, as [`Self::cause`] names it: its
@@ -124,27 +141,70 @@ impl MessagePrimitives {
     }
 }
 
-/// The attentions among `messages`: from an attention's sender, about one subject, in text.
-fn attentions_among(roles: &FleetRoles, messages: impl Iterator<Item = (String, Resource<Message>)>) -> Vec<Held> {
-    messages
-        .filter_map(|(home, message)| {
-            let spec = message.spec();
-            let sender = Sender::from_role(roles.role_of(&spec.sender)?)?;
-            let subject_address = spec.subject()?.address.clone();
-            // An attention's body is always text; a typed request is no attention.
-            let MessageBody::Text(reason) = spec.body.value() else { return None };
-            let reason = reason.clone();
-            Some(Held {
-                reason,
-                home,
-                sender,
-                sender_address: spec.sender.clone(),
-                subject: subject_of(&subject_address)?,
-                subject_address,
-                message,
+impl MessagePrimitives {
+    /// The attentions among `messages`: from an attention's sender, about one subject, in text.
+    /// A launch is addressed by its one address (#3108 R4), whose segment is not a standing
+    /// launch's record name, so each convoy subject is named by [`convoy_record`]: one listing of
+    /// the ensure declarations when any subject is a launch.
+    async fn attentions_among(
+        &self,
+        namespace: &str,
+        roles: &FleetRoles,
+        messages: impl Iterator<Item = (String, Resource<Message>)>,
+    ) -> Result<Vec<Held>, String> {
+        let attentions: Vec<_> = messages
+            .filter_map(|(home, message)| {
+                let spec = message.spec();
+                let sender = Sender::from_role(roles.role_of(&spec.sender)?)?;
+                let subject_address = spec.subject()?.address.clone();
+                // An attention's body is always text; a typed request is no attention.
+                let MessageBody::Text(reason) = spec.body.value() else { return None };
+                Some((home, sender, subject_address, reason.clone(), message))
             })
-        })
-        .collect()
+            .collect();
+        let convoys: BTreeSet<Address> = attentions.iter().filter_map(|(_, _, subject, _, _)| convoy_of(subject)).collect();
+        let standing = if convoys.iter().any(|convoy| split_launch(convoy.name()).is_some()) {
+            self.standing_roles(namespace).await?
+        } else {
+            BTreeSet::new()
+        };
+        let records =
+            convoys.into_iter().map(|convoy| Ok((convoy.clone(), convoy_record(&convoy, &standing)?))).collect::<Result<_, String>>()?;
+        Ok(attentions
+            .into_iter()
+            .filter_map(|(home, sender, subject_address, reason, message)| {
+                Some(Held {
+                    reason,
+                    home,
+                    sender,
+                    sender_address: message.spec().sender.clone(),
+                    subject: subject_of(&subject_address, &records)?,
+                    subject_address,
+                    message,
+                })
+            })
+            .collect())
+    }
+
+    /// The standing roles the ensures declare, by project and role. An attention may be about a
+    /// generation never launched, or retired, so a role is told standing by its declaration, not
+    /// by a launch.
+    async fn standing_roles(&self, namespace: &str) -> Result<BTreeSet<(String, String)>, String> {
+        let ensures = self.backend()?.definitions::<ConvoyEnsure>(namespace).list().await.map_err(|error| error.to_string())?;
+        Ok(ensures.into_iter().map(|ensure| (ensure.spec.project_ref, ensure.spec.role)).collect())
+    }
+}
+
+/// The convoy record launch address `convoy` names: `project:P/convoy:R%23n` is launch `n` of
+/// standing role `R` when `standing` declares it in `P`, else the record its segment names.
+fn convoy_record(convoy: &Address, standing: &BTreeSet<(String, String)>) -> Result<String, String> {
+    let segment = convoy.name();
+    if let (Some((of, n)), Some(project)) = (split_launch(segment), convoy.get(Kind::Project)) {
+        if standing.contains(&(project.to_owned(), of.to_owned())) {
+            return Ok(format!("{}#{n}", standing_name(project, of)?));
+        }
+    }
+    Ok(segment.to_owned())
 }
 
 impl MessagePrimitives {
@@ -200,7 +260,7 @@ impl MessagePrimitives {
             .map_err(|error| error.to_string())?
             .ok_or_else(|| format!("convoy `{name}` is not in this home's records"))?;
         let held = Read {
-            address: super::convoy_reference_address(name, convoy.object.spec.project_ref.as_deref())?,
+            address: super::convoy_reference_address(name, convoy.object.spec.project_ref.as_deref().unwrap_or(namespace))?,
             revision: convoy.object.metadata.resource_version.clone(),
         };
         let principal = format!("principal:{}", convoy.object.spec.dispatching_principal_ref.name);

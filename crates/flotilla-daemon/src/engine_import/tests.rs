@@ -1185,10 +1185,8 @@ fn open_demands_import_as_the_attentions_their_writers_send() {
     // Each convoy is the launch it imports as, numbered by the convoy (#1, or a standing
     // generation's generation): a hold is on the role's generation by its launch, as the ensure
     // pass raises and clears it, and a convoy with no project of its own is under its namespace's.
-    // A standing launch's record is named by its full name.
-    let generation = flotilla_resources::convoy::engine::convoy_reference_address("project:flotilla/convoy:gui#1", Some("flotilla"))
-        .expect("launch record address")
-        .to_string();
+    // A standing launch is at its one address, the role's segment numbered (#3108 R4).
+    let generation = "project:flotilla/convoy:gui%231".to_owned();
     let cases = [
         ("project:flotilla/role:operator/message:ensure-attention-standing-gui", "standing", generation.as_str()),
         ("project:flotilla/role:operator/message:ensure-config-drift-standing-gui", "standing", "project:flotilla/role:gui"),

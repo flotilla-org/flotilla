@@ -60,7 +60,7 @@ async fn a_turn_header_frames_as_the_old_view_did() {
     }
     let home = EngineMessagesHome::open("home", NAMESPACE, &backend);
     let primitives = home.primitives();
-    let convoy = convoy_reference_address("crew", None).expect("the convoy's address");
+    let convoy = convoy_reference_address("crew", NAMESPACE).expect("the convoy's address");
     let mut review = intent(REVIEWER, CODER, MessageRelation::Peer, "Please address the review.");
     review.references = vec![IntentReference::subject(convoy, Revision::new("1".to_owned()).expect("revision"))];
     review.expectation = IntentExpectation::Reply;

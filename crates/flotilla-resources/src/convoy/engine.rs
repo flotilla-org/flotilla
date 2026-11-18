@@ -277,11 +277,16 @@ pub fn launch_address(project: &flotilla_address::Address, launch: &str) -> Resu
 /// The inbox of `role` in convoy `convoy` of `project`: `project:P/convoy:C/role:R`, with a
 /// launch's convoy as [`launch_address`] names it. A crew member's vessel takes no part.
 pub fn seat_address(project: &flotilla_address::Address, convoy: &str, role: &str) -> Result<flotilla_address::Address, String> {
-    let convoy = match split_launch(convoy) {
-        Some(_) => launch_address(project, convoy)?,
-        None => project.child(flotilla_address::Kind::Convoy, convoy).map_err(|error| error.to_string())?,
-    };
-    convoy.child(flotilla_address::Kind::Role, role).map_err(|error| error.to_string())
+    convoy_address_in(project, convoy)?.child(flotilla_address::Kind::Role, role).map_err(|error| error.to_string())
+}
+
+/// Convoy record `convoy` under `project`: a launch at its [`launch_address`], any other name as
+/// the project's child.
+fn convoy_address_in(project: &flotilla_address::Address, convoy: &str) -> Result<flotilla_address::Address, String> {
+    match split_launch(convoy) {
+        Some(_) => launch_address(project, convoy),
+        None => project.child(flotilla_address::Kind::Convoy, convoy).map_err(|error| error.to_string()),
+    }
 }
 
 /// The inbox a crew role address names: `P/C/V/R` is the convoy role `project:P/convoy:C/role:R`
@@ -309,16 +314,20 @@ pub fn convoy_records(address: &flotilla_address::Address) -> Vec<String> {
     standing.into_iter().chain([segment.to_owned()]).collect()
 }
 
-/// The address a message refers to convoy record `name` by: the record's name under the project it
-/// declares, or under none.
-pub fn convoy_reference_address(name: &str, project: Option<&str>) -> Result<flotilla_address::Address, String> {
-    let address = match project {
-        Some(project) => {
-            flotilla_address::Address::project(project).and_then(|project| project.child(flotilla_address::Kind::Convoy, name))
-        }
-        None => flotilla_address::Address::convoy(name),
-    };
-    address.map_err(|error| format!("convoy `{name}`: {error}"))
+/// The address a message refers to convoy record `name` by, under `project` (the project it
+/// declares, else its namespace's): a launch has one address, its [`launch_address`], which its
+/// seats are under (#3108 R4).
+pub fn convoy_reference_address(name: &str, project: &str) -> Result<flotilla_address::Address, String> {
+    flotilla_address::Address::project(project)
+        .map_err(|error| error.to_string())
+        .and_then(|project| convoy_address_in(&project, name))
+        .map_err(|error| format!("convoy `{name}`: {error}"))
+}
+
+/// The address a message refers to `convoy` by: [`convoy_reference_address`] under the project it
+/// declares, else its namespace's, as its seats are.
+pub fn convoy_address(convoy: &ResourceObject<Convoy>) -> Result<flotilla_address::Address, String> {
+    convoy_reference_address(&convoy.metadata.name, convoy.spec.project_ref.as_deref().unwrap_or(&convoy.metadata.namespace))
 }
 
 /// What `convoy` is a launch of. A launch read from the engine is named by its launch. An old
@@ -503,9 +512,8 @@ impl ImportedLaunches {
 
     /// `address`, written against the old store in `namespace`, with the convoy it names as the
     /// launch that convoy imports as, at the launch's address ([`launch_address`]) in its
-    /// project, as the import writes it, whether or not the old address named the project. The
-    /// convoy itself (an address ending at it) is the launch's record, as the engine refers to
-    /// one ([`convoy_reference_address`]); a standing launch's record is named by its full name. An
+    /// project, as the import writes it, whether or not the old address named the project: the
+    /// convoy itself has that one address too (#3108 R4, [`convoy_reference_address`]). An
     /// artifact about that convoy is about the launch, at the project-free convoy address artifacts
     /// take ([`crate::address::artifact_address`]). An address naming no convoy is unchanged, and
     /// one naming a convoy that imports as no launch is refused: an imported record names a convoy
@@ -521,10 +529,6 @@ impl ImportedLaunches {
         })?;
         let name = launch.name();
         let unaddressable = |error: String| format!("`{address}` as launch `{name}`: {error}");
-        if at + 1 == segments.len() {
-            // The convoy itself is referred to by its record, as the engine refers to one.
-            return convoy_reference_address(&name, Some(&launch.project)).map_err(unaddressable);
-        }
         let artifact = segments.iter().any(|segment| segment.kind() == Kind::Artifact);
         let mut mapped = match &segments[..at] {
             [] if artifact => Address::convoy(&name).map_err(|error| error.to_string()),
@@ -816,10 +820,11 @@ mod tests {
             mapped("project:flotilla/convoy:governor-7/role:governor").as_deref(),
             Ok("project:flotilla/convoy:governor%232/role:governor")
         );
-        // A convoy itself is its launch's record, as an attention or a reference names it.
+        // A convoy itself is at its launch's one address, as its seats are under (#3108 R4).
         assert_eq!(mapped("project:flotilla/convoy:demo").as_deref(), Ok("project:flotilla/convoy:demo%234"));
-        let standing = convoy_reference_address("project:flotilla/convoy:governor#2", Some("flotilla")).expect("record");
-        assert_eq!(mapped("project:flotilla/convoy:governor-7").as_deref(), Ok(standing.as_str()));
+        assert_eq!(mapped("project:flotilla/convoy:governor-7").as_deref(), Ok("project:flotilla/convoy:governor%232"));
+        let standing = convoy_reference_address("project:flotilla/convoy:governor#2", "flotilla").expect("record");
+        assert_eq!(standing.as_str(), "project:flotilla/convoy:governor%232", "the engine refers to a launch at its one address");
         assert_eq!(mapped("project:flotilla/role:operator").as_deref(), Ok("project:flotilla/role:operator"));
         assert!(mapped("project:flotilla/convoy:gone/role:coder").expect_err("refused").contains("not in this host's replica"));
     }

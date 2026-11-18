@@ -366,6 +366,59 @@ async fn a_seat_subject_is_spelled_as_its_session() {
     }
 }
 
+// Behaviour (#3108 R4): a launch has one address. An attention about a convoy role is about that
+// role's seat, and one about the convoy is about the seat's convoy, for a finite launch and a
+// standing one, whose seat's convoy segment is not its record's name; each reads back about the
+// launch's record, so clearing one by its subject clears it.
+#[tokio::test]
+async fn an_attention_cause_and_its_seat_share_the_launchs_address() {
+    use flotilla_resources::attentions::{Attention, Fact, Sender, Subject};
+    let mut home = Home::open(0, 0).await;
+    let standing = home.standing().await;
+    let standing_session = home.crew_here(&standing);
+    // The standing role is declared, as every standing launch's is.
+    let ensure = ConvoyEnsureSpec::builder()
+        .project_ref(NAMESPACE.into())
+        .role("coder".into())
+        .workflow_ref("workflow".into())
+        .repositories(Vec::new())
+        .build();
+    home.backend
+        .definitions::<ConvoyEnsure>(NAMESPACE)
+        .create(&InputMeta::builder().name("ensure-coder".to_owned()).build(), &ensure)
+        .await
+        .expect("the standing role's ensure");
+    let primitives = home.messages.primitives();
+    let project = Address::project(NAMESPACE).expect("project");
+    for (launch, session) in [(home.crew.clone(), home.session.clone()), (standing, standing_session)] {
+        let seat = flotilla_resources::convoy::engine::seat_address(&project, &launch, "coder").expect("the seat");
+        let held = Fact::DeliveryHeld { session, convoy: launch.clone(), role: "coder".into() };
+        let refused = Fact::ReclaimRefused { convoy: launch.clone() };
+        for fact in [held, refused] {
+            primitives.raise(NAMESPACE, &Attention::new(fact, "held", Utc::now())).await.expect("raise");
+        }
+        let subjects: BTreeSet<String> = primitives
+            .person_messages(NAMESPACE)
+            .await
+            .expect("person messages")
+            .into_iter()
+            .filter_map(|(_, message)| Some(message.spec().subject()?.address.as_str().to_owned()))
+            .collect();
+        let convoy = seat.parent().expect("the seat's convoy");
+        assert!(subjects.contains(seat.as_str()), "{launch}: the role's attention is about its seat: {subjects:?}");
+        assert!(subjects.contains(convoy.as_str()), "{launch}: the convoy's attention is about its seat's convoy: {subjects:?}");
+
+        let about = Subject::convoy(launch.clone());
+        let open: BTreeSet<_> =
+            primitives.open(NAMESPACE, None, Some(&about)).await.expect("open").into_iter().map(|open| open.subject).collect();
+        let role = Subject::ConvoyRole { convoy: launch.clone(), role: "coder".into() };
+        assert_eq!(open, BTreeSet::from([about.clone(), role.clone()]), "{launch}: each reads back about its launch's record");
+        primitives.clear(NAMESPACE, Sender::Teardown, &about).await.expect("clear");
+        primitives.clear(NAMESPACE, Sender::TurnRules, &role).await.expect("clear");
+        assert!(primitives.open(NAMESPACE, None, Some(&about)).await.expect("open").is_empty(), "{launch}: cleared by its subject");
+    }
+}
+
 // Behaviour: a standing role's inbox is held by its newest generation's running crew; an older
 // generation still running holds only its own seat.
 #[tokio::test]

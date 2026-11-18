@@ -272,10 +272,7 @@ fn convoy_read(convoy: &ResourceObject<Convoy>, conversion: &Conversion<'_>) -> 
 /// attention, whether or not the generation bootstrapped and so has a launch.
 fn generation_read(held: &ResourceObject<Convoy>, ensure: &ResourceObject<ConvoyEnsure>) -> Result<Read, String> {
     let launch = format!("{}#{}", standing_name(&ensure.spec.project_ref, &ensure.spec.role)?, held.spec.generation);
-    Ok(Read {
-        address: convoy_reference_address(&launch, held.spec.project_ref.as_deref())?,
-        revision: held.metadata.resource_version.clone(),
-    })
+    Ok(Read { address: convoy_reference_address(&launch, &ensure.spec.project_ref)?, revision: held.metadata.resource_version.clone() })
 }
 
 fn child(parent: &Address, kind: Kind, name: &str) -> Result<Address, String> {

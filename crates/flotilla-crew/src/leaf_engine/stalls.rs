@@ -229,7 +229,7 @@ pub(super) fn supervision_expectation(rung: StallRung) -> flotilla_messaging::In
 
 /// A message's reference to `convoy` at the revision it was read at.
 pub(super) fn convoy_reference(convoy: &ResourceObject<Convoy>) -> Result<flotilla_messaging::IntentReference, String> {
-    let address = flotilla_resources::convoy::engine::convoy_reference_address(&convoy.metadata.name, convoy.spec.project_ref.as_deref())?;
+    let address = flotilla_resources::convoy::engine::convoy_address(convoy)?;
     let revision = flotilla_address::Revision::new(convoy.metadata.resource_version.clone())
         .map_err(|error| format!("convoy `{}`: {error}", convoy.metadata.name))?;
     Ok(flotilla_messaging::IntentReference::new(address, revision))

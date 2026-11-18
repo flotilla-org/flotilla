@@ -220,7 +220,7 @@ fn crew_spec() -> ConvoySpec {
 
 /// A turn's subject: the fixture's convoy `launch`, admitted in project `flotilla`, at `revision`.
 fn convoy_subject(launch: &str, revision: &str) -> flotilla_messaging::IntentReference {
-    let address = flotilla_resources::convoy::engine::convoy_reference_address(launch, Some("flotilla")).expect("convoy address");
+    let address = flotilla_resources::convoy::engine::convoy_reference_address(launch, "flotilla").expect("convoy address");
     flotilla_messaging::IntentReference::subject(address, flotilla_address::Revision::new(revision).expect("revision"))
 }
 

@@ -1402,7 +1402,7 @@ impl MessagePrimitives {
             Err(ResourceError::NotFound { .. }) => None,
             Err(error) => return Err(error.to_string()),
         };
-        let authority = convoy_reference_address(convoy, project.as_deref())?;
+        let authority = convoy_reference_address(convoy, project.as_deref().unwrap_or(namespace))?;
         self.world.update(|world| world.authority.put(&flotilla_state_machines::Ref::new(authority.as_str()), true));
         self.inbox.drop(&id, DropReason::Withdrawn { by: by.clone(), authority }).await.map_err(|error| error.to_string())?;
         self.withdraw_awaiting(&id, &by, "withdrawn by an operator").await;
@@ -2399,7 +2399,7 @@ impl OldStoreRecords {
     }
 
     fn convoy_address(&self, name: &str) -> Result<Address, String> {
-        convoy_reference_address(name, self.convoy(name).and_then(|convoy| convoy.spec.project_ref.as_deref()))
+        convoy_reference_address(name, &self.convoy_project(name).unwrap_or_else(|| self.namespace.clone()))
     }
 
     /// A crew session's seat, the address its convoy role's messages are received at (the crew's

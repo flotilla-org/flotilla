@@ -1381,8 +1381,7 @@ impl CrewService {
             return Ok(linked);
         }
         // The escalation runs the other way: from the crew to this ruling's sender, about the convoy.
-        let convoy_name = convoy.metadata.name.as_str();
-        let about = flotilla_resources::convoy::engine::convoy_reference_address(convoy_name, convoy.spec.project_ref.as_deref())?;
+        let about = flotilla_resources::convoy::engine::convoy_address(convoy)?;
         let found = self.awaited_reply_from(&parties.to, &parties.from, &[about]).await.map_err(|error| error.to_string())?;
         if found.is_some() {
             return Ok(found);
@@ -1396,7 +1395,7 @@ impl CrewService {
             parties.from.as_str(),
             parties.to.as_str(),
             &turn_message_producer_key(
-                &supervision_message_source(convoy_name, stalled.seat(), index),
+                &supervision_message_source(&convoy.metadata.name, stalled.seat(), index),
                 &stalled.began_at.timestamp_micros().to_string(),
             ),
         );
@@ -3293,7 +3292,10 @@ impl CrewService {
         let hold_key =
             format!("{}:{}:{}:{}:{}", request.convoy, request.vessel, request.role, request.source, attention.raised_at.timestamp_micros());
         let mut references = request.references.clone();
-        let about = flotilla_resources::convoy::engine::convoy_reference_address(&request.convoy, convoy.spec.project_ref.as_deref())?;
+        let about = flotilla_resources::convoy::engine::convoy_reference_address(
+            &request.convoy,
+            convoy.spec.project_ref.as_deref().unwrap_or(&request.namespace),
+        )?;
         let revision = flotilla_address::Revision::new(convoy.metadata.resource_version.clone()).map_err(|error| error.to_string())?;
         references.push(flotilla_messaging::IntentReference::new(about.clone(), revision));
         let hold = |inbox: flotilla_address::Address, body: String| {
