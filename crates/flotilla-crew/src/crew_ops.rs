@@ -1235,7 +1235,7 @@ impl CrewService {
             return Ok(CommandValue::Ok);
         }
         let stalled = status.stalls.naming(vessel, role).ok_or_else(|| format!("crew `{vessel}/{role}` is not stalled"))?;
-        off_frame(|| self.authorize_supervision(namespace, stalled, actor_crew_id, principal)).await?;
+        let actor = off_frame(|| self.authorize_supervision(namespace, &convoy, stalled, actor_crew_id, principal)).await?;
         if action == flotilla_protocol::CrewSupervisionAction::Escalate && stalled.rung == flotilla_resources::StallRung::Operator {
             return Ok(CommandValue::CrewEscalationRefused {
                 rung: flotilla_resources::StallRung::Operator,
@@ -1243,7 +1243,7 @@ impl CrewService {
             });
         }
         let project = convoy.spec.project_ref.as_str();
-        let (sender, party) = off_frame(|| self.supervision_sender(namespace, stalled, actor_crew_id, principal)).await?;
+        let (sender, party) = off_frame(|| self.supervision_sender(namespace, actor.as_ref(), principal)).await?;
         let seat = Party::Seat { project: project.to_owned(), convoy: convoy_name.to_owned(), role: role.to_owned() };
         let parties =
             Parties { from: self.party_inbox(namespace, &party, project).await?, to: self.party_inbox(namespace, &seat, project).await? };
@@ -1300,52 +1300,96 @@ impl CrewService {
         Ok(CommandValue::Ok)
     }
 
-    /// Refuses supervision by anyone but the stall's named crew supervisor or an operator.
+    /// Authorises a supervision ruling on a stall in `convoy`, returning the acting crew's seat.
+    /// A crew may rule when supervision reaches it: it is the stall's recorded supervisor, or
+    /// it holds a rung of the Project's supervision ladder, by the rule that routes the stall's
+    /// supervision turns ([`supervises`](crate::leaf_engine::supervises)), escalated stalls
+    /// included. Without a crew, an operator principal rules.
     async fn authorize_supervision(
         &self,
         namespace: &str,
+        convoy: &ResourceObject<ResourceConvoy>,
         stalled: &flotilla_resources::StalledCondition,
         actor_crew_id: Option<&str>,
         principal: Option<&PrincipalRef>,
-    ) -> Result<(), String> {
-        if let Some(crew_id) = actor_crew_id {
-            let supervisor = stalled.supervisor.as_ref().ok_or_else(|| "this stall has no crew supervisor".to_string())?;
-            let sessions = self
-                .resource_backend
-                .clone()
-                .using::<ResourceTerminalSession>(namespace)
-                .query_declared(&StoreQuery {
-                    fields: BTreeMap::from([("status.crew.id".into(), crew_id.into())]),
+    ) -> Result<Option<flotilla_resources::StallSupervisor>, String> {
+        let Some(crew_id) = actor_crew_id else {
+            if principal.is_none() {
+                return Err("crew supervision requires the named supervisor or an operator principal".to_string());
+            }
+            return Ok(None);
+        };
+        let sessions = self
+            .resource_backend
+            .clone()
+            .using::<ResourceTerminalSession>(namespace)
+            .query_declared(&StoreQuery {
+                fields: BTreeMap::from([("status.crew.id".into(), crew_id.into())]),
+                include_replicas: true,
+                ..Default::default()
+            })
+            .await
+            .map_err(|error| error.to_string())?;
+        let seat = sessions
+            .items
+            .iter()
+            .map(|source| &source.object)
+            .filter(|session| session.status.as_ref().and_then(|status| status.crew.as_ref()).is_some_and(|crew| crew.id == crew_id))
+            .find_map(|session| {
+                let labels = &session.metadata.labels;
+                Some(flotilla_resources::StallSupervisor {
+                    convoy: labels.get(CONVOY_LABEL)?.clone(),
+                    vessel: labels.get(VESSEL_LABEL)?.clone(),
+                    role: labels.get(ROLE_LABEL)?.clone(),
+                })
+            })
+            .ok_or_else(|| "crew identity has no crew seat".to_string())?;
+        let recorded = |convoy: &ResourceObject<ResourceConvoy>| {
+            convoy.status.as_ref().is_some_and(|status| status.stalls.iter().any(|stall| stall.supervisor.as_ref() == Some(&seat)))
+        };
+        if stalled.supervisor.as_ref() == Some(&seat) || recorded(convoy) {
+            return Ok(Some(seat));
+        }
+        // A convoy's own crew holds no Project-wide rung unless the convoy is one of the
+        // Project's role convoys: it supervises only the stalls it was sent, recorded above.
+        if seat.convoy == convoy.metadata.name && convoy.spec.role.is_empty() {
+            return Err("crew identity does not own this supervision rung".to_string());
+        }
+        let backend = &self.resource_backend;
+        let project = convoy.spec.project_ref.as_str();
+        // The Project's own policy, and its convoys: a Project-wide rung resolves to no other.
+        let projects = match backend.including_replicas::<flotilla_resources::Project>(namespace).get(project).await {
+            Ok(found) => vec![found],
+            Err(ResourceError::NotFound { .. }) => Vec::new(),
+            Err(error) => return Err(error.to_string()),
+        };
+        let convoys = backend
+            .query_declared::<ResourceConvoy>(
+                namespace,
+                &StoreQuery {
+                    fields: BTreeMap::from([("spec.project_ref".into(), project.into())]),
                     include_replicas: true,
                     ..Default::default()
-                })
-                .await
-                .map_err(|error| error.to_string())?;
-            let authorized = sessions.items.iter().map(|source| &source.object).any(|session| {
-                session.status.as_ref().and_then(|status| status.crew.as_ref()).is_some_and(|crew| crew.id == crew_id)
-                    && session.metadata.labels.get(CONVOY_LABEL) == Some(&supervisor.convoy)
-                    && session.metadata.labels.get(VESSEL_LABEL) == Some(&supervisor.vessel)
-                    && session.metadata.labels.get(ROLE_LABEL) == Some(&supervisor.role)
-            });
-            if !authorized {
-                return Err("crew identity does not own this supervision rung".to_string());
-            }
-        } else if principal.is_none() {
-            return Err("crew supervision requires the named supervisor or an operator principal".to_string());
+                },
+            )
+            .await
+            .map_err(|error| error.to_string())?;
+        let declarations = flotilla_store::CascadeDeclarations::load(backend, namespace).await.map_err(|error| error.to_string())?;
+        let receivers = flotilla_messaging::MessageReceiverSnapshot::load(backend, namespace).await.map_err(|error| error.to_string())?;
+        if crate::leaf_engine::supervises(&receivers, &declarations, project, &projects, &convoys.items, Some(convoy), &seat)? {
+            return Ok(Some(seat));
         }
-        Ok(())
+        Err("crew identity does not own this supervision rung".to_string())
     }
 
-    /// Who a supervision ruling is from: the stall's crew supervisor, or the operator.
+    /// Who a supervision ruling is from: the acting crew's seat, or the operator.
     async fn supervision_sender(
         &self,
         namespace: &str,
-        stalled: &flotilla_resources::StalledCondition,
-        actor_crew_id: Option<&str>,
+        seat: Option<&flotilla_resources::StallSupervisor>,
         principal: Option<&PrincipalRef>,
     ) -> Result<(String, Party), String> {
-        if actor_crew_id.is_some() {
-            let supervisor = stalled.supervisor.as_ref().expect("checked supervisor above");
+        if let Some(supervisor) = seat {
             let supervisor_convoy = self
                 .resource_backend
                 .including_replicas::<ResourceConvoy>(namespace)

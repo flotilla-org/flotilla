@@ -1155,3 +1155,53 @@ async fn failed_session_resume_does_not_invent_provisioning_failure() {
     assert!(error.contains("agent launch rejected"), "{error}");
     assert!(!error.contains("failed provisioning"), "{error}");
 }
+
+// d10: a stall escalated past the crew rungs sits at the operator rung, its supervision
+// exhausted and no supervisor recorded, yet its supervision turns still reach the Project's
+// governor, by the default ladder's governor rung. Whoever supervision reaches may rule on it:
+// the governor's resume is accepted, while a crew supervision does not reach is refused.
+#[tokio::test]
+async fn the_governor_resumes_a_stall_escalated_past_the_crew_rungs() {
+    use flotilla_protocol::CrewSupervisionAction;
+    use flotilla_resources::{StallRung, StallSupervisor};
+    let (crew, backend, probe, held) = fixture(CrewWorkPhase::Working).await;
+    probe.fail.store(false, Ordering::SeqCst);
+    crew.set_turn_delivery_actuator(Arc::new(CrewTurnDeliveryActuator { crew: Arc::downgrade(&crew) })).await;
+    let (governor, governor_crew) = held.admit_crewed("governor", "governor", "watch", "governor", "governor-session").await;
+    let (_, bystander_crew) = held.admit_crewed("bystander", "reviewer", "watch", "reviewer", "bystander-session").await;
+    let convoy = held
+        .stall(&backend, |stalled| {
+            stalled.rung = StallRung::Operator;
+            stalled.supervision_exhausted = true;
+            stalled.supervision_index = Some(2);
+            stalled.supervisor = None;
+        })
+        .await;
+
+    // Delivery's rule: the escalated stall's turns reach the governor, and not the bystander.
+    let projects = backend.including_replicas::<flotilla_resources::Project>("flotilla").list().await.expect("projects").items;
+    let convoys = backend.including_replicas::<ResourceConvoy>("flotilla").list().await.expect("convoys").items;
+    let declarations = flotilla_store::CascadeDeclarations::load(&backend, "flotilla").await.expect("declarations");
+    let receivers = flotilla_messaging::MessageReceiverSnapshot::load(&backend, "flotilla").await.expect("receivers");
+    let reaches = |seat: StallSupervisor| {
+        crate::leaf_engine::supervises(&receivers, &declarations, "flotilla", &projects, &convoys, Some(&convoy), &seat).expect("ladder")
+    };
+    assert!(reaches(StallSupervisor { convoy: governor.clone(), vessel: "watch".into(), role: "governor".into() }));
+
+    fn resume<'a>(convoy_name: &'a str, actor: &'a str) -> CrewSupervisionRequest<'a> {
+        CrewSupervisionRequest {
+            namespace: "flotilla",
+            convoy_name,
+            vessel: "work",
+            role: "coder",
+            operation: CrewSupervisionAction::Resume,
+            message: "Carry on.",
+            actor_crew_id: Some(actor),
+            principal: None,
+        }
+    }
+    let error = crew.supervise(resume(&held.launch, &bystander_crew)).await.expect_err("supervision does not reach the bystander");
+    assert!(error.contains("does not own this supervision rung"), "{error}");
+    let accepted = crew.supervise(resume(&held.launch, &governor_crew)).await.expect("the governor's resume");
+    assert_eq!(accepted, flotilla_protocol::CommandValue::Ok);
+}
