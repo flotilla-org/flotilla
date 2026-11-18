@@ -3,7 +3,7 @@ use std::path::Path;
 use chrono::Utc;
 use flotilla_core::primitives::demand_import::retired;
 use flotilla_daemon_testkit::import_fixture::{
-    artifact, clone, demand, designation, document, ended_convoy, forge, live_convoy, message, own, populated, NS, THERE,
+    access_delivery, artifact, clone, demand, designation, document, ended_convoy, forge, live_convoy, message, own, populated, NS, THERE,
 };
 use flotilla_engine_store::ImportTarget;
 use flotilla_provisioning::stored::forge_observation::{ChangeRequestRecord, IssueRecord};
@@ -834,22 +834,33 @@ type EngineConvoyResource = flotilla_state_machines::Resource<flotilla_state_mac
 
 // Behaviour (#3108 import, ruling (a)): an ended convoy imports as its creation and then its end
 // edge, Deliver or Abandon, made by the import at its old `finished_at`, the Abandon under the
-// import's grant. Once its dependents are imported, one nothing holds retires at that same time,
-// and one a pending message to its crew holds stays ended. The report counts each end, the
+// import's grant. Once its dependents are imported, the import withdraws each message pending to
+// an ended convoy's crew, as the end does on the engine (#3108 ruling 2), so on start nothing but
+// the import has written. Then one nothing holds retires at its end's time, and one an access
+// delivery to its crew holds stays ended. The report counts each end, the withdrawals, the
 // retirements and what holds the rest, by kind.
 #[test]
 fn ended_convoys_import_with_their_end_and_retire_unless_held() {
     use flotilla_schema::CodeEnum as _;
     use flotilla_state_machines::machines::convoy::{AbandonCause, ConvoyEdge, ConvoyEdgeKind, ConvoyLabel};
+    use flotilla_state_machines::machines::message::{DropReason, MessageState};
 
-    let mut waiting = message("for-held");
-    waiting["spec"]["receiver"] = json!("flotilla/held/implement/coder");
+    let pending_to = |name: &str, convoy: &str| {
+        let mut waiting = message(name);
+        waiting["spec"]["receiver"] = json!(format!("flotilla/{convoy}/implement/coder"));
+        waiting
+    };
+    let mut delivery = access_delivery("access-held", false);
+    delivery["spec"]["access"] = json!("flotilla/held/implement/coder");
     let documents = vec![
         designation(),
         ended_convoy("landed", "Landed", "2026-10-19T01:00:00Z", json!({"disposition": "merged"})),
         ended_convoy("failed", "Failed", "2026-10-19T02:00:00Z", json!({"message": "vessel failed"})),
         ended_convoy("held", "Abandoned", "2026-10-19T03:00:00Z", json!({"message": "stopped by an operator"})),
-        waiting,
+        ended_convoy("waited", "Abandoned", "2026-10-19T04:00:00Z", json!({"message": "stopped by an operator"})),
+        pending_to("for-held", "held"),
+        pending_to("for-waited", "waited"),
+        delivery,
     ];
     let dir = tempfile::tempdir().expect("tempdir");
     let mut target =
@@ -861,24 +872,42 @@ fn ended_convoys_import_with_their_end_and_retire_unless_held() {
     assert_eq!(
         tallies,
         [
-            ("ended abandoned", 1),
+            ("ended abandoned", 2),
             ("ended failed", 1),
             ("ended landed", 1),
             ("held", 1),
-            ("held by message", 1),
+            ("held by access-delivery", 1),
             ("launch numbers raised to 1", 1),
-            ("retired", 2)
+            ("retired", 3)
         ],
         "{summary:?}"
     );
+    assert_eq!(summary.tallies["Message"].get("withdrawn: its convoy ended"), Some(&2), "{summary:?}");
 
     let at = |time: &str| Timestamp::from_datetime(&time.parse().expect("time"));
     let mut store = engine(dir.path());
     let mut read = store.read().expect("read");
+    // Each message pending to an ended convoy's crew is withdrawn by the import, on the authority
+    // of the convoy's launch, when the convoy ended.
+    for (name, convoy, finished) in [("for-held", "held", "2026-10-19T03:00:00Z"), ("for-waited", "waited", "2026-10-19T04:00:00Z")] {
+        let launch = format!("project:flotilla/convoy:{convoy}%231");
+        let record = format!("{launch}/role:coder/message:{name}");
+        let id = read.resolve(<MessageResource as Kind>::CODE, &record, HERE).expect("resolve").unwrap_or_else(|| panic!("{record}"));
+        let message = read.load::<MessageResource>(id).expect("load").expect("held").value;
+        match message.state() {
+            MessageState::Dropped { reason: DropReason::Withdrawn { by, authority }, .. } => {
+                assert_eq!((by.as_str(), authority.as_str()), (launch.as_str(), launch.as_str()), "{name}");
+            }
+            other => panic!("{name} is withdrawn, not {other:?}"),
+        }
+        let change = read.last_change(id).expect("entry").expect("its change");
+        assert_eq!((change.writer.as_str(), change.at), ("import", at(finished)), "{name}: the import withdraws it when its convoy ended");
+    }
     for (of, finished, label) in [
         ("landed", "2026-10-19T01:00:00Z", ConvoyLabel::Retired),
         ("failed", "2026-10-19T02:00:00Z", ConvoyLabel::Retired),
         ("held", "2026-10-19T03:00:00Z", ConvoyLabel::Abandoned),
+        ("waited", "2026-10-19T04:00:00Z", ConvoyLabel::Retired),
     ] {
         let (id, convoy) = convoy_launch(&mut read, of);
         assert_eq!(convoy.label(), label, "{of}");

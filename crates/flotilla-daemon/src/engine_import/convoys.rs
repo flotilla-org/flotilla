@@ -6,7 +6,7 @@ use std::collections::{BTreeMap, BTreeSet};
 
 use flotilla_address::Address;
 use flotilla_admission::{reconcilers::convoy_ensure::generation_end, standing::fold};
-use flotilla_engine_convoys::convoy_import::{end_into, import_all, retire_into, write_into, ConvoyImportWorld};
+use flotilla_engine_convoys::convoy_import::{end_into, import_all, retire_into, withdraw_into, write_into, ConvoyImportWorld};
 use flotilla_engine_store::{Import, ImportTarget, IMPORT_WRITER};
 use flotilla_provisioning::engine::{
     import::{created, ImportRefusal, ImportReport},
@@ -123,8 +123,21 @@ pub(super) fn convoys(source: &Source, target: &mut Import, carried: &mut Carrie
 /// Retires each imported convoy that ended and that nothing imported holds, at its end's time:
 /// the step after every importer, so each record that could hold a convoy is written first.
 /// Counts the convoys retired and, for those held, each kind of record holding them.
+/// First the messages pending to its seats are withdrawn, as its end withdraws them on the engine
+/// (#3108 ruling 2), so nothing imported sets that off on start.
 pub(super) fn retirements(_: &Source, target: &mut Import, carried: &mut Carried, report: &mut ImportReport) {
     for (key, (ended, at)) in &carried.ended {
+        match withdraw_into(target, ended, *at) {
+            Ok(withdrawn) => {
+                for _ in 0..withdrawn {
+                    report.tally("Message", "withdrawn: its convoy ended");
+                }
+            }
+            Err(reason) => {
+                report.refused.push(ImportRefusal { kind: KIND, record: ended.name().to_owned(), reason });
+                continue;
+            }
+        }
         match retire_into(target, ended, *at) {
             Ok(held) if held.is_empty() => {
                 report.tally(KIND, "retired");

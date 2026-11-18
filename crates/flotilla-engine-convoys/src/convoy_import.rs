@@ -54,7 +54,7 @@ use flotilla_state_machines::{
             DutyId, DutyScope, Keep, MemoryConvoyWorld, Priority, Progress, Promise, PromiseId, PromiseSource, Reject, Retire, Retract,
             Seat, SeatName, Submission, Submit, Terms,
         },
-        message::MessageRef,
+        message::{DropMessage, DropReason, MemoryMessageWorld, Message, MessageRef},
     },
     Home, Ref, Resource, StoredState, Version, WriteError,
 };
@@ -773,6 +773,41 @@ pub fn end_into(target: &flotilla_engine_store::Import, written: &Resource<Convo
     end.grant(&mut world);
     home.apply(written.name(), end.edge.clone(), &world, end.at).map_err(|error| format!("the machine refuses its end: {error:?}"))?;
     Ok(home.get(written.name()).cloned().expect("an applied edge leaves its resource"))
+}
+
+/// Withdraws each message homed at `target`'s home pending to a seat of `ended`, an imported
+/// convoy as [`end_into`] ended it, as its end does on the engine: by the convoy's launch address,
+/// on its authority, written by the import. Imported history sets nothing off on start, so the
+/// import writes what the end would have: at `at`, or at a message's own time when it came later.
+/// How many it withdrew.
+pub fn withdraw_into(target: &flotilla_engine_store::Import, ended: &Resource<Convoy>, at: Timestamp) -> Result<usize, String> {
+    let home_name = target.store().home().to_owned();
+    let (convoy, seats) = crate::holds::addresses(ended)?;
+    let pending: Vec<Resource<Message>> = {
+        let mut store = target.store();
+        let mut read = store.read().map_err(|error| error.to_string())?;
+        let ids = crate::holds::pending_to(&mut read, &seats, &home_name).map_err(|error| error.to_string())?;
+        let mut pending = Vec::new();
+        for id in ids {
+            pending.extend(read.load::<Resource<Message>>(id).map_err(|error| error.to_string())?.map(|loaded| loaded.value));
+        }
+        pending
+    };
+    if pending.is_empty() {
+        return Ok(0);
+    }
+    let mut home = Home::<Message, flotilla_engine_store::StoreLog>::with_log(flotilla_engine_store::IMPORT_WRITER, target.log())
+        .map_err(|error| format!("{error:?}"))?;
+    let mut world = MemoryMessageWorld::default();
+    world.authority.put(&Ref::new(convoy.as_str()), true);
+    let reason = DropReason::Withdrawn { by: convoy.clone(), authority: convoy };
+    for message in &pending {
+        home.restore(message.clone()).map_err(|error| format!("{error:?}"))?;
+        let when = Timestamp(at.0.max(message.since().0));
+        home.apply(message.name(), DropMessage { reason: reason.clone() }, &world, when)
+            .map_err(|error| format!("message `{}`: the machine refuses its withdrawal: {error:?}", message.name()))?;
+    }
+    Ok(pending.len())
 }
 
 /// Retires `ended`, an imported convoy as [`end_into`] ended it, at `at` when nothing imported

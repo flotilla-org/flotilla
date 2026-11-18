@@ -19,7 +19,7 @@
 
 use std::collections::BTreeSet;
 
-use flotilla_address::Kind as AddressKind;
+use flotilla_address::{Address, Kind as AddressKind};
 use flotilla_provisioning::stored::{
     account::{AccountBinding, BindingLabel, BindingSpec},
     checkout::{Checkout, CheckoutRequest},
@@ -60,16 +60,8 @@ pub fn holds(read: &mut Read<'_>, convoy: &Resource<Convoy>, home: &str) -> Resu
     let unaddressable = |error: String| StoreError::Stream(format!("convoy {name}'s holds: {error}"));
     let mut holds = BTreeSet::new();
 
-    let convoy_address = match split_launch(name) {
-        Some(_) => launch_address(project, name),
-        None => project.child(AddressKind::Convoy, name).map_err(|error| error.to_string()),
-    }
-    .map_err(unaddressable)?;
+    let (convoy_address, seats) = addresses(convoy).map_err(unaddressable)?;
     let roles: BTreeSet<&str> = spec.seats.iter().map(|row| row.record.role.as_str()).collect();
-    let mut seats = Vec::new();
-    for role in &roles {
-        seats.push(seat_address(project, name, role).map_err(unaddressable)?);
-    }
 
     for seat in &seats {
         for label in [MessageLabel::Pending, MessageLabel::Awaiting] {
@@ -146,6 +138,32 @@ pub fn holds(read: &mut Read<'_>, convoy: &Resource<Convoy>, home: &str) -> Resu
 }
 
 /// Names the first resource `query` finds as `<label>:<name>`.
+/// `convoy`'s address, its launch's when it is one, and the addresses of its seats.
+pub(crate) fn addresses(convoy: &Resource<Convoy>) -> Result<(Address, Vec<Address>), String> {
+    let (name, project) = (convoy.name(), &convoy.spec().project);
+    let convoy_address = match split_launch(name) {
+        Some(_) => launch_address(project, name)?,
+        None => project.child(AddressKind::Convoy, name).map_err(|error| error.to_string())?,
+    };
+    let roles: BTreeSet<&str> = convoy.spec().seats.iter().map(|row| row.record.role.as_str()).collect();
+    let seats = roles.into_iter().map(|role| seat_address(project, name, role)).collect::<Result<_, _>>()?;
+    Ok((convoy_address, seats))
+}
+
+/// The messages homed at `home` pending to any of `seats`.
+pub(crate) fn pending_to(read: &mut Read<'_>, seats: &[Address], home: &str) -> Result<Vec<ResourceId>, StoreError> {
+    let mut pending = Vec::new();
+    for seat in seats {
+        each(read, &MessageSpec::by_inbox(seat, &MessageLabel::Pending), |read, id| {
+            if read.identity(id)?.is_some_and(|(identity, _)| identity.home == home) {
+                pending.push(id);
+            }
+            Ok(())
+        })?;
+    }
+    Ok(pending)
+}
+
 fn first<Q>(read: &mut Read<'_>, query: &IndexQuery<Q>, holds: &mut BTreeSet<String>, label: &str) -> Result<(), StoreError> {
     let page = read.page(query, None, 1)?;
     if let Some(id) = page.ids.first() {
