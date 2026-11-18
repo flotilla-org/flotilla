@@ -247,9 +247,17 @@ impl AgentActivityView {
     }
 
     /// Whether the agent took up a turn submitted at `submitted`: it began working after it,
-    /// or this daemon saw a prompt submitted or a tool called after it.
+    /// its hooks recorded a change of activity after it (a turn it already finished, as a daemon
+    /// started since reads it), or this daemon saw a prompt submitted or a tool called after it.
+    /// A screen read is not counted: a redraw can show a change the agent never made, and an Idle
+    /// recorded before the submission is no change. An ended session takes no receipt, so its
+    /// end confirms nothing.
     pub fn took_up_after(&self, submitted: DateTime<Utc>) -> bool {
         self.working_since().is_some_and(|since| since > submitted)
+            || (self.reading.ended.is_none()
+                && !self.from_screen()
+                && self.reading.activity.is_some()
+                && self.reading.activity_since.is_some_and(|since| since > submitted))
             || self.progress.is_some_and(|progress| {
                 progress.prompt_submit_at.is_some_and(|at| at > submitted) || progress.tool_at.is_some_and(|at| at > submitted)
             })

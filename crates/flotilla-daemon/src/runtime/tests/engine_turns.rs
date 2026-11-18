@@ -27,6 +27,10 @@ struct EngineCrew {
     launch: String,
     /// The convoy's launch.
     convoy: String,
+    /// What a restarted daemon's runtime state is made from.
+    config: Arc<ConfigStore>,
+    registry: Arc<ProviderRegistry>,
+    profile: LocalProvisioningProfile,
 }
 
 async fn engine_crew(adapter: &str, pool: Arc<dyn TerminalPool>) -> EngineCrew {
@@ -85,18 +89,34 @@ async fn engine_crew(adapter: &str, pool: Arc<dyn TerminalPool>) -> EngineCrew {
     designate_fleet(&daemon).await;
     super::super::open_message_primitives(&daemon).await.expect("open the Message path");
     let primitives = daemon.message_primitives().expect("Message path");
-    let state = Arc::new(ControllerRuntimeState::new(
-        Arc::clone(&daemon),
-        config,
-        registry,
+    let state = runtime_state(&daemon, &config, &registry, &profile);
+    EngineCrew { _temp: temp, daemon, state, primitives, launch, convoy, config, registry, profile }
+}
+
+fn runtime_state(
+    daemon: &Arc<InProcessDaemon>,
+    config: &Arc<ConfigStore>,
+    registry: &Arc<ProviderRegistry>,
+    profile: &LocalProvisioningProfile,
+) -> Arc<ControllerRuntimeState> {
+    Arc::new(ControllerRuntimeState::new(
+        Arc::clone(daemon),
+        Arc::clone(config),
+        Arc::clone(registry),
         None,
         profile.host_id.clone(),
         profile.host_direct_environment_name(),
-    ));
-    EngineCrew { _temp: temp, daemon, state, primitives, launch, convoy }
+    ))
 }
 
 impl EngineCrew {
+    /// Delivery as a daemon started over the same store has it: its runtime state, with no turn
+    /// in flight or held, is new, and the pool remembers the turns it accepted.
+    fn restarted_delivery(&self) -> MessageDelivery {
+        let state = runtime_state(&self.daemon, &self.config, &self.registry, &self.profile);
+        MessageDelivery::new(state, Arc::clone(&self.primitives), NAMESPACE.into(), RuntimeHealth::default())
+    }
+
     fn delivery(&self) -> MessageDelivery {
         MessageDelivery::new(Arc::clone(&self.state), Arc::clone(&self.primitives), NAMESPACE.into(), RuntimeHealth::default())
     }
@@ -537,4 +557,67 @@ async fn a_launch_waits_for_its_environments_registration() {
     // A launch that reaches its pool before the registration fails as waiting, not refused.
     let Err(failure) = runtime.launch(&record(&unadopted)).await else { panic!("no environment to launch in") };
     assert_eq!(failure, LaunchFailure::waits("environment env-unadopted is not registered on this host yet"));
+}
+
+// Behaviour (d8): a turn typed just before a restart, which its agent took up and finished before
+// the restarted daemon looked, is received after the restart. The restarted daemon finds the turn
+// typed and holds it; the Idle the agent's hooks recorded after the submission confirms it, though
+// the agent is no longer working and this daemon saw nothing of the turn.
+#[tokio::test(start_paused = true)]
+async fn a_turn_its_agent_finished_before_a_restart_is_received_after_it() {
+    let pool = Arc::new(KeyedPool { inner: FakeTerminalPool::new(), accepted: Default::default() });
+    pool.inner
+        .add_sessions(vec![ProviderTerminalSession::builder()
+            .session_name("agent".into())
+            .status(TerminalStatus::Running)
+            .screen_activity(ScreenActivity::Stable)
+            .build()])
+        .await;
+    let crew = engine_crew("claude-code", pool.clone()).await;
+    let agents = Arc::clone(crew.primitives.sessions());
+    agents.observe(&crew.launch, Activity::Idle, "Stop".into(), EngineCrew::at(Utc::now())).expect("idle before the turn");
+    crew.send("restart-turn", "system:turn-rules", MessageRelation::System, "wake").await;
+    // One pass types the turn; the daemon stops before any pass collects it.
+    crew.delivery().pass().await.expect("delivery pass");
+    tokio::time::timeout(Duration::from_secs(1), async {
+        while pool.inner.delivered.lock().await.is_empty() {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("the turn is typed");
+    // The agent takes the turn up and finishes it, as its hooks record.
+    let typed = Utc::now();
+    agents
+        .observe(&crew.launch, Activity::Working, "UserPromptSubmit".into(), EngineCrew::at(typed + chrono::Duration::seconds(1)))
+        .expect("working");
+    agents.observe(&crew.launch, Activity::Idle, "Stop".into(), EngineCrew::at(typed + chrono::Duration::seconds(2))).expect("idle");
+
+    let mut restarted = crew.restarted_delivery();
+    passes(&mut restarted, 20).await;
+    assert_eq!(pool.inner.delivered.lock().await.len(), 1, "the restarted daemon does not type the turn again");
+    assert!(crew.delivered("restart-turn").await, "the agent's recorded Idle after the turn confirms it");
+}
+
+// Behaviour (d8): a graceful stop settles the turn being typed and records its receipt before
+// delivery ends, rather than leaving the turn to a restarted daemon's hold.
+#[tokio::test(start_paused = true)]
+async fn a_graceful_stop_records_the_receipt_of_a_turn_in_flight() {
+    let mut probe = DeliveryProbePool::new(vec![ScreenActivity::Stable]);
+    probe.working_after_delivery = true;
+    let pool = Arc::new(probe);
+    // Codex's Working line is what the probe shows once the turn is typed.
+    let crew = engine_crew("codex", pool.clone()).await;
+    crew.primitives.sessions().observe_screen(&crew.launch, Activity::Idle, EngineCrew::at(Utc::now())).expect("idle before the turn");
+    let task = tokio::spawn(crew.delivery().run(Arc::new(ControllerLoadMetrics::default())));
+    crew.send("stop-turn", "system:turn-rules", MessageRelation::System, "wake").await;
+    // Waits for the turn to be typed without letting virtual time run: its confirmation is still
+    // under way when the stop is asked for.
+    pool.submission_attempted.notified().await;
+    assert!(!crew.delivered("stop-turn").await, "the turn is in flight");
+
+    assert!(crew.state.delivery_stop.settle(Duration::from_secs(10)).await, "delivery answers the stop");
+    assert!(crew.delivered("stop-turn").await, "the stop recorded the turn's receipt");
+    assert_eq!(pool.deliveries.load(Ordering::SeqCst), 1);
+    tokio::time::timeout(Duration::from_secs(1), task).await.expect("delivery ends at the stop").expect("delivery task");
 }

@@ -131,7 +131,14 @@ pub struct DaemonRuntime {
     /// Set by `shutdown` so `Drop` can tell an intended stop from a runtime
     /// that vanished while the daemon was meant to keep working.
     stop_expected: bool,
+    /// Asks message delivery to settle its turns before the tasks are aborted; none without
+    /// controllers.
+    delivery_stop: Option<Arc<primitives::DeliveryStop>>,
 }
+
+/// How long a graceful stop waits for message delivery to settle its turns: a typed turn's
+/// confirmation runs within its grace.
+const DELIVERY_SETTLE_WITHIN: Duration = Duration::from_secs(10);
 
 impl DaemonRuntime {
     pub async fn start(
@@ -463,6 +470,7 @@ impl DaemonRuntime {
 
         let controller_metrics = Arc::new(flotilla_store::load_metrics::ControllerMetricsRegistry::default());
         let mut controller_state = None;
+        let mut delivery_stop = None;
         daemon
             .install_convoy_ensure_reconciler(Arc::new(
                 EnsureReconciler::builder()
@@ -552,6 +560,7 @@ impl DaemonRuntime {
             )
             .await;
             daemon.set_session_capability_source(Arc::new(RuntimeSessionCapabilities { state: Arc::downgrade(&state) })).await;
+            delivery_stop = Some(Arc::clone(&state.delivery_stop));
             controller_state = Some(state);
         }
 
@@ -569,7 +578,7 @@ impl DaemonRuntime {
                 .build(),
         ));
 
-        Ok(Self { tasks, blob_store, controller_metrics, stop_expected: false })
+        Ok(Self { tasks, blob_store, controller_metrics, stop_expected: false, delivery_stop })
     }
 }
 
@@ -711,7 +720,13 @@ impl DaemonRuntime {
     /// SIGTERM, SIGINT, idle timeout, explicit shutdown — should call this, so
     /// that `Drop`'s ERROR path stays reserved for a runtime that disappeared
     /// while the daemon was still meant to be working.
-    pub fn shutdown(mut self) {
+    /// Message delivery settles its turns first, so a turn typed before the stop has its receipt.
+    pub async fn shutdown(mut self) {
+        if let Some(delivery) = &self.delivery_stop {
+            if !delivery.settle(DELIVERY_SETTLE_WITHIN).await {
+                warn!(within = ?DELIVERY_SETTLE_WITHIN, "message delivery did not settle its turns before the stop");
+            }
+        }
         self.stop_expected = true;
         info!(tasks = self.tasks.len(), "daemon runtime stopping; aborting supervisory tasks");
     }

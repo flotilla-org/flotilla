@@ -4906,7 +4906,7 @@ async fn slow_startup_reconciliation_does_not_delay_listening_or_fleet_health() 
     })
     .await
     .expect("background startup completes credential delivery");
-    runtime.shutdown();
+    runtime.shutdown().await;
     shutdown.send(true).expect("shutdown");
     task.await.expect("server task").expect("server stops");
 }

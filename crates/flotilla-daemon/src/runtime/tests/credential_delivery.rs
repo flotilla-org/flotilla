@@ -991,7 +991,7 @@ async fn slow_work_credential_phase_keeps_heartbeat_available_and_completes() {
         .find(|record| record["fields"]["phase"] == "reconcile_work_credentials" && record["fields"]["status"] == "completed")
         .unwrap_or_else(|| panic!("credential phase timing absent from log: {records}"));
     assert!(finish["fields"]["duration_ms"].as_f64().expect("duration") >= 38_650.0);
-    runtime.shutdown();
+    runtime.shutdown().await;
 }
 
 // Credential attention ignores terminal convoy history before decoding it.

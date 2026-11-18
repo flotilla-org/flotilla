@@ -436,9 +436,17 @@ impl TurnHolds {
         self.until.contains_key(message)
     }
 
-    /// Releases every hold that has run out by `now`.
-    pub fn expire(&mut self, now: std::time::Instant) {
-        self.until.retain(|_, until| *until > now);
+    /// Releases every hold that has run out by `now`, and names their messages.
+    pub fn expire(&mut self, now: std::time::Instant) -> Vec<String> {
+        let mut expired = Vec::new();
+        self.until.retain(|message, until| {
+            let held = *until > now;
+            if !held {
+                expired.push(message.clone());
+            }
+            held
+        });
+        expired
     }
 
     /// When the next hold runs out.

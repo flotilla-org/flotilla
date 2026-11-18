@@ -2076,7 +2076,7 @@ async fn artifact_environment_reference_contract() {
         // This transport fixture admits only a ledger promise; PR promise
         // gating is covered by the controller and dummy-fleet scenarios.
         assert_eq!(status.crew_work["work"]["coder"].phase, CrewWorkPhase::Done);
-        runtime.shutdown();
+        runtime.shutdown().await;
     }
 }
 

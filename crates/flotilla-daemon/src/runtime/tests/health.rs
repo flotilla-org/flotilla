@@ -431,7 +431,7 @@ async fn daemon_reports_recent_abnormal_restart_frequency_in_fleet_health() {
     let host = daemon.resource_backend().using::<Host>(NAMESPACE).get(host_id.as_str()).await.expect("local Host");
     assert!(host.status.expect("local Host status").ready, "historical abnormal exits must not block placement after recovery");
 
-    runtime.shutdown();
+    runtime.shutdown().await;
 }
 
 // Losing an agent adapter blocks placement, while the same live daemon can

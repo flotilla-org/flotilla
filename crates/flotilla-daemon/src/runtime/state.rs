@@ -73,6 +73,8 @@ pub(super) struct ControllerRuntimeState {
     pub(super) local_backing_observed: tokio::sync::watch::Sender<bool>,
     pub(super) clone_flights: Arc<CloneFlights>,
     pub(super) terminal_deliveries: StdMutex<HashMap<String, PendingTerminalDelivery>>,
+    /// A graceful stop asks message delivery to settle its turns through this.
+    pub(super) delivery_stop: Arc<super::primitives::DeliveryStop>,
     /// Composer drafts set aside for machinery turns, held only in memory.
     pub(super) composer_drafts: Arc<flotilla_terminal::drafts::ComposerDrafts>,
     /// Serialises a launch's delivery of a binding with the provision controller's withdrawal of
@@ -332,6 +334,7 @@ impl ControllerRuntimeState {
             local_backing_observed: tokio::sync::watch::Sender::new(false),
             clone_flights: Arc::new(CloneFlights::default()),
             terminal_deliveries: StdMutex::new(HashMap::new()),
+            delivery_stop: Arc::default(),
             composer_drafts: Arc::default(),
             account_deliveries: StdMutex::new(HashMap::new()),
             exit_receipts: ExitReceiptObserver::default(),

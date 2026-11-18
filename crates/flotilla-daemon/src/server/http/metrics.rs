@@ -406,7 +406,7 @@ mod tests {
                 > 0));
         }
         assert!(text.contains("flotilla_forge_budget_calls_total{host=\"metrics-host\",identity=\"host gh login\",budget=\"REST\"} 1"));
-        runtime.shutdown();
+        runtime.shutdown().await;
     }
 
     // Behaviour: the loopback policy admits GET /metrics without credentials,

@@ -108,7 +108,7 @@ async fn bad_ssh_host_does_not_block_daemon_startup_or_other_hosts() {
     assert!(good.status.expect("other SSH observation").ready);
     assert!(daemon.resource_backend().using::<FulfilmentKind>(NAMESPACE).get("host-direct-good-ssh-host").await.is_ok());
 
-    runtime.shutdown();
+    runtime.shutdown().await;
 }
 
 #[tokio::test]

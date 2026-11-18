@@ -115,7 +115,7 @@ pub async fn run(
         // Stop background tasks after the accept loop ends. SIGTERM, SIGINT, idle
         // timeout, and explicit shutdown return Ok and clear the lifecycle marker;
         // a server error deliberately leaves it behind as an abnormal exit.
-        runtime.shutdown();
+        runtime.shutdown().await;
         if result.is_ok() {
             lifecycle.finish()?;
         }

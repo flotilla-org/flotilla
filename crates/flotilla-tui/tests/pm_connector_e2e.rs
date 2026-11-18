@@ -281,7 +281,7 @@ async fn lifecycle(forward: Option<WheelhouseHttpSink>) {
     restarted.abort();
     let _ = restarted.await;
     assert_eq!(query_state.subscribed_queries(), baseline_queries, "reconnect cleanup releases named query demand");
-    runtime.shutdown();
+    runtime.shutdown().await;
 }
 #[tokio::test]
 async fn connector_real_daemon_subject_lifecycle() {

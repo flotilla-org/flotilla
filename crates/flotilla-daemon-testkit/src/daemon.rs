@@ -310,7 +310,7 @@ impl TestDaemon {
         relay.disconnect();
         let node = daemon.node_id().clone();
         if let Some(runtime) = runtime {
-            runtime.shutdown();
+            runtime.shutdown().await;
         }
         drop(daemon);
         tokio::task::yield_now().await;
@@ -334,7 +334,7 @@ impl TestDaemon {
         fleet.stop();
         let node = daemon.node_id().clone();
         if let Some(runtime) = runtime {
-            runtime.shutdown();
+            runtime.shutdown().await;
         }
         drop(daemon);
         drop(fleet);

@@ -51,7 +51,7 @@ use flotilla_state_machines::{
     Resource, Transport,
 };
 use futures::TryStreamExt;
-use tracing::{debug, warn, Instrument};
+use tracing::{debug, info, warn, Instrument};
 
 use super::{
     state::ControllerRuntimeState,
@@ -112,6 +112,39 @@ pub(super) struct MessageDelivery {
     wake: Arc<tokio::sync::Notify>,
     /// The homes the last sweep's expiries wait to hear from: only hearing from one wakes a pass.
     awaiting_heard: Arc<std::sync::Mutex<BTreeSet<String>>>,
+}
+
+/// A graceful stop's request to message delivery, and delivery's answer once it has settled its
+/// turns (d8): the runtime asks before it aborts its tasks.
+#[derive(Debug)]
+pub(crate) struct DeliveryStop {
+    requested: tokio::sync::watch::Sender<bool>,
+    settled: tokio::sync::watch::Sender<bool>,
+    running: std::sync::atomic::AtomicBool,
+}
+
+impl Default for DeliveryStop {
+    fn default() -> Self {
+        Self {
+            requested: tokio::sync::watch::Sender::new(false),
+            settled: tokio::sync::watch::Sender::new(false),
+            running: std::sync::atomic::AtomicBool::new(false),
+        }
+    }
+}
+
+impl DeliveryStop {
+    /// Asks delivery to settle its turns and waits at most `within` for its answer: at once when
+    /// no delivery runs. Whether it answered.
+    pub(crate) async fn settle(&self, within: Duration) -> bool {
+        self.requested.send_replace(true);
+        if !self.running.load(std::sync::atomic::Ordering::SeqCst) {
+            return true;
+        }
+        let mut settled = self.settled.subscribe();
+        let answered = tokio::time::timeout(within, async { settled.wait_for(|settled| *settled).await.is_ok() }).await;
+        answered.unwrap_or(false)
+    }
 }
 
 impl MessageDelivery {
@@ -197,6 +230,9 @@ impl MessageDelivery {
         watch!(flotilla_resources::Issue);
         watch!(flotilla_resources::Artifact);
         watch!(flotilla_resources::Vessel);
+        let stops = Arc::clone(&self.state.delivery_stop);
+        stops.running.store(true, std::sync::atomic::Ordering::SeqCst);
+        let mut stop = stops.requested.subscribe();
         let mut failures = 0_u32;
         loop {
             metrics.wakes.increment();
@@ -221,7 +257,14 @@ impl MessageDelivery {
                     (failures <= RETRY_LIMIT).then(|| RETRY.delay(failures))
                 }
             };
+            // A stop is taken before any other wake: no pass starts a turn after it.
             tokio::select! {
+                biased;
+                Ok(()) = async { stop.wait_for(|requested| *requested).await.map(|_| ()) } => {
+                    self.settle_turns().await;
+                    stops.settled.send_replace(true);
+                    return;
+                }
                 () = wake.notified() => {}
                 () = async {
                     match next {
@@ -244,7 +287,7 @@ impl MessageDelivery {
         let now = Timestamp::from_datetime(&Utc::now());
         // Receipts first: a turn confirmed before its session's teardown records
         // its receipt before rebind unbinds and ends that session (#3894).
-        self.collect_turns().await;
+        self.collect_turns(false).await;
         self.confirm_held_turns().await;
         let holders = self.holders(now).await?;
         let person = self.primitives.register_person(now).await?;
@@ -381,14 +424,14 @@ impl MessageDelivery {
         Ok(())
     }
 
-    /// Settles finished turns: a confirmed one records its receipts, then
-    /// each message's deliver; an unconfirmed one stays pending, held.
-    async fn collect_turns(&mut self) {
+    /// Settles finished turns, or with `settle` every turn once it finishes: a confirmed one
+    /// records its receipts, then each message's deliver; an unconfirmed one stays pending, held.
+    async fn collect_turns(&mut self, settle: bool) {
         let finished: Vec<_> = {
             let mut deliveries = self.state.terminal_deliveries.lock().expect("terminal deliveries lock poisoned");
             self.inflight
                 .keys()
-                .filter(|session| deliveries.get(*session).is_none_or(|delivery| delivery.task.is_finished()))
+                .filter(|session| settle || deliveries.get(*session).is_none_or(|delivery| delivery.task.is_finished()))
                 .cloned()
                 .collect::<Vec<_>>()
                 .into_iter()
@@ -415,6 +458,7 @@ impl MessageDelivery {
                 Ok(TerminalDeliveryOutcome::Unconfirmed(TerminalDeliveryFailure::SubmissionUnconfirmed)) => {
                     let until = std::time::Instant::now()
                         + flotilla_resources::delivery_hold::DELIVERY_HOLD_FOR.to_std().expect("positive hold bound");
+                    info!(%session, messages = ?turn.members, submitted_at = %turn.submitted_at, "a turn typed without confirmation is held");
                     self.held.hold(turn.members.iter().cloned(), until);
                     self.held_turns.push(turn);
                 }
@@ -426,6 +470,7 @@ impl MessageDelivery {
                     turn.submitted_at = typed_at.unwrap_or(turn.submitted_at);
                     let left = (turn.submitted_at + flotilla_resources::delivery_hold::DELIVERY_HOLD_FOR) - self.state.daemon.clock().now();
                     let until = std::time::Instant::now() + left.to_std().unwrap_or_default();
+                    info!(%session, messages = ?turn.members, submitted_at = %turn.submitted_at, "a turn typed before this daemon started is held");
                     self.held.hold(turn.members.iter().cloned(), until);
                     self.held_turns.push(turn);
                 }
@@ -434,7 +479,17 @@ impl MessageDelivery {
                 Err(error) => debug!(%session, %error, "engine turn delivery did not complete"),
             }
         }
-        self.held.expire(std::time::Instant::now());
+        for message in self.held.expire(std::time::Instant::now()) {
+            warn!(%message, "a held turn's hold ran out unconfirmed; it may be typed again");
+        }
+    }
+
+    /// A graceful stop (d8): waits for each turn being typed to settle, then records the receipts
+    /// of those confirmed and of held turns the agent's record confirms, so a restart does not
+    /// leave a turn the agent already took to a hold.
+    async fn settle_turns(&mut self) {
+        self.collect_turns(true).await;
+        self.confirm_held_turns().await;
     }
 
     /// Shows on each launch's observation when the turn it holds unconfirmed was submitted, and
