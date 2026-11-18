@@ -773,10 +773,11 @@ async fn a_coder_relaunched_after_its_change_request_is_kept_does_not_deliver_it
 
 // When the terminal refuses submissions, as cleat does while a composer holds text, message
 // delivery keeps each turn queued and retries it: the convoy still lands with each turn acted on
-// once, and no crew command fails.
+// once, and no crew command fails. Turns are short (still past the second of work that confirms a
+// delivery), so the retry pass fits in the wait.
 #[tokio::test(start_paused = true)]
 async fn refused_submissions_are_retried_and_each_turn_lands_once() {
-    let fleet = TestDaemon::builder().agent("turn_delay_ms = 10000").terminal("refusal_rate = 0.5").start().await;
+    let fleet = TestDaemon::builder().agent("turn_delay_ms = 2000").terminal("refusal_rate = 0.5").start().await;
     let name = fleet.dispatch(CrewMix::CoderReviewer, DUMMY_FULFILMENT_KIND).await;
     acted_on_each_turn_once(&fleet, &name).await;
     assert!(fleet.counts().submissions_refused > 0, "{:?}", fleet.counts());

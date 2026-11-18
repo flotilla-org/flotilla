@@ -471,8 +471,10 @@ mod host_tests {
         let config = ConfigStore::with_base(directory.path().to_path_buf());
         let root = ExecutionEnvironmentPath::new("/workspace/fleet");
         for (dirty_rate, unpushed_rate) in [(0.0, 0.0), (1.0, 1.0)] {
-            let mut settings = DummyFleetConfig::default();
-            settings.vcs = flotilla_config::dummy_fleet::DummyVcsConfig { dirty_rate, unpushed_rate };
+            let settings = DummyFleetConfig {
+                vcs: flotilla_config::dummy_fleet::DummyVcsConfig { dirty_rate, unpushed_rate },
+                ..DummyFleetConfig::default()
+            };
             let factory = DummyVcsFactory { fleet: DummyFleet::new(settings) };
             let runner = Arc::new(DummyCommandRunner::default());
             let vcs = factory.probe(&vessel_bag("one"), &config, &root, runner).await.unwrap_or_else(|_| panic!("claimed"));
