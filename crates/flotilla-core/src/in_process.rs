@@ -3660,6 +3660,12 @@ impl InProcessDaemon {
     pub fn event_sink(&self) -> Arc<dyn EventSink> {
         self.event_sink.clone()
     }
+
+    /// Captures command completions apart from the lossy event broadcast. Capture
+    /// before dispatching a command to be sure of receiving its outcome.
+    pub fn capture_completions(&self) -> flotilla_daemon_api::event_sink::CommandCompletions {
+        self.event_source.capture_completions()
+    }
 }
 
 /// Non-trait methods that are called directly on the concrete `InProcessDaemon`

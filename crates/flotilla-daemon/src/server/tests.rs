@@ -5728,9 +5728,9 @@ async fn caller_can_stall_and_promise(daemon: &InProcessDaemon, caller: flotilla
         },
     ] {
         let stalling = matches!(action, CommandAction::CrewStall { .. });
-        let mut events = daemon.subscribe();
+        let mut completions = daemon.capture_completions();
         let id = daemon.execute_for_caller(Command::builder().action(action).build(), Some(caller.clone())).await.unwrap();
-        let event = super::environment_connection::command_completion(&mut events, id).await.unwrap();
+        let event = super::environment_connection::command_completion(&mut completions, id).await.unwrap();
         assert!(matches!(&event, DaemonEvent::CommandFinished { result: CommandValue::Ok, .. }), "{event:?}");
         let status = convoys.get(&own).await.unwrap().status.unwrap();
         // The crew's stall is the home's stall judgement, made by the coder; the seat reads
