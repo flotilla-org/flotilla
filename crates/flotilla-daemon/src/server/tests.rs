@@ -2220,7 +2220,7 @@ async fn query_commands_return_directed_response_instead_of_remote_dispatch() {
 
     // Local query commands (host=None) execute directly and return QueryResult.
     let response = request_dispatcher
-        .dispatch(401, Request::Execute { command: Command::builder().action(CommandAction::QueryHostList {}).build() })
+        .dispatch(401, Request::Execute { command: Command::builder().action(CommandAction::QueryHostList {}).build(), request_key: None })
         .await;
 
     match ok_response(response, 401) {
@@ -2274,6 +2274,7 @@ async fn request_dispatcher_forwards_daemon_log_query_through_peer_manager() {
                 .dispatch(
                     402,
                     Request::Execute {
+                        request_key: None,
                         command: Command::builder()
                             .action(CommandAction::QueryDaemonLogs {
                                 query: DaemonLogQuery {
@@ -4952,6 +4953,7 @@ async fn remote_command_mutations_route_remote_step_requests() {
         .dispatch(
             402,
             Request::Execute {
+                request_key: None,
                 command: Command::builder()
                     .action(CommandAction::Checkout {
                         repo: RepoSelector::Identity(repo_identity.clone()),
@@ -5374,6 +5376,7 @@ async fn environment_transport_refuses_other_convoy_and_host_commands() {
         Request::Shutdown,
         Request::GetStatus,
         Request::Execute {
+            request_key: None,
             command: Command::builder()
                 .action(CommandAction::QueryCrewList { context: CrewCommandContext { convoy: Some("other".into()), ..Default::default() } })
                 .build(),
@@ -5414,6 +5417,7 @@ async fn environment_transport_refuses_other_convoy_and_host_commands() {
         .write(Message::Request {
             id: 10,
             request: Request::Execute {
+                request_key: None,
                 command: Command::builder()
                     .action(CommandAction::CrewPromise {
                         context: CrewCommandContext::default(),
@@ -5527,7 +5531,7 @@ async fn environment_supervisor_authority_is_project_bound_and_revocable() {
     let mut ordinary = crew.clone();
     ordinary.role = "governor".into(); // A name alone is never a binding.
     ordinary.terminal_session = None;
-    let request = |action| Request::Execute { command: Command::builder().action(action).build() };
+    let request = |action| Request::Execute { command: Command::builder().action(action).build(), request_key: None };
     for (of, allowed) in [("target", true), ("foreign", false)] {
         let convoy = current_launch(&daemon, of);
         let convoy = convoy.as_str();
@@ -5596,7 +5600,7 @@ async fn environment_supervisor_authority_is_project_bound_and_revocable() {
     ] {
         let mut scoped = request(action);
         super::environment_supervision::authorize(&daemon, &mut scoped, &crew).await.unwrap();
-        let Request::Execute { command } = scoped else { panic!("execute") };
+        let Request::Execute { command, .. } = scoped else { panic!("execute") };
         let selected = match command.action {
             CommandAction::QueryDispatchBoard { project }
             | CommandAction::QueryDispatchQueue { project }
@@ -5663,7 +5667,7 @@ async fn environment_supervisor_authority_is_project_bound_and_revocable() {
     });
     super::environment_supervision::authorize(&daemon, &mut fail, &crew).await.unwrap();
     assert!(
-        matches!(fail, Request::Execute { command } if matches!(&command.action, CommandAction::CrewSupervise { actor_crew_id: Some(id), operation: flotilla_protocol::CrewSupervisionAction::Fail, .. } if id == &crew.crew_id))
+        matches!(fail, Request::Execute { command, .. } if matches!(&command.action, CommandAction::CrewSupervise { actor_crew_id: Some(id), operation: flotilla_protocol::CrewSupervisionAction::Fail, .. } if id == &crew.crew_id))
     );
     let mut read = request(CommandAction::QueryCrewStalls { full: true });
     assert!(super::environment_supervision::authorize(&daemon, &mut read, &crew).await.is_ok());
@@ -5774,6 +5778,55 @@ async fn host_direct_caller_keeps_crew_stall_and_promise() {
     assert!(!resolution.transport_bound);
     assert_eq!(resolution.caller.crew.as_ref().unwrap().crew_id, launch_of(&daemon, "placed-session"));
     caller_can_stall_and_promise(&daemon, resolution.caller).await;
+}
+
+// A crew command answers with its id once accepted, before it runs, so however long it runs
+// (a handoff delivering across many convoys) the client's request does not wait on it. A retry
+// that carries the request's key follows the first execution instead of running again: a
+// promise, which refuses a second declaration of its label, is declared once and both answer Ok.
+#[tokio::test]
+async fn crew_commands_answer_on_acceptance_and_keyed_retries_run_once() {
+    use futures::FutureExt;
+    let (_tmp, daemon) = placed_crew_daemon("placed-environment").await;
+    let evidence = flotilla_protocol::CommandCaller {
+        principal_ref: flotilla_protocol::PrincipalRef::implicit_for_namespace("flotilla"),
+        process: Some(flotilla_protocol::CallerProcess::builder().pid(42).uid(1000).build()),
+        crew: None,
+    };
+    let caller = super::caller::resolve_main_caller(&daemon, evidence, &placed_caller_claims(&daemon), None).await.unwrap().caller;
+    let context = CrewCommandContext { crew_id: caller.crew.as_ref().map(|crew| crew.crew_id.clone()), ..Default::default() };
+    let promise = || {
+        Command::builder()
+            .action(CommandAction::CrewPromise {
+                context: context.clone(),
+                operation: flotilla_protocol::commands::CrewPromiseOperation::Promise { id: "once".into(), kind: "pr".into() },
+            })
+            .build()
+    };
+    let keyed =
+        |command| daemon.execute_keyed(Some("retry-key"), Some(&caller), daemon.execute_for_caller_typed(command, Some(caller.clone())));
+    let mut completions = daemon.capture_completions();
+    let first = keyed(promise()).await.unwrap();
+    assert!(completions.finished(first).now_or_never().is_none(), "the answer does not wait for the command to run");
+    let retry = keyed(promise()).await.unwrap();
+    assert_ne!(first, retry, "a retry is answered under its own id");
+    for id in [first, retry] {
+        let finished = completions.finished(id).await.expect("outcome");
+        assert!(matches!(&finished, DaemonEvent::CommandFinished { result: CommandValue::Ok, .. }), "{finished:?}");
+    }
+    let late = keyed(promise()).await.unwrap();
+    assert!(matches!(completions.finished(late).await, Some(DaemonEvent::CommandFinished { result: CommandValue::Ok, .. })));
+
+    // Unkeyed, the same command runs again, and the promise refuses its second declaration.
+    let again = daemon.execute_for_caller(promise(), Some(caller.clone())).await.unwrap();
+    let refused = completions.finished(again).await.expect("outcome");
+    assert!(
+        matches!(&refused, DaemonEvent::CommandFinished { result: CommandValue::Error { message }, .. } if message.contains("already exists")),
+        "{refused:?}"
+    );
+    let own = current_launch(&daemon, "own");
+    let status = daemon.resource_backend().using::<Convoy>("flotilla").get(&own).await.unwrap().status.unwrap();
+    assert_eq!(flotilla_resources::promises::owned(&status, "work", "coder").iter().filter(|promise| promise.id == "once").count(), 1);
 }
 
 // A pre-#3270 mount set continues to work independently of socket adoption.

@@ -25,6 +25,7 @@ use repository_discovery::{discover_repository_change_request_with, DaemonForgeC
 mod host_registry_tests;
 mod host_summary_tests;
 mod projection_ports;
+mod request_keys;
 use flotilla_daemon_api::action_support::empty_repo_identity;
 use flotilla_discovery_api::EnvironmentAssertion;
 use flotilla_discovery_api::EnvironmentBag;
@@ -794,6 +795,8 @@ pub struct InProcessDaemon {
     repository_providers: Mutex<HashMap<(String, RepositoryKey), Arc<repository_operations::RepositoryProviderLease>>>,
     /// Running commands, keyed by command ID, for cancellation.
     active_commands: Arc<Mutex<HashMap<u64, CancellationToken>>>,
+    /// Keyed requests, so a retried request follows its first execution.
+    request_keys: std::sync::Mutex<request_keys::RequestKeys>,
     self_weak: Weak<InProcessDaemon>,
     admission: ConvoyAdmission,
     convoy_ensure_reconciler: RwLock<Option<Arc<dyn ConvoyEnsureReconciler>>>,
@@ -1470,6 +1473,7 @@ impl InProcessDaemon {
             checkout_namespace_changes: tokio::sync::watch::channel(()).0,
             repository_providers: Mutex::new(HashMap::new()),
             active_commands: Arc::new(Mutex::new(HashMap::new())),
+            request_keys: Default::default(),
             self_weak: self_weak.clone(),
             admission: ConvoyAdmission::builder()
                 .lifecycle_reads(lifecycle_reads.clone() as Arc<dyn flotilla_resources::lifecycle_reads::LifecycleReads>)
@@ -5551,6 +5555,60 @@ impl InProcessDaemon {
         flotilla_store::load_metrics::inherit_or(COMMANDS, execution).await
     }
 
+    /// Runs `execute` once per `request_key` from `caller`. A retry with the same key gets its
+    /// own command id and finishes with the first execution's outcome, without running it again;
+    /// a refused or failed first execution releases the key. Without a key, `execute` just runs.
+    pub async fn execute_keyed(
+        &self,
+        request_key: Option<&str>,
+        caller: Option<&flotilla_protocol::CommandCaller>,
+        execute: impl std::future::Future<Output = Result<u64, flotilla_protocol::DispatcherError>>,
+    ) -> Result<u64, flotilla_protocol::DispatcherError> {
+        let Some(request_key) = request_key else { return execute.await };
+        let scope = match caller {
+            Some(caller) if caller.crew.is_some() => caller.to_string(),
+            Some(caller) => format!("{}/{}", caller.principal_ref.namespace, caller.principal_ref.name),
+            None => String::new(),
+        };
+        let key = (scope, request_key.to_owned());
+        let admission = self
+            .request_keys
+            .lock()
+            .expect("request keys lock")
+            .admit(key.clone(), std::time::Instant::now(), || self.next_command_id.fetch_add(1, Ordering::Relaxed));
+        if let request_keys::Admission::Follow { id, outcome } = admission {
+            let identity = self.start_context_free_command(id, format!("retry of request {request_key}"));
+            if let Some(outcome) = outcome {
+                self.finish_context_free_command(id, identity, *outcome);
+            }
+            return Ok(id);
+        }
+        // Capture before executing: the first execution may finish before it answers.
+        let mut completions = self.event_source.capture_completions();
+        let id = match execute.await {
+            Ok(id) => id,
+            Err(error) => {
+                self.finish_followers(&key, CommandValue::Error { message: error.to_string() });
+                return Err(error);
+            }
+        };
+        let daemon = self.self_weak.clone();
+        tokio::spawn(async move {
+            let Some(DaemonEvent::CommandFinished { result, .. }) = completions.finished(id).await else { return };
+            if let Some(daemon) = daemon.upgrade() {
+                daemon.finish_followers(&key, result);
+            }
+        });
+        Ok(id)
+    }
+
+    fn finish_followers(&self, key: &request_keys::RequestKey, outcome: CommandValue) {
+        let followers = self.request_keys.lock().expect("request keys lock").settle(key, &outcome, std::time::Instant::now());
+        for follower in followers {
+            self.finish_context_free_command(follower, empty_repo_identity(), outcome.clone());
+        }
+    }
+
     async fn executor_provider_data(&self, repo_identity: &RepoIdentity, _repo_root: &Path, registry: &ProviderRegistry) -> ProviderData {
         let mut providers = ProviderData::default();
 
@@ -5655,6 +5713,75 @@ impl InProcessDaemon {
         })
     }
 
+    /// Accepts a crew action: its command id answers at once, and the action, which may deliver
+    /// turns across many convoys, runs on its own and reports through `CommandFinished`.
+    fn accept_crew_action(
+        &self,
+        id: u64,
+        command: Command,
+        caller: Option<flotilla_protocol::CommandCaller>,
+        dispatching_principal_ref: Option<PrincipalRef>,
+    ) -> Result<u64, flotilla_protocol::DispatcherError> {
+        let daemon = self.self_weak.upgrade().ok_or("daemon is shutting down")?;
+        tokio::spawn(flotilla_store::load_metrics::inherit_or(COMMANDS, async move {
+            let description = command.description().to_string();
+            if let Err(message) = Box::pin(daemon.execute_crew_action(id, &command, &caller, &dispatching_principal_ref)).await {
+                let identity = daemon.start_context_free_command(id, description);
+                daemon.finish_context_free_command(id, identity, CommandValue::Error { message });
+            }
+        }));
+        Ok(id)
+    }
+
+    async fn execute_crew_action(
+        &self,
+        id: u64,
+        command: &Command,
+        caller: &Option<flotilla_protocol::CommandCaller>,
+        dispatching_principal_ref: &Option<PrincipalRef>,
+    ) -> Result<u64, String> {
+        let crew = crew_actions::CrewActions {
+            crew: &self.crew,
+            port: self,
+            resource_backend: &self.resource_backend,
+            clock: &self.clock,
+            events: action_events::ActionEvents { node_id: &self.node_id, sink: &self.event_sink },
+        };
+        match &command.action {
+            CommandAction::CrewHandoff { .. } => Box::pin(crew.execute_action_crew_handoff(id, command)).await,
+            CommandAction::ConvoyResume { .. } => {
+                Box::pin(crew.execute_action_convoy_resume(id, command, caller, dispatching_principal_ref)).await
+            }
+            CommandAction::ConvoyWithdrawPendingBrief { .. } => {
+                Box::pin(crew.execute_action_convoy_withdraw_pending_brief(id, command)).await
+            }
+            CommandAction::CrewPromise { .. } => Box::pin(crew.execute_action_crew_promise(id, command)).await,
+            CommandAction::CrewComplete { .. } => {
+                Box::pin(crew.execute_action_crew_complete(id, command, caller, dispatching_principal_ref)).await
+            }
+            CommandAction::CrewFail { .. } => Box::pin(crew.execute_action_crew_fail(id, command, caller)).await,
+            CommandAction::CrewStall { .. } => Box::pin(crew.execute_action_crew_stall(id, command)).await,
+            CommandAction::CrewSupervise { .. } => {
+                Box::pin(crew.execute_action_crew_supervise(id, command, caller, dispatching_principal_ref)).await
+            }
+            CommandAction::ConvoyLink { .. } => Box::pin(crew.execute_action_convoy_link(id, command)).await,
+            CommandAction::ConvoyUnlink { .. } => Box::pin(crew.execute_action_convoy_unlink(id, command)).await,
+            CommandAction::ConvoyDelete { .. } => {
+                Box::pin(crew.execute_action_convoy_delete(id, command, caller, dispatching_principal_ref)).await
+            }
+            CommandAction::ConvoyAbandon { .. } => {
+                Box::pin(crew.execute_action_convoy_abandon(id, command, caller, dispatching_principal_ref)).await
+            }
+            CommandAction::ConvoyWorkForceComplete { .. } => {
+                Box::pin(crew.execute_action_convoy_work_force_complete(id, command, dispatching_principal_ref)).await
+            }
+            CommandAction::ConvoyPromiseVerdict { .. } => {
+                Box::pin(crew.execute_action_convoy_promise_verdict(id, command, dispatching_principal_ref)).await
+            }
+            _ => Err("not a crew action".into()),
+        }
+    }
+
     // This executor has many async arms. Box substantial nested futures below
     // so their combined state fits on the default Tokio test-thread stack.
     #[tracing::instrument(name = "execute_impl", skip_all, fields(command = %command.description()))]
@@ -5734,13 +5861,6 @@ impl InProcessDaemon {
             admission: &self.admission,
             events: action_events::ActionEvents { node_id: &self.node_id, sink: &self.event_sink },
         };
-        let crew = crew_actions::CrewActions {
-            crew: &self.crew,
-            port: self,
-            resource_backend: &self.resource_backend,
-            clock: &self.clock,
-            events: action_events::ActionEvents { node_id: &self.node_id, sink: &self.event_sink },
-        };
         let projections = self.projections_actions();
         let executor = self.executor_actions();
         match &command.action {
@@ -5768,36 +5888,20 @@ impl InProcessDaemon {
                 return boxed_action!(projections.execute_action_resource_watch(id, &command, &command_node_id))
             }
             CommandAction::Refresh { repo: None } => return boxed_action!(executor.execute_action_refresh_all(id, &command)),
-            CommandAction::CrewHandoff { .. } => return boxed_action!(crew.execute_action_crew_handoff(id, &command)),
-            CommandAction::ConvoyResume { .. } => {
-                return boxed_action!(crew.execute_action_convoy_resume(id, &command, &caller, &dispatching_principal_ref))
-            }
-            CommandAction::ConvoyWithdrawPendingBrief { .. } => {
-                return boxed_action!(crew.execute_action_convoy_withdraw_pending_brief(id, &command))
-            }
-            CommandAction::CrewPromise { .. } => return boxed_action!(crew.execute_action_crew_promise(id, &command)),
-            CommandAction::CrewComplete { .. } => {
-                return boxed_action!(crew.execute_action_crew_complete(id, &command, &caller, &dispatching_principal_ref))
-            }
-            CommandAction::CrewFail { .. } => return boxed_action!(crew.execute_action_crew_fail(id, &command, &caller)),
-            CommandAction::CrewStall { .. } => return boxed_action!(crew.execute_action_crew_stall(id, &command)),
-            CommandAction::CrewSupervise { .. } => {
-                return boxed_action!(crew.execute_action_crew_supervise(id, &command, &caller, &dispatching_principal_ref))
-            }
-            CommandAction::ConvoyLink { .. } => return boxed_action!(crew.execute_action_convoy_link(id, &command)),
-            CommandAction::ConvoyUnlink { .. } => return boxed_action!(crew.execute_action_convoy_unlink(id, &command)),
-            CommandAction::ConvoyDelete { .. } => {
-                return boxed_action!(crew.execute_action_convoy_delete(id, &command, &caller, &dispatching_principal_ref))
-            }
-            CommandAction::ConvoyAbandon { .. } => {
-                return boxed_action!(crew.execute_action_convoy_abandon(id, &command, &caller, &dispatching_principal_ref))
-            }
-            CommandAction::ConvoyWorkForceComplete { .. } => {
-                return boxed_action!(crew.execute_action_convoy_work_force_complete(id, &command, &dispatching_principal_ref))
-            }
-            CommandAction::ConvoyPromiseVerdict { .. } => {
-                return boxed_action!(crew.execute_action_convoy_promise_verdict(id, &command, &dispatching_principal_ref))
-            }
+            CommandAction::CrewHandoff { .. }
+            | CommandAction::ConvoyResume { .. }
+            | CommandAction::ConvoyWithdrawPendingBrief { .. }
+            | CommandAction::CrewPromise { .. }
+            | CommandAction::CrewComplete { .. }
+            | CommandAction::CrewFail { .. }
+            | CommandAction::CrewStall { .. }
+            | CommandAction::CrewSupervise { .. }
+            | CommandAction::ConvoyLink { .. }
+            | CommandAction::ConvoyUnlink { .. }
+            | CommandAction::ConvoyDelete { .. }
+            | CommandAction::ConvoyAbandon { .. }
+            | CommandAction::ConvoyWorkForceComplete { .. }
+            | CommandAction::ConvoyPromiseVerdict { .. } => return self.accept_crew_action(id, command, caller, dispatching_principal_ref),
             CommandAction::ConvoyStart { .. } => {
                 return boxed_action!(admission.execute_action_convoy_start(id, &command, &dispatching_principal_ref))
             }

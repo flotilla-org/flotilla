@@ -349,6 +349,10 @@ pub enum Request {
     },
     Execute {
         command: Command,
+        /// The caller's stable key for this request, kept across its retries. A retry with the
+        /// same key, from the same caller, follows the first execution rather than repeating it.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        request_key: Option<String>,
     },
     Cancel {
         command_id: u64,

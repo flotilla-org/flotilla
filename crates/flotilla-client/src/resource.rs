@@ -593,7 +593,7 @@ mod tests {
         let daemon = SocketDaemon::from_session(client_session).expect("create socket daemon");
         let client = ResourceClient::new(daemon);
         let server = tokio::spawn(async move {
-            let Some(Message::Request { id, request: Request::Execute { command } }) =
+            let Some(Message::Request { id, request: Request::Execute { command, .. } }) =
                 server_session.read().await.expect("read list request")
             else {
                 panic!("expected list request");
@@ -610,7 +610,7 @@ mod tests {
                 .await
                 .expect("write list response");
 
-            let Some(Message::Request { id, request: Request::Execute { command } }) =
+            let Some(Message::Request { id, request: Request::Execute { command, .. } }) =
                 server_session.read().await.expect("read watch request")
             else {
                 panic!("expected watch request");
@@ -676,7 +676,7 @@ mod tests {
             let mut fixture = duplicated_three_root_fixture();
             let mut next_command_id = 1;
             for pass in 0..2 {
-                let Some(Message::Request { id, request: Request::Execute { command } }) =
+                let Some(Message::Request { id, request: Request::Execute { command, .. } }) =
                     server_session.read().await.expect("read host inventory")
                 else {
                     panic!("expected host inventory request");
@@ -696,7 +696,7 @@ mod tests {
 
                 for root in ["a", "b", "c"] {
                     for kind in SINGLE_HOME_SWEEP_KINDS {
-                        let Some(Message::Request { id, request: Request::Execute { command } }) =
+                        let Some(Message::Request { id, request: Request::Execute { command, .. } }) =
                             server_session.read().await.expect("read resource inventory")
                         else {
                             panic!("expected resource inventory request");
@@ -724,7 +724,7 @@ mod tests {
 
                 if pass == 0 {
                     for _ in 0..6 {
-                        let Some(Message::Request { id, request: Request::Execute { command } }) =
+                        let Some(Message::Request { id, request: Request::Execute { command, .. } }) =
                             server_session.read().await.expect("read raw delete")
                         else {
                             panic!("expected raw delete request");

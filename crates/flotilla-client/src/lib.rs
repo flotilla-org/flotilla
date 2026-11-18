@@ -267,6 +267,15 @@ impl SocketDaemon {
         from_session_stateful_bounded(socket_path, session, None).await
     }
 
+    /// Execute `command`, keyed by `request_key` when given: a retry with the same key, as the
+    /// same caller, follows the first execution's outcome instead of running the command again.
+    pub async fn execute_keyed(&self, command: Command, request_key: Option<String>) -> Result<u64, String> {
+        match into_success_response(self.request(Request::Execute { command, request_key }).await?)? {
+            Response::Execute { command_id } => Ok(command_id),
+            other => Err(format!("unexpected response for execute: {other:?}")),
+        }
+    }
+
     /// Connect as a crew process whose identity variables are `crew_claims` rather than this
     /// process's own environment: the claims [`crew_claims_from`](flotilla_protocol::crew_claims_from)
     /// takes from a crew's launch environment.
@@ -570,11 +579,21 @@ pub enum CommandProgress<'a> {
 pub async fn wait_for_command(
     daemon: &dyn DaemonHandle,
     command: Command,
+    progress: impl FnMut(CommandProgress<'_>),
+) -> Result<flotilla_protocol::commands::CommandValue, String> {
+    wait_for_execution(daemon, daemon.execute(command), progress).await
+}
+
+/// Wait for the command `execute` starts, as [`wait_for_command`] does; `execute` runs only after
+/// this has subscribed, so its completion cannot pass unseen.
+pub async fn wait_for_execution(
+    daemon: &dyn DaemonHandle,
+    execute: impl std::future::Future<Output = Result<u64, String>>,
     mut progress: impl FnMut(CommandProgress<'_>),
 ) -> Result<flotilla_protocol::commands::CommandValue, String> {
     use flotilla_protocol::commands::CommandValue;
     let mut events = daemon.subscribe();
-    let command_id = daemon.execute(command).await?;
+    let command_id = execute.await?;
     loop {
         match events.recv().await {
             Ok(event) => {
@@ -1242,10 +1261,7 @@ impl DaemonHandle for SocketDaemon {
     }
 
     async fn execute(&self, command: Command) -> Result<u64, String> {
-        match into_success_response(self.request(Request::Execute { command }).await?)? {
-            Response::Execute { command_id } => Ok(command_id),
-            other => Err(format!("unexpected response for execute: {other:?}")),
-        }
+        self.execute_keyed(command, None).await
     }
 
     async fn observe_focus(&self, _surface_id: uuid::Uuid, targets: Vec<flotilla_protocol::ResourceRef>) -> Result<(), String> {
@@ -1262,7 +1278,7 @@ impl DaemonHandle for SocketDaemon {
     /// side. The parameter exists on the `DaemonHandle` trait for
     /// `InProcessDaemon`'s use, where there is no Hello handshake.
     async fn execute_query(&self, command: Command, _session_id: uuid::Uuid) -> Result<flotilla_protocol::commands::CommandValue, String> {
-        match into_success_response(self.request(Request::Execute { command }).await?)? {
+        match into_success_response(self.request(Request::Execute { command, request_key: None }).await?)? {
             Response::QueryResult { value, .. } => Ok(value),
             Response::Execute { command_id } => Err(format!("expected QueryResult, got Execute response for command {command_id}")),
             other => Err(format!("unexpected response for query: {other:?}")),

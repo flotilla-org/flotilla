@@ -73,7 +73,7 @@ pub(super) fn authorize(request: &mut Request, crew: &CallerCrew) -> Result<(), 
     // New crew operations are denied until explicitly added to this allowlist
     // with validation against the transport-bound identity.
     match request {
-        Request::Execute { command } => {
+        Request::Execute { command, .. } => {
             if command.node_id.is_some() || command.provisioning_target.is_some() || command.context_repo.is_some() {
                 return Err("EnvironmentCommandDenied: explicit routing is forbidden".into());
             }
@@ -329,11 +329,13 @@ mod tests {
             Request::GetTopology,
             Request::ListRepos,
             Request::Execute {
+                request_key: None,
                 command: flotilla_protocol::Command::builder()
                     .action(CommandAction::CrewComplete { context: CrewCommandContext::default(), message: None, disposition: None })
                     .build(),
             },
             Request::Execute {
+                request_key: None,
                 command: flotilla_protocol::Command::builder()
                     .action(CommandAction::CrewHandoff {
                         context: CrewCommandContext::default(),
@@ -346,6 +348,7 @@ mod tests {
             },
             Request::ArtifactList { convoy: Some("other-convoy".into()), kind: None, subject: None },
             Request::Execute {
+                request_key: None,
                 command: flotilla_protocol::Command::builder()
                     .action(CommandAction::QueryExplainConvoy { namespace: None, name: "other-convoy".into() })
                     .build(),
@@ -357,6 +360,7 @@ mod tests {
         // the core handler qualifies the address.
         for target in ["reviewer", "work/reviewer"] {
             let mut request = Request::Execute {
+                request_key: None,
                 command: flotilla_protocol::Command::builder()
                     .action(CommandAction::CrewHandoff {
                         context: CrewCommandContext::default(),
@@ -371,6 +375,7 @@ mod tests {
         }
         for target in ["own-convoy/work/coder", "", "work/", "/coder", "flotilla/own-convoy/work/", "flotilla//work/coder"] {
             let mut request = Request::Execute {
+                request_key: None,
                 command: flotilla_protocol::Command::builder()
                     .action(CommandAction::CrewHandoff {
                         context: CrewCommandContext::default(),

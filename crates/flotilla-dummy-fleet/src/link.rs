@@ -62,6 +62,8 @@ pub(crate) struct CrewLink<'a> {
     pub(crate) environment: &'a str,
     pub(crate) identity: &'a CrewIdentity,
     pub(crate) cwd: &'a str,
+    /// The stable key of the command being sent, kept across its retries.
+    pub(crate) request_key: Option<&'a str>,
 }
 
 impl CrewLink<'_> {
@@ -72,7 +74,8 @@ impl CrewLink<'_> {
         if command.action.is_query() {
             return client.execute_query(command, uuid::Uuid::new_v4()).await;
         }
-        tokio::time::timeout(COMMAND_RESULT_TIMEOUT, flotilla_client::wait_for_command(&*client, command, |_| {}))
+        let execute = client.execute_keyed(command, self.request_key.map(str::to_owned));
+        tokio::time::timeout(COMMAND_RESULT_TIMEOUT, flotilla_client::wait_for_execution(&*client, execute, |_| {}))
             .await
             .map_err(|_| "the command's result was lost".to_string())?
     }

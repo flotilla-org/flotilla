@@ -100,11 +100,11 @@ impl FakeDaemon {
         }
         while let Ok(Some(Message::Request { id, request })) = session.read().await {
             let reply = match request {
-                Request::Execute { command } if command.action.is_query() => {
+                Request::Execute { command, .. } if command.action.is_query() => {
                     let value = CommandValue::Error { message: "the stand-in explains nothing".into() };
                     vec![Message::ok_response(id, Response::QueryResult { command_id: id, value })]
                 }
-                Request::Execute { command } => {
+                Request::Execute { command, .. } => {
                     let finished = DaemonEvent::CommandFinished {
                         command_id: id,
                         node_id: NodeId::new("fake-daemon"),

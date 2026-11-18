@@ -275,6 +275,9 @@ pub(crate) struct Crew {
     cwd: String,
     /// Turns worked on since the crew started, keying each turn's hook-count draw.
     turns_taken: u64,
+    /// The key of the command the crew is sending until it succeeds, which its retries carry
+    /// so the daemon runs it once.
+    request_key: Option<String>,
 }
 
 enum Ending {
@@ -292,7 +295,19 @@ impl Crew {
     ) -> Self {
         let replayed = !replay.is_empty();
         let cwd = session.cwd().as_path().display().to_string();
-        Self { fleet, session, identity, turns, held: VecDeque::new(), script_finished: false, replay, replayed, cwd, turns_taken: 0 }
+        Self {
+            fleet,
+            session,
+            identity,
+            turns,
+            held: VecDeque::new(),
+            script_finished: false,
+            replay,
+            replayed,
+            cwd,
+            turns_taken: 0,
+            request_key: None,
+        }
     }
 
     fn resuming(&self) -> bool {
@@ -301,7 +316,13 @@ impl Crew {
 
     /// The crew's way to its daemon, as its process in the vessel has.
     fn link(&self) -> CrewLink<'_> {
-        CrewLink { fleet: &self.fleet, environment: &self.session.environment, identity: &self.identity, cwd: &self.cwd }
+        CrewLink {
+            fleet: &self.fleet,
+            environment: &self.session.environment,
+            identity: &self.identity,
+            cwd: &self.cwd,
+            request_key: self.request_key.as_deref(),
+        }
     }
 
     /// Send a crew command or publish, or take its recorded outcome while resuming. Queries are
@@ -541,11 +562,17 @@ impl Crew {
     /// `None` once the session is gone.
     async fn persist(&mut self, act: impl Into<Act>) -> Option<CommandValue> {
         let act = act.into();
+        // Every retry of this command carries one key: a retry after a lost answer follows the
+        // first execution, while one after a refusal runs again.
+        let key = uuid::Uuid::new_v4().to_string();
         loop {
             let mut backoff = Duration::from_millis(self.fleet.config.agent.retry_backoff_ms);
             let mut last_error = String::new();
             for _ in 0..COMMAND_ATTEMPTS {
-                match self.act(act.clone()).await {
+                self.request_key = Some(key.clone());
+                let result = self.act(act.clone()).await;
+                self.request_key = None;
+                match result {
                     Ok(value) => return Some(value),
                     Err(error) => {
                         tracing::warn!(crew = %self.identity.subject(), %error, "dummy crew command refused; retrying");

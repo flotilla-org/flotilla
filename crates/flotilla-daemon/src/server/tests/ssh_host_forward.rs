@@ -165,6 +165,7 @@ async fn promise(session: &MessageSession, id: u64, promise_id: &str) {
             session,
             id,
             Request::Execute {
+                request_key: None,
                 command: Command::builder()
                     .action(CommandAction::CrewPromise {
                         context: CrewCommandContext::default(),

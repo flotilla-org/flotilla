@@ -23,7 +23,7 @@ fn is_interactive_request(request: &Request) -> bool {
     // SubscribeQueries registers interest before awaiting result sets, so a
     // cancelled setup could leave a live subscription after an error response.
     // FetchMore performs its side effect only after its last await.
-    matches!(request, Request::Execute { command } if command.action.is_query())
+    matches!(request, Request::Execute { command, .. } if command.action.is_query())
         || matches!(
             request,
             Request::ListRepos | Request::GetStatus | Request::GetTopology | Request::FetchMore { .. } | Request::RecoverQueries { .. }
@@ -354,7 +354,7 @@ impl<'a> RequestDispatcher<'a> {
     }
 
     async fn dispatch_request_execute(&self, id: u64, request: Request) -> Message {
-        let Request::Execute { command } = request else {
+        let Request::Execute { command, request_key } = request else {
             return Message::error_response(id, "Execute request selected the wrong handler");
         };
         if command.action.is_query() {
@@ -370,7 +370,8 @@ impl<'a> RequestDispatcher<'a> {
                 Ok(principal_ref) => {
                     let mut caller = self.caller.clone();
                     caller.principal_ref = principal_ref.unwrap_or_else(|| self.caller.principal_ref.clone());
-                    match self.remote_command_router.dispatch_execute_for_caller_typed(command, Some(caller)).await {
+                    let execute = self.remote_command_router.dispatch_execute_for_caller_typed(command, Some(caller.clone()));
+                    match self.daemon.execute_keyed(request_key.as_deref(), Some(&caller), execute).await {
                         Ok(command_id) => Message::ok_response(id, Response::Execute { command_id }),
                         Err(e) => Message::error_response(id, e),
                     }

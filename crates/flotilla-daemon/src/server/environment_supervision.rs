@@ -97,7 +97,7 @@ pub(super) async fn authorize(daemon: &InProcessDaemon, request: &mut Request, c
     if super::environment_connection::authorize(request, crew).is_ok() {
         return Ok(None);
     }
-    let Request::Execute { command } = request else { return Err("EnvironmentCommandDenied: supervisor request denied".into()) };
+    let Request::Execute { command, .. } = request else { return Err("EnvironmentCommandDenied: supervisor request denied".into()) };
     if command.node_id.is_some() || command.provisioning_target.is_some() || command.context_repo.is_some() {
         return Err("EnvironmentCommandDenied: explicit routing is forbidden".into());
     }
