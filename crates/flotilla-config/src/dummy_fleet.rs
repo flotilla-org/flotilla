@@ -34,6 +34,8 @@ pub struct DummyFleetConfig {
     pub change_request: DummyChangeRequestConfig,
     #[serde(default)]
     pub terminal: DummyTerminalConfig,
+    #[serde(default)]
+    pub vcs: DummyVcsConfig,
     /// A forge shared by every host of a rehearsal fleet (#3374). When set,
     /// dummy coders open their change requests there over the Forgejo API,
     /// so change-request numbers are unique across hosts, instead of on this
@@ -51,6 +53,7 @@ impl Default for DummyFleetConfig {
             agent: DummyAgentConfig::default(),
             change_request: DummyChangeRequestConfig::default(),
             terminal: DummyTerminalConfig::default(),
+            vcs: DummyVcsConfig::default(),
             shared_forge: None,
         }
     }
@@ -68,6 +71,19 @@ pub struct DummyTerminalConfig {
     /// a retried delivery goes through.
     #[serde(default, deserialize_with = "deserialize_rate")]
     pub refusal_rate: f64,
+}
+
+/// What the dummy VCS reports of the checkouts it made. Each checkout's draw is by its path, so a
+/// checkout stays dirty or unpushed for its life.
+#[derive(Debug, Clone, Default, PartialEq, Deserialize, Serialize)]
+pub struct DummyVcsConfig {
+    /// Probability that a checkout reports uncommitted changes.
+    #[serde(default, deserialize_with = "deserialize_rate")]
+    pub dirty_rate: f64,
+    /// Probability that a checkout's branch reports commits not pushed to its own name on the
+    /// forge, unless a merged change request's head holds them.
+    #[serde(default, deserialize_with = "deserialize_rate")]
+    pub unpushed_rate: f64,
 }
 
 /// How dummy environments are realised.
