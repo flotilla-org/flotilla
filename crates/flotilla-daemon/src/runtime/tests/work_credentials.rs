@@ -1,4 +1,5 @@
 use super::*;
+use crate::runtime::credentials::RuntimeWorkCredentialReconciler;
 use crate::testkits::engine::{admit_convoy, engine};
 use flotilla_engine_convoys_testkit::{agent, convoy};
 use flotilla_resources::convoy::engine::note;
@@ -536,7 +537,7 @@ impl KeyedDelivery {
 
     /// What crew operations call on a handoff: delivery for one environment.
     fn reconciler(&self) -> Arc<dyn flotilla_crew::ports::WorkCredentialReconciler> {
-        Arc::new(crate::runtime::credentials::RuntimeWorkCredentialReconciler { state: Arc::downgrade(&self.state) })
+        Arc::new(RuntimeWorkCredentialReconciler { state: Arc::downgrade(&self.state) })
     }
 
     fn git_config(&self) -> String {
