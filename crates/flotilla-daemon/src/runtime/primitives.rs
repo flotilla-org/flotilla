@@ -728,7 +728,7 @@ impl MessageDelivery {
         let session = holder.session_id.clone();
         let typed = text.clone();
         let submitted_at = self.state.daemon.clock().now();
-        let identity = turn_key(&members);
+        let typed_members = members.clone();
         let stop = tokio_util::sync::CancellationToken::new();
         let teardown = stop.clone();
         let trace_spans: Vec<_> = members.iter().map(|message| flotilla_tracing::queued_span(message, "attempt")).collect();
@@ -748,7 +748,7 @@ impl MessageDelivery {
                 if teardown.is_cancelled() {
                     return Ok(TerminalDeliveryOutcome::Deferred("teardown stopped the turn before it was typed; no input sent"));
                 }
-                type_turn(&*pool, &drafts, adapter.as_deref(), &session, &typed, &identity, submitted_at).await
+                type_turn(&*pool, &drafts, adapter.as_deref(), &session, &typed, &typed_members, submitted_at).await
             }
             .instrument(primary_span),
         ));
@@ -763,7 +763,7 @@ impl MessageDelivery {
 const RETYPE_LIMIT: usize = 4;
 
 /// A turn's key: the identity of the messages it carries, as a pool records it (1 to 256 bytes).
-fn turn_key(members: &[String]) -> String {
+pub(super) fn turn_key(members: &[String]) -> String {
     use sha2::Digest;
     let mut digest = sha2::Sha256::new();
     for message in members {
@@ -773,27 +773,38 @@ fn turn_key(members: &[String]) -> String {
     format!("turn:{:x}", digest.finalize())
 }
 
-/// Types the turn `text`, keyed by its messages' `identity`, into `session` at `now`. The pool
+/// Types the turn `text`, keyed by the identity of its `messages`, into `session` at `now`. The pool
 /// writes nothing for a key it already accepted: a turn this daemon forgot it typed, across a
 /// restart, is not typed twice. One typed so long ago that its hold has run out was judged lost;
-/// it is retyped under a key naming when it was first accepted.
+/// it is retyped under a key naming when it was first accepted. Either way the repeat is logged at
+/// info, naming the turn's `messages` and the session, since the pool itself writes nothing for it.
 pub(super) async fn type_turn(
     pool: &dyn flotilla_terminal::TerminalPool,
     drafts: &flotilla_terminal::drafts::ComposerDrafts,
     adapter: Option<&dyn flotilla_agent::adapter::AgentAdapter>,
     session: &str,
     text: &str,
-    identity: &str,
+    messages: &[String],
     now: chrono::DateTime<Utc>,
 ) -> Result<TerminalDeliveryOutcome, String> {
-    let mut key = identity.to_owned();
+    let identity = turn_key(messages);
+    let mut key = identity.clone();
     for _ in 0..RETYPE_LIMIT {
-        match submit_and_confirm(pool, drafts, adapter, session, text, &key).await? {
-            TerminalDeliveryOutcome::AlreadyTyped { at_unix_ms } if hold_ran_out(at_unix_ms, now) => {
-                key = format!("{identity}@{at_unix_ms}");
-            }
-            outcome => return Ok(outcome),
+        let outcome = submit_and_confirm(pool, drafts, adapter, session, text, &key).await?;
+        let TerminalDeliveryOutcome::AlreadyTyped { at_unix_ms } = outcome else { return Ok(outcome) };
+        let first_accepted = i64::try_from(at_unix_ms).ok().and_then(chrono::DateTime::<Utc>::from_timestamp_millis);
+        if !hold_ran_out(at_unix_ms, now) {
+            info!(
+                %session, ?messages, %key, ?first_accepted,
+                "a keyed turn repeat: the pool accepted this turn before and wrote nothing now"
+            );
+            return Ok(outcome);
         }
+        info!(
+            %session, ?messages, %key, ?first_accepted,
+            "a keyed turn repeat whose hold ran out: judged lost, it is retyped under a new key"
+        );
+        key = format!("{identity}@{at_unix_ms}");
     }
     Err(format!("turn {identity} was judged lost {RETYPE_LIMIT} times over; it is left pending"))
 }

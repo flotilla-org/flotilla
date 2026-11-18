@@ -1,5 +1,5 @@
 use super::*;
-use crate::runtime::primitives::type_turn;
+use crate::runtime::primitives::{turn_key, type_turn};
 use flotilla_terminal::drafts::ComposerDrafts;
 
 #[tokio::test]
@@ -257,16 +257,20 @@ async fn accepted_but_unconfirmed_delivery_is_never_retyped() {
 
 // Behaviour (cleat#411): a turn the pool already accepted under its key is not typed again, but
 // held from when it was accepted; one accepted so long ago that its hold ran out was judged lost
-// and is retyped once, under a key naming when it was first accepted.
+// and is retyped once, under a key naming when it was first accepted. Run 4 R4-5: either repeat is
+// logged at info, naming the turn's message and its session, though the pool writes nothing for it.
 #[tokio::test(start_paused = true)]
 async fn a_keyed_turn_is_typed_once_unless_it_was_judged_lost() {
     let now = chrono::Utc::now();
     let ms = |at: chrono::DateTime<chrono::Utc>| u64::try_from(at.timestamp_millis()).expect("after the epoch");
     let recent = ms(now - chrono::Duration::minutes(1));
     let lapsed = ms(now - flotilla_resources::delivery_hold::DELIVERY_HOLD_FOR - chrono::Duration::minutes(1));
+    let messages = vec!["message-review".to_string()];
+    let key = turn_key(&messages);
     for (accepted_at, retyped) in [(recent, false), (lapsed, true)] {
-        let pool =
-            KeyedPool { inner: FakeTerminalPool::new(), accepted: std::sync::Mutex::new([("turn:k".to_string(), accepted_at)].into()) };
+        let (logging, logs) = flotilla_log_testkit::capture(tracing::Level::INFO);
+        let _logging = tracing::dispatcher::set_default(&logging);
+        let pool = KeyedPool { inner: FakeTerminalPool::new(), accepted: std::sync::Mutex::new([(key.clone(), accepted_at)].into()) };
         pool.inner
             .add_sessions(vec![ProviderTerminalSession::builder()
                 .session_name("agent".into())
@@ -274,15 +278,21 @@ async fn a_keyed_turn_is_typed_once_unless_it_was_judged_lost() {
                 .screen_activity(ScreenActivity::Stable)
                 .build()])
             .await;
-        let outcome = type_turn(&pool, &ComposerDrafts::default(), None, "agent", "review", "turn:k", now).await.expect("an outcome");
+        let outcome = type_turn(&pool, &ComposerDrafts::default(), None, "agent", "review", &messages, now).await.expect("an outcome");
         let written = pool.inner.delivered.lock().await.len();
+        let logged = logs.text();
+        let repeat =
+            logged.lines().find(|line| line.contains("a keyed turn repeat")).unwrap_or_else(|| panic!("no repeat logged: {logged}"));
+        assert!(repeat.contains("INFO") && repeat.contains("session=agent") && repeat.contains("message-review"), "{repeat}");
         if retyped {
             assert_eq!(written, 1, "a lapsed turn is retyped once");
-            assert!(pool.accepted.lock().unwrap().contains_key(&format!("turn:k@{lapsed}")), "under its first acceptance");
+            assert!(pool.accepted.lock().unwrap().contains_key(&format!("{key}@{lapsed}")), "under its first acceptance");
             assert_ne!(outcome, TerminalDeliveryOutcome::AlreadyTyped { at_unix_ms: lapsed });
+            assert!(repeat.contains("judged lost"), "{repeat}");
         } else {
             assert_eq!(written, 0, "a turn typed before is not typed again");
             assert_eq!(outcome, TerminalDeliveryOutcome::AlreadyTyped { at_unix_ms: recent });
+            assert!(repeat.contains("wrote nothing now"), "{repeat}");
         }
     }
 }
