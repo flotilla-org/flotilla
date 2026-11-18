@@ -6,6 +6,29 @@ pub(super) enum CompletionAction {
     Delete,
     /// An operator deletes the convoy while its work is still running.
     DeleteLive,
+    /// The work commits on its branch without pushing, leaving an untracked file when `untracked`,
+    /// and completes naming change request 884, which the forge observer then reads in `state` at
+    /// the checkout's head.
+    ChangeRequest {
+        state: flotilla_resources::ObservedChangeRequestState,
+        untracked: bool,
+    },
+}
+
+/// What became of a convoy's checkout once its change request was read.
+#[derive(Debug)]
+pub(super) struct ReleaseSeen {
+    /// The checkout launch's reading, last read.
+    pub(super) reading: LifecycleReading,
+    /// Its recorded inspection's `landed`, and why.
+    pub(super) landed: Option<bool>,
+    pub(super) landed_details: Vec<String>,
+    /// The worktree is still on disk.
+    pub(super) on_disk: bool,
+    /// Archives saved under the test's directory.
+    pub(super) archives: usize,
+    /// The convoy's phase, last read.
+    pub(super) convoy: Option<ConvoyPhase>,
 }
 
 pub(super) struct NoPrProcessRunner;
@@ -71,6 +94,10 @@ impl CommandRunner for Stage4aGitRunner {
     async fn exists(&self, cmd: &str, args: &[&str]) -> bool {
         self.inner.exists(cmd, args).await
     }
+    // A forced removal writes its archive's manifest through the runner, on the local disk.
+    async fn write_file(&self, path: &Path, content: &str) -> Result<(), String> {
+        ProcessCommandRunner.write_file(path, content).await
+    }
 }
 
 #[async_trait]
@@ -104,7 +131,7 @@ pub(super) async fn run_stage4a_flow_reaches_running_and_completes_convoy(
     config: Arc<ConfigStore>,
     repo_default_dir: PathBuf,
     completion_action: CompletionAction,
-) {
+) -> Option<ReleaseSeen> {
     std::fs::create_dir_all(&repo_default_dir).expect("repo default dir");
     let host_id = daemon.local_host_id().expect("local host id").to_string();
     let profile = LocalProvisioningProfile { repo_default_dir: repo_default_dir.display().to_string(), ..manual_profile(&host_id, false) };
@@ -150,7 +177,17 @@ pub(super) async fn run_stage4a_flow_reaches_running_and_completes_convoy(
                     .name("implement".to_string())
                     .crew(vec![CrewSpec::builder()
                         .role("coder".to_string())
-                        .promises(vec![flotilla_resources::TemplatePromise::decision_ledger("coder")])
+                        .promises(match completion_action {
+                            // The coder owes its PR, as a deliverer does.
+                            CompletionAction::ChangeRequest { .. } => vec![
+                                flotilla_resources::TemplatePromise::decision_ledger("coder"),
+                                flotilla_resources::TemplatePromise {
+                                    kind: flotilla_resources::promises::PromiseKind::Pr,
+                                    owner: "coder".to_string(),
+                                },
+                            ],
+                            _ => vec![flotilla_resources::TemplatePromise::decision_ledger("coder")],
+                        })
                         .source(CrewSource::Tool { command: "bash -lc 'echo stage4a'".to_string() })
                         .build()])
                     .build()])
@@ -232,6 +269,15 @@ pub(super) async fn run_stage4a_flow_reaches_running_and_completes_convoy(
         tokio::time::sleep(Duration::from_millis(200)).await;
     }
 
+    if let CompletionAction::ChangeRequest { state: request_state, untracked } = completion_action {
+        let seen = release_after_change_request(&daemon, &convoy_name, &launch, &repo_default_dir, request_state, untracked).await;
+        for handle in controller_handles {
+            handle.abort();
+            let _ = handle.await;
+        }
+        return Some(seen);
+    }
+
     if matches!(completion_action, CompletionAction::DeleteLive) {
         // A delete ends the convoy, never deletes it (#3108); what it held is released.
         let holder = flotilla_resources::convoy::engine::checkout_holder(&convoys.get(&convoy_name).await.expect("convoy"))
@@ -291,7 +337,7 @@ pub(super) async fn run_stage4a_flow_reaches_running_and_completes_convoy(
             handle.abort();
             let _ = handle.await;
         }
-        return;
+        return None;
     }
 
     let teardown_checkout_path = if matches!(completion_action, CompletionAction::Delete) {
@@ -328,7 +374,9 @@ pub(super) async fn run_stage4a_flow_reaches_running_and_completes_convoy(
                     work: "implement".to_string(),
                     message: Some(match completion_action {
                         CompletionAction::Delete => "https://github.com/flotilla-org/flotilla/pull/884".to_string(),
-                        CompletionAction::Retain | CompletionAction::DeleteLive => "done".to_string(),
+                        CompletionAction::Retain | CompletionAction::DeleteLive | CompletionAction::ChangeRequest { .. } => {
+                            "done".to_string()
+                        }
                     }),
                 })
                 .build(),
@@ -397,6 +445,137 @@ pub(super) async fn run_stage4a_flow_reaches_running_and_completes_convoy(
         handle.abort();
         let _ = handle.await;
     }
+    None
+}
+
+/// Runs the `ChangeRequest` completion of running convoy `convoy_name`, and reads what became of
+/// its checkout once the convoy ended, or once its release had long enough to finish.
+async fn release_after_change_request(
+    daemon: &Arc<InProcessDaemon>,
+    convoy_name: &str,
+    vessel: &str,
+    repo_default_dir: &Path,
+    state: flotilla_resources::ObservedChangeRequestState,
+    untracked: bool,
+) -> ReleaseSeen {
+    let backend = daemon.resource_backend();
+    let convoys = backend.clone().using::<Convoy>(NAMESPACE);
+    // The checkout is held for the convoy's launch, `<name>#<n>`, as the holder names it.
+    let holder =
+        flotilla_resources::convoy::engine::checkout_holder(&convoys.get(convoy_name).await.expect("convoy")).expect("held for its launch");
+    let reads = daemon.lifecycle_reads();
+    let held = || reads.checkouts().and_then(|checkouts| checkouts.held(&holder)).expect("held checkouts");
+    let checkout = held().into_iter().find(|checkout| !checkout.ended()).expect("convoy checkout should exist");
+    let launch = checkout.name.clone();
+    let checkout_path = checkout.ready_path().expect("checkout should be ready under its path").to_owned();
+
+    // The work commits on its branch and does not push it.
+    fs::write(Path::new(&checkout_path).join("work.txt"), "the work\n").expect("write work");
+    let git = |args: &[&str]| {
+        let output = ProcessCommand::new("git")
+            .arg("-C")
+            .arg(&checkout_path)
+            .args(["-c", "user.name=Flotilla Test", "-c", "user.email=test@flotilla.invalid"])
+            .args(args)
+            .output()
+            .expect("run git");
+        assert!(output.status.success(), "git {args:?}: {}", String::from_utf8_lossy(&output.stderr));
+        String::from_utf8(output.stdout).expect("utf-8 git output").trim().to_owned()
+    };
+    git(&["add", "work.txt"]);
+    git(&["commit", "-m", "the work"]);
+    let head = git(&["rev-parse", "HEAD"]);
+    if untracked {
+        fs::write(Path::new(&checkout_path).join("left-over.pyc"), "test run output\n").expect("write untracked file");
+    }
+
+    record_successful_empty_branch_scan(daemon, convoy_name).await;
+    let engine_path = daemon.convoy_engine_path();
+    let engine = engine_path.get().expect("the engine's convoys");
+    let current = convoys.get(convoy_name).await.expect("convoy");
+    engine.verdict(&current, "template/decision-ledger", true, "operator", "ledger seen").await.expect("ledger kept");
+    // The coder submits its PR, as `crew promise submit` does.
+    let mut rx = daemon.subscribe();
+    let submit = daemon
+        .execute(
+            Command::builder()
+                .action(CommandAction::CrewPromise {
+                    context: CrewCommandContext {
+                        crew_id: None,
+                        namespace: Some(NAMESPACE.to_string()),
+                        convoy: Some(convoy_name.to_string()),
+                        vessel_ref: Some(vessel.to_string()),
+                        role: Some("coder".to_string()),
+                    },
+                    operation: flotilla_protocol::commands::CrewPromiseOperation::Submit {
+                        promise: Some("template/pr".to_string()),
+                        kind: "pr".to_string(),
+                        reference: "https://github.com/flotilla-org/flotilla/pull/884".to_string(),
+                        metadata: BTreeMap::new(),
+                    },
+                })
+                .build(),
+        )
+        .await
+        .expect("submit the PR");
+    assert_eq!(wait_for_command_result(&mut rx, submit).await, CommandValue::Ok);
+    publish_change_request(&backend, 884, "test-host", state, &head).await;
+    if state == flotilla_resources::ObservedChangeRequestState::Closed {
+        // The close rejects the submission, and the operator then retracts the promise.
+        let pr_open_again = || {
+            let convoys = convoys.clone();
+            async move {
+                convoys.get(convoy_name).await.ok().and_then(|convoy| convoy.status).is_some_and(|status| {
+                    flotilla_resources::promises::owned(&status, "implement", "coder").iter().any(|promise| {
+                        promise.id == "template/pr"
+                            && promise.state == flotilla_resources::promises::PromiseState::Open
+                            && !promise.submissions.is_empty()
+                    })
+                })
+            }
+        };
+        wait_until_with_timeout(Duration::from_secs(20), pr_open_again).await;
+        let current = convoys.get(convoy_name).await.expect("convoy");
+        engine.verdict(&current, "template/pr", false, "operator", "closed unmerged; retraction accepted").await.expect("retract");
+    }
+
+    // The release ends the launch; one the removal refuses is given the same time to end.
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(20);
+    while tokio::time::Instant::now() < deadline && !held().iter().any(|checkout| checkout.name == launch && checkout.ended()) {
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    let checkout = held().into_iter().find(|checkout| checkout.name == launch).expect("the checkout launch");
+    let inspection = checkout.integration.as_ref().map(|integration| &integration.inspection);
+    ReleaseSeen {
+        reading: checkout.reading.clone(),
+        landed: inspection.and_then(|inspection| inspection.landed),
+        landed_details: inspection.map(|inspection| inspection.landed_details.clone()).unwrap_or_default(),
+        on_disk: Path::new(&checkout_path).exists(),
+        // Archives are saved beside the clone a worktree is of, which may sit beside the
+        // repositories' directory rather than in it.
+        archives: saved_archives(repo_default_dir.parent().unwrap_or(repo_default_dir)),
+        convoy: convoys.get(convoy_name).await.ok().and_then(|convoy| convoy.status).map(|status| status.phase),
+    }
+}
+
+/// The checkout archives saved under `root`, in any `.flotilla-archives` below it.
+fn saved_archives(root: &Path) -> usize {
+    let Ok(entries) = fs::read_dir(root) else { return 0 };
+    entries
+        .flatten()
+        .filter(|entry| entry.file_type().is_ok_and(|kind| kind.is_dir()))
+        .map(|entry| {
+            if entry.file_name() == ".flotilla-archives" {
+                fs::read_dir(entry.path())
+                    .map(|archives| {
+                        archives.flatten().filter(|archive| !archive.file_name().to_string_lossy().starts_with(".partial-")).count()
+                    })
+                    .unwrap_or(0)
+            } else {
+                saved_archives(&entry.path())
+            }
+        })
+        .sum()
 }
 
 pub(super) async fn record_successful_empty_branch_scan(daemon: &InProcessDaemon, convoy: &str) {

@@ -768,6 +768,77 @@ async fn passing_teardown_gate_removes_the_managed_worktree_path() {
     run_stage4a_flow_reaches_running_and_completes_convoy(daemon, config, repo_default_dir, CompletionAction::Delete).await;
 }
 
+/// A convoy whose work completes naming change request 884, read by the forge observer in
+/// `state`: what became of its checkout.
+async fn checkout_release_after_change_request(state: flotilla_resources::ObservedChangeRequestState, untracked: bool) -> ReleaseSeen {
+    let temp = TempDir::new().expect("tempdir");
+    let repo_default_dir = temp.path().join("flotilla-repos");
+    let git_repo =
+        TestGitRepo::init(temp.path().join("repo")).with_initial_commit().with_origin("git@github.com:flotilla-org/flotilla.git");
+    let repo = git_repo.path().to_path_buf();
+    let config_base = temp.path().join("config");
+    fs::create_dir_all(&config_base).expect("config directory");
+    fs::write(config_base.join("daemon.toml"), "machine_id = \"change-request-release-test\"\n").expect("daemon config");
+    let config = Arc::new(ConfigStore::with_base(config_base));
+    config.add_observation_root(&ExecutionEnvironmentPath::new(&repo)).expect("persist observation root");
+    let daemon = daemon_with_backend_runner_and_change_requests(
+        vec![repo.clone()],
+        Arc::clone(&config),
+        flotilla_store_memory::engine_home_backend(),
+        Arc::new(Stage4aGitRunner { inner: Arc::new(MergedPrProcessRunner::new(884)), upstream: repo.clone() }),
+        Some(Arc::new(FakeChangeRequest::new())),
+    )
+    .await;
+    run_stage4a_flow_reaches_running_and_completes_convoy(
+        daemon,
+        config,
+        repo_default_dir,
+        CompletionAction::ChangeRequest { state, untracked },
+    )
+    .await
+    .expect("what became of the checkout")
+}
+
+// F5 (run 3): the checkout is held for the convoy's launch, `<name>#<n>`, and its change request
+// is found through that launch's convoy, so a merged one lands it. Its commits were never pushed,
+// so without the change request it would be archived as forced removal.
+#[tokio::test]
+async fn a_merged_change_request_releases_its_checkout_as_landed() {
+    let seen = checkout_release_after_change_request(flotilla_resources::ObservedChangeRequestState::Merged, false).await;
+    assert_eq!(seen.convoy, Some(ConvoyPhase::Landed), "{seen:?}");
+    assert_eq!(seen.landed, Some(true), "{seen:?}");
+    assert!(matches!(seen.reading, LifecycleReading::Released), "{seen:?}");
+    assert!(!seen.on_disk, "{seen:?}");
+    assert_eq!(seen.archives, 0, "a landed checkout is removed, not archived: {seen:?}");
+}
+
+// A change request closed unmerged did not land the work: its checkout is kept as an archive,
+// never removed as landed.
+#[tokio::test]
+async fn a_change_request_closed_unmerged_archives_its_checkout() {
+    let seen = checkout_release_after_change_request(flotilla_resources::ObservedChangeRequestState::Closed, false).await;
+    assert_eq!(seen.convoy, Some(ConvoyPhase::Landed), "{seen:?}");
+    assert_eq!(seen.landed, Some(false), "{seen:?}");
+    assert!(seen.landed_details.iter().any(|detail| detail.contains("#884")), "the change request was read: {seen:?}");
+    assert!(matches!(seen.reading, LifecycleReading::Released), "{seen:?}");
+    assert!(!seen.on_disk, "{seen:?}");
+    assert_eq!(seen.archives, 1, "{seen:?}");
+}
+
+// CURRENT BEHAVIOUR, pending Robert's ruling (run 3's trial-a): a merged change request's
+// checkout left with an untracked file is landed, but its landed removal refuses a dirty checkout.
+// The one release attempt fails (DirtyCheckout) and then waits on the checkout's integration or its
+// host's observation changing: the launch stays Ready and on disk, with nothing archived.
+#[tokio::test]
+async fn a_landed_checkout_with_an_untracked_file_stays_unreleased() {
+    let seen = checkout_release_after_change_request(flotilla_resources::ObservedChangeRequestState::Merged, true).await;
+    assert_eq!(seen.convoy, Some(ConvoyPhase::Landed), "{seen:?}");
+    assert_eq!(seen.landed, Some(true), "{seen:?}");
+    assert!(matches!(seen.reading, LifecycleReading::Ready { .. }), "{seen:?}");
+    assert!(seen.on_disk, "{seen:?}");
+    assert_eq!(seen.archives, 0, "{seen:?}");
+}
+
 #[test]
 fn crew_provisioning_recovers_lost_session_after_in_process_daemon_restart_and_runs_handoffs() {
     // This full provisioning scenario builds a large async state machine.

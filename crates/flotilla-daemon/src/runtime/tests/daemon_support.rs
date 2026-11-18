@@ -1,6 +1,18 @@
 use super::*;
 
 pub(super) async fn publish_merged_change_request(backend: &ResourceBackend, number: u64, authority: &str) {
+    publish_change_request(backend, number, authority, flotilla_resources::ObservedChangeRequestState::Merged, "abc").await;
+}
+
+/// Change request `number` as the forge observer at `authority` records it: in `state`, its head
+/// at `head`.
+pub(super) async fn publish_change_request(
+    backend: &ResourceBackend,
+    number: u64,
+    authority: &str,
+    state: flotilla_resources::ObservedChangeRequestState,
+    head: &str,
+) {
     let records = backend.clone().using::<flotilla_resources::ChangeRequest>(NAMESPACE);
     let name = cr_name("github.com", "flotilla-org/flotilla", number);
     let record = match records
@@ -32,8 +44,8 @@ pub(super) async fn publish_merged_change_request(backend: &ResourceBackend, num
                 author: Default::default(),
                 review_decision: Default::default(),
                 review_requested_from_owner: Default::default(),
-                state: flotilla_resources::Observation::known(flotilla_resources::ObservedChangeRequestState::Merged, observed_at),
-                head_sha: flotilla_resources::Observation::known("abc".to_string(), observed_at),
+                state: flotilla_resources::Observation::known(state, observed_at),
+                head_sha: flotilla_resources::Observation::known(head.to_string(), observed_at),
                 checks: flotilla_resources::Observation::known(flotilla_resources::ObservedChecks::Pass, observed_at),
                 review: flotilla_resources::ChangeRequestReviewObservation {
                     actionable_at_head: flotilla_resources::Observation::known(false, observed_at),
@@ -42,7 +54,7 @@ pub(super) async fn publish_merged_change_request(backend: &ResourceBackend, num
             },
         )
         .await
-        .expect("publish merged CR observation");
+        .expect("publish CR observation");
 }
 
 pub(super) fn credential_mapping_config(path: &Path, key: Option<&str>) {

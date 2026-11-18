@@ -263,12 +263,10 @@ async fn inspect_recorded_landed(
     if state == ChangeRequestState::Open {
         return (condition(ConditionValue::False, format!("PR #{id} OPEN, not merged")), None, Some(observation));
     }
+    // A change request closed unmerged did not land its work: the checkout is kept, not removed
+    // as landed, whatever the reason it was closed.
     if state == ChangeRequestState::Closed {
-        return (
-            condition(ConditionValue::True, format!("PR #{id} closed")),
-            Some(LandedEvidence::builder().change_request_id(id.to_string()).checkout_head_in_merged_head(false).build()),
-            Some(observation),
-        );
+        return (condition(ConditionValue::False, format!("PR #{id} closed, not merged")), None, Some(observation));
     }
     let mut evidence = recorded.landed_evidence.filter(|evidence| evidence.change_request_id == id).cloned();
     if evidence.is_none() {
@@ -359,7 +357,6 @@ async fn inspect_landed(
                             .observed_at(observed_at.to_string())
                             .build();
                         let landing = match state {
-                            ChangeRequestState::Closed => Some(("closed", ConditionValue::True, format!("PR #{number} closed"), false)),
                             ChangeRequestState::Merged => {
                                 let merged_head =
                                     item.get("headRefOid").and_then(serde_json::Value::as_str).filter(|value| !value.is_empty());
@@ -382,11 +379,12 @@ async fn inspect_landed(
                                         false,
                                     ),
                                 };
-                                Some(("merged", value, detail, head_verified))
+                                Some((value, detail, head_verified))
                             }
-                            ChangeRequestState::Open => None,
+                            // Closed unmerged did not land the work, whatever the reason it was closed.
+                            ChangeRequestState::Closed | ChangeRequestState::Open => None,
                         };
-                        if let Some((outcome, value, detail, head_verified)) = landing {
+                        if let Some((value, detail, head_verified)) = landing {
                             (
                                 IntegrationCondition::builder()
                                     .value(value)
@@ -397,7 +395,7 @@ async fn inspect_landed(
                                     LandedEvidence::builder()
                                         .change_request_id(number)
                                         .maybe_merged_at(merged_at.map(str::to_string))
-                                        .maybe_target_ref(if outcome == "merged" { target_ref.map(str::to_string) } else { None })
+                                        .maybe_target_ref(target_ref.map(str::to_string))
                                         .checkout_head_in_merged_head(head_verified)
                                         .build(),
                                 ),
@@ -407,7 +405,11 @@ async fn inspect_landed(
                             (
                                 IntegrationCondition::builder()
                                     .value(ConditionValue::False)
-                                    .details(vec![format!("PR #{number} OPEN, not merged")])
+                                    .details(vec![if state == ChangeRequestState::Closed {
+                                        format!("PR #{number} closed, not merged")
+                                    } else {
+                                        format!("PR #{number} OPEN, not merged")
+                                    }])
                                     .observed_at(observed_at.to_string())
                                     .build(),
                                 None,
@@ -1074,7 +1076,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn closed_unmerged_change_request_keeps_landed_without_verified_head() {
+    async fn closed_unmerged_change_request_is_not_landed() {
         let runner = Arc::new(MockRunner::new(vec![
             Ok("2".into()),
             Ok(r#"[{"number": 1162, "state": "CLOSED", "mergedAt": null, "baseRefName": "main"}]"#.into()),
@@ -1089,8 +1091,8 @@ mod tests {
             "2026-07-27T00:00:00Z",
         )
         .await;
-        assert_eq!(landed.value, ConditionValue::True);
-        assert!(!evidence.expect("closed change request evidence").checkout_head_in_merged_head);
+        assert_eq!(landed.value, ConditionValue::False, "{:?}", landed.details);
+        assert!(evidence.is_none(), "a closed change request is no landing evidence");
         assert_eq!(runner.calls().len(), 2, "closed PR must not trigger a Git ancestry check");
     }
 

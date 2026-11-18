@@ -180,14 +180,13 @@ impl ConvoyHolderInputs {
 impl HolderInputs for ConvoyHolderInputs {
     async fn inputs(&self, holder: Option<&CheckoutHolder>, spec: &CheckoutSpec) -> Result<CheckoutInputs, String> {
         let Some(CheckoutHolder::Convoy(launch)) = holder else { return Ok(CheckoutInputs::default()) };
-        // The holder is a launch (`<launch_of>#<n>`); a finite convoy's launch_of is its record's name.
-        let name = flotilla_resources::checkout_records::launched(launch);
-        let owner = Some(name.to_owned());
-        let convoy = match self.backend.including_replicas::<Convoy>(&self.namespace).get(name).await {
+        // The holder is a launch (`<launch_of>#<n>`), and the Convoy views are named by their launch.
+        let owner = Some(flotilla_resources::checkout_records::launched(launch).to_owned());
+        let convoy = match self.backend.including_replicas::<Convoy>(&self.namespace).get(launch).await {
             Ok(convoy) => convoy.object,
             // A holder with no record supplies nothing but its name.
             Err(ResourceError::NotFound { .. }) => return Ok(CheckoutInputs { owner, ..CheckoutInputs::default() }),
-            Err(error) => return Err(format!("read convoy {name}: {error}")),
+            Err(error) => return Err(format!("read convoy {launch}: {error}")),
         };
         let forges: Vec<_> = self
             .backend
