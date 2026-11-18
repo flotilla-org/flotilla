@@ -6,6 +6,10 @@
 //! realise and run crews without containers, processes or forges. Without the
 //! section nothing changes. Every rate is a probability in `[0, 1]`, drawn
 //! deterministically from `seed` and the subject's identity.
+//!
+//! The fleet stands in for systems that outlive the daemon (vendors, cleat,
+//! forges), and keeps their state in a file it writes behind by up to 100 ms.
+//! A graceful stop writes it all out; a crash (`kill -9`) may lose that much.
 
 use serde::{Deserialize, Deserializer, Serialize};
 

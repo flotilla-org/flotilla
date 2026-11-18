@@ -47,6 +47,21 @@ pub fn attach_dummy_fleet(fleet: &Arc<DummyFleet>, daemon: &Arc<InProcessDaemon>
     fleet.attach(daemon_crew_port(daemon))
 }
 
+/// The fleet as part of the daemon's process: a graceful stop stops its crews and writes out its
+/// state file before the runtime's tasks end.
+pub fn dummy_fleet_component(fleet: &Arc<DummyFleet>) -> Arc<dyn crate::runtime::ProcessComponent> {
+    Arc::new(FleetComponent(Arc::clone(fleet)))
+}
+
+struct FleetComponent(Arc<DummyFleet>);
+
+#[async_trait]
+impl crate::runtime::ProcessComponent for FleetComponent {
+    async fn stop(&self) {
+        self.0.shutdown().await;
+    }
+}
+
 /// The port [`attach_dummy_fleet`] attaches: `daemon`'s command path and its
 /// hook-attention recording. A harness that outlives one daemon, as a crew's
 /// process outlives a daemon restart, forwards to the current daemon's port.

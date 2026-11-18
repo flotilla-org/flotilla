@@ -126,10 +126,11 @@ impl DummySession {
         format!("flotilla dummy crew · {} · {}\n", self.role, if self.working() { SCREEN_WORKING } else { SCREEN_IDLE })
     }
 
-    fn stop(&self) {
-        if let Some(crew) = self.crew.lock().unwrap_or_else(std::sync::PoisonError::into_inner).take() {
-            crew.abort();
-        }
+    /// Abort the crew; the handle it returns ends once the crew has.
+    fn stop(&self) -> Option<JoinHandle<()>> {
+        let crew = self.crew.lock().unwrap_or_else(std::sync::PoisonError::into_inner).take()?;
+        crew.abort();
+        Some(crew)
     }
 }
 
@@ -178,11 +179,10 @@ impl DummySessions {
         }
     }
 
-    /// Stop every crew where it is, as its process's end does.
-    pub(crate) fn stop_all(&self) {
-        for session in self.lock().values() {
-            session.stop();
-        }
+    /// Stop every crew where it is, as its process's end does. Each returned handle ends once its
+    /// crew has stopped.
+    pub(crate) fn stop_all(&self) -> Vec<JoinHandle<()>> {
+        self.lock().values().filter_map(|session| session.stop()).collect()
     }
 
     /// The events that restore every session: its launch, the turns delivered to it and its

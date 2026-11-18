@@ -96,7 +96,7 @@ pub async fn run(
         if let Some(fleet) = &dummy_fleet {
             crate::dummy_fleet::attach_dummy_fleet(fleet, &daemon)?;
         }
-        let runtime = DaemonRuntime::start_with_options(
+        let mut runtime = DaemonRuntime::start_with_options(
             daemon,
             Arc::clone(&config),
             Some(socket_path.to_path_buf()),
@@ -108,6 +108,9 @@ pub async fn run(
             },
         )
         .await?;
+        if let Some(fleet) = &dummy_fleet {
+            runtime.stop_with_runtime(crate::dummy_fleet::dummy_fleet_component(fleet));
+        }
         server.install_controller_metrics(Arc::clone(&runtime.controller_metrics));
         server.install_blob_store(Arc::clone(&runtime.blob_store))?;
 

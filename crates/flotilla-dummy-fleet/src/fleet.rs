@@ -157,8 +157,18 @@ impl DummyFleet {
     /// End this fleet as its process's end does: its crews stop where they are, and nothing
     /// more is recorded. The fleet [opened](Self::open) from its state file next takes over.
     pub fn stop(&self) {
+        drop(self.sessions.stop_all());
         self.journal.close();
-        self.sessions.stop_all();
+    }
+
+    /// [Stop](Self::stop), returning once every crew has stopped and every change the fleet
+    /// recorded is in its state file: the end of a graceful process stop.
+    pub async fn shutdown(&self) {
+        for crew in self.sessions.stop_all() {
+            // An aborted crew ends cancelled; one that had already finished ends as it did.
+            let _ = crew.await;
+        }
+        self.journal.close();
     }
 
     pub(crate) fn record(&self, event: &Event) {

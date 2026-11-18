@@ -134,6 +134,8 @@ pub struct DaemonRuntime {
     /// Asks message delivery to settle its turns before the tasks are aborted; none without
     /// controllers.
     delivery_stop: Option<Arc<primitives::DeliveryStop>>,
+    /// What a graceful stop stops after delivery settles: see [`Self::stop_with_runtime`].
+    process_components: Vec<Arc<dyn ProcessComponent>>,
 }
 
 /// How long a graceful stop waits for message delivery to settle its turns: a typed turn's
@@ -584,7 +586,7 @@ impl DaemonRuntime {
                 .build(),
         ));
 
-        Ok(Self { tasks, blob_store, controller_metrics, stop_expected: false, delivery_stop })
+        Ok(Self { tasks, blob_store, controller_metrics, stop_expected: false, delivery_stop, process_components: Vec::new() })
     }
 }
 
@@ -733,9 +735,26 @@ impl DaemonRuntime {
                 warn!(within = ?DELIVERY_SETTLE_WITHIN, "message delivery did not settle its turns before the stop");
             }
         }
+        for component in std::mem::take(&mut self.process_components) {
+            component.stop().await;
+        }
         self.stop_expected = true;
         info!(tasks = self.tasks.len(), "daemon runtime stopping; aborting supervisory tasks");
     }
+
+    /// Stop `component` with this runtime: a graceful [shutdown](Self::shutdown) stops it once
+    /// message delivery has settled and before the supervisory tasks abort, so nothing it is
+    /// doing waits on a controller that has gone.
+    pub fn stop_with_runtime(&mut self, component: Arc<dyn ProcessComponent>) {
+        self.process_components.push(component);
+    }
+}
+
+/// Something that runs inside the daemon's process and ends with it.
+#[async_trait::async_trait]
+pub trait ProcessComponent: Send + Sync {
+    /// End it, returning once what it holds is settled.
+    async fn stop(&self);
 }
 
 impl Drop for DaemonRuntime {

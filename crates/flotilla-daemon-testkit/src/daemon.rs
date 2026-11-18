@@ -48,7 +48,7 @@ use flotilla_client::{
 use flotilla_config::{ConfigStore, DaemonConfig};
 use flotilla_core::in_process::InProcessDaemon;
 use flotilla_daemon::{
-    dummy_fleet::{daemon_crew_port, install_dummy_fleet},
+    dummy_fleet::{daemon_crew_port, dummy_fleet_component, install_dummy_fleet},
     peer::PeerManager,
     runtime::{engine_opener, DaemonRuntime, RuntimeOptions},
     server::{build_remote_command_router, PeerConnectionEvent},
@@ -331,11 +331,15 @@ impl TestDaemon {
         let Self { daemon, fleet, runtime, relay, operator, composition, dispatched, dir } = self;
         drop(operator);
         relay.disconnect();
-        fleet.stop();
         let node = daemon.node_id().clone();
-        if let Some(runtime) = runtime {
+        // The fleet stops with the runtime, as flotillad's graceful stop stops it.
+        if let Some(mut runtime) = runtime {
+            runtime.stop_with_runtime(dummy_fleet_component(&fleet));
             runtime.shutdown().await;
+        } else {
+            fleet.stop();
         }
+        let ended = fleet.snapshot();
         drop(daemon);
         drop(fleet);
         tokio::task::yield_now().await;
@@ -345,6 +349,7 @@ impl TestDaemon {
         let fleet = install_dummy_fleet(&daemon_config, config.state_dir().as_path(), &mut discovery)
             .expect("dummy fleet state")
             .expect("dummy fleet configured");
+        assert_eq!(fleet.snapshot(), ended, "a graceful stop leaves every change the fleet recorded in its state file");
         fleet.attach(Arc::clone(&relay) as Arc<dyn CrewCommandPort>).expect("attach the crews' command relay");
         let (daemon, runtime) = untouched(composition.refused(), compose(&composition, config, discovery, &relay)).await;
         assert_eq!(daemon.node_id(), &node, "restart preserves the daemon's identity");
