@@ -50,7 +50,8 @@ pub struct HeldJoins {
 #[derive(Default)]
 struct State {
     held: Option<Held>,
-    /// Each registered view's sequence: it has composed every change before it.
+    /// Each registered view's sequence: it has composed every change before it. A view's
+    /// [`JoinsReader`] holds the other reference; once it is dropped the next read forgets the view.
     readers: BTreeMap<u64, Arc<AtomicU64>>,
     next_reader: u64,
 }
@@ -171,6 +172,12 @@ impl HeldJoins {
             }
         }
         let held = held.as_mut().expect("held above");
+        // A view whose reader was dropped has left: it no longer holds back an eviction.
+        let registered = readers.len();
+        readers.retain(|_, composed| Arc::strong_count(composed) > 1);
+        if readers.len() < registered {
+            held.unchecked = true;
+        }
         held.evict(readers.values().map(|composed| composed.load(Ordering::Acquire)).min());
         Ok(read(Joins { held }))
     }
@@ -184,7 +191,7 @@ impl HeldJoins {
             .map_or_else(HeldCount::default, |held| HeldCount { vessels: held.vessels.len(), terminals: held.terminals.len() })
     }
 
-    fn register(&self, composes_convoys: bool) -> (u64, Arc<AtomicU64>) {
+    fn register(&self, composes_convoys: bool) -> Arc<AtomicU64> {
         let mut state = locked(&self.state);
         let reader = state.next_reader;
         state.next_reader = state.next_reader.saturating_add(1);
@@ -194,23 +201,15 @@ impl HeldJoins {
         if let Some(held) = state.held.as_mut().filter(|held| composes_convoys && held.released_evicted) {
             held.refill_owed = true;
         }
-        (reader, composed)
-    }
-
-    fn leave(&self, reader: u64) {
-        let mut state = locked(&self.state);
-        state.readers.remove(&reader);
-        if let Some(held) = state.held.as_mut() {
-            held.unchecked = true;
-        }
+        composed
     }
 }
 
 /// A view's place in the held joins' journal: while it is registered, no launch is evicted whose
-/// last change it has not composed. Leaves when dropped.
+/// last change it has not composed. Leaves when dropped. Dropping takes no lock, so a view may be
+/// dropped while its store is locked: the next read forgets it.
 pub struct JoinsReader {
     reads: Arc<dyn LifecycleReads>,
-    reader: u64,
     composed: Arc<AtomicU64>,
 }
 
@@ -218,8 +217,8 @@ impl JoinsReader {
     /// Registers a view of `reads`' held joins; `composes_convoys` for a view that composes
     /// convoys, which reads every launch again if released launches were evicted before it.
     pub fn register(reads: Arc<dyn LifecycleReads>, composes_convoys: bool) -> Result<Self, String> {
-        let (reader, composed) = reads.joins()?.register(composes_convoys);
-        Ok(Self { reads, reader, composed })
+        let composed = reads.joins()?.register(composes_convoys);
+        Ok(Self { reads, composed })
     }
 
     /// [`HeldJoins::read`] of this view's port.
@@ -231,14 +230,6 @@ impl JoinsReader {
     /// what it no longer needs. Takes no lock.
     pub fn composed(&self, sequence: u64) {
         self.composed.fetch_max(sequence, Ordering::Release);
-    }
-}
-
-impl Drop for JoinsReader {
-    fn drop(&mut self) {
-        if let Ok(joins) = self.reads.joins() {
-            joins.leave(self.reader);
-        }
     }
 }
 
@@ -604,5 +595,57 @@ impl Joins<'_> {
                 self.held.unchecked = true;
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::{sync::mpsc, thread, time::Duration};
+
+    use super::*;
+
+    struct Reads {
+        joins: HeldJoins,
+    }
+
+    impl LifecycleReads for Reads {
+        fn home(&self) -> Result<&str, String> {
+            Ok("here")
+        }
+
+        fn try_reading(
+            &self,
+            _: crate::lifecycle_reads::ProvisioningKind,
+            _: &str,
+            _: Option<&str>,
+        ) -> Result<Option<flotilla_protocol::LifecycleReading>, String> {
+            Ok(None)
+        }
+
+        fn joins(&self) -> Result<&HeldJoins, String> {
+            Ok(&self.joins)
+        }
+    }
+
+    // A read holds the joins' lock while it reads the store, and a view's last owner may drop it
+    // while holding the store: dropping a reader must not wait on that read, or the two deadlock.
+    #[test]
+    fn a_reader_drops_while_a_read_holds_the_joins() {
+        let reads: Arc<dyn LifecycleReads> = Arc::new(Reads { joins: HeldJoins::default() });
+        let leaving = JoinsReader::register(Arc::clone(&reads), true).expect("register");
+        let staying = JoinsReader::register(Arc::clone(&reads), true).expect("register");
+        staying
+            .read(|_| {
+                let (dropped, wait) = mpsc::channel();
+                thread::spawn(move || {
+                    drop(leaving);
+                    let _ = dropped.send(());
+                });
+                wait.recv_timeout(Duration::from_secs(10)).expect("a reader drops while the joins are read");
+            })
+            .expect("read");
+        // The next read forgets the dropped reader.
+        staying.read(|_| ()).expect("read");
+        assert_eq!(locked(&reads.joins().expect("joins").state).readers.len(), 1);
     }
 }
