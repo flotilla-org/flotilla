@@ -87,11 +87,11 @@ license = "Apache-2.0 OR MIT"
 # When adding dependencies anywhere in the workspace, update the external-crate
 # allowlist in clippy.toml (use the library crate name, including any rename).
 [workspace.dependencies]
-drydock = { git = "https://github.com/flotilla-org/drydock", rev = "30282004caf2b82d903bfbb8e1dfce0ba49b8bdc" }
-drydock-protocol = { git = "https://github.com/flotilla-org/drydock", rev = "30282004caf2b82d903bfbb8e1dfce0ba49b8bdc" }
-drydock-agent = { git = "https://github.com/flotilla-org/drydock", rev = "30282004caf2b82d903bfbb8e1dfce0ba49b8bdc" }
-drydock-transport = { git = "https://github.com/flotilla-org/drydock", rev = "30282004caf2b82d903bfbb8e1dfce0ba49b8bdc" }
-drydock-host = { git = "https://github.com/flotilla-org/drydock", rev = "30282004caf2b82d903bfbb8e1dfce0ba49b8bdc" }
+drydock = { git = "https://github.com/flotilla-org/drydock", rev = "66d4dc98bb5fa9d1072e3c70e8a62d28ee42d922" }
+drydock-protocol = { git = "https://github.com/flotilla-org/drydock", rev = "66d4dc98bb5fa9d1072e3c70e8a62d28ee42d922" }
+drydock-agent = { git = "https://github.com/flotilla-org/drydock", rev = "66d4dc98bb5fa9d1072e3c70e8a62d28ee42d922" }
+drydock-transport = { git = "https://github.com/flotilla-org/drydock", rev = "66d4dc98bb5fa9d1072e3c70e8a62d28ee42d922" }
+drydock-host = { git = "https://github.com/flotilla-org/drydock", rev = "66d4dc98bb5fa9d1072e3c70e8a62d28ee42d922" }
 rigging-ssh = { git = "https://github.com/flotilla-org/rigging", rev = "261a4460166fc79e1b6442a693f62d4e41bef8d4" }
 rigging-stream = { git = "https://github.com/flotilla-org/rigging", rev = "261a4460166fc79e1b6442a693f62d4e41bef8d4" }
 rigging-tls = { git = "https://github.com/flotilla-org/rigging", rev = "261a4460166fc79e1b6442a693f62d4e41bef8d4" }
@@ -105,13 +105,13 @@ rigging-condition = { git = "https://github.com/flotilla-org/rigging", rev = "26
 # The webhook relay's wire types (flotilla-org/flotilla.work#1).
 # Every rigging pin matches drydock's and binnacle's rigging rev, so the build holds one copy of each crate; move them together.
 rigging-relay-protocol = { git = "https://github.com/flotilla-org/rigging", rev = "261a4460166fc79e1b6442a693f62d4e41bef8d4" }
-binnacle-cli = { git = "https://github.com/flotilla-org/binnacle", rev = "0eb2af53542b0fdcea843165bd6a71fa6a6c66c3", features = ["described", "clap"] }
-binnacle-core = { git = "https://github.com/flotilla-org/binnacle", rev = "0eb2af53542b0fdcea843165bd6a71fa6a6c66c3" }
-binnacle-described = { git = "https://github.com/flotilla-org/binnacle", rev = "0eb2af53542b0fdcea843165bd6a71fa6a6c66c3" }
-binnacle-described-http = { git = "https://github.com/flotilla-org/binnacle", rev = "0eb2af53542b0fdcea843165bd6a71fa6a6c66c3" }
-binnacle-format = { git = "https://github.com/flotilla-org/binnacle", rev = "0eb2af53542b0fdcea843165bd6a71fa6a6c66c3" }
-binnacle-layout = { git = "https://github.com/flotilla-org/binnacle", rev = "0eb2af53542b0fdcea843165bd6a71fa6a6c66c3" }
-binnacle-ratatui = { git = "https://github.com/flotilla-org/binnacle", rev = "0eb2af53542b0fdcea843165bd6a71fa6a6c66c3", features = ["described"] }
+binnacle-cli = { git = "https://github.com/flotilla-org/binnacle", rev = "db69691ff6da9342ddb51ebee3da5bfa3ae1fa9f", features = ["described", "clap"] }
+binnacle-core = { git = "https://github.com/flotilla-org/binnacle", rev = "db69691ff6da9342ddb51ebee3da5bfa3ae1fa9f" }
+binnacle-described = { git = "https://github.com/flotilla-org/binnacle", rev = "db69691ff6da9342ddb51ebee3da5bfa3ae1fa9f" }
+binnacle-described-http = { git = "https://github.com/flotilla-org/binnacle", rev = "db69691ff6da9342ddb51ebee3da5bfa3ae1fa9f" }
+binnacle-format = { git = "https://github.com/flotilla-org/binnacle", rev = "db69691ff6da9342ddb51ebee3da5bfa3ae1fa9f" }
+binnacle-layout = { git = "https://github.com/flotilla-org/binnacle", rev = "db69691ff6da9342ddb51ebee3da5bfa3ae1fa9f" }
+binnacle-ratatui = { git = "https://github.com/flotilla-org/binnacle", rev = "db69691ff6da9342ddb51ebee3da5bfa3ae1fa9f", features = ["described"] }
 chrono = { version = "0.4", default-features = false, features = ["clock"] }
 serde_yml = "0.0.12"
 tokio-util = "0.7"
