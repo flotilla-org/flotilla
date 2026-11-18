@@ -5,7 +5,7 @@
 use chrono::{DateTime, SecondsFormat, Utc};
 use serde_json::{json, Value};
 
-use crate::model::{CheckState, Item, ItemState, Label, Repository, Review};
+use crate::model::{CheckState, Item, ItemState, Label, MergeStatus, Repository, Review};
 
 /// URLs for one repository on one forge.
 pub(crate) struct Urls<'a> {
@@ -128,7 +128,7 @@ pub(crate) fn pull(urls: &Urls<'_>, item: &Item) -> Value {
         "html_url": format!("{}/pulls/{}", urls.web(), item.number),
         "diff_url": format!("{}/pulls/{}.diff", urls.web(), item.number),
         "patch_url": format!("{}/pulls/{}.patch", urls.web(), item.number),
-        "mergeable": item.state == ItemState::Open && !pull.draft,
+        "mergeable": item.state == ItemState::Open && !pull.draft && pull.merge_status == MergeStatus::Mergeable,
         "merged": merged,
         "merged_at": optional_time(pull.merged_at),
         "merge_commit_sha": pull.merge_commit_sha,

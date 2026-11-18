@@ -131,12 +131,11 @@ impl ForgejoChangeRequestProvider {
         } else {
             None
         };
-        // Forgejo's `mergeable` is false for a draft too, which says nothing about conflicts.
-        let mergeable = match (value["mergeable"].as_bool(), state) {
-            (Some(true), _) => Some(ObservedMergeability::Mergeable),
-            (Some(false), Some(ObservedChangeRequestState::Open)) => Some(ObservedMergeability::Conflicting),
-            _ => None,
-        };
+        // Forgejo's `mergeable` is `PullRequest.Mergeable()` (models/issues/pull.go, Forgejo 16):
+        // false while the merge check is still running on a new head, on a conflict, on a failed
+        // check and on a draft. The API has no field that tells these apart, so false is unknown,
+        // never a conflict.
+        let mergeable = value["mergeable"].as_bool().filter(|mergeable| *mergeable).map(|_| ObservedMergeability::Mergeable);
         let requested = self.operator_login.as_deref().and_then(|operator| {
             value["requested_reviewers"].as_array().map(|reviewers| {
                 reviewers.iter().any(|reviewer| reviewer["login"].as_str().is_some_and(|login| login.eq_ignore_ascii_case(operator)))
@@ -1331,6 +1330,31 @@ mod tests {
         assert_eq!(observe(&provider, 1).await.checks.value, Some(ObservedChecks::Pass), "the new head has no status");
         fake.set_draft(&repo, 1, true).expect("draft");
         assert_eq!(observe(&provider, 1).await.mergeable.value, None);
+        assert_no_refusals(&fake);
+    }
+
+    // Behaviour (run 3 F2): Forgejo's `mergeable` is false on an open request while its merge
+    // check runs on a fresh head, on a conflict, and on a failed check alike, so false reads as
+    // unknown, never as conflicting; true is mergeable.
+    #[tokio::test]
+    async fn an_open_request_forgejo_does_not_call_mergeable_is_unknown_not_conflicting() {
+        use flotilla_fake_forge::MergeStatus;
+        let (fake, _clock, provider) = empty_fake();
+        let repo = team_repo();
+        fake.create_pull(
+            &repo,
+            NewPull { title: "Work".into(), head: "work".into(), base: "main".into(), body: String::new(), user: None, draft: false },
+        )
+        .expect("pull");
+        fake.push_head(&repo, 1).expect("push");
+        for status in [MergeStatus::Checking, MergeStatus::Conflict, MergeStatus::Error] {
+            fake.set_merge_status(&repo, 1, status).expect("merge check");
+            let observed = observe(&provider, 1).await;
+            assert_eq!(observed.state.value, Some(ObservedChangeRequestState::Open), "{status:?}");
+            assert_eq!(observed.mergeable.value, None, "{status:?}");
+        }
+        fake.set_merge_status(&repo, 1, MergeStatus::Mergeable).expect("merge check");
+        assert_eq!(observe(&provider, 1).await.mergeable.value, Some(ObservedMergeability::Mergeable));
         assert_no_refusals(&fake);
     }
 

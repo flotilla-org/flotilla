@@ -26,8 +26,8 @@ pub mod serve;
 pub use client::InProcessClient;
 pub use config::{Config, StartupError};
 pub use model::{
-    CheckState, Clock, FakeForge, ForgeError, ForgeSettings, Item, ItemEdit, ItemState, NewIssue, NewPull, NewReview, Refusal, RepoRef,
-    ReviewState, SystemClock,
+    CheckState, Clock, FakeForge, ForgeError, ForgeSettings, Item, ItemEdit, ItemState, MergeStatus, NewIssue, NewPull, NewReview, Refusal,
+    RepoRef, ReviewState, SystemClock,
 };
 
 #[cfg(test)]
