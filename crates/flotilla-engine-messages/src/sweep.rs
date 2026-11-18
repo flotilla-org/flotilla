@@ -11,9 +11,14 @@ use std::{
     sync::Arc,
 };
 
+use flotilla_address::Address;
+use flotilla_resources::convoy::engine::{convoy_records, launch_address, seat_address};
 use flotilla_schema::{reads::carry, Kind, Timestamp};
 use flotilla_state_machines::{
-    machines::message::{Deliver, DropReason, Expectation, Message, MessageState, Receipts, Settle, Settlement, Supersedes},
+    machines::{
+        convoy::{Convoy, ConvoyLabel},
+        message::{Deliver, DropReason, Expectation, Message, MessageState, Receipts, Settle, Settlement, Supersedes},
+    },
     Ref, Resource, Source,
 };
 
@@ -37,6 +42,8 @@ pub struct SweepReport {
     pub answered: usize,
     pub outcomes: usize,
     pub withdrawn: usize,
+    /// Pending messages withdrawn by the end of the convoy whose seat they were sent to.
+    pub convoy_ended: usize,
     pub expired: usize,
     pub undeliverable: usize,
     pub superseded: usize,
@@ -54,7 +61,15 @@ pub struct SweepReport {
 impl SweepReport {
     /// Whether the sweep settled or dropped anything.
     pub fn acted(&self) -> bool {
-        self.answered + self.outcomes + self.withdrawn + self.expired + self.undeliverable + self.superseded + self.reconciled > 0
+        self.answered
+            + self.outcomes
+            + self.withdrawn
+            + self.convoy_ended
+            + self.expired
+            + self.undeliverable
+            + self.superseded
+            + self.reconciled
+            > 0
     }
 
     fn due_at(&mut self, at: Timestamp, now: Timestamp) {
@@ -255,6 +270,7 @@ impl MessagePrimitives {
     /// - a reply in the replica settles an awaited reply;
     /// - an outcome observed to hold settles it;
     /// - a delivery condition observed not to hold withdraws it as turn-rules;
+    /// - a pending one to a seat of a convoy that ended is withdrawn by that convoy's end;
     /// - a passed deadline expires it, with the bound consumer's host's stream
     ///   watermark as `AppliedThrough` (a consumer homed here is applied through now);
     /// - an inbox left unbound past its threshold drops it as undeliverable.
@@ -347,6 +363,18 @@ impl MessagePrimitives {
                     }
                 }
             }
+            // Its seat's convoy ended: the end withdraws what that seat was never handed, on the
+            // ended launch's authority, at the message's own home (#3108).
+            if state == MessageState::Pending {
+                if let Some(convoy) = self.ended_seat(&spec.inbox)? {
+                    self.world().update(|world| world.authority.put(&Ref::new(convoy.as_str()), true));
+                    if drop_message(inbox, &name, DropReason::Withdrawn { by: convoy.clone(), authority: convoy }).await {
+                        report.convoy_ended += 1;
+                        continue;
+                    }
+                    index.refused(&name, "drop(its convoy ended)");
+                }
+            }
             if spec.deadline.is_some_and(|deadline| now > deadline) {
                 if drop_message(inbox, &name, DropReason::Expired).await {
                     report.expired += 1;
@@ -385,6 +413,38 @@ impl MessagePrimitives {
                 Ok(log
                     .lookup(&Ref::<Receipts>::new(message))
                     .and_then(|(_, rows)| rows.iter().next().map(|(receiver, transport)| (receiver.clone(), *transport))))
+            })
+            .map_err(|error| error.to_string())
+    }
+
+    /// The launch address of the ended convoy whose seat `inbox` is, read from the replica; `None`
+    /// when it names no seat, or a convoy holding the seat under that name is still open.
+    fn ended_seat(&self, inbox: &Address) -> Result<Option<Address>, String> {
+        let names = convoy_records(inbox);
+        if names.is_empty() {
+            return Ok(None);
+        }
+        self.service()
+            .with_store(|store| {
+                let mut read = store.read()?;
+                let mut ended = None;
+                for name in &names {
+                    for id in read.resolve_named(<Resource<Convoy> as Kind>::CODE, name)? {
+                        let Some(loaded) = read.load::<Resource<Convoy>>(id)? else { continue };
+                        let spec = loaded.value.spec();
+                        let seat = |role: &str| seat_address(&spec.project, &loaded.name, role).is_ok_and(|seat| &seat == inbox);
+                        if !spec.seats.iter().any(|row| seat(&row.record.role)) {
+                            continue;
+                        }
+                        match loaded.value.label() {
+                            ConvoyLabel::Delivered | ConvoyLabel::Abandoned | ConvoyLabel::Retired => {
+                                ended = launch_address(&spec.project, &loaded.name).ok();
+                            }
+                            _ => return Ok(None),
+                        }
+                    }
+                }
+                Ok(ended)
             })
             .map_err(|error| error.to_string())
     }

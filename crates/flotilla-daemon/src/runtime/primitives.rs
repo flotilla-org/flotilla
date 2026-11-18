@@ -811,14 +811,18 @@ fn awaited(awaiting: &std::sync::Mutex<BTreeSet<String>>, home: &str) -> bool {
 }
 
 /// The engine kinds whose commits delivery reads: messages, the consumer
-/// records that hold receipts, and the senders' awaiting records.
+/// records that hold receipts, the senders' awaiting records, and convoys,
+/// whose ends withdraw the messages pending to their seats.
 fn delivery_kinds() -> BTreeSet<flotilla_schema::KindCode> {
     use flotilla_schema::Kind;
     use flotilla_state_machines::{
-        machines::{agent_session::AgentSession, awaiting_reply::AwaitingReply, message::Message, person::Person, service::Service},
+        machines::{
+            agent_session::AgentSession, awaiting_reply::AwaitingReply, convoy::Convoy, message::Message, person::Person, service::Service,
+        },
         Resource,
     };
     BTreeSet::from([
+        Resource::<Convoy>::CODE,
         Resource::<Message>::CODE,
         Resource::<AgentSession>::CODE,
         Resource::<Person>::CODE,
