@@ -1303,13 +1303,13 @@ mod tests {
             submissions: vec![Submission {
                 reference: format!("cr/github.com/org/repo/{number}"),
                 metadata: BTreeMap::new(),
-                submitted_at: Utc::now(),
+                submitted_at: Some(Utc::now()),
                 verdict: None,
             }],
         };
         let convoys = backend.using::<Convoy>("ops");
         for (name, phase, number) in [("abandoned", ConvoyPhase::Abandoned, 42), ("landed", ConvoyPhase::Landed, 43)] {
-            let spec = ConvoySpec::builder().workflow_ref("dev".into()).role("coder".into()).build();
+            let spec = ConvoySpec::builder().workflow_ref("dev".into()).project_ref("flotilla".into()).role("coder".into()).build();
             let convoy = convoys.create(&InputMeta::builder().name(name.into()).build(), &spec).await.expect("convoy");
             let mut status = ConvoyStatus { phase, ..Default::default() };
             status.promises.entry("work".into()).or_default().insert("coder".into(), vec![promise(number, PromiseState::Submitted)]);

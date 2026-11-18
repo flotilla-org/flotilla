@@ -305,7 +305,7 @@ async fn an_abandoned_convoys_merged_pr_is_the_observers_verdict() {
         submission: Submission {
             reference: "cr/github.com/org/repo/1".into(),
             metadata: BTreeMap::new(),
-            submitted_at: chrono::Utc::now(),
+            submitted_at: Some(chrono::Utc::now()),
             verdict: None,
         },
     };
