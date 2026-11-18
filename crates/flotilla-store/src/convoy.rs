@@ -30,6 +30,18 @@ pub fn abandoned_convoys_query() -> crate::StoreQuery {
     }
 }
 
+/// The ended convoys still held, landed ones as well as abandoned and failed: the engine's views
+/// hold a launch until it retires, so a landed one listed may still hold a checkout to be
+/// released. The old store keeps every landed convoy, so only a reader of the engine's launches
+/// lists these.
+pub fn ended_convoys_query() -> crate::StoreQuery {
+    crate::StoreQuery {
+        field_values: BTreeMap::from([("status.phase".into(), ["Landed", "Failed", "Abandoned"].map(String::from).to_vec())]),
+        include_replicas: true,
+        ..Default::default()
+    }
+}
+
 /// Each named standing role's current generation: its newest live convoy, by the ConvoyEnsure name
 /// the convoy was ensured from. A role with no live generation is absent. Every host reads the same
 /// generations, so the answer needs no status of the ensure's own (#3108).

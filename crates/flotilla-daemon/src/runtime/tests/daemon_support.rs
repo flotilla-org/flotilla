@@ -349,7 +349,7 @@ pub(super) fn detection_registry(runner: Arc<dyn CommandRunner>) -> Arc<Provider
 
 /// The record name the observer writes for a stored `(service, scope, number)`
 /// change request spelling that needs no Forge directory.
-fn cr_name(service: &str, scope: &str, number: u64) -> String {
+pub(super) fn cr_name(service: &str, scope: &str, number: u64) -> String {
     flotilla_resources::address::record_name(
         &flotilla_resources::address::stored_change_request_address(service, scope, number, &[]).expect("change request address"),
     )

@@ -14,7 +14,19 @@ pub(super) enum CompletionAction {
         pushed: bool,
         untracked: bool,
         then: OnHold,
+        release: Release,
     },
+}
+
+/// When the checkout's release reaches its path.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(super) enum Release {
+    /// As soon as the convoy ends.
+    Prompt,
+    /// Only once the convoy has ended and the change request's observer has had its chance to
+    /// collect the observation: the path is unreadable until then, so each release attempt fails
+    /// and is retried.
+    AfterCollection,
 }
 
 /// What a person does about a checkout whose release is held.
@@ -171,8 +183,13 @@ pub(super) async fn run_stage4a_flow_reaches_running_and_completes_convoy(
         profile.host_id.clone(),
         profile.host_direct_environment_name(),
     ));
-    let controller_handles =
+    let mut controller_handles =
         spawn_controller_loops(Arc::clone(&state), &provisioning, NAMESPACE, ControllerSupervision::default(), RuntimeHealth::default());
+    // The convoys' change request demand, as the runtime keeps it beside its controllers.
+    let observation_daemon = Arc::clone(&daemon);
+    controller_handles.push(tokio::spawn(attributed(caller("change request demands"), async move {
+        observation_daemon.watch_change_request_convoy_demands(NAMESPACE).await;
+    })));
     // Startup realises the host's environment before work arrives. Nothing holds a host-direct
     // environment, so its realisation wakes no vessel: one placed before it waits for the resync.
     let host_environment = profile.host_direct_environment_name();
@@ -481,7 +498,7 @@ async fn release_after_change_request(
     repo_default_dir: &Path,
     completion: CompletionAction,
 ) -> ReleaseSeen {
-    let CompletionAction::ChangeRequest { state, pushed, untracked, then } = completion else {
+    let CompletionAction::ChangeRequest { state, pushed, untracked, then, release } = completion else {
         panic!("a change request completion");
     };
     let backend = daemon.resource_backend();
@@ -520,6 +537,8 @@ async fn release_after_change_request(
     if untracked {
         fs::write(Path::new(&checkout_path).join("left-over.pyc"), "test run output\n").expect("write untracked file");
     }
+    // The checkout's path is unreadable while it is to be released late.
+    let unreadable = (release == Release::AfterCollection).then(|| Unreadable::new(Path::new(&checkout_path)));
 
     record_successful_empty_branch_scan(daemon, convoy_name).await;
     let engine_path = daemon.convoy_engine_path();
@@ -569,6 +588,54 @@ async fn release_after_change_request(
         wait_until_with_timeout(Duration::from_secs(20), pr_open_again).await;
         let current = convoys.get(convoy_name).await.expect("convoy");
         engine.verdict(&current, "template/pr", false, "operator", "closed unmerged; retraction accepted").await.expect("retract");
+    }
+
+    if let Some(unreadable) = unreadable {
+        // The convoy ends while its checkout cannot be released.
+        wait_until_with_timeout(Duration::from_secs(20), || {
+            let convoys = convoys.clone();
+            async move {
+                convoys
+                    .get(convoy_name)
+                    .await
+                    .ok()
+                    .and_then(|convoy| convoy.status)
+                    .is_some_and(|status| status.phase == ConvoyPhase::Landed)
+            }
+        })
+        .await;
+        // The convoy demand watch takes in the convoy's end.
+        tokio::time::sleep(Duration::from_secs(1)).await;
+        // A waiter on the change request comes and goes, as the convoy's own leaf rows do as it
+        // lands: its demand released, the observer collects the observation unless something
+        // else still demands it.
+        let waiter = uuid::Uuid::new_v4();
+        let leaf = flotilla_protocol::Leaf {
+            address: flotilla_protocol::LeafAddress::ChangeRequest {
+                service: "github.com".into(),
+                scope: "flotilla-org/flotilla".into(),
+                number: 884,
+            },
+            field_path: ".state".into(),
+            operator: flotilla_protocol::LeafOperator::Equal,
+            literal: "Closed".into(),
+        };
+        let request =
+            flotilla_protocol::WaitSubscriptionRequest { namespace: NAMESPACE.into(), leaves: vec![leaf], freshness_demand: None };
+        daemon.subscribe_wait(waiter, request).await.expect("wait on the change request");
+        daemon.unsubscribe_waits(waiter).await;
+        let records = backend.clone().using::<flotilla_resources::ChangeRequest>(NAMESPACE);
+        let record = cr_name("github.com", "flotilla-org/flotilla", 884);
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(2);
+        while tokio::time::Instant::now() < deadline && records.get(&record).await.is_ok() {
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+        drop(unreadable);
+        // Its failed releases back off: a recheck tries it again now.
+        let mut rx = daemon.subscribe();
+        let recheck = CommandAction::CheckoutRecheck { checkout: checkout.checkout_name().to_owned() };
+        let id = daemon.execute(Command::builder().action(recheck).build()).await.expect("recheck the checkout");
+        assert_eq!(wait_for_command_result(&mut rx, id).await, CommandValue::Ok);
     }
 
     // A held release is told to a person, as teardown's attention about the checkout at its home,
@@ -644,6 +711,25 @@ async fn release_after_change_request(
         told,
         explained,
         still_told: told_about().await.len(),
+    }
+}
+
+/// A directory's parent made unsearchable, so the directory cannot be read, until dropped.
+struct Unreadable(PathBuf);
+
+impl Unreadable {
+    fn new(path: &Path) -> Self {
+        use std::os::unix::fs::PermissionsExt;
+        let parent = path.parent().expect("the checkout's parent").to_path_buf();
+        fs::set_permissions(&parent, fs::Permissions::from_mode(0o000)).expect("make the checkout unreadable");
+        Self(parent)
+    }
+}
+
+impl Drop for Unreadable {
+    fn drop(&mut self) {
+        use std::os::unix::fs::PermissionsExt;
+        let _ = fs::set_permissions(&self.0, fs::Permissions::from_mode(0o755));
     }
 }
 

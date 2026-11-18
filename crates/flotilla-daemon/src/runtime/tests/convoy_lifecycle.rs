@@ -776,6 +776,17 @@ async fn checkout_release_after_change_request(
     untracked: bool,
     then: OnHold,
 ) -> ReleaseSeen {
+    checkout_released(state, pushed, untracked, then, Release::Prompt).await
+}
+
+/// As [`checkout_release_after_change_request`], its release reaching the checkout as `release`.
+async fn checkout_released(
+    state: flotilla_resources::ObservedChangeRequestState,
+    pushed: bool,
+    untracked: bool,
+    then: OnHold,
+    release: Release,
+) -> ReleaseSeen {
     let temp = TempDir::new().expect("tempdir");
     let repo_default_dir = temp.path().join("flotilla-repos");
     let git_repo =
@@ -798,7 +809,7 @@ async fn checkout_release_after_change_request(
         daemon,
         config,
         repo_default_dir,
-        CompletionAction::ChangeRequest { state, pushed, untracked, then },
+        CompletionAction::ChangeRequest { state, pushed, untracked, then, release },
     )
     .await
     .expect("what became of the checkout")
@@ -811,6 +822,21 @@ async fn checkout_release_after_change_request(
 async fn a_merged_change_request_releases_its_checkout_as_landed() {
     let seen =
         checkout_release_after_change_request(flotilla_resources::ObservedChangeRequestState::Merged, false, false, OnHold::Nothing).await;
+    assert_eq!(seen.convoy, Some(ConvoyPhase::Landed), "{seen:?}");
+    assert_eq!(seen.landed, Some(true), "{seen:?}");
+    assert!(matches!(seen.reading, LifecycleReading::Released), "{seen:?}");
+    assert!(!seen.on_disk, "{seen:?}");
+    assert_eq!(seen.archives, 0, "a landed checkout is removed, not archived: {seen:?}");
+}
+
+// The convoy ends, its change request's observer has its chance to collect the observation, and
+// only then is the checkout released: the convoy's demand is held until the checkout it holds is
+// released, so the merged change request is still observed and the checkout is removed as landed.
+#[tokio::test]
+async fn a_checkout_released_after_its_convoy_ended_is_still_judged_against_its_merged_change_request() {
+    let seen =
+        checkout_released(flotilla_resources::ObservedChangeRequestState::Merged, false, false, OnHold::Nothing, Release::AfterCollection)
+            .await;
     assert_eq!(seen.convoy, Some(ConvoyPhase::Landed), "{seen:?}");
     assert_eq!(seen.landed, Some(true), "{seen:?}");
     assert!(matches!(seen.reading, LifecycleReading::Released), "{seen:?}");

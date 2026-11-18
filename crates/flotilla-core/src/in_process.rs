@@ -2375,6 +2375,8 @@ impl InProcessDaemon {
             Err(_) => reads,
         };
         self.lifecycle_reads.install(Arc::clone(&reads))?;
+        // A convoy's change request stays demanded until the checkouts it holds are released.
+        self.change_request_observer.install_lifecycle_reads(Arc::clone(&reads))?;
         // The old store's Clone and Environment reads are served from the engine's records.
         self.resource_backend.install_engine_records(Arc::new(flotilla_store::LifecycleViews::new(Arc::clone(&reads))));
         // The old store's TerminalSession, Vessel and Convoy reads are served from the engine's launches.
