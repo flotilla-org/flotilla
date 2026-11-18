@@ -288,6 +288,49 @@ async fn active_teardown_refuses_unset_or_failing_inspector() {
     }
 }
 
+// R4: landing evidence is judged by when its checkout was inspected, not when it is read. The gate
+// refuses an inspection older than the evidence's lifetime; an operator's delete of an ended convoy
+// asks for such a checkout afresh, once, and reads fresh evidence as it is.
+#[tokio::test]
+async fn landing_evidence_is_as_old_as_its_inspection() {
+    let (crew, backend, launch, held) = active_delete_fixture().await;
+    let inspector = Arc::new(FreshDeleteInspection(0.into(), Arc::clone(&held.engine.engine.checkouts.checkouts)));
+    let inspections = || inspector.0.load(std::sync::atomic::Ordering::SeqCst);
+    held.engine
+        .engine
+        .checkouts
+        .checkouts
+        .inspected(
+            &launch,
+            Inspection {
+                landed: Some(true),
+                landed_evidence: Some(Landed {
+                    change_request: 42,
+                    merged_at: Some(Utc::now()),
+                    target_ref: None,
+                    head_in_merged_head: true,
+                }),
+                ..Default::default()
+            },
+        )
+        .expect("inspection");
+    held.engine.end(&backend, &held.launch, ConvoyPhase::Failed).await;
+    crew.set_checkout_inspector(inspector.clone());
+    let convoy = held.convoy(&backend).await;
+    let checkouts = crew.held_checkouts(&convoy).await.expect("held");
+
+    crew.verify_convoy_teardown_gate_for_checkouts(&convoy, &checkouts, false).await.expect("fresh evidence");
+    crew.teardown("flotilla", &held.launch, false).await.expect("fresh evidence");
+    assert_eq!(inspections(), 0, "fresh evidence is read as it is");
+
+    held.clock.advance(31);
+    let error = crew.verify_convoy_teardown_gate_for_checkouts(&convoy, &checkouts, false).await.expect_err("stale evidence");
+    assert!(error.contains("checkout: Landed evidence is missing or stale"), "{error}");
+    assert_eq!(inspections(), 0, "the gate asks for no inspection");
+    crew.teardown("flotilla", &held.launch, false).await.expect("inspected afresh");
+    assert_eq!(inspections(), 1, "the delete asks for the stale checkout once");
+}
+
 // #3710: each manual Active-convoy delete forces one fresh checkout inspection,
 // including a second request inside the normal evidence freshness horizon.
 #[tokio::test]

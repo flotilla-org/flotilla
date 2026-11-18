@@ -1480,7 +1480,7 @@ impl CrewService {
         if convoy.status.as_ref().is_some_and(|status| status.phase == flotilla_resources::ConvoyPhase::Abandoned) {
             return Ok(());
         }
-        let mut checkout_list = self.held_checkouts(&convoy).await?;
+        let checkout_list = self.held_checkouts(&convoy).await?;
         if checkout_list.iter().any(|checkout| !checkout.ended())
             && convoy.status.as_ref().is_some_and(|status| status.phase == ConvoyPhase::Active)
         {
@@ -1490,15 +1490,74 @@ impl CrewService {
             })?;
             // Each live checkout is inspected afresh at its home before the gate reads it. Fail
             // closed: an unavailable inspection must not authorize deletion from an older one.
-            for checkout in checkout_list.iter().filter(|checkout| !checkout.ended()) {
-                inspector
-                    .inspect_now(namespace, checkout)
-                    .await
-                    .map_err(|error| format!("fresh inspection failed for checkout {}: {error}", checkout.checkout_name()))?;
-            }
-            checkout_list = self.held_checkouts(&convoy).await?;
+            let live = checkout_list.iter().filter(|checkout| !checkout.ended());
+            let (checkout_list, answered) = self.inspect_afresh(&*inspector, &convoy, &checkout_list, live, true).await?;
+            return self.judge_teardown_gate(&convoy, &checkout_list, &answered).await;
         }
-        self.verify_convoy_teardown_gate_for_checkouts(&convoy, &checkout_list, false).await
+        // Otherwise a live checkout whose inspection is older than the evidence's lifetime is asked
+        // for afresh when an inspector is wired; without one, the gate refuses the stale evidence.
+        // Only this operator's delete waits on an inspection: an answer has no deadline, and the
+        // gate's reconciler callers must not wait on a home that may not answer.
+        let Some(inspector) = self.checkout_inspector.read().expect("checkout inspector lock").clone() else {
+            return self.judge_teardown_gate(&convoy, &checkout_list, &BTreeSet::new()).await;
+        };
+        let now = self.clock.now();
+        let stale = checkout_list.iter().filter(|checkout| {
+            !checkout.ended()
+                && checkout.integration.as_ref().is_none_or(|integration| !integration.inspected_within(now, LANDING_EVIDENCE_TTL))
+        });
+        let (checkout_list, answered) = self.inspect_afresh(&*inspector, &convoy, &checkout_list, stale, false).await?;
+        self.judge_teardown_gate(&convoy, &checkout_list, &answered).await
+    }
+
+    /// Asks each of `asked`'s homes to inspect it now and returns `checkout_list` reread, with the
+    /// names of the checkouts whose inspection was answered. An answer is the inspection's own
+    /// evidence: a home writes an inspection only when its values change, so an answered one that
+    /// changed nothing is as fresh as the answer, whatever its record's time says. When `required`,
+    /// a failed inspection fails the call; otherwise its checkout stays unanswered, and the gate
+    /// judges the evidence it has, refusing it if it is stale. Either way an unavailable inspection
+    /// never authorizes anything from an older one.
+    async fn inspect_afresh<'a>(
+        &self,
+        inspector: &dyn crate::ports::CheckoutIntegrationInspector,
+        convoy: &ResourceObject<ResourceConvoy>,
+        checkout_list: &[CheckoutRecord],
+        asked: impl Iterator<Item = &'a CheckoutRecord>,
+        required: bool,
+    ) -> Result<(Vec<CheckoutRecord>, BTreeSet<String>), String> {
+        let mut answered = BTreeSet::new();
+        for checkout in asked {
+            match inspector.inspect_now(&convoy.metadata.namespace, checkout).await {
+                Ok(()) => {
+                    answered.insert(checkout.checkout_name().to_owned());
+                }
+                Err(error) if required => {
+                    return Err(format!("fresh inspection failed for checkout {}: {error}", checkout.checkout_name()))
+                }
+                Err(error) => {
+                    tracing::info!(convoy = %convoy.metadata.name, checkout = checkout.checkout_name(), %error, "a stale checkout's inspection failed; the gate judges the evidence it has")
+                }
+            }
+        }
+        if answered.is_empty() {
+            return Ok((checkout_list.to_vec(), answered));
+        }
+        let mut reread = self
+            .held_checkouts(convoy)
+            .await?
+            .into_iter()
+            .map(|checkout| (checkout.checkout_name().to_owned(), checkout))
+            .collect::<BTreeMap<_, _>>();
+        // A checkout the reread does not hold is judged as it was given, unanswered.
+        answered.retain(|name| reread.contains_key(name));
+        let checkout_list = checkout_list
+            .iter()
+            .map(|checkout| match answered.contains(checkout.checkout_name()) {
+                true => reread.remove(checkout.checkout_name()).unwrap_or_else(|| checkout.clone()),
+                false => checkout.clone(),
+            })
+            .collect();
+        Ok((checkout_list, answered))
     }
 
     async fn cascade_convoy_children(&self, namespace: &str, name: &str) -> Result<(), String> {
@@ -1512,6 +1571,8 @@ impl CrewService {
     }
 
     /// Gates teardown on the integration evidence of the convoy's checkouts, as the engine holds them.
+    /// It asks for no inspection: evidence inspected longer ago than its lifetime is refused, and a
+    /// checkout's release inspects it afresh before it ends.
     pub async fn verify_convoy_teardown_gate_for_checkouts(
         &self,
         convoy: &ResourceObject<ResourceConvoy>,
@@ -1521,6 +1582,17 @@ impl CrewService {
         if force {
             return Ok(());
         }
+        self.judge_teardown_gate(convoy, checkout_list, &BTreeSet::new()).await
+    }
+
+    /// Judges the convoy's checkouts' integration evidence: evidence is fresh when its inspection is
+    /// within the evidence's lifetime, or was `answered` for this judgement.
+    async fn judge_teardown_gate(
+        &self,
+        convoy: &ResourceObject<ResourceConvoy>,
+        checkout_list: &[CheckoutRecord],
+        answered: &BTreeSet<String>,
+    ) -> Result<(), String> {
         let namespace = &convoy.metadata.namespace;
         let name = &convoy.metadata.name;
         if convoy.status.as_ref().is_some_and(|status| status.phase == flotilla_resources::ConvoyPhase::Abandoned) {
@@ -1625,7 +1697,10 @@ impl CrewService {
             } else {
                 vec![("Clean", inspection.clean), ("Pushed", inspection.pushed), ("Landed", inspection.landed)]
             };
-            let fresh = integration.failing_since.is_none() && integration.confirmed_within(now, LANDING_EVIDENCE_TTL);
+            // Judged by when it was inspected, not when it is read: an unchanged inspection is
+            // not rewritten, so its record says nothing of a checkout changed since.
+            let fresh = integration.failing_since.is_none()
+                && (answered.contains(checkout_name) || integration.inspected_within(now, LANDING_EVIDENCE_TTL));
             let unjudged = required.iter().filter(|(_, judged)| judged.is_none()).map(|(label, _)| *label).collect::<Vec<_>>();
             if !fresh || !unjudged.is_empty() {
                 let stale = if fresh { unjudged } else { required.iter().map(|(label, _)| *label).collect() };
@@ -1689,7 +1764,7 @@ impl CrewService {
                 continue;
             };
             let fresh = checkout.integration.as_ref().is_some_and(|integration| {
-                integration.failing_since.is_none() && integration.confirmed_within(self.clock.now(), LANDING_EVIDENCE_TTL)
+                integration.failing_since.is_none() && integration.inspected_within(self.clock.now(), LANDING_EVIDENCE_TTL)
             });
             if fresh && checkout.inspection().is_some_and(|inspection| inspection.pushed == Some(true)) {
                 outcomes.push(

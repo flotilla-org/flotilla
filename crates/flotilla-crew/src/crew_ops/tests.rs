@@ -95,6 +95,27 @@ struct Held {
     session: String,
     /// The launches and crew ids of the convoys admitted before it.
     prelude: Vec<(String, String)>,
+    /// The crew service's clock, which a test may run ahead of the engine's.
+    clock: Arc<AheadClock>,
+}
+
+/// The system clock, `ahead` seconds on: what the crew service reads as now when time has passed
+/// since the engine recorded something.
+#[derive(Default)]
+struct AheadClock {
+    ahead: std::sync::atomic::AtomicI64,
+}
+
+impl AheadClock {
+    fn advance(&self, seconds: i64) {
+        self.ahead.fetch_add(seconds, Ordering::SeqCst);
+    }
+}
+
+impl flotilla_resources::Clock for AheadClock {
+    fn now(&self) -> chrono::DateTime<chrono::Utc> {
+        chrono::Utc::now() + chrono::Duration::seconds(self.ahead.load(Ordering::SeqCst))
+    }
 }
 
 impl Held {
@@ -293,6 +314,7 @@ async fn build_fixture(
         calls: AtomicUsize::new(0),
     });
     let reconciler: Arc<dyn WorkCredentialReconciler> = probe.clone();
+    let clock = Arc::new(AheadClock::default());
     let crew = Arc::new(
         CrewService::builder()
             .resource_backend(backend.clone())
@@ -301,7 +323,7 @@ async fn build_fixture(
             .lifecycle_reads(engine.reads())
             .vessel_seats(Arc::new(flotilla_store::EngineVesselSeats::new(engine.reads())))
             .work_credential_reconciler(RwLock::new(Some(reconciler)))
-            .clock(Arc::new(SystemClock))
+            .clock(Arc::clone(&clock) as Arc<dyn flotilla_resources::Clock>)
             .provisioning_namespace(namespace)
             .config(config)
             .host_name(HostName::new("host"))
@@ -368,7 +390,7 @@ async fn build_fixture(
         CrewWorkPhase::Interrupted => engine.engine.terminals.lost(&session, "pool lost the session"),
         other => panic!("no fixture for a {other:?} coder"),
     }
-    let held = Held { _config: config_dir, engine, launch, vessel, session, prelude: admitted };
+    let held = Held { _config: config_dir, engine, launch, vessel, session, prelude: admitted, clock };
     assert_eq!(held.convoy(&backend).await.status.expect("status").crew_work["work"]["coder"].phase, phase);
     (crew, backend, probe, held)
 }
