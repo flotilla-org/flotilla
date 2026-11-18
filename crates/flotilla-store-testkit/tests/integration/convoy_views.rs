@@ -300,6 +300,11 @@ impl ConvoyRecords for Convoys {
     fn holds(&self, _: &str, _: Option<&str>) -> Result<Option<flotilla_resources::convoy_records::LaunchHolds>, String> {
         unreachable!("the views read no holds")
     }
+    fn newest_holding(&self, role: &str, project: Option<&str>) -> Result<Option<ConvoyRecord>, String> {
+        let held =
+            |record: &ConvoyRecord| record.role() == role && Some(record.project.as_str()).filter(|project| !project.is_empty()) == project;
+        Ok(self.records().into_iter().filter(held).max_by_key(|record| record.admitted_at))
+    }
     // A listing leaves retired launches out, as the engine's does.
     fn at(&self, home: &str) -> Result<ConvoyListing, String> {
         let records = self.records().into_iter().filter(|record| record.home == home && !record.retired).collect();

@@ -1254,6 +1254,46 @@ mod tests {
         assert_eq!(response.phase, "Failed");
     }
 
+    // Behaviour (#3108 retirement): a convoy that failed at its start, and has retired, is still
+    // explained by its plain name, with how it ended; its role's address names no convoy.
+    #[tokio::test]
+    async fn a_retired_convoy_is_explained_by_its_plain_name() {
+        use flotilla_protocol::commands::ExplainedHolds;
+
+        let fixture = ProjectionFixture::new();
+        // An earlier convoy of the name, abandoned and retired, is not the one it names.
+        let mut newest = String::new();
+        for phase in [ConvoyPhase::Abandoned, ConvoyPhase::Failed] {
+            newest = fixture
+                .admit(
+                    &flotilla_resources::convoy_address::convoy_record_name(),
+                    ConvoySpec::builder().workflow_ref("review".to_string()).role("start-fail".to_string()).build(),
+                    ConvoyStatus { phase, ..flotilla_engine_convoys_testkit::single_agent("coder") },
+                )
+                .await;
+            let now = flotilla_schema::Timestamp::from_datetime(&Utc::now());
+            let retired = fixture.home.convoys.convoys().retire(&newest, now).expect("retire");
+            assert_eq!(retired, flotilla_engine_convoys::convoys::Retirement::Retired);
+        }
+
+        // A verb on one convoy resolves the plain name to its newest launch.
+        assert_eq!(flotilla_store::resolve_convoy_record(&fixture.backend, "flotilla", "start-fail@flotilla").await, Ok(newest));
+        // Its project is its namespace, as admission gives a convoy of no project ref.
+        let explanation =
+            fixture.projections().explain_convoy("flotilla", "start-fail@flotilla").await.expect("explained by its plain name");
+        assert_eq!(explanation.phase, "Failed");
+        assert_eq!(explanation.message.as_deref(), Some("failed"), "its end");
+        assert_eq!(explanation.held_by, Some(ExplainedHolds::Retired));
+        let address = flotilla_address::Address::project("flotilla")
+            .and_then(|project| project.child(flotilla_address::Kind::Convoy, "start-fail"))
+            .expect("address");
+        assert_eq!(
+            flotilla_store::subject_record_name(&fixture.backend, "flotilla", &address).await.expect("read"),
+            None,
+            "a role address names no retired convoy"
+        );
+    }
+
     // Behaviour (#3108 retirement): explain says what holds a launch from retiring, by kind and
     // what it names, while it is open and once it ends; then that it retired.
     #[tokio::test]

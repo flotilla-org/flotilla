@@ -220,6 +220,20 @@ impl<T: Resource> DefinitionResolver<T> {
         Some(self.reads(&records.home(), copies, Some(name)))
     }
 
+    /// The newest record holding `labels`, one only a read by name finds included; `None` where
+    /// the port reads none so.
+    pub(crate) async fn engine_newest_labelled(
+        &self,
+        labels: &BTreeMap<String, String>,
+    ) -> Option<Result<Option<ReadResourceObject<T>>, ResourceError>> {
+        let records = self.records()?;
+        if !self.holds_engine_records() {
+            return None;
+        }
+        let newest = port_reads::newest_labelled(&*records, labels).await?;
+        Some(newest.map_err(ResourceError::other).map(|newest| newest.map(|record| self.read(&records.home(), record))))
+    }
+
     /// [`Self::engine_copies`] of those a listing holds: none that only a read by name finds.
     pub(crate) async fn engine_listed_copies(&self, name: &str) -> Option<Result<Vec<ReadResourceObject<T>>, ResourceError>> {
         let records = self.records()?;

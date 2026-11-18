@@ -622,6 +622,10 @@ pub trait ConvoyRecords: Send + Sync {
     /// What holds launch `name` held at `home`, or at this home when `None`, from retiring; none
     /// when no such launch is held.
     fn holds(&self, name: &str, home: Option<&str>) -> Result<Option<LaunchHolds>, String>;
+    /// The newest launch, at any home this store holds and retired or not, that holds `role` in
+    /// `project`, or in no project when `None`: what a plain name names once no live or unretired
+    /// launch answers for it. A launch that cannot be read is passed over.
+    fn newest_holding(&self, role: &str, project: Option<&str>) -> Result<Option<ConvoyRecord>, String>;
     /// Every launch held at `home`; one that cannot be read is listed as unreadable.
     fn at(&self, home: &str) -> Result<ConvoyListing, String>;
     /// Every launch at every home this store holds; one that cannot be read is listed as

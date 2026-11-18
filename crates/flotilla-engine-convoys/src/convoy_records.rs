@@ -175,6 +175,45 @@ impl ConvoyRecords for EngineConvoyRecords {
         })
     }
 
+    fn newest_holding(&self, role: &str, project: Option<&str>) -> Result<Option<ConvoyRecord>, String> {
+        let homes = self.service.homes();
+        self.read(&format!("the newest launch holding {role}"), |read| {
+            // No index names a launch by its role: each launch's admission is read, and only the
+            // one chosen is read whole.
+            let mut newest: Option<(DateTime<Utc>, ResourceId)> = None;
+            for home in &homes {
+                let mut after = None;
+                loop {
+                    let page = read.scan::<Resource<Convoy>>(home, after, PAGE)?;
+                    for id in page.ids {
+                        let Some(loaded) = read.load::<Resource<Convoy>>(id)? else { continue };
+                        let spec = loaded.value.spec();
+                        if spec.project.get(AddressKind::Project).filter(|project| !project.is_empty()) != project {
+                            continue;
+                        }
+                        let Ok(admission) = AdmissionDocument::decode(loaded.value.name(), spec.admission.value().bytes()) else {
+                            continue;
+                        };
+                        if admission.ensure_admission.as_ref().map_or(admission.role.as_str(), |ensure| ensure.role.as_str()) != role {
+                            continue;
+                        }
+                        let admitted = read.creation_time(id)?.to_datetime();
+                        if newest.as_ref().is_none_or(|(at, _)| admitted > *at) {
+                            newest = Some((admitted, id));
+                        }
+                    }
+                    after = page.next;
+                    if after.is_none() {
+                        break;
+                    }
+                }
+            }
+            let Some((_, id)) = newest else { return Ok(None) };
+            let Some(loaded) = read.load::<Resource<Convoy>>(id)? else { return Ok(None) };
+            Ok(entry(read, &self.stalls, loaded, Retired::Read)?.and_then(Result::ok))
+        })
+    }
+
     fn at(&self, home: &str) -> Result<ConvoyListing, String> {
         self.read(&format!("at {home}"), |read| Self::scan(read, &self.stalls, home))
     }

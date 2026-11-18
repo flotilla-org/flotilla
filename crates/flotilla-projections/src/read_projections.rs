@@ -1316,6 +1316,10 @@ impl ReadProjections<'_> {
                 .map_err(|error| error.to_string())?;
             convoy_sources.items.extend(named.items);
         }
+        // A plain name whose launches have all retired names its newest one.
+        if convoy_name.select(&convoy_sources.items)?.is_none() {
+            convoy_sources.items.extend(convoy_name.newest_launch(self.backend, namespace).await?);
+        }
         let convoy_source = convoy_name.select(&convoy_sources.items)?.ok_or_else(|| format!("no convoy matches `{convoy_name}`"))?;
         // With the engine holding the convoy, the promises explained are the engine's (#3587 layer 8).
         let convoy = flotilla_resources::convoy::engine::viewed_read(self.convoy_engine, convoy_source)?;

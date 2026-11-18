@@ -818,6 +818,27 @@ impl KindRecords<Convoy> for ConvoyViews {
         Ok(copies)
     }
 
+    /// The newest launch holding the role `labels` name, in the project they name or in none,
+    /// a retired one with how it ended: a plain name's last resort. Labels other than those two
+    /// select nothing here.
+    async fn newest_labelled(&self, labels: &BTreeMap<String, String>) -> Option<Result<Option<Record<Convoy>>, String>> {
+        use flotilla_resources::labels::{PROJECT_LABEL, ROLE_LABEL};
+        let role = labels.get(ROLE_LABEL)?.clone();
+        if labels.keys().any(|label| label != ROLE_LABEL && label != PROJECT_LABEL) {
+            return None;
+        }
+        let project = labels.get(PROJECT_LABEL).cloned();
+        let newest = match self.blocking(move |reads| reads.convoys()?.newest_holding(&role, project.as_deref())).await {
+            Ok(newest) => newest,
+            Err(error) => return Some(Err(error.to_string())),
+        };
+        let Some(record) = newest else { return Some(Ok(None)) };
+        Some(match self.stored(&record.name, Some(&record.home), BTreeSet::new()).await {
+            Ok(views) => Ok(views.into_iter().next().map(|view| view_record(view, record.home.clone()))),
+            Err(error) => Err(error.to_string()),
+        })
+    }
+
     /// The launches of the name the views hold: what a reader of the listing holds of it, never
     /// a retired one composed from the store.
     async fn sources_named(&self, name: &str) -> Result<Vec<Record<Convoy>>, String> {

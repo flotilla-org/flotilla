@@ -395,6 +395,9 @@ impl flotilla_resources::convoy_records::ConvoyRecords for Launches {
     fn holds(&self, _: &str, _: Option<&str>) -> Result<Option<flotilla_resources::convoy_records::LaunchHolds>, String> {
         unreachable!("the sweep lists every launch")
     }
+    fn newest_holding(&self, _: &str, _: Option<&str>) -> Result<Option<flotilla_resources::convoy_records::ConvoyRecord>, String> {
+        unreachable!("the sweep lists every launch")
+    }
     fn at(&self, _: &str) -> Result<flotilla_resources::convoy_records::ConvoyListing, String> {
         unreachable!("the sweep lists every launch")
     }

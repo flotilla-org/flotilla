@@ -147,9 +147,41 @@ impl<'a> ConvoyName<'a> {
         Ok(candidates)
     }
 
-    /// The convoy this name answers with in `namespace`, read through one indexed query; where
-    /// that selects none, the record of the name read by name, which gives a retired one too.
+    /// The convoy this plain name answers with in `namespace`: [`Self::lookup_address`]'s, else
+    /// [`Self::newest_launch`], so a name whose launches have all retired still names its last.
     pub async fn lookup(
+        &self,
+        backend: &crate::ResourceBackend,
+        namespace: &str,
+    ) -> Result<Option<flotilla_resources::ReadResourceObject<flotilla_resources::Convoy>>, String> {
+        match self.lookup_address(backend, namespace).await? {
+            Some(found) => Ok(Some(found)),
+            None => self.newest_launch(backend, namespace).await,
+        }
+    }
+
+    /// The newest launch holding this name's role in its project, a retired one included: what a
+    /// plain name names once no live or unretired launch answers for it.
+    pub async fn newest_launch(
+        &self,
+        backend: &crate::ResourceBackend,
+        namespace: &str,
+    ) -> Result<Option<flotilla_resources::ReadResourceObject<flotilla_resources::Convoy>>, String> {
+        let mut labels = BTreeMap::from([(flotilla_resources::ROLE_LABEL.to_owned(), self.name.to_owned())]);
+        if let Some(project) = self.project {
+            labels.insert(flotilla_resources::PROJECT_LABEL.to_owned(), project.to_owned());
+        }
+        backend
+            .including_replicas::<flotilla_resources::Convoy>(namespace)
+            .newest_labelled(&labels)
+            .await
+            .map_err(|error| error.to_string())
+    }
+
+    /// What a convoy address names in `namespace`, read through one indexed query: a live or
+    /// unretired holder of the role, never a retired one; where that selects none, the record of
+    /// the name read by name, which gives a retired one too.
+    pub async fn lookup_address(
         &self,
         backend: &crate::ResourceBackend,
         namespace: &str,
@@ -259,7 +291,7 @@ pub async fn subject_record_name(
     address: &flotilla_address::Address,
 ) -> Result<Option<String>, String> {
     if address.kind() == flotilla_address::Kind::Convoy {
-        let convoy = ConvoyName::of(address).lookup(backend, namespace).await?;
+        let convoy = ConvoyName::of(address).lookup_address(backend, namespace).await?;
         return Ok(convoy.map(|convoy| convoy.object.metadata.name));
     }
     Ok(flotilla_address::record_name(address))

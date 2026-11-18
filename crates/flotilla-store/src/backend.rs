@@ -425,6 +425,15 @@ impl<T: Resource> ReplicaReadResolver<T> {
         self.get_all(name).await
     }
 
+    /// The newest record at any home whose labels hold `labels`, one only a read by name finds
+    /// included (a retired convoy); none where the engine does not serve the kind so.
+    pub async fn newest_labelled(&self, labels: &BTreeMap<String, String>) -> Result<Option<ReadResourceObject<T>>, ResourceError> {
+        if T::REPLICATION_CLASS == crate::ReplicationClass::Definitions {
+            return Ok(None);
+        }
+        self.backend.definitions::<T>(&self.namespace).engine_newest_labelled(labels).await.unwrap_or(Ok(None))
+    }
+
     /// Read every visible provenance for one name without listing the namespace.
     pub async fn get_all(&self, name: &str) -> Result<ReadResourceList<T>, ResourceError> {
         if let Some(reads) = self.engine_copies(name).await {

@@ -66,6 +66,15 @@ pub(crate) async fn sources_named<R: Resource>(records: &dyn KindRecords<R>, nam
     counted(ReadShape::Keyed, records.sources_named(name).await)
 }
 
+/// The newest record holding `labels`, retired ones included, where the port reads them so.
+pub(crate) async fn newest_labelled<R: Resource>(
+    records: &dyn KindRecords<R>,
+    labels: &std::collections::BTreeMap<String, String>,
+) -> Option<Result<Option<Record<R>>, String>> {
+    let newest = records.newest_labelled(labels).await?;
+    Some(counted(ReadShape::WholeKind, newest.map(|newest| newest.into_iter().collect())).map(|mut newest| newest.pop()))
+}
+
 /// The open records addressed to `receiver`, where the port keeps them indexed.
 pub(crate) async fn open_to<R: Resource>(records: &dyn KindRecords<R>, receiver: &str) -> Option<Result<Vec<Record<R>>, String>> {
     let open = records.open_to(receiver).await?;

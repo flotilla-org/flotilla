@@ -370,6 +370,11 @@ pub trait KindRecords<R: crate::Resource>: Send + Sync + std::fmt::Debug {
     async fn sources_named(&self, name: &str) -> Result<Vec<Record<R>>, String> {
         self.copies(name).await
     }
+    /// The newest record at any home whose labels hold `labels`, one that only a read by name
+    /// finds included (a retired convoy); `None` when the port reads none so.
+    async fn newest_labelled(&self, _labels: &BTreeMap<String, String>) -> Option<Result<Option<Record<R>>, String>> {
+        None
+    }
     /// Every home's open record addressed to `receiver`, through the port's own index; `None`
     /// when the port keeps none, and readers filter [`KindRecords::sources`].
     async fn open_to(&self, _receiver: &str) -> Option<Result<Vec<Record<R>>, String>> {
