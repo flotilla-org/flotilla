@@ -1225,3 +1225,49 @@ async fn a_peer_handoff_leaves_its_receivers_stall_for_guidance() {
     assert_eq!(stall(&status), Some(stalled), "a peer's turn is not guidance: the stall stays as it was");
     assert_eq!(status.crew_work["work"]["coder"].phase, CrewWorkPhase::Stalled);
 }
+
+// d10's 58 escalations left awaiting the governor: a stall the operator's resume ends withdraws
+// its supervision's awaiting record, and so the supervision message the governor holds.
+#[tokio::test]
+async fn a_stall_resumed_by_the_operator_withdraws_its_escalation() {
+    use flotilla_engine_messages::sweep::OpenMessages;
+    use flotilla_protocol::{CrewSupervisionAction, StallReason};
+    let (crew, _backend, probe, held) = fixture(CrewWorkPhase::Working).await;
+    probe.fail.store(false, Ordering::SeqCst);
+    crew.set_turn_delivery_actuator(Arc::new(CrewTurnDeliveryActuator { crew: Arc::downgrade(&crew) })).await;
+    held.admit_crewed("governor", "governor", "watch", "governor", "governor-session").await;
+    let context = CrewCommandContext::builder().convoy(held.launch.clone()).vessel_ref(held.vessel.clone()).role("coder".into()).build();
+    crew.stall(&context, StallReason::Other, None, "a command kept failing".into()).await.expect("the coder stalls");
+    crew.reconcile_crew_stalls_once("flotilla").await.expect("judge");
+    let primitives = held.messages().primitives();
+    let subject = primitives.roles("flotilla").await.expect("roles").stall_subject(&held.receiver("work", "coder")).expect("subject");
+    assert!(primitives.awaiting().stalled(&subject).expect("read"), "the coder's supervision awaits a reply");
+    let escalations = || async {
+        let views = held.messages().views().await.expect("messages");
+        views.into_iter().map(|read| read.object).filter(|message| message.spec.relation == MessageRelation::Supervisor).collect::<Vec<_>>()
+    };
+    let sent = escalations().await;
+    assert_eq!(sent.len(), 1, "{sent:?}");
+    assert!(!sent[0].status.as_ref().is_some_and(|status| status.phase.is_terminal()), "{sent:?}");
+    let mut open = OpenMessages::default();
+    held.messages().sweep(&mut open).await.expect("sweep");
+
+    let principal = PrincipalRef::implicit_for_namespace("flotilla");
+    crew.supervise(CrewSupervisionRequest {
+        namespace: "flotilla",
+        convoy_name: &held.launch,
+        vessel: "work",
+        role: "coder",
+        operation: CrewSupervisionAction::Resume,
+        message: "Carry on.",
+        actor_crew_id: None,
+        principal: Some(&principal),
+    })
+    .await
+    .expect("the operator's resume");
+    crew.reconcile_crew_stalls_once("flotilla").await.expect("judge");
+    assert!(!primitives.awaiting().stalled(&subject).expect("read"), "the resumed stall's record is withdrawn");
+    assert_eq!(held.messages().sweep(&mut open).await.expect("sweep").sender_withdrew, 1);
+    let withdrawn = escalations().await;
+    assert!(withdrawn[0].status.as_ref().is_some_and(|status| status.phase.is_terminal()), "the escalation is withdrawn: {withdrawn:?}");
+}

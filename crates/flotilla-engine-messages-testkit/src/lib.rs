@@ -4,7 +4,12 @@
 
 use std::sync::{Arc, RwLock};
 
-use flotilla_engine_messages::{records::MessageRecords, roles::FleetRoles, MessagePrimitives};
+use flotilla_engine_messages::{
+    records::MessageRecords,
+    roles::FleetRoles,
+    sweep::{OpenMessages, SweepReport},
+    MessagePrimitives,
+};
 use flotilla_inbox::InboxBackend;
 use flotilla_messaging::{EngineMessages, Intent};
 use flotilla_resources::{
@@ -105,6 +110,11 @@ impl EngineMessagesHome {
     /// resource verb, each then read in the inbox it names.
     pub async fn views(&self) -> Result<Vec<ReadResourceObject<OldMessage>>, ResourceError> {
         views(&self.primitives, &self.backend, &self.namespace).await
+    }
+
+    /// One sweep of this home's open messages, now, on from what `open` followed.
+    pub async fn sweep(&self, open: &mut OpenMessages) -> Result<SweepReport, String> {
+        self.primitives.sweep(&self.namespace, Timestamp::from_datetime(&chrono::Utc::now()), open).await
     }
 
     /// The path as the crew's Message port.

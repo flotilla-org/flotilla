@@ -16,6 +16,7 @@ use flotilla_resources::convoy::engine::{convoy_records, launch_address, seat_ad
 use flotilla_schema::{reads::carry, Kind, Timestamp};
 use flotilla_state_machines::{
     machines::{
+        awaiting_reply::{AwaitingReply, AwaitingReplyState},
         convoy::{Convoy, ConvoyLabel},
         message::{Deliver, DropReason, Expectation, Message, MessageState, Receipts, Settle, Settlement, Supersedes},
     },
@@ -32,6 +33,9 @@ pub struct OpenMessages {
     open: BTreeSet<String>,
     replied: BTreeSet<String>,
     superseded: BTreeMap<String, String>,
+    /// Open messages here whose sender withdrew its awaiting record, at whichever home it is
+    /// homed: the sender waits no longer, so the message is withdrawn by it.
+    withdrawn: BTreeMap<String, Address>,
     /// Consecutive refused sweeps per open message, for a warning when one persists.
     refusals: BTreeMap<String, u32>,
 }
@@ -47,6 +51,8 @@ pub struct SweepReport {
     pub expired: usize,
     pub undeliverable: usize,
     pub superseded: usize,
+    /// Messages whose sender withdrew its awaiting record: a stall that ended, say.
+    pub sender_withdrew: usize,
     /// Receipts already committed whose `deliver` had not been recorded.
     pub reconciled: usize,
     /// The earliest time after the sweep's `now` that an open message's
@@ -68,6 +74,7 @@ impl SweepReport {
             + self.expired
             + self.undeliverable
             + self.superseded
+            + self.sender_withdrew
             + self.reconciled
             > 0
     }
@@ -166,12 +173,26 @@ impl OpenMessages {
                     self.cursors.insert(home.clone(), through);
                 }
                 Some(mut cursor) => loop {
-                    let (last, messages) = primitives
+                    let (last, messages, withdrawals) = primitives
                         .service
                         .with_store(|store| {
                             let mut read = store.read()?;
                             let events = read.changes_since(home, cursor, 256)?;
                             let last = events.last().map(|event| event.home_seq);
+                            let records: BTreeSet<_> = events
+                                .iter()
+                                .filter(|event| event.kind == Resource::<AwaitingReply>::CODE)
+                                .map(|event| event.name.clone())
+                                .collect();
+                            let mut withdrawals = Vec::new();
+                            for name in records {
+                                let Some(id) = read.resolve(Resource::<AwaitingReply>::CODE, &name, home)? else { continue };
+                                let Some(loaded) = read.load::<Resource<AwaitingReply>>(id)? else { continue };
+                                let record = loaded.value;
+                                if matches!(record.state(), AwaitingReplyState::Withdrawn { .. }) && record.spec().message.home == own {
+                                    withdrawals.push((record.spec().message.name.clone(), record.spec().sender.clone()));
+                                }
+                            }
                             let names: BTreeSet<_> = events
                                 .iter()
                                 .filter(|event| event.kind == Resource::<Message>::CODE)
@@ -185,10 +206,11 @@ impl OpenMessages {
                                 };
                                 messages.push((name, message));
                             }
-                            Ok((last, messages))
+                            Ok((last, messages, withdrawals))
                         })
                         .map_err(|error| error.to_string())?;
                     let Some(last) = last else { break };
+                    self.withdrawn.extend(withdrawals);
                     for (name, message) in messages {
                         match message {
                             Some(message) => self.observe_message(primitives, &own, home, message)?,
@@ -205,6 +227,7 @@ impl OpenMessages {
         let open = &self.open;
         self.replied.retain(|name| open.contains(name));
         self.superseded.retain(|name, _| open.contains(name));
+        self.withdrawn.retain(|name, _| open.contains(name));
         self.refusals.retain(|name, _| open.contains(name));
         Ok(())
     }
@@ -258,6 +281,7 @@ impl OpenMessages {
         self.open.remove(name);
         self.replied.remove(name);
         self.superseded.remove(name);
+        self.withdrawn.remove(name);
         self.refusals.remove(name);
     }
 }
@@ -271,6 +295,8 @@ impl MessagePrimitives {
     /// - an outcome observed to hold settles it;
     /// - a delivery condition observed not to hold withdraws it as turn-rules;
     /// - a pending one to a seat of a convoy that ended is withdrawn by that convoy's end;
+    /// - one whose sender withdrew the record awaiting it, as when the stall it supervised
+    ///   ended, is withdrawn by its sender;
     /// - a passed deadline expires it, with the bound consumer's host's stream
     ///   watermark as `AppliedThrough` (a consumer homed here is applied through now);
     /// - an inbox left unbound past its threshold drops it as undeliverable.
@@ -320,6 +346,16 @@ impl MessagePrimitives {
                         Err(error) => tracing::warn!(message = %name, %newer, %error, "a superseded message stays live; retrying"),
                     }
                 }
+            }
+            // Its sender withdrew the record awaiting it, so nothing waits on it: withdrawn by the
+            // sender, on its own authority.
+            if let Some(sender) = index.withdrawn.get(&name).cloned() {
+                self.world().update(|world| world.authority.put(&Ref::new(sender.as_str()), true));
+                if drop_message(inbox, &name, DropReason::Withdrawn { by: sender.clone(), authority: sender }).await {
+                    report.sender_withdrew += 1;
+                    continue;
+                }
+                index.refused(&name, "drop(its sender withdrew)");
             }
             let applied = match state.receiver() {
                 Some(receiver) if receiver.host != self.home() => {
