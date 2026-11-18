@@ -1507,10 +1507,67 @@ fn checkout_observation_prefers_replica_status(tc: hegel::TestCase) {
             .replace(&remote_records.list().await.unwrap(), chrono::Utc::now())
             .await
             .unwrap();
-        let runtime = CheckoutControllerRuntime::new(Arc::new(NoCommands), None, Some(home.including_replicas::<ChangeRequest>(NAMESPACE)));
+        let runtime =
+            CheckoutControllerRuntime::new(Arc::new(NoCommands), None, Some(ChangeRequestObservations::new(home.clone(), NAMESPACE)));
         let observed = runtime.observed_change_request_of("https://github.com/flotilla-org/flotilla", "3556").await.unwrap();
         assert_eq!(observed.and_then(|status| status.state.value), Some(ObservedChangeRequestState::Merged));
     });
+}
+
+// A change request on a declared Forge is stored under the forge's id, not its URL host: a
+// checkout's repository URL, in any of the Forge's spellings, finds it through the Forge, and the
+// same owner, repository and number on another forge is another change request.
+#[tokio::test]
+async fn checkout_observation_finds_a_declared_forges_change_request() {
+    use flotilla_resources::{
+        ChangeRequestReviewObservation, ChangeRequestSpec, ForgeKind, ForgeSpec, InputMeta, Observation, ObservedChangeRequestState,
+    };
+    let home = ResourceBackend::new(InMemoryBackend::default());
+    let forge = ForgeSpec::builder()
+        .forge_id("lab".to_string())
+        .kind(ForgeKind::Forgejo)
+        .hosts(BTreeSet::from(["forgejo-manchego".to_string(), "forgejo.lab.flotilla.work".to_string()]))
+        .https_url("https://forgejo.lab.flotilla.work".to_string())
+        .git_ssh_host("forgejo.lab.flotilla.work".to_string())
+        .build();
+    home.using::<flotilla_resources::Forge>(NAMESPACE).create(&InputMeta::builder().name("lab".into()).build(), &forge).await.unwrap();
+    let records = home.using::<ChangeRequest>(NAMESPACE);
+    let observed_at = chrono::Utc::now();
+    for (service, state) in [("lab", ObservedChangeRequestState::Merged), ("github.com", ObservedChangeRequestState::Open)] {
+        let name = flotilla_resources::address::record_name(
+            &flotilla_resources::address::stored_change_request_address(service, "robert/engine-trial", 4, std::slice::from_ref(&forge))
+                .unwrap(),
+        )
+        .unwrap();
+        let spec = ChangeRequestSpec::builder()
+            .service(service.into())
+            .scope("robert/engine-trial".into())
+            .number(4)
+            .observing_authority("observer".into())
+            .build();
+        let created = records.create(&InputMeta::builder().name(name.clone()).build(), &spec).await.unwrap();
+        let status = ChangeRequestStatus {
+            title: Default::default(),
+            author: Default::default(),
+            review_decision: Default::default(),
+            review_requested_from_owner: Default::default(),
+            state: Observation::known(state, observed_at),
+            head_sha: Observation::known("head".into(), observed_at),
+            checks: Observation::unknown(observed_at),
+            review: ChangeRequestReviewObservation { actionable_at_head: Observation::unknown(observed_at) },
+            mergeable: Observation::unknown(observed_at),
+        };
+        records.update_status(&name, &created.metadata.resource_version, &status).await.unwrap();
+    }
+    let runtime =
+        CheckoutControllerRuntime::new(Arc::new(ProcessCommandRunner), None, Some(ChangeRequestObservations::new(home, NAMESPACE)));
+    let state = |url: &'static str| {
+        let runtime = &runtime;
+        async move { runtime.observed_change_request_of(url, "4").await.unwrap().and_then(|status| status.state.value) }
+    };
+    assert_eq!(state("https://forgejo.lab.flotilla.work/robert/engine-trial").await, Some(ObservedChangeRequestState::Merged));
+    assert_eq!(state("https://forgejo-manchego/robert/engine-trial.git").await, Some(ObservedChangeRequestState::Merged));
+    assert_eq!(state("https://github.com/robert/engine-trial").await, Some(ObservedChangeRequestState::Open));
 }
 
 // #3340: real controller-runtime mapping retains both the archive and every

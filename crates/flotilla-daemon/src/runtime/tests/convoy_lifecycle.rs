@@ -615,11 +615,8 @@ async fn checkout_authority_observes_replicated_landing_and_convoy_authority_set
     records.update_status(&record.metadata.name, &record.metadata.resource_version, &status).await.expect("replicated head");
     // Checkout host B inspects its checkout against the change request the convoy binds, as its
     // Checkout controller does, and records what it found.
-    let inspector = CheckoutControllerRuntime::new(
-        runner,
-        Some(vcs),
-        Some(checkout_host.including_replicas::<flotilla_resources::ChangeRequest>(NAMESPACE)),
-    );
+    let inspector =
+        CheckoutControllerRuntime::new(runner, Some(vcs), Some(ChangeRequestObservations::new(checkout_host.clone(), NAMESPACE)));
     let observed = inspector
         .inspect_at(
             &git_repo.path().display().to_string(),
@@ -786,6 +783,90 @@ fn crew_provisioning_recovers_lost_session_after_in_process_daemon_restart_and_r
         .expect("test thread")
         .join()
         .expect("test thread completed");
+}
+
+// The daemon's Checkout controller judges a released checkout landed against its change request's
+// replicated observation. On a Forgejo forge that record is stored under the forge's id, which the
+// checkout's repository URL reaches only through the declared Forge.
+#[tokio::test]
+async fn the_checkout_controller_finds_a_forgejo_change_request_landed() {
+    let temp = TempDir::new().expect("tempdir");
+    fs::write(temp.path().join("daemon.toml"), "machine_id = \"forgejo-landing-test\"\n").expect("daemon config");
+    let config = Arc::new(ConfigStore::with_base(temp.path()));
+    let daemon = in_memory_daemon(Vec::new(), Arc::clone(&config)).await;
+    engine_environments(&daemon);
+    daemon
+        .register_direct_environment_for_test(
+            EnvironmentId::new("landing-env"),
+            Arc::new(MergedPrProcessRunner::new(4)),
+            EnvironmentBag::new().with(EnvironmentAssertion::binary("git", "/usr/bin/git")),
+            None,
+        )
+        .expect("register environment");
+    let backend = daemon.resource_backend();
+    declare_mapping_forge(&backend, NAMESPACE).await;
+    let git_repo = TestGitRepo::init(temp.path().join("checkout")).with_initial_commit();
+    let head = ProcessCommand::new("git").arg("-C").arg(git_repo.path()).args(["rev-parse", "HEAD"]).output().expect("HEAD");
+    let head = String::from_utf8(head.stdout).expect("utf-8 HEAD").trim().to_owned();
+
+    // The merged change request, as the forge observer records it: under the forge id `lab`.
+    let forges =
+        backend.using::<Forge>(NAMESPACE).list().await.expect("forges").items.into_iter().map(|forge| forge.spec).collect::<Vec<_>>();
+    let name = flotilla_resources::address::record_name(
+        &flotilla_resources::address::stored_change_request_address("lab", "robert/engine-trial", 4, &forges).expect("address"),
+    )
+    .expect("record name");
+    let records = backend.using::<flotilla_resources::ChangeRequest>(NAMESPACE);
+    let spec = flotilla_resources::ChangeRequestSpec::builder()
+        .service("lab".to_string())
+        .scope("robert/engine-trial".to_string())
+        .number(4)
+        .observing_authority("test-host".to_string())
+        .build();
+    let created = records.create(&InputMeta::builder().name(name.clone()).build(), &spec).await.expect("change request");
+    let observed_at = Utc::now();
+    let status = flotilla_resources::ChangeRequestStatus {
+        title: Default::default(),
+        author: Default::default(),
+        review_decision: Default::default(),
+        review_requested_from_owner: Default::default(),
+        state: flotilla_resources::Observation::known(flotilla_resources::ObservedChangeRequestState::Merged, observed_at),
+        head_sha: flotilla_resources::Observation::known(head, observed_at),
+        checks: flotilla_resources::Observation::unknown(observed_at),
+        review: flotilla_resources::ChangeRequestReviewObservation {
+            actionable_at_head: flotilla_resources::Observation::unknown(observed_at),
+        },
+        mergeable: flotilla_resources::Observation::unknown(observed_at),
+    };
+    records.update_status(&name, &created.metadata.resource_version, &status).await.expect("merged");
+
+    let state = Arc::new(ControllerRuntimeState::new(daemon, config, passthrough_registry(), None, "local".into(), "local-env".into()));
+    let path = git_repo.path().display().to_string();
+    let checkout = CheckoutSpec::Observed(ResourceObservedCheckoutSpec {
+        r#ref: "main".to_string(),
+        path: path.clone(),
+        repo_ref: RepositoryKey(flotilla_resources::repo_key("https://lab.example/robert/engine-trial")),
+        host_ref: "local".to_string(),
+        is_main: false,
+    });
+    let integration = checkout_routing(&state)
+        .runtime_for("landing-env", &path)
+        .await
+        .expect("checkout runtime")
+        .inspect_at(
+            &path,
+            &checkout,
+            Some("https://lab.example/robert/engine-trial"),
+            flotilla_vcs::checkout_integration::RecordedAssociation {
+                change_request_id: Some("4"),
+                complete: true,
+                observe_remote_ref: false,
+            },
+            None,
+        )
+        .await
+        .expect("inspect");
+    assert_eq!(integration.landed.value, ConditionValue::True, "{:?}", integration.landed);
 }
 
 use flotilla_orchestration_testkit::InProcessDiscoveryExt;

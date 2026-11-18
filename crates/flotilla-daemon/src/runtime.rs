@@ -33,6 +33,7 @@ use flotilla_crew::reconcilers::vessel::{ConvoyVesselWake, CrewSeats, VesselPlan
 use flotilla_discovery::registry::ProviderRegistry;
 use flotilla_paths::path_context::DaemonHostPath;
 use flotilla_protocol::CanonicalHostId;
+use flotilla_provisioning::checkout_runtime::ChangeRequestObservations;
 use flotilla_provisioning::engine::ProvisioningLifecycles;
 use flotilla_provisioning::reconcilers::{ForgeDefaultBranchResolver, RepositoryReconciler};
 use flotilla_resources::LANDING_EVIDENCE_TTL;
@@ -1217,6 +1218,13 @@ fn spawn_terminal_controller(
     }
 }
 
+/// The Checkout controller's work in this host's environments. A released checkout is judged
+/// landed against the replicated observation of its change request.
+fn checkout_routing(state: &Arc<ControllerRuntimeState>) -> RoutingCheckoutRuntime {
+    let change_requests = ChangeRequestObservations::new(state.daemon.resource_backend(), &state.namespace);
+    RoutingCheckoutRuntime { state: Arc::clone(state), change_requests: Some(change_requests) }
+}
+
 /// The Checkout controller (#3108): the single writer of this home's checkout launches, making
 /// each in its environment for its holder Convoy and removing it once that convoy has ended. The
 /// observed-checkout refresh names the launches whose paths it saw change, and each is observed
@@ -1236,7 +1244,7 @@ fn spawn_checkout_controller(
         }
     };
     let home = service.home().to_owned();
-    let routing = RoutingCheckoutRuntime { state: Arc::clone(state), change_requests: None };
+    let routing = checkout_routing(state);
     let actuator = CheckoutActuator::new(
         Arc::new(checkouts::EngineCheckoutProvider { routing }),
         Arc::new(checkouts::ConvoyHolderInputs {

@@ -63,7 +63,9 @@ use flotilla_provider_runtime::CommandOutput;
 use flotilla_provider_runtime::CommandRunner;
 use flotilla_provider_runtime::EnvVars;
 use flotilla_provider_runtime::ProcessCommandRunner;
-use flotilla_provisioning::checkout_runtime::{CheckoutControllerRuntime, CheckoutRemoval, CheckoutRemovalOutcome};
+use flotilla_provisioning::checkout_runtime::{
+    ChangeRequestObservations, CheckoutControllerRuntime, CheckoutRemoval, CheckoutRemovalOutcome,
+};
 use flotilla_provisioning::engine::terminal_actuator::TerminalLiveness;
 use flotilla_provisioning::reconcilers::{CloneRuntime, EnvironmentRuntime};
 use flotilla_replay_testkit::Masks;

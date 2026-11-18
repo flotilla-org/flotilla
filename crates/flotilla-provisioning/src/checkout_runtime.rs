@@ -7,10 +7,10 @@ use std::{collections::BTreeSet, path::Path, sync::Arc};
 use flotilla_provider_runtime::ChannelLabel;
 use flotilla_provider_runtime::CommandRunner;
 use flotilla_resources::{
-    canonicalize_repo_url, ChangeRequest, ChangeRequestStatus, CheckoutBranchProvenance, CheckoutIntegrationStatus, CheckoutSpec,
-    LandedEvidence,
+    address::{remote_change_request_address, stored_change_request_address},
+    ChangeRequest, ChangeRequestStatus, CheckoutBranchProvenance, CheckoutIntegrationStatus, CheckoutSpec, Forge, LandedEvidence,
 };
-use flotilla_store::ReplicaReadResolver;
+use flotilla_store::ResourceBackend;
 use flotilla_vcs::checkout_integration::{inspect_recorded_checkout_integration, ChangeRequestIntegrationInput, RecordedAssociation};
 use flotilla_vcs::vcs as core_vcs;
 use flotilla_vcs::vcs::CheckoutRegistration;
@@ -70,7 +70,21 @@ pub fn managed_checkout_reason(owner: Option<&str>, checkout: &str) -> String {
 pub struct CheckoutControllerRuntime {
     runner: Arc<dyn CommandRunner>,
     vcs: Option<Arc<dyn Vcs>>,
-    change_requests: Option<ReplicaReadResolver<ChangeRequest>>,
+    change_requests: Option<ChangeRequestObservations>,
+}
+
+/// Where a checkout's inspection reads the change request its branch is associated with: the
+/// replicated observations in `namespace`, and the Forges its repository URL resolves through.
+#[derive(Clone)]
+pub struct ChangeRequestObservations {
+    backend: ResourceBackend,
+    namespace: String,
+}
+
+impl ChangeRequestObservations {
+    pub fn new(backend: ResourceBackend, namespace: &str) -> Self {
+        Self { backend, namespace: namespace.to_owned() }
+    }
 }
 
 /// Selects the VCS discovery path used by the daemon’s environment-routing adapter.
@@ -92,17 +106,33 @@ impl CheckoutControllerRuntime {
 
     /// The replicated observation of change request `id` of the repository at `url`.
     async fn observed_change_request_of(&self, url: &str, id: &str) -> Result<Option<ChangeRequestStatus>, String> {
-        let Some(change_requests) = &self.change_requests else { return Ok(None) };
-        let Ok(canonical) = canonicalize_repo_url(url) else { return Ok(None) };
-        let qualified = canonical.split_once("://").map(|(_, qualified)| qualified).unwrap_or(&canonical);
-        let Some((service, scope)) = qualified.split_once('/') else { return Ok(None) };
+        let Some(observations) = &self.change_requests else { return Ok(None) };
         let Ok(number) = id.parse::<u64>() else { return Ok(None) };
-        let copies = change_requests.list().await.map_err(|error| error.to_string())?;
+        // Records name their repository by forge id, never by URL host: both sides resolve to
+        // addresses through the declared Forges.
+        let forges = observations
+            .backend
+            .definitions::<Forge>(&observations.namespace)
+            .list()
+            .await
+            .map_err(|error| error.to_string())?
+            .into_iter()
+            .map(|forge| forge.spec)
+            .collect::<Vec<_>>();
+        let Ok(wanted) = remote_change_request_address(url, number, &forges) else { return Ok(None) };
+        let copies = observations
+            .backend
+            .including_replicas::<ChangeRequest>(&observations.namespace)
+            .list()
+            .await
+            .map_err(|error| error.to_string())?;
         // A demanded local placeholder may precede the observing host's copy.
         // Match the subject first, then use the shared whole-observation selection.
         Ok(flotilla_resources::pick_replica_read(
             copies.items.into_iter().filter(|record| {
-                record.object.spec.service == service && record.object.spec.scope == scope && record.object.spec.number == number
+                let spec = &record.object.spec;
+                spec.number == number
+                    && stored_change_request_address(&spec.service, &spec.scope, number, &forges).is_ok_and(|address| address == wanted)
             }),
             |record| (&record.object, matches!(record.provenance, flotilla_resources::ResourceProvenance::Local)),
         )
@@ -398,11 +428,7 @@ pub fn utf8_path(path: &str) -> Result<&str, String> {
     }
 }
 impl CheckoutControllerRuntime {
-    pub fn new(
-        runner: Arc<dyn CommandRunner>,
-        vcs: Option<Arc<dyn Vcs>>,
-        change_requests: Option<ReplicaReadResolver<ChangeRequest>>,
-    ) -> Self {
+    pub fn new(runner: Arc<dyn CommandRunner>, vcs: Option<Arc<dyn Vcs>>, change_requests: Option<ChangeRequestObservations>) -> Self {
         Self { runner, vcs, change_requests }
     }
     pub fn vcs(&self, checkout: &str) -> Result<Arc<dyn Vcs>, String> {

@@ -15,12 +15,11 @@ use flotilla_protocol::RepoSelector;
 use flotilla_provider_runtime::ChannelLabel;
 use flotilla_provider_runtime::CommandRunner;
 use flotilla_provisioning::checkout_runtime::{
-    removal_source_path, CheckoutControllerRuntime, CheckoutRemoval, CheckoutRemovalOutcome, PreparedCheckout,
+    removal_source_path, ChangeRequestObservations, CheckoutControllerRuntime, CheckoutRemoval, CheckoutRemovalOutcome, PreparedCheckout,
 };
 use flotilla_provisioning::reconcilers::clone::runtime::CloneControllerRuntime;
 use flotilla_provisioning::reconcilers::{CloneRuntime, ForgeDefaultBranchResolver};
-use flotilla_resources::{canonicalize_repo_url, ChangeRequest, CloneCredentials, Convoy, Forge, ForgeIdentity};
-use flotilla_store::ReplicaReadResolver;
+use flotilla_resources::{canonicalize_repo_url, CloneCredentials, Convoy, Forge, ForgeIdentity};
 use flotilla_vcs::vcs::CheckoutMaterialisationError;
 use flotilla_vcs::vcs::CheckoutRegistration;
 use flotilla_vcs::vcs::WorktreeMetadata;
@@ -333,7 +332,7 @@ impl CloneRuntime for RoutingCloneRuntime {
 
 pub(super) struct RoutingCheckoutRuntime {
     pub(super) state: Arc<ControllerRuntimeState>,
-    pub(super) change_requests: Option<ReplicaReadResolver<ChangeRequest>>,
+    pub(super) change_requests: Option<ChangeRequestObservations>,
 }
 
 #[async_trait]
