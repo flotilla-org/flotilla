@@ -1200,8 +1200,12 @@ async fn the_governor_resumes_a_stall_escalated_past_the_crew_rungs() {
             principal: None,
         }
     }
-    let error = crew.supervise(resume(&held.launch, &bystander_crew)).await.expect_err("supervision does not reach the bystander");
-    assert!(error.contains("does not own this supervision rung"), "{error}");
+    for (actor, refusal) in
+        [(bystander_crew.as_str(), "supervision does not reach the bystander"), ("unrelated-crew", "a crew with no seat")]
+    {
+        let error = crew.supervise(resume(&held.launch, actor)).await.expect_err(refusal);
+        assert!(error.contains("does not own this supervision rung"), "{refusal}: {error}");
+    }
     let accepted = crew.supervise(resume(&held.launch, &governor_crew)).await.expect("the governor's resume");
     assert_eq!(accepted, flotilla_protocol::CommandValue::Ok);
 }

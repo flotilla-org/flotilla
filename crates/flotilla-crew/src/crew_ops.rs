@@ -1356,7 +1356,8 @@ impl CrewService {
                     role: labels.get(ROLE_LABEL)?.clone(),
                 })
             })
-            .ok_or_else(|| "crew identity has no crew seat".to_string())?;
+            // A crew identity with no seat holds no rung: it is refused as any other non-holder is.
+            .ok_or_else(|| "crew identity does not own this supervision rung".to_string())?;
         let recorded = |convoy: &ResourceObject<ResourceConvoy>| {
             convoy.status.as_ref().is_some_and(|status| status.stalls.iter().any(|stall| stall.supervisor.as_ref() == Some(&seat)))
         };
