@@ -1,61 +1,30 @@
-//! Additional authority follows a live project supervision binding, not a role name.
+//! Additional authority follows supervision: a crew that stall supervision is routed to may act
+//! as its Project's supervisor, by the same resolution that routes the turn.
 use std::collections::BTreeMap;
 
 use flotilla_core::in_process::InProcessDaemon;
+use flotilla_messaging::MessageReceiverSnapshot;
 use flotilla_protocol::{CallerCrew, CommandAction, CrewCommandContext, DaemonEvent, Request};
-use flotilla_resources::{
-    Convoy, ConvoyEnsure, Project, ResolvedCascade, TerminalSession, TerminalSessionSource, ENSURED_FROM_ANNOTATION,
-    ROLE_ADDRESS_ANNOTATION,
-};
-use flotilla_store::{ResolvedCascadeStoreExt, StoreQuery};
+use flotilla_resources::{Convoy, Project, StallSupervisor, TerminalSession, TerminalSessionSource, CONVOY_LABEL, VESSEL_LABEL};
+use flotilla_store::{CascadeDeclarations, StoreQuery};
 
-async fn binding(daemon: &InProcessDaemon, crew: &CallerCrew) -> Result<String, String> {
+/// The Project the caller supervises: its own convoy's, when supervision reaches the caller's
+/// seat there as stall supervision turns are routed, or reached it for a stall in `target`.
+async fn binding(daemon: &InProcessDaemon, crew: &CallerCrew, target: Option<&str>) -> Result<String, String> {
     let backend = daemon.resource_backend();
     let convoy = backend.using::<Convoy>(&crew.namespace).get(&crew.convoy).await.map_err(|e| e.to_string())?;
     let project = convoy.spec.project_ref;
     let terminal = crew.terminal_session.as_ref().ok_or("EnvironmentCommandDenied: no terminal binding")?;
     let session = backend.using::<TerminalSession>(&crew.namespace).get(terminal).await.map_err(|e| e.to_string())?;
-    let mut addresses = Vec::new();
-    if let Some(address) = session.metadata.annotations.get(ROLE_ADDRESS_ANNOTATION) {
-        addresses.push(address.clone());
-    }
-    // A standing role binds the convoy that is its current generation.
-    let ensured_from = convoy.metadata.annotations.get(ENSURED_FROM_ANNOTATION).cloned();
-    let current = match ensured_from {
-        Some(ensure) => flotilla_store::current_generations(&backend, &crew.namespace, [ensure]).await.map_err(|e| e.to_string())?,
-        None => BTreeMap::new(),
-    };
-    for (ensure, _) in current.into_iter().filter(|(_, generation)| generation.metadata.name == crew.convoy) {
-        // Runtime observations can outlive their Definition. Only a live
-        // declaration may confer a standing role binding.
-        let declaration = match backend.definitions::<ConvoyEnsure>(&crew.namespace).get(&ensure).await {
-            Ok(declaration) => declaration,
-            Err(flotilla_resources::ResourceError::NotFound { .. }) => continue,
-            Err(error) => return Err(error.to_string()),
-        };
-        if declaration.spec.project_ref == project {
-            addresses.push(format!("{project}/{}", declaration.spec.role));
-        }
-    }
-    if addresses.is_empty() {
-        return Err("EnvironmentCommandDenied: no standing role binding".into());
-    }
-    let declaration = backend.definitions::<Project>(&crew.namespace).get(&project).await.map_err(|e| e.to_string())?;
-    let cascade = ResolvedCascade::load(&backend, &crew.namespace, &project, &declaration.spec).await.map_err(|e| e.to_string())?;
-    for address in addresses {
-        let Some((bound_project, role)) = address.split_once('/') else { continue };
-        if bound_project != project
-            || !cascade
-                .roles
-                .get(role)
-                .is_some_and(|definition| definition.subscriptions.iter().flatten().any(|subscription| subscription.topic == "supervision"))
-        {
-            continue;
-        }
-        let holder = flotilla_messaging::resolve_message_receiver(&backend, &crew.namespace, &address).await.map_err(|e| e.to_string())?;
-        if holder.is_some_and(|holder| holder.object.metadata.name == *terminal) {
-            return Ok(project);
-        }
+    let label = |key: &str| session.metadata.labels.get(key).cloned().ok_or("EnvironmentCommandDenied: terminal has no crew seat");
+    let seat = StallSupervisor { convoy: label(CONVOY_LABEL)?, vessel: label(VESSEL_LABEL)?, role: session.spec.role.clone() };
+    let projects = backend.including_replicas::<Project>(&crew.namespace).list().await.map_err(|e| e.to_string())?.items;
+    let convoys = backend.including_replicas::<Convoy>(&crew.namespace).list().await.map_err(|e| e.to_string())?.items;
+    let declarations = CascadeDeclarations::load(&backend, &crew.namespace).await.map_err(|e| e.to_string())?;
+    let receivers = MessageReceiverSnapshot::load(&backend, &crew.namespace).await.map_err(|e| e.to_string())?;
+    let target = target.and_then(|name| convoys.iter().map(|source| &source.object).find(|convoy| convoy.metadata.name == name));
+    if flotilla_crew::leaf_engine::supervises(&receivers, &declarations, &project, &projects, &convoys, target, &seat)? {
+        return Ok(project);
     }
     Err("EnvironmentCommandDenied: caller is not the project's current supervisor".into())
 }
@@ -153,7 +122,15 @@ pub(super) async fn authorize(daemon: &InProcessDaemon, request: &mut Request, c
     ) {
         return Err("EnvironmentCommandDenied: command is outside supervisor authority".into());
     }
-    let project = binding(daemon, crew).await.map_err(|_| "EnvironmentCommandDenied: no current supervisor binding".to_string())?;
+    // A ruling on a stall names its convoy; whoever that stall's turn went to may rule on it.
+    let target = match &command.action {
+        CommandAction::CrewSupervise { convoy, .. } => Some(convoy.clone()),
+        CommandAction::CrewFail { context, .. } => context.convoy.clone(),
+        _ => None,
+    };
+    let project = binding(daemon, crew, target.as_deref())
+        .await
+        .map_err(|_| "EnvironmentCommandDenied: no current supervisor binding".to_string())?;
     match &mut command.action {
         CommandAction::CrewSupervise { namespace, convoy, actor_crew_id, .. } => {
             convoy_scope(daemon, crew, &project, namespace, convoy).await?;

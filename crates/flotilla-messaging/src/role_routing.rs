@@ -62,16 +62,17 @@ impl CrewAddressBook {
 /// `topic:<project>/<name>` is an address, independent of any role spelling.
 /// Resolve nearest-first supervision recipients, skipping absent holders. Within
 /// a Project, priorities express the charter's governor/operator/owner sequence.
-/// A source holder is excluded so a stalled governor advances rather than loops.
+/// A source holder is excluded so a stalled governor advances rather than loops; with no
+/// sender, every holder is listed.
 /// A pass over many senders reads `declarations` and `receivers` once and resolves each here.
 pub fn supervision_path(
     declarations: &CascadeDeclarations,
     receivers: &MessageReceiverSnapshot,
     project: &str,
-    sender: &str,
+    sender: Option<&str>,
 ) -> Result<Vec<RoleContact>, ResourceError> {
     topic_candidates_from_declarations(
-        TopicRouting::builder().project(project).topic("supervision").sender(sender).reach(TopicReach::Ancestors).build(),
+        TopicRouting::builder().project(project).topic("supervision").maybe_sender(sender).reach(TopicReach::Ancestors).build(),
         ReceiverPresence::Current(receivers),
         declarations,
     )

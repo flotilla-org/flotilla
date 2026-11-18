@@ -1,7 +1,8 @@
 use super::stalls::{crew_role_address, stalled_source_actor};
 use flotilla_messaging::MessageReceiverSnapshot;
 use flotilla_resources::{
-    Convoy, Project, ReadResourceObject, ResourceObject, StallRung, StalledCondition, SupervisionTarget, ENSURED_FROM_ANNOTATION,
+    Convoy, Project, ReadResourceObject, ResourceObject, StallRung, StallSupervisor, StalledCondition, SupervisionTarget,
+    ENSURED_FROM_ANNOTATION,
 };
 use flotilla_store::CascadeDeclarations;
 use std::borrow::Borrow;
@@ -24,23 +25,36 @@ pub(super) fn supervision_policy(
 ) -> Result<Vec<SupervisionTarget>, String> {
     let status = convoy.status.as_ref().ok_or("convoy has no status")?;
     let project = convoy.spec.project_ref.as_str();
+    let workflow_policy = status.workflow_snapshot.as_ref().and_then(|workflow| workflow.supervision.clone());
+    let sender = seat
+        .map(|(vessel, role)| crew_role_address(project, &convoy.metadata.name, vessel, role))
+        .unwrap_or_else(|| format!("{project}/{}", convoy.spec.role));
+    ladder(routes, project, projects, workflow_policy, Some(&sender))
+}
+
+/// A Project's supervision ladder: the workflow's policy, else the Project's, else the bosun
+/// then the project's governor; Project and fleet rungs come from supervision subscriptions
+/// when any holder subscribes. `sender`, when given, is left out of the subscribed rungs.
+fn ladder(
+    routes: SupervisionRoutes<'_>,
+    project: &str,
+    projects: &[impl Borrow<ReadResourceObject<Project>>],
+    workflow_policy: Option<Vec<SupervisionTarget>>,
+    sender: Option<&str>,
+) -> Result<Vec<SupervisionTarget>, String> {
     let project_policy = projects
         .iter()
         .map(|source| source.borrow())
         .find(|source| source.object.metadata.name == project)
         .and_then(|source| source.object.spec.supervision.clone());
-    let mut policy =
-        status.workflow_snapshot.as_ref().and_then(|workflow| workflow.supervision.clone()).or(project_policy).unwrap_or_else(|| {
-            vec![
-                SupervisionTarget::ConvoyCrew { vessel: String::new(), role: "bosun".into() },
-                SupervisionTarget::ProjectCrew { convoy_role: "governor".into(), vessel: String::new(), role: "governor".into() },
-            ]
-        });
-    let sender = seat
-        .map(|(vessel, role)| crew_role_address(project, &convoy.metadata.name, vessel, role))
-        .unwrap_or_else(|| format!("{project}/{}", convoy.spec.role));
+    let mut policy = workflow_policy.or(project_policy).unwrap_or_else(|| {
+        vec![
+            SupervisionTarget::ConvoyCrew { vessel: String::new(), role: "bosun".into() },
+            SupervisionTarget::ProjectCrew { convoy_role: "governor".into(), vessel: String::new(), role: "governor".into() },
+        ]
+    });
     let path =
-        flotilla_messaging::supervision_path(routes.declarations, routes.receivers, project, &sender).map_err(|error| error.to_string())?;
+        flotilla_messaging::supervision_path(routes.declarations, routes.receivers, project, sender).map_err(|error| error.to_string())?;
     if !path.is_empty() {
         // Explicit convoy supervision remains first; Project and fleet
         // routing comes from subscriptions, not role-name guesses.
@@ -67,33 +81,9 @@ pub(super) fn resolve_target(
             found.map(|(name, _)| (convoy.metadata.name.clone(), name.clone(), role.clone(), StallRung::Bosun))
         }
         SupervisionTarget::ProjectCrew { convoy_role, vessel, role } => {
-            // The standing role's newest live generation holds the role ahead of any other live
-            // convoy of it.
-            let candidate = available_convoys
-                .iter()
-                .map(|source| &source.borrow().object)
-                .filter(|candidate| {
-                    candidate.spec.project_ref == convoy.spec.project_ref
-                        && candidate.spec.role == *convoy_role
-                        && candidate.metadata.name != convoy.metadata.name
-                        && candidate.status.as_ref().is_some_and(|status| !status.phase.is_terminal())
-                })
-                .max_by_key(|candidate| {
-                    (
-                        candidate.metadata.annotations.contains_key(ENSURED_FROM_ANNOTATION),
-                        candidate.spec.generation,
-                        &candidate.metadata.name,
-                    )
-                });
-            let supervisor = candidate.and_then(|candidate| {
-                candidate.status.as_ref().and_then(|status| {
-                    status
-                        .crew_work
-                        .iter()
-                        .find(|(name, crew)| (vessel.is_empty() || *name == vessel) && crew.contains_key(role))
-                        .map(|(name, _)| (candidate.metadata.name.clone(), name.clone(), role.clone(), StallRung::Governor))
-                })
-            });
+            let (candidate, seat) =
+                project_crew(&convoy.spec.project_ref, (convoy_role, vessel, role), available_convoys, Some(&convoy.metadata.name));
+            let supervisor = seat.map(|seat| (seat.convoy, seat.vessel, seat.role, StallRung::Governor));
             if supervisor.is_none() {
                 let project = &convoy.spec.project_ref;
                 let missing = if candidate.is_some() { " crew" } else { "" };
@@ -130,6 +120,82 @@ pub(super) fn resolve_target(
         SupervisionTarget::Operator => None,
     };
     Ok(candidate)
+}
+
+/// The convoy holding a Project's standing role and, in it, the crew seat at `vessel`/`role`
+/// (any vessel when empty): the role's newest live generation ahead of any other live convoy of
+/// it. `excluding` names a convoy that cannot supervise, as a stalled convoy cannot itself.
+fn project_crew<'a>(
+    project: &str,
+    (convoy_role, vessel, role): (&str, &str, &str),
+    available_convoys: &'a [impl Borrow<ReadResourceObject<Convoy>>],
+    excluding: Option<&str>,
+) -> (Option<&'a ResourceObject<Convoy>>, Option<StallSupervisor>) {
+    let candidate = available_convoys
+        .iter()
+        .map(|source| &source.borrow().object)
+        .filter(|candidate| {
+            candidate.spec.project_ref == project
+                && candidate.spec.role == convoy_role
+                && excluding != Some(candidate.metadata.name.as_str())
+                && candidate.status.as_ref().is_some_and(|status| !status.phase.is_terminal())
+        })
+        .max_by_key(|candidate| {
+            (candidate.metadata.annotations.contains_key(ENSURED_FROM_ANNOTATION), candidate.spec.generation, &candidate.metadata.name)
+        });
+    let seat =
+        candidate.and_then(|candidate| {
+            candidate.status.as_ref().and_then(|status| {
+                status.crew_work.iter().find(|(name, crew)| (vessel.is_empty() || *name == vessel) && crew.contains_key(role)).map(
+                    |(name, _)| StallSupervisor { convoy: candidate.metadata.name.clone(), vessel: name.clone(), role: role.to_string() },
+                )
+            })
+        });
+    (candidate, seat)
+}
+
+/// Whether supervision of `project` reaches the crew at `seat`: it holds a Project-wide rung of
+/// the Project's ladder, resolved as a stall's supervision turn is routed, or it is the recorded
+/// supervisor of a stall in `convoy`. Whoever is sent a supervision turn is a supervisor, so the
+/// crew transport authorises a supervisor's commands by this and by nothing else.
+pub fn supervises(
+    receivers: &MessageReceiverSnapshot,
+    declarations: &CascadeDeclarations,
+    project: &str,
+    projects: &[impl Borrow<ReadResourceObject<Project>>],
+    available_convoys: &[impl Borrow<ReadResourceObject<Convoy>>],
+    convoy: Option<&ResourceObject<Convoy>>,
+    seat: &StallSupervisor,
+) -> Result<bool, String> {
+    let recorded = convoy
+        .and_then(|convoy| convoy.status.as_ref())
+        .is_some_and(|status| status.stalls.iter().any(|stall| stall.supervisor.as_ref() == Some(seat)));
+    if recorded {
+        return Ok(true);
+    }
+    // A convoy's own crew (a bosun) supervises only the stalls it was sent, recorded above.
+    for target in ladder(SupervisionRoutes { declarations, receivers }, project, projects, None, None)? {
+        let holder = match target {
+            SupervisionTarget::ProjectCrew { convoy_role, vessel, role } => {
+                project_crew(project, (&convoy_role, &vessel, &role), available_convoys, None).1
+            }
+            SupervisionTarget::Address { address } if !address.starts_with("principal:") => {
+                receivers.resolve(&address).map_err(|error| error.to_string())?.and_then(|holder| {
+                    let labels = &holder.object.metadata.labels;
+                    Some(StallSupervisor {
+                        convoy: labels.get(flotilla_resources::CONVOY_LABEL)?.clone(),
+                        vessel: labels.get(flotilla_resources::VESSEL_LABEL)?.clone(),
+                        role: labels.get(flotilla_resources::ROLE_LABEL).cloned().unwrap_or_else(|| holder.object.spec.role.clone()),
+                    })
+                })
+            }
+            SupervisionTarget::ConvoyCrew { .. } | SupervisionTarget::Address { .. } | SupervisionTarget::Operator => None,
+        };
+        if holder.as_ref() == Some(seat) {
+            return Ok(true);
+        }
+    }
+    Ok(false)
 }
 
 pub(crate) enum EscalationAdmission {

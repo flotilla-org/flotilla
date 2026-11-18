@@ -700,8 +700,6 @@ async fn supervised_coder_scenario(action: CrewSupervisionAction) {
 // coder's supervision turn through the default project supervision, and resumes it with the
 // command the turn gives; the coder's convoy lands with no operator ruling.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-#[ignore = "the governor's resume through its environment connection is denied: the Fleet project's cascade declares no \
-            governor role subscribed to supervision, though default supervision delivers it the turn"]
 async fn the_standing_governor_resumes_a_stalled_coder() {
     use flotilla_environment::environment::dummy::dummy_draw;
 

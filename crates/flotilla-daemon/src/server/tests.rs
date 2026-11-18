@@ -5516,14 +5516,12 @@ pub(super) async fn supervisor_daemon() -> (tempfile::TempDir, Arc<InProcessDaem
     (_tmp, daemon)
 }
 
-// Supervision is conferred by a current role holder's subscription, not by a
-// caller's role spelling. Every extra command stays within that bound Project.
+// Supervision authority is where supervision is routed (here a current role holder's
+// subscription), not a caller's role spelling. Every extra command stays within that Project.
 #[tokio::test]
 async fn environment_supervisor_authority_is_project_bound_and_revocable() {
-    use flotilla_resources::ConvoyEnsure;
     let (_tmp, daemon) = supervisor_daemon().await;
     let backend = daemon.resource_backend();
-    let ensures = backend.using::<ConvoyEnsure>("flotilla");
     let crew =
         super::environment_connection::environment_crews(&daemon, &EnvironmentId::new("supervisor-environment")).await.unwrap().remove(0);
     let mut ordinary = crew.clone();
@@ -5670,8 +5668,21 @@ async fn environment_supervisor_authority_is_project_bound_and_revocable() {
     let mut read = request(CommandAction::QueryCrewStalls { full: true });
     assert!(super::environment_supervision::authorize(&daemon, &mut read, &crew).await.is_ok());
     assert!(super::environment_supervision::authorize(&daemon, &mut read, &ordinary).await.is_err());
-    ensures.delete("holder").await.unwrap();
-    assert!(super::environment_supervision::authorize(&daemon, &mut read, &crew).await.is_err(), "retired role binding loses authority");
+    // Authority follows supervision routing: once the Project no longer routes supervision to
+    // the role, its holder is no longer the Project's supervisor.
+    let projects = backend.using::<flotilla_resources::Project>("flotilla");
+    projects.delete("project-a").await.unwrap();
+    projects
+        .create(
+            &InputMeta::builder().name("project-a".into()).build(),
+            &serde_json::from_value::<flotilla_resources::ProjectSpec>(serde_json::json!({"display_name": "A"})).unwrap(),
+        )
+        .await
+        .unwrap();
+    assert!(
+        super::environment_supervision::authorize(&daemon, &mut read, &crew).await.is_err(),
+        "a role supervision no longer reaches loses authority"
+    );
 }
 
 pub(super) fn caller_mountinfo(environment: &EnvironmentId, bound: bool) -> super::caller::PeerMounts {
