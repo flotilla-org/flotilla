@@ -6,7 +6,8 @@ use std::collections::{BTreeMap, BTreeSet};
 
 use flotilla_engine_store::{Import, ImportTarget};
 use flotilla_provisioning::engine::import::{
-    import_checkouts, import_clones, import_environments, import_image_builds, import_terminal_sessions, import_vessels, ImportReport,
+    import_checkouts, import_clones, import_environments, import_image_builds, import_terminal_sessions, import_vessels, ImportRefusal,
+    ImportReport,
 };
 use flotilla_resources::{
     convoy::engine::engine_name, Checkout, Clone as CloneResource, Convoy, Environment, Host, ImageBuild, TerminalSession, Vessel,
@@ -116,8 +117,8 @@ fn namespace_lifecycles(source: &Source, namespace: &str, target: &mut Import, c
         })
         .collect();
     // Each checkout is held for the launch its convoy's record imported as, at the convoy's home,
-    // created under that launch's version. One whose convoy ended, or was not imported, is not:
-    // nothing would release it.
+    // created under that launch's version. One whose convoy ended is not: nothing would release
+    // it. One whose convoy imports as no open launch at that home is refused with why (#3108).
     let convoy_code = <Resource<EngineConvoy> as Kind>::CODE;
     for record in
         source.owned::<Checkout>("checkouts", namespace, "Checkout", target, report).into_iter().map(|record| (record.object, record.home))
@@ -134,11 +135,19 @@ fn namespace_lifecycles(source: &Source, namespace: &str, target: &mut Import, c
         if let Some(convoy) = record.0.metadata.labels.get(CONVOY_LABEL).filter(|convoy| holder(convoy).is_none()) {
             // Nothing on the engine reacts to an imported end, so nothing would release it. The
             // first-start counts say how many, by end.
-            let reason = match carried.ended.contains_key(&(convoy_home.clone(), convoy.clone())) {
-                true => "an orphaned worktree left on disk: held for an ended convoy",
-                false => "held for a convoy that was not imported",
+            if carried.ended.contains_key(&(convoy_home.clone(), convoy.clone())) {
+                report.drop_rows("Checkout", "an orphaned worktree left on disk: held for an ended convoy", 1);
+                continue;
+            }
+            let why = match carried.convoy_launches.launch(&record.0.metadata.namespace, convoy) {
+                Err(reason) => reason.to_string(),
+                Ok(launch) => format!("names a convoy imported as `{launch}`, not open at `{convoy_home}`"),
             };
-            report.drop_rows("Checkout", reason, 1);
+            report.refused.push(ImportRefusal {
+                kind: "Checkout",
+                record: record.0.metadata.name.clone(),
+                reason: format!("at `{}`: its holder {why} (`{convoy}`)", record.1),
+            });
             continue;
         }
         import_checkouts(std::slice::from_ref(&record), &holder, &clone_launches, target, report);

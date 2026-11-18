@@ -665,6 +665,23 @@ fn lifecycle_records_import_by_state_and_name_what_they_cannot_map() {
     }
 }
 
+// Behaviour (#3108, R2): a checkout held for a convoy that imports as no launch is refused by name
+// and counted by why: nothing is dropped.
+#[test]
+fn a_checkout_held_for_a_convoy_with_no_launch_is_refused() {
+    let mut held = document(
+        "Checkout",
+        "held-for-gone",
+        json!({"kind": "worktree", "repo_ref": "repo", "env_ref": "env-a", "ref": "feature", "target_path": "/w", "clone_ref": "clone-a"}),
+        json!({"phase": "Ready"}),
+    );
+    held["metadata"]["labels"] = json!({"flotilla.work/convoy": "gone"});
+    let summary = rehearse(&rows(vec![clone("clone-a"), held]), HERE);
+    assert_eq!(refused(&summary), [("Checkout", "held-for-gone")], "{summary:?}");
+    assert_eq!(summary.kinds["Checkout"].dropped, 0, "{summary:?}");
+    assert_eq!(summary.tallies["Checkout"].get("refused: names a convoy not in this host's replica"), Some(&1), "{summary:?}");
+}
+
 #[test]
 fn a_standing_convoys_generations_import_as_one_stable_identity() {
     let generations = (1..=2).map(|generation| {
@@ -1142,12 +1159,19 @@ fn attention_records() -> Vec<Value> {
 fn open_demands_import_as_the_attentions_their_writers_send() {
     let source = rows(attention_records());
     let summary = rehearse(&source, HERE);
-    assert_eq!(summary.kinds["Demand"], Counts { imported: 5, dropped: 5, refused: 3 }, "{summary:?}");
+    // A demand about a convoy the source does not hold is refused (#3108 R2), counted by why.
+    assert_eq!(summary.kinds["Demand"], Counts { imported: 5, dropped: 4, refused: 4 }, "{summary:?}");
     assert_eq!(
         refused(&summary),
-        [("Demand", "ensure-attention-pooled"), ("Demand", "surprise"), ("Demand", "terminal-delivery-misaimed")],
+        [
+            ("Demand", "ensure-attention-pooled"),
+            ("Demand", "reclaim-refusal-gone"),
+            ("Demand", "surprise"),
+            ("Demand", "terminal-delivery-misaimed")
+        ],
         "{summary:?}"
     );
+    assert_eq!(summary.tallies["Demand"].get("refused: names a convoy not in this host's replica"), Some(&1), "{summary:?}");
 
     let mut target = Import::in_memory(HERE, crate::runtime::decided_registry().expect("registry")).expect("target");
     let imported = import(&source, &mut target);

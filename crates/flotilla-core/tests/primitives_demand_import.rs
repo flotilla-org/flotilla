@@ -204,14 +204,19 @@ fn every_generated_demand_is_converted_dropped_or_refused_once(tc: TestCase) {
         let resolved = matches!(drawn.state, DemandState::Satisfied | DemandState::Acknowledged);
         let shape_refused = !resolved && (drawn.options || drawn.verdict || drawn.writer == Writer::Unknown);
         let held_by_another_record = matches!(drawn.writer, Writer::TerminalAttention | Writer::DeclarationRefused);
+        // #3108: an open demand about a convoy this host does not hold is refused, never dropped.
+        let convoy_gone = !resolved && !shape_refused && !held_by_another_record && !convoy_held;
         match result {
-            Err(refusal) => assert!(shape_refused, "{name} refused: {}", refusal.reason),
+            Err(refusal) => assert!(
+                shape_refused || (convoy_gone && refusal.reason.contains("names a convoy not in this host's replica")),
+                "{name} refused: {}",
+                refusal.reason
+            ),
             Ok(Imported::Dropped(dropped)) => {
-                assert!(!shape_refused, "{name} dropped as {}", dropped.reason);
+                assert!(!shape_refused && !convoy_gone, "{name} dropped as {}", dropped.reason);
                 assert!(
                     held_by_another_record
                         || resolved
-                        || !convoy_held
                         || (drawn.writer == Writer::Credential && dropped.reason == "folded into its vessel's attention"),
                     "{name} dropped as {}",
                     dropped.reason

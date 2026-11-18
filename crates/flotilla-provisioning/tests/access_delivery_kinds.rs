@@ -132,9 +132,12 @@ fn failed() -> serde_json::Value {
     spec
 }
 
-/// The launch `demo` imported as at `alpha`; no other convoy imported.
-fn demo_launch(home: &str, convoy: &str) -> Option<String> {
-    (home == "alpha" && convoy == "demo").then(|| "demo#4".to_owned())
+/// The launch `demo` imports as; no other convoy imports as one.
+fn demo_launch(_namespace: &str, convoy: &str) -> Result<String, String> {
+    match convoy {
+        "demo" => Ok("demo#4".to_owned()),
+        _ => Err("names a convoy not in this host's replica".to_owned()),
+    }
 }
 
 /// The name of the imported record of `spec`, its key naming the launch `demo#4`.
@@ -175,10 +178,11 @@ fn every_record_of_this_home_imports_under_its_convoys_launch() {
     assert!(!target.holds::<AccessDeliverySpec>("access-c", "beta").expect("holds"));
 }
 
-// Behaviour (#3108): a delivery whose convoy did not import, or whose key names no convoy, is
-// dropped and counted by its reason: its controller would find no launch for it.
+// Behaviour (#3108, R2): a delivery whose convoy imports as no launch, or whose key names no
+// convoy, is refused by name with why: nothing is dropped, and its controller would find no launch
+// for it.
 #[test]
-fn a_delivery_whose_convoy_did_not_import_is_dropped() {
+fn a_delivery_whose_convoy_imports_as_no_launch_is_refused() {
     let mut elsewhere = delivered();
     elsewhere["access"] = "flotilla/ended/implement/coder".into();
     let mut keyless = delivered();
@@ -187,9 +191,15 @@ fn a_delivery_whose_convoy_did_not_import_is_dropped() {
     let mut report = ImportReport::default();
     let mut target = flotilla_engine_store::Import::in_memory("alpha", access_delivery::registry().expect("registry")).expect("target");
     import_access_deliveries(&copies, demo_launch, &mut target, &mut report);
-    assert!(report.imported.is_empty() && report.refused.is_empty(), "{report:?}");
-    assert_eq!(report.dropped.get(&("AccessDelivery", "its convoy was not imported at its home")), Some(&1));
-    assert_eq!(report.dropped.get(&("AccessDelivery", "its access key names no convoy")), Some(&1));
+    assert!(report.imported.is_empty() && report.dropped.is_empty(), "{report:?}");
+    let refused: Vec<_> = report.refused.iter().map(|refusal| (refusal.record.as_str(), refusal.reason.as_str())).collect();
+    assert_eq!(
+        refused,
+        [
+            ("access-a", "at `alpha`: it names a convoy not in this host's replica (`ended`)"),
+            ("access-b", "at `alpha`: its access key names no convoy"),
+        ]
+    );
 }
 
 // Behaviour: a deleted copy is dropped and counted, and a name one home holds in two namespaces,

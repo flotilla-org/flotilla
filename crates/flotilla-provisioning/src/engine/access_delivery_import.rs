@@ -3,15 +3,16 @@
 //! | Old copy | Imported |
 //! |---|---|
 //! | Deleted | dropped |
-//! | Its convoy not imported | dropped |
+//! | Its convoy imports as no launch | refused, with why |
 //! | `spec` | the record's columns and its needs, the access key naming its convoy's launch |
 //! | Name | the digest of the rewritten key and the place |
 //! | Owner references, labels and annotations | dropped; the convoy label is read back from the access key |
 //!
 //! Each copy imports at the home that wrote it. An old convoy imports as a launch of another name,
-//! and the delivery's controller reads its convoy from the key, so the key is rewritten to name
-//! that launch; one whose convoy did not import holds an access nothing on the engine holds. The
-//! engine has no namespaces, so one name a home holds in two namespaces is refused.
+//! open or ended, and the delivery's controller reads its convoy from the key, so the key is
+//! rewritten to name that launch; one whose convoy imports as no launch is refused, as every
+//! dependent naming such a convoy is (#3108). The engine has no namespaces, so one name a home
+//! holds in two namespaces is refused.
 
 use std::collections::{BTreeMap, BTreeSet};
 
@@ -33,11 +34,11 @@ pub struct AccessDeliveryCopy {
 }
 
 /// Writes every copy at a home `target` imports, each at its copy's creation time and under the
-/// launch `launch` answers its convoy imported as at the copy's home; drops are counted and
-/// refusals named in `report`.
+/// launch its convoy imports as, which `launch` answers by the copy's namespace and convoy, or
+/// says why there is none; drops are counted and refusals named in `report`.
 pub fn import_access_deliveries(
     copies: &[AccessDeliveryCopy],
-    launch: impl Fn(&str, &str) -> Option<String>,
+    launch: impl Fn(&str, &str) -> Result<String, String>,
     target: &mut impl ImportTarget,
     report: &mut ImportReport,
 ) {
@@ -47,12 +48,24 @@ pub fn import_access_deliveries(
             report.drop_rows(KIND, "deleted", 1);
             continue;
         }
+        let refuse = |reason: String| ImportRefusal {
+            kind: KIND,
+            record: copy.object.metadata.name.clone(),
+            reason: format!("at `{}`: {reason}", copy.home),
+        };
         let Some(convoy) = convoy_of_access(&copy.object.spec.access) else {
-            report.drop_rows(KIND, "its access key names no convoy", 1);
+            report.refused.push(refuse("its access key names no convoy".to_owned()));
             continue;
         };
-        let Some(access) = launch(&copy.home, &convoy).and_then(|launch| with_convoy(&copy.object.spec.access, &launch)) else {
-            report.drop_rows(KIND, "its convoy was not imported at its home", 1);
+        let access = match launch(&copy.namespace, &convoy) {
+            Ok(launch) => with_convoy(&copy.object.spec.access, &launch),
+            Err(reason) => {
+                report.refused.push(refuse(format!("it {reason} (`{convoy}`)")));
+                continue;
+            }
+        };
+        let Some(access) = access else {
+            report.refused.push(refuse(format!("its access key cannot name launch of `{convoy}`")));
             continue;
         };
         let mut object = copy.object.clone();

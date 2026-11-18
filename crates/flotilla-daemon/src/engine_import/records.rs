@@ -141,12 +141,14 @@ pub(super) fn accounts(source: &Source, target: &mut Import, carried: &mut Carri
 }
 
 /// Every namespace's at once: the engine has no namespaces.
-/// Each delivery under the launch its convoy imported as at the delivery's home.
+/// Each delivery under the launch its convoy imports as, open or ended.
 pub(super) fn access_deliveries(source: &Source, target: &mut Import, carried: &mut Carried, report: &mut ImportReport) {
     let copies: Vec<_> = source
         .owned::<AccessDelivery>("accessdeliveries", None, "AccessDelivery", target, report)
         .into_iter()
         .map(|copy| AccessDeliveryCopy { namespace: copy.namespace, object: copy.object, home: copy.home })
         .collect();
-    import_access_deliveries(&copies, |home: &str, convoy: &str| carried.launch(home, convoy), target, report);
+    let launches = &carried.convoy_launches;
+    let launch = |namespace: &str, convoy: &str| launches.launch(namespace, convoy).map_err(|reason| reason.to_string());
+    import_access_deliveries(&copies, launch, target, report);
 }

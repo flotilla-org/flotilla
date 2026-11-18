@@ -18,7 +18,7 @@ use std::collections::BTreeMap;
 use flotilla_address::{Address, Kind};
 use flotilla_protocol::ResourceRef;
 use flotilla_resources::{
-    convoy::engine::{convoy_reference_address, standing_name},
+    convoy::engine::{convoy_reference_address, standing_name, NoLaunch},
     Convoy, ConvoyEnsure, MessageReference, ResourceObject, TerminalSession, Vessel, CONVOY_LABEL, ROLE_LABEL,
 };
 use flotilla_schema::Timestamp;
@@ -220,7 +220,7 @@ fn classify<'r>(old: &'r OldDemand<'_>, records: &DemandRecords<'_>) -> Class<'r
         };
         return match convoy() {
             Err(reason) => Class::Refused(reason),
-            Ok(convoy) if !records.convoys.contains_key(convoy) => Class::Dropped("its convoy is gone"),
+            Ok(convoy) if !records.convoys.contains_key(convoy) => Class::Refused(gone(convoy)),
             Ok(convoy) => Class::Credential { group: (old.home.as_str(), convoy, vessel.as_str()), principal },
         };
     } else {
@@ -236,6 +236,12 @@ fn classify<'r>(old: &'r OldDemand<'_>, records: &DemandRecords<'_>) -> Class<'r
 fn addressed(record: &RetiredDemand) -> String {
     let DemandAddressee::Principal { principal_ref } = &record.spec.addressee;
     format!("principal:{}", principal_ref.name)
+}
+
+/// Why a demand about convoy `convoy`, which this host's replica does not hold, is refused: every
+/// record naming a convoy with no launch is (#3108).
+fn gone(convoy: &str) -> String {
+    format!("it {} (`{convoy}`)", NoLaunch::NotHeld)
 }
 
 fn convoy_target(record: &RetiredDemand) -> Result<&str, String> {
@@ -295,30 +301,30 @@ fn map(
         let Some(convoy) = records.convoys.get(name) else { return Ok(None) };
         Ok(Some((*convoy, convoy_read(convoy, conversion)?)))
     };
-    let gone = || Ok(Mapped::Dropped("its convoy is gone"));
     match writer {
         Writer::Delivery { session } => {
             let Some(terminal) = records.terminals.get(session) else { return Ok(Mapped::Dropped("its TerminalSession is gone")) };
             let label = |key| terminal.metadata.labels.get(key).ok_or_else(|| format!("TerminalSession `{session}` has no `{key}` label"));
-            let Some((held, read)) = convoy(label(CONVOY_LABEL)?)? else { return gone() };
+            let target = label(CONVOY_LABEL)?;
+            let Some((held, read)) = convoy(target)? else { return Err(gone(target)) };
             let role = Read { address: child(&read.address, Kind::Role, label(ROLE_LABEL)?)?, revision: read.revision };
             let reason = reason(record, DELIVERY_HOLD_REASON_ANNOTATION, || "Turn delivery is held until a person rules.".into());
             Ok(attention(Cause::DeliveryHeld { role }, reason, held))
         }
         Writer::Hold { ensure, convoy: target } => {
-            let Some(held) = records.convoys.get(target) else { return gone() };
+            let Some(held) = records.convoys.get(target) else { return Err(gone(target)) };
             let Some(ensure) = records.ensures.get(ensure) else { return Ok(Mapped::Dropped("its ConvoyEnsure is gone")) };
             let read = generation_read(held, ensure)?;
             let reason = reason(record, ENSURE_HOLD_REASON_ANNOTATION, || format!("Standing convoy `{target}` is held."));
             Ok(attention(Cause::Hold { convoy: read }, reason, held))
         }
         Writer::Reclaim { convoy: target } => {
-            let Some((held, read)) = convoy(target)? else { return gone() };
+            let Some((held, read)) = convoy(target)? else { return Err(gone(target)) };
             let reason = reason(record, RECLAIM_REFUSAL_REASON_ANNOTATION, || format!("Reclaim of convoy `{target}` is refused."));
             Ok(attention(Cause::ReclaimRefused { convoy: read }, reason, held))
         }
         Writer::Drift { ensure, convoy: target } => {
-            let Some(held) = records.convoys.get(target) else { return gone() };
+            let Some(held) = records.convoys.get(target) else { return Err(gone(target)) };
             let Some(ensure) = records.ensures.get(ensure) else { return Ok(Mapped::Dropped("its ConvoyEnsure is gone")) };
             let read = generation_read(held, ensure)?;
             let project =
@@ -342,7 +348,7 @@ fn credential(
     if group.iter().any(|old| addressed(old.record) != principal) {
         return Err("its vessel's credential demands are addressed to different people".into());
     }
-    let Some(convoy) = records.convoys.get(convoy) else { return Ok(Mapped::Dropped("its convoy is gone")) };
+    let Some(convoy) = records.convoys.get(convoy) else { return Err(gone(convoy)) };
     let Some(vessel) =
         records.vessels.iter().find(|vessel| vessel.spec.convoy_ref == convoy.metadata.name && vessel.spec.vessel_name == vessel_name)
     else {

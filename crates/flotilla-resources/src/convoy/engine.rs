@@ -496,6 +496,11 @@ impl ImportedLaunches {
         self.get(namespace, record).map(ImportedLaunch::name)
     }
 
+    /// [`Self::name`], or why record `record` in `namespace` imports as no launch.
+    pub fn launch(&self, namespace: &str, record: &str) -> Result<String, NoLaunch> {
+        self.name(namespace, record).ok_or_else(|| self.missing(namespace, record).unwrap_or(NoLaunch::NotHeld))
+    }
+
     /// `address`, written against the old store in `namespace`, with the convoy it names as the
     /// launch that convoy imports as, at the launch's address ([`launch_address`]) in its
     /// project, as the import writes it, whether or not the old address named the project. The
