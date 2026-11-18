@@ -1,8 +1,8 @@
 //! The records the Message path reads about the convoys, crews and declarations its messages name,
 //! each read by its key (#3108): a convoy's copies by name, a session, artifact, repository or
 //! vessel by name, a declaration by name, a seat's sessions through its convoy's vessel, and the
-//! newest launches of a standing role at each home. No read here lists a kind whole, save the
-//! Forge catalog and this home's session launches, which have no key to read by.
+//! newest launches of a standing role at each home, and this home's live session launches. No read
+//! here lists a kind whole, save the Forge catalog, which has no key to read by.
 
 use std::{
     collections::BTreeSet,
@@ -206,12 +206,16 @@ impl KeyedReads {
         .await
     }
 
-    /// This home's running agent session launches: no key reaches them, so every launch held
-    /// here is read.
+    /// This home's running agent session launches, read by key from the launches that have not
+    /// ended: the read follows the live launches, not the ended ones retained beside them.
     pub async fn running_here(&self) -> Result<Vec<TerminalRecord>, String> {
         let here = self.home.clone();
         self.blocking(move |reads| {
-            Ok(reads.terminals()?.at(&here)?.into_iter().filter(|launch| launch.is_agent() && launch.is_running()).collect())
+            let terminals = reads.terminals()?;
+            if terminals.home() != here {
+                return Err(format!("the terminal sessions are read at {}, not at this home {here}", terminals.home()));
+            }
+            Ok(terminals.live()?.into_iter().filter(|launch| launch.is_agent() && launch.is_running()).collect())
         })
         .await
     }

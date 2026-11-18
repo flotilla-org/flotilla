@@ -264,6 +264,36 @@ async fn role_holders_are_read_from_this_homes_running_sessions() {
     assert_eq!(cost.convoys_converted, 1, "the crew's convoy is read by its name, once: {cost:#?}");
 }
 
+/// What finding the role holders read with `ended` ended agent launches retained at this home
+/// beside the crew's running coder.
+async fn holders_read_beside_ended(ended: usize) -> Cost {
+    let home = Home::open(0, 0).await;
+    for n in 0..ended {
+        let launch = home.engine.terminals.request(&TerminalsFixture::agent(&format!("ended-{n}"), "coder", "env"));
+        home.engine.terminals.ready(&launch, &format!("pool-ended-{n}"), &TerminalLaunchFacts::default());
+        home.engine.terminals.release(&launch);
+    }
+    // The session views take these launches in at their next read, as a running daemon's took
+    // them in as they ended: that is not the pass's cost.
+    home.backend.clone().using::<TerminalSession>(NAMESPACE).list().await.expect("the session views");
+    let before = home.meters();
+    let holders = home.measured(home.holders()).await;
+    assert!(holders.contains_key(&home.session), "the crew's coder still holds its seat: {holders:?}");
+    let cost = home.spent(before);
+    let scanned = home.reads.snapshot().get("TerminalSession").map_or(0, |counts| counts.whole_kind);
+    assert_eq!(scanned, 0, "no scan of this home's terminal launches: {:#?}", home.reads.snapshot());
+    cost
+}
+
+// Read cost (d10): a delivery pass reads this home's live launches by key, never every launch the
+// home has retained, so its reads do not grow with the ended launches beside the running ones.
+#[tokio::test]
+async fn role_holders_read_only_this_homes_live_launches() {
+    let cost = assert_flat_reads([0, 32], holders_read_beside_ended).await;
+    // The running launch, then its vessel's sessions when its seat is read.
+    assert_eq!(cost.terminal_launches, 2, "only the running launch is read: {cost:#?}");
+}
+
 /// What raising a credential refresh about the crew's vessel read, with `others` other convoys'
 /// vessels at another home. No other project is declared: raising reads the open attentions in
 /// every person inbox, which every project's declaration names (`person_inboxes`).
