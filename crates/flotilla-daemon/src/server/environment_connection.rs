@@ -7,7 +7,7 @@ use std::{
 
 use flotilla_core::in_process::InProcessDaemon;
 use flotilla_daemon_api::action_support::empty_repo_identity;
-use flotilla_daemon_api::event_sink::CommandCompletions;
+use flotilla_daemon_api::event_sink::CompletionCapture;
 use flotilla_protocol::{
     CallerCrew, CommandAction, CommandCaller, CrewCommandContext, DaemonEvent, EnvironmentId, Message, PrincipalRef, Request, Response,
     ResponseResult,
@@ -124,10 +124,10 @@ pub(super) fn authorize(request: &mut Request, crew: &CallerCrew) -> Result<(), 
 }
 
 /// One command is in flight per environment connection. Crew clients are serial;
-/// the capture holds completions only, never the host's event stream, so other
-/// traffic cannot crowd out this command's outcome.
-pub(super) async fn command_completion(completions: &mut CommandCompletions, command_id: u64) -> Result<DaemonEvent, String> {
-    completions.finished(command_id).await.ok_or_else(|| {
+/// the capture is sent this command's completion only, never the host's event
+/// stream, so other traffic can neither crowd out its outcome nor queue behind it.
+pub(super) async fn command_completion(completion: CompletionCapture, command_id: u64) -> Result<DaemonEvent, String> {
+    completion.finished(command_id).await.ok_or_else(|| {
         format!("EnvironmentCompletionLost: command {command_id} outcome unavailable (daemon events closed); it may have completed, do not retry blindly")
     })
 }
@@ -208,7 +208,7 @@ pub(super) async fn serve(
         let caller_namespace = crew.namespace.clone();
         let caller =
             CommandCaller { principal_ref: PrincipalRef::implicit_for_namespace(&crew.namespace), process: None, crew: Some(crew) };
-        let mut completions = daemon.capture_completions();
+        let completion = daemon.capture_completion();
         let dispatcher = RequestDispatcher::new_with_caller(
             &daemon,
             &router,
@@ -241,7 +241,7 @@ pub(super) async fn serve(
         if let Some(command_id) = command_id {
             let completion = tokio::select! {
                 result = tracing::Instrument::instrument(
-                    command_completion(&mut completions, command_id),
+                    command_completion(completion, command_id),
                     tracing::info_span!(parent: &span, "environment_connection.completion_wait", command_id),
                 ) => result,
                 _ = shutdown.changed() => return,
@@ -411,7 +411,7 @@ mod tests {
         let capacity = 4;
         let sink = BroadcastEventSink::new(tokio::sync::broadcast::channel(capacity).0);
         let mut broadcast = sink.subscribe();
-        let mut completions = sink.capture_completions();
+        let (completion, unfinished) = (sink.capture_completion(), sink.capture_completion());
         sink.emit(finished(99));
         sink.emit(finished(1));
         for _ in 0..capacity * 4 {
@@ -424,15 +424,14 @@ mod tests {
             });
         }
         assert!(matches!(broadcast.recv().await, Err(tokio::sync::broadcast::error::RecvError::Lagged(_))), "the broadcast lags");
-        let own = tokio::time::timeout(std::time::Duration::from_secs(1), command_completion(&mut completions, 1))
+        let own = tokio::time::timeout(std::time::Duration::from_secs(1), command_completion(completion, 1))
             .await
             .expect("own completion is retained")
             .expect("own outcome");
         assert!(matches!(own, DaemonEvent::CommandFinished { command_id: 1, .. }));
 
         drop(sink);
-        let result =
-            tokio::time::timeout(std::time::Duration::from_secs(1), command_completion(&mut completions, 3)).await.expect("no hang");
+        let result = tokio::time::timeout(std::time::Duration::from_secs(1), command_completion(unfinished, 3)).await.expect("no hang");
         assert!(result.expect_err("unknown outcome").starts_with("EnvironmentCompletionLost:"));
     }
 

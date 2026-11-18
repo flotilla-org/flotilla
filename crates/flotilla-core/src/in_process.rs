@@ -3681,10 +3681,16 @@ impl InProcessDaemon {
         self.event_sink.clone()
     }
 
-    /// Captures command completions apart from the lossy event broadcast. Capture
-    /// before dispatching a command to be sure of receiving its outcome.
-    pub fn capture_completions(&self) -> flotilla_daemon_api::event_sink::CommandCompletions {
-        self.event_source.capture_completions()
+    /// Captures one command's completion apart from the lossy event broadcast. Capture
+    /// before dispatching the command to be sure of receiving its outcome.
+    pub fn capture_completion(&self) -> flotilla_daemon_api::event_sink::CompletionCapture {
+        self.event_source.capture_completion()
+    }
+
+    /// Every command completion, apart from the lossy event broadcast, for a consumer that
+    /// routes each outcome as it arrives.
+    pub fn watch_completions(&self) -> flotilla_daemon_api::event_sink::CommandCompletions {
+        self.event_source.watch_completions()
     }
 }
 
@@ -5584,7 +5590,7 @@ impl InProcessDaemon {
             return Ok(id);
         }
         // Capture before executing: the first execution may finish before it answers.
-        let mut completions = self.event_source.capture_completions();
+        let completion = self.event_source.capture_completion();
         let id = match execute.await {
             Ok(id) => id,
             Err(error) => {
@@ -5594,7 +5600,7 @@ impl InProcessDaemon {
         };
         let daemon = self.self_weak.clone();
         tokio::spawn(async move {
-            let Some(DaemonEvent::CommandFinished { result, .. }) = completions.finished(id).await else { return };
+            let Some(DaemonEvent::CommandFinished { result, .. }) = completion.finished(id).await else { return };
             if let Some(daemon) = daemon.upgrade() {
                 daemon.finish_followers(&key, result);
             }

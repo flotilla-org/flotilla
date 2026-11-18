@@ -364,7 +364,7 @@ pub(super) async fn handle(
     let mut collector_slot = if kind == "execute" { Some(commands.collector.lock().await) } else { None };
     let collector = collector_slot.as_mut().map(|slot| {
         slot.get_or_insert_with(|| {
-            ProgressCollector::new(daemon.subscribe(), daemon.capture_completions(), commands.eviction_sequence.clone())
+            ProgressCollector::new(daemon.subscribe(), daemon.watch_completions(), commands.eviction_sequence.clone())
         })
     });
     let mut routes = match collector.as_ref() {
@@ -685,7 +685,7 @@ async fn collect_progress(
     let routes = Arc::new(Mutex::new(ProgressRoutes::default()));
     routes.lock().await.senders.insert(command_id, sender);
     let (retire, retired) = mpsc::unbounded_channel();
-    let collect = collect_all_progress(sink.subscribe(), sink.capture_completions(), routes, order, retired, true);
+    let collect = collect_all_progress(sink.subscribe(), sink.watch_completions(), routes, order, retired, true);
     tokio::spawn(async move {
         collect.await;
         drop(retire);
@@ -1806,7 +1806,7 @@ mod tests {
         let (bus, _) = broadcast::channel(64);
         let events = BroadcastEventSink::new(bus.clone());
         let order = Arc::new(AtomicU64::new(0));
-        let collector = ProgressCollector::new(events.subscribe(), events.capture_completions(), order.clone());
+        let collector = ProgressCollector::new(events.subscribe(), events.watch_completions(), order.clone());
         let mut states = Vec::new();
         for id in 0..8 {
             let (sender, state) = watch::channel(CommandState::new(Uuid::new_v4(), None, &order));
@@ -2018,7 +2018,7 @@ mod tests {
         let now = Instant::now();
         let events = BroadcastEventSink::new(broadcast::channel(1).0);
         let mut first_state = None;
-        let collector = ProgressCollector::new(events.subscribe(), events.capture_completions(), h.commands.eviction_sequence.clone());
+        let collector = ProgressCollector::new(events.subscribe(), events.watch_completions(), h.commands.eviction_sequence.clone());
         for n in 0..RECORD_LIMIT {
             let id = Uuid::from_u128((RECORD_LIMIT - n) as u128);
             let permit = h.commands.reserve_for_at(&user(), now).await.unwrap();
@@ -2063,7 +2063,7 @@ mod tests {
             let (sender, receiver) = watch::channel(state);
             let observer = sender.clone();
             let events = BroadcastEventSink::new(broadcast::channel(4).0);
-            let collector = ProgressCollector::new(events.subscribe(), events.capture_completions(), h.commands.eviction_sequence.clone());
+            let collector = ProgressCollector::new(events.subscribe(), events.watch_completions(), h.commands.eviction_sequence.clone());
             collector.routes.lock().await.senders.insert(77, sender);
             let registration = Some(collector.registration(77));
             let permit = h.commands.reserve_for(&user()).await.unwrap();

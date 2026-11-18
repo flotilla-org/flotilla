@@ -5732,9 +5732,9 @@ async fn caller_can_stall_and_promise(daemon: &InProcessDaemon, caller: flotilla
         },
     ] {
         let stalling = matches!(action, CommandAction::CrewStall { .. });
-        let mut completions = daemon.capture_completions();
+        let completion = daemon.capture_completion();
         let id = daemon.execute_for_caller(Command::builder().action(action).build(), Some(caller.clone())).await.unwrap();
-        let event = super::environment_connection::command_completion(&mut completions, id).await.unwrap();
+        let event = super::environment_connection::command_completion(completion, id).await.unwrap();
         assert!(matches!(&event, DaemonEvent::CommandFinished { result: CommandValue::Ok, .. }), "{event:?}");
         let status = convoys.get(&own).await.unwrap().status.unwrap();
         // The crew's stall is the home's stall judgement, made by the coder; the seat reads
@@ -5805,21 +5805,25 @@ async fn crew_commands_answer_on_acceptance_and_keyed_retries_run_once() {
     };
     let keyed =
         |command| daemon.execute_keyed(Some("retry-key"), Some(&caller), daemon.execute_for_caller_typed(command, Some(caller.clone())));
-    let mut completions = daemon.capture_completions();
+    let completion = daemon.capture_completion();
     let first = keyed(promise()).await.unwrap();
-    assert!(completions.finished(first).now_or_never().is_none(), "the answer does not wait for the command to run");
+    let mut first_finished = Box::pin(completion.finished(first));
+    assert!((&mut first_finished).now_or_never().is_none(), "the answer does not wait for the command to run");
+    let completion = daemon.capture_completion();
     let retry = keyed(promise()).await.unwrap();
     assert_ne!(first, retry, "a retry is answered under its own id");
-    for id in [first, retry] {
-        let finished = completions.finished(id).await.expect("outcome");
+    for finished in [first_finished.await, completion.finished(retry).await] {
+        let finished = finished.expect("outcome");
         assert!(matches!(&finished, DaemonEvent::CommandFinished { result: CommandValue::Ok, .. }), "{finished:?}");
     }
+    let completion = daemon.capture_completion();
     let late = keyed(promise()).await.unwrap();
-    assert!(matches!(completions.finished(late).await, Some(DaemonEvent::CommandFinished { result: CommandValue::Ok, .. })));
+    assert!(matches!(completion.finished(late).await, Some(DaemonEvent::CommandFinished { result: CommandValue::Ok, .. })));
 
     // Unkeyed, the same command runs again, and the promise refuses its second declaration.
+    let completion = daemon.capture_completion();
     let again = daemon.execute_for_caller(promise(), Some(caller.clone())).await.unwrap();
-    let refused = completions.finished(again).await.expect("outcome");
+    let refused = completion.finished(again).await.expect("outcome");
     assert!(
         matches!(&refused, DaemonEvent::CommandFinished { result: CommandValue::Error { message }, .. } if message.contains("already exists")),
         "{refused:?}"
