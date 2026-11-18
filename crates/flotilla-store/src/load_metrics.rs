@@ -12,6 +12,7 @@
 
 use std::{
     collections::BTreeMap,
+    marker::PhantomData,
     sync::{
         atomic::{AtomicU64, Ordering},
         Arc, Mutex,
@@ -52,29 +53,135 @@ fn bucket_upper(index: usize) -> u64 {
     u64::try_from(upper).unwrap_or(u64::MAX)
 }
 
-/// A latency distribution recorded in microseconds.
-pub struct LatencyHistogram {
-    buckets: Box<[AtomicU64]>,
-    sum_micros: AtomicU64,
-    max_micros: AtomicU64,
+/// The bounds, in microseconds, a histogram exports as Prometheus buckets. Each is an
+/// inclusive `le`, counted exactly as values are recorded; values above the last
+/// reach only `+Inf`. The bounds suit what the histogram measures, so a scrape carries
+/// at most about 25 buckets per series rather than the 976 internal quantile buckets.
+pub trait ExportBounds: Send + Sync + 'static {
+    const MICROS: &'static [u64];
 }
 
-impl Default for LatencyHistogram {
+/// In-process histograms that only report quantiles export no buckets.
+#[derive(Debug)]
+pub enum NotExported {}
+impl ExportBounds for NotExported {
+    const MICROS: &'static [u64] = &[];
+}
+
+/// A controller's reconcile of one object: sub-millisecond keyed passes up to passes
+/// that call out (Docker, a fetch) for tens of seconds; a minute is stuck.
+#[derive(Debug)]
+pub enum ReconcileTime {}
+impl ExportBounds for ReconcileTime {
+    const MICROS: &'static [u64] = &[
+        500, 1_000, 2_500, 5_000, 10_000, 25_000, 50_000, 100_000, 250_000, 500_000, 1_000_000, 2_500_000, 5_000_000, 10_000_000,
+        30_000_000, 60_000_000,
+    ];
+}
+
+/// An object's wait in a controller's work queue: near zero when the loop is idle, minutes
+/// behind a backlog.
+#[derive(Debug)]
+pub enum ControllerQueueWait {}
+impl ExportBounds for ControllerQueueWait {
+    const MICROS: &'static [u64] = &[
+        100,
+        250,
+        500,
+        1_000,
+        2_500,
+        5_000,
+        10_000,
+        25_000,
+        50_000,
+        100_000,
+        250_000,
+        500_000,
+        1_000_000,
+        2_500_000,
+        5_000_000,
+        10_000_000,
+        30_000_000,
+        60_000_000,
+        120_000_000,
+    ];
+}
+
+/// A store read's or write's wait for the writer or a reader: microseconds normally; a
+/// second is pathological.
+#[derive(Debug)]
+pub enum StoreQueueWait {}
+impl ExportBounds for StoreQueueWait {
+    const MICROS: &'static [u64] =
+        &[5, 10, 25, 50, 100, 250, 500, 1_000, 2_500, 5_000, 10_000, 25_000, 50_000, 100_000, 250_000, 500_000, 1_000_000];
+}
+
+/// A store read's or write's execution: microseconds for a keyed read, milliseconds to
+/// seconds for scans and large transactions.
+#[derive(Debug)]
+pub enum StoreExecution {}
+impl ExportBounds for StoreExecution {
+    const MICROS: &'static [u64] =
+        &[10, 25, 50, 100, 250, 500, 1_000, 2_500, 5_000, 10_000, 25_000, 50_000, 100_000, 250_000, 500_000, 1_000_000, 2_500_000];
+}
+
+/// An issue's wait from ready to its convoy: seconds to a day.
+#[derive(Debug)]
+pub enum DispatchWait {}
+impl ExportBounds for DispatchWait {
+    const MICROS: &'static [u64] = &[
+        1_000_000,
+        5_000_000,
+        15_000_000,
+        30_000_000,
+        60_000_000,
+        120_000_000,
+        300_000_000,
+        600_000_000,
+        1_800_000_000,
+        3_600_000_000,
+        7_200_000_000,
+        14_400_000_000,
+        43_200_000_000,
+        86_400_000_000,
+    ];
+}
+
+/// A latency distribution recorded in microseconds: quantile buckets for in-process
+/// summaries, and `B`'s exported buckets.
+pub struct LatencyHistogram<B: ExportBounds = NotExported> {
+    buckets: Box<[AtomicU64]>,
+    exported: Box<[AtomicU64]>,
+    sum_micros: AtomicU64,
+    max_micros: AtomicU64,
+    bounds: PhantomData<fn() -> B>,
+}
+
+impl<B: ExportBounds> Default for LatencyHistogram<B> {
     fn default() -> Self {
-        Self { buckets: (0..BUCKETS).map(|_| AtomicU64::new(0)).collect(), sum_micros: AtomicU64::new(0), max_micros: AtomicU64::new(0) }
+        Self {
+            buckets: (0..BUCKETS).map(|_| AtomicU64::new(0)).collect(),
+            exported: B::MICROS.iter().map(|_| AtomicU64::new(0)).collect(),
+            sum_micros: AtomicU64::new(0),
+            max_micros: AtomicU64::new(0),
+            bounds: PhantomData,
+        }
     }
 }
 
-impl std::fmt::Debug for LatencyHistogram {
+impl<B: ExportBounds> std::fmt::Debug for LatencyHistogram<B> {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         formatter.debug_tuple("LatencyHistogram").field(&self.snapshot().summary()).finish()
     }
 }
 
-impl LatencyHistogram {
+impl<B: ExportBounds> LatencyHistogram<B> {
     pub fn record(&self, latency: Duration) {
         let micros = u64::try_from(latency.as_micros()).unwrap_or(u64::MAX);
         self.buckets[bucket(micros)].fetch_add(1, Ordering::Relaxed);
+        if let Some(exported) = self.exported.get(B::MICROS.partition_point(|bound| *bound < micros)) {
+            exported.fetch_add(1, Ordering::Relaxed);
+        }
         self.sum_micros.fetch_add(micros, Ordering::Relaxed);
         self.max_micros.fetch_max(micros, Ordering::Relaxed);
     }
@@ -82,6 +189,7 @@ impl LatencyHistogram {
     pub fn snapshot(&self) -> HistogramSnapshot {
         HistogramSnapshot {
             buckets: self.buckets.iter().map(|bucket| bucket.load(Ordering::Relaxed)).collect(),
+            exported: B::MICROS.iter().zip(&self.exported).map(|(bound, count)| (*bound, count.load(Ordering::Relaxed))).collect(),
             sum_micros: self.sum_micros.load(Ordering::Relaxed),
             max_micros: self.max_micros.load(Ordering::Relaxed),
         }
@@ -92,17 +200,20 @@ impl LatencyHistogram {
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct HistogramSnapshot {
     buckets: Vec<u64>,
+    /// Exported bounds in microseconds and the records in each, not cumulative.
+    exported: Vec<(u64, u64)>,
     sum_micros: u64,
     max_micros: u64,
 }
 
 impl HistogramSnapshot {
-    /// Inclusive bucket bounds in microseconds and cumulative counts.
+    /// The exported inclusive bounds in microseconds and cumulative counts; records
+    /// above the last bound are only in [`HistogramSnapshot::count`].
     pub fn cumulative_buckets(&self) -> impl Iterator<Item = (u64, u64)> + '_ {
         let mut total = 0;
-        self.buckets.iter().enumerate().map(move |(index, count)| {
+        self.exported.iter().map(move |(bound, count)| {
             total += count;
-            (bucket_upper(index), total)
+            (*bound, total)
         })
     }
 
@@ -125,7 +236,13 @@ impl HistogramSnapshot {
             .map(|(index, count)| count.saturating_sub(earlier.buckets.get(index).copied().unwrap_or(0)))
             .collect::<Vec<_>>();
         let highest = buckets.iter().rposition(|count| *count > 0).map_or(0, bucket_upper);
-        Self { buckets, sum_micros: self.sum_micros.saturating_sub(earlier.sum_micros), max_micros: highest.min(self.max_micros) }
+        let exported = self
+            .exported
+            .iter()
+            .enumerate()
+            .map(|(index, (bound, count))| (*bound, count.saturating_sub(earlier.exported.get(index).map_or(0, |(_, count)| *count))))
+            .collect();
+        Self { buckets, exported, sum_micros: self.sum_micros.saturating_sub(earlier.sum_micros), max_micros: highest.min(self.max_micros) }
     }
 
     /// The smallest bucket bound below which `quantile` of the records fall.
@@ -221,13 +338,13 @@ pub struct StoreLoadMetrics {
     /// Reads refused as busy, once per refusal returned to a caller.
     pub read_contention: Counter,
     /// Time from a write's submission until the writer thread starts it.
-    pub write_wait: LatencyHistogram,
-    pub write_execution: LatencyHistogram,
+    pub write_wait: LatencyHistogram<StoreQueueWait>,
+    pub write_execution: LatencyHistogram<StoreExecution>,
     /// Writes queued behind the running one, observed as each write starts;
     /// a burst that drains between starts is not seen.
     pub write_queue_peak: Peak,
-    pub read_wait: LatencyHistogram,
-    pub read_execution: LatencyHistogram,
+    pub read_wait: LatencyHistogram<StoreQueueWait>,
+    pub read_execution: LatencyHistogram<StoreExecution>,
     /// Reads queued behind those running, observed as each read starts.
     pub read_queue_peak: Peak,
     /// Reads the reader skipped because their caller gave up or their
@@ -290,8 +407,8 @@ pub struct ControllerLoadMetrics {
     pub reads: Arc<CallerReads>,
     pub watch_reads: Arc<CallerReads>,
     /// Prepare plus reconcile and its writes, per reconciled object.
-    pub reconcile: LatencyHistogram,
-    pub queue_wait: LatencyHistogram,
+    pub reconcile: LatencyHistogram<ReconcileTime>,
+    pub queue_wait: LatencyHistogram<ControllerQueueWait>,
     busy: Mutex<BusyTime>,
     /// Reconciles that asked to run again after a delay, and requeues
     /// absorbed because one was already scheduled for the object.
@@ -522,7 +639,7 @@ mod tests {
             assert_eq!(bucket(value), BUCKETS - 1, "{value}");
             assert_eq!(bucket_upper(bucket(value)), u64::MAX);
         }
-        let histogram = LatencyHistogram::default();
+        let histogram = <LatencyHistogram>::default();
         histogram.record(Duration::MAX);
         assert_eq!(histogram.snapshot().summary().p99_micros, u64::MAX);
     }
@@ -534,7 +651,7 @@ mod tests {
         // Latencies from zero to an hour, as lists that may be empty.
         let before = tc.draw(gs::vecs(gs::integers::<u64>().min_value(0).max_value(3_600_000_000)).max_size(40));
         let during = tc.draw(gs::vecs(gs::integers::<u64>().min_value(0).max_value(3_600_000_000)).max_size(40));
-        let histogram = LatencyHistogram::default();
+        let histogram = <LatencyHistogram>::default();
         for micros in &before {
             histogram.record(Duration::from_micros(*micros));
         }
@@ -560,6 +677,25 @@ mod tests {
         } else {
             assert_eq!((phase.p50_micros, phase.mean_micros), (0, 0));
         }
+    }
+
+    // Behaviour: exported buckets count each record once, at the first bound not below
+    // it, and a phase keeps only its own records.
+    #[test]
+    fn exported_buckets_count_records_at_their_bound() {
+        let histogram = LatencyHistogram::<ReconcileTime>::default();
+        histogram.record(Duration::from_micros(500));
+        let earlier = histogram.snapshot();
+        for micros in [501, 1_000, 60_000_000, 60_000_001] {
+            histogram.record(Duration::from_micros(micros));
+        }
+        let cumulative = |snapshot: &HistogramSnapshot| snapshot.cumulative_buckets().take(3).collect::<Vec<_>>();
+        assert_eq!(cumulative(&histogram.snapshot()), [(500, 1), (1_000, 3), (2_500, 3)]);
+        let phase = histogram.snapshot().since(&earlier);
+        assert_eq!(cumulative(&phase), [(500, 0), (1_000, 2), (2_500, 2)]);
+        assert_eq!(phase.cumulative_buckets().last(), Some((60_000_000, 3)));
+        assert_eq!(phase.count(), 4);
+        assert_eq!(<LatencyHistogram>::default().snapshot().cumulative_buckets().count(), 0);
     }
 
     #[test]

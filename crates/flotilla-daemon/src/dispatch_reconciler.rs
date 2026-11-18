@@ -18,7 +18,11 @@ use flotilla_resources::{
     pinned_workflow_ref, Clock, Convoy, DispatchPolicy, DispatchQueueAttention, DispatchQueueEntry, Project, ProjectStatusPatch,
     ReadWatchEvent, ResolvedIssueSourceBinding, ResourceError, ResourceObject, SystemClock,
 };
-use flotilla_store::{apply_status_patch, load_metrics::HistogramSnapshot, load_metrics::LatencyHistogram, ResourceBackend};
+use flotilla_store::{
+    apply_status_patch,
+    load_metrics::{DispatchWait, HistogramSnapshot, LatencyHistogram},
+    ResourceBackend,
+};
 use futures::{stream::BoxStream, FutureExt, StreamExt};
 use tracing::{info, warn};
 
@@ -58,7 +62,7 @@ struct PassIssueReads {
 /// are operator-authored names, a small set.
 #[derive(Debug, Default)]
 pub(crate) struct DispatchMetrics {
-    time_from_ready: std::sync::Mutex<BTreeMap<(String, String), Arc<LatencyHistogram>>>,
+    time_from_ready: std::sync::Mutex<BTreeMap<(String, String), Arc<LatencyHistogram<DispatchWait>>>>,
 }
 
 impl DispatchMetrics {

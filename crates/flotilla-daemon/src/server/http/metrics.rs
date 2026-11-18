@@ -80,8 +80,7 @@ impl Exposition {
     }
     fn histogram(&mut self, name: &str, labels: &str, histogram: &HistogramSnapshot) {
         self.family(name, "histogram");
-        // Even u64::MAX is a real finite microsecond bound, not an infinity
-        // sentinel. Preserve it and append the separate Prometheus +Inf bucket.
+        // The histogram's own export bounds, then +Inf for everything above the last.
         for (upper, count) in histogram.cumulative_buckets() {
             self.sample(&format!("{name}_bucket"), &format!("{labels},le=\"{}\"", upper as f64 / 1_000_000.0), count);
         }
@@ -209,6 +208,7 @@ mod tests {
         body::{to_bytes, Body},
         http::Request,
     };
+    use flotilla_store::load_metrics::{ExportBounds, LatencyHistogram, StoreExecution};
     use std::time::Duration;
     use tower::ServiceExt;
 
@@ -389,6 +389,8 @@ mod tests {
                 | prometheus_parse::Value::Untyped(value) => assert!(value.is_finite() && *value >= 0.0),
                 prometheus_parse::Value::Histogram(buckets) => {
                     assert!(buckets.windows(2).all(|pair| pair[0].count <= pair[1].count));
+                    // Each histogram exports its own bounds (at most 25) and +Inf.
+                    assert!(buckets.len() <= 26, "{} exports {} buckets", sample.metric, buckets.len());
                 }
                 _ => panic!("unexpected summary"),
             }
@@ -530,11 +532,11 @@ mod tests {
         assert!(!text.contains("fleet unreachable"), "the sync error text is not a label");
     }
 
-    // Behaviour: the largest internal microsecond bucket stays finite and
-    // ordered below one +Inf bucket. One boundary example covers this conversion.
+    // Behaviour: a value above a histogram's last bound reaches only +Inf, and the
+    // finite buckets are exactly the histogram's own bounds.
     #[test]
-    fn histogram_top_bucket_is_finite() {
-        let histogram = flotilla_store::load_metrics::LatencyHistogram::default();
+    fn a_value_above_the_last_bound_reaches_only_inf() {
+        let histogram = LatencyHistogram::<StoreExecution>::default();
         histogram.record(Duration::MAX);
         let mut out = Exposition { current: String::new(), host: "host".into(), families: Default::default() };
         out.histogram("latency_seconds", "", &histogram.snapshot());
@@ -542,21 +544,25 @@ mod tests {
         let scrape = prometheus_parse::Scrape::parse(text.lines().map(|line| Ok(line.to_owned()))).unwrap();
         let sample = scrape.samples.iter().find(|sample| sample.metric == "latency_seconds").unwrap();
         let prometheus_parse::Value::Histogram(buckets) = &sample.value else { panic!("expected histogram") };
-        assert_eq!(buckets.iter().filter(|bucket| bucket.less_than.is_infinite()).count(), 1);
-        let finite = &buckets[buckets.len() - 2];
-        assert!(finite.less_than.is_finite());
-        assert_eq!(finite.less_than, u64::MAX as f64 / 1_000_000.0);
-        assert_eq!(finite.count, 1.0);
-        assert_eq!(buckets.last().unwrap().count, 1.0);
+        let (infinite, finite) = buckets.split_last().unwrap();
+        assert!(infinite.less_than.is_infinite());
+        assert_eq!(infinite.count, 1.0);
+        let bounds = finite.iter().map(|bucket| bucket.less_than).collect::<Vec<_>>();
+        assert_eq!(bounds, StoreExecution::MICROS.iter().map(|bound| *bound as f64 / 1_000_000.0).collect::<Vec<_>>());
+        assert!(finite.iter().all(|bucket| bucket.count == 0.0));
     }
 
     // Behaviour: bucket exposition conserves counts and sums, uses inclusive
     // cumulative bounds, and always terminates with +Inf. The generator spans
-    // empty/duplicate samples, zero and sub-bucket boundaries through one second.
+    // empty/duplicate samples, zero, values exactly on a bound, and values past the
+    // last bound.
     #[hegel::test]
     fn histogram_exposition_conserves_observations(tc: hegel::TestCase) {
-        let values = tc.draw(hegel::generators::vecs(hegel::generators::integers::<u64>().min_value(0).max_value(1_000_000)).max_size(40));
-        let histogram = flotilla_store::load_metrics::LatencyHistogram::default();
+        let mut values =
+            tc.draw(hegel::generators::vecs(hegel::generators::integers::<u64>().min_value(0).max_value(3_000_000)).max_size(40));
+        let on_bounds = tc.draw(hegel::generators::vecs(hegel::generators::sampled_from(StoreExecution::MICROS.to_vec())).max_size(10));
+        values.extend(on_bounds);
+        let histogram = LatencyHistogram::<StoreExecution>::default();
         for value in &values {
             histogram.record(Duration::from_micros(*value));
         }

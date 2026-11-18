@@ -274,8 +274,8 @@ async fn drive(target: &dyn FleetTarget, plan: &LoadPlan) -> Result<LoadReport, 
     let mut target_errors = 0u64;
     let mut target_error_samples = Vec::new();
     let mut failing_ticks = 0u32;
-    let backlog = LatencyHistogram::default();
-    let admission = LatencyHistogram::default();
+    let backlog = <LatencyHistogram>::default();
+    let admission = <LatencyHistogram>::default();
     let mut peak_running = 0usize;
     let mut ramp_end: Option<Instant> = None;
     let mut warmup_ended_at_window = 0;
