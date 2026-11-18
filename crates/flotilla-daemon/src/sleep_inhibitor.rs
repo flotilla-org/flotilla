@@ -703,6 +703,15 @@ mod tests {
         hosts.create(&InputMeta::builder().name("test-host".to_string()).build(), &HostSpec::default()).await.expect("create host");
     }
 
+    /// Waits for the inhibitor to release, every state before the release a hold. The work that
+    /// releases it reaches the inhibitor as several watch events, in no fixed order: a landing is
+    /// two writes, its work kept and then its launch delivered, and a feed pass between them shows
+    /// the convoy kept but not yet terminal; a vessel's release changes both its own view and its
+    /// convoy's, which is composed with its vessels. The inhibitor holds until the last of them.
+    async fn held_until_released(states: &mut mpsc::UnboundedReceiver<bool>) {
+        while next_state(states).await {}
+    }
+
     async fn next_state(states: &mut mpsc::UnboundedReceiver<bool>) -> bool {
         tokio::time::timeout(Duration::from_secs(1), states.recv())
             .await
@@ -760,7 +769,7 @@ mod tests {
         assert!(next_state(&mut rx).await);
 
         land_convoy(&backend, &second).await;
-        assert!(!next_state(&mut rx).await);
+        held_until_released(&mut rx).await;
         task.abort();
     }
 
@@ -830,7 +839,7 @@ mod tests {
         assert!(next_state(&mut rx).await);
         assert!(next_state(&mut rx).await);
         land_convoy(&backend, &unplaced).await;
-        assert!(!next_state(&mut rx).await);
+        held_until_released(&mut rx).await;
         task.abort();
     }
 
@@ -858,7 +867,7 @@ mod tests {
         assert!(next_state(&mut rx).await);
         assert!(next_state(&mut rx).await);
         engine_vessels.step(&vessel, VesselStep::Released);
-        assert!(!next_state(&mut rx).await);
+        held_until_released(&mut rx).await;
         task.abort();
         followed.abort();
     }
