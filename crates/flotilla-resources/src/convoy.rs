@@ -1656,6 +1656,17 @@ pub struct TurnDeliveryEpisode {
     pub evidence_at: DateTime<Utc>,
     pub judged_claim_at: DateTime<Utc>,
     pub outcome: TurnDeliveryOutcome,
+    /// Whether the turn asked its target to act: its rule's [`owes`](crate::TurnDeliveryRule::owes)
+    /// as it fired (run 4). A turn that only informed (checks passed) leaves a seat that has
+    /// submitted every promise owing nothing. Episodes recorded without it asked to act.
+    #[serde(default = "asked_to_act")]
+    #[builder(default = true)]
+    pub owes: bool,
+}
+
+/// An episode recorded before [`TurnDeliveryEpisode::owes`] asked its target to act.
+fn asked_to_act() -> bool {
+    true
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -3299,6 +3310,7 @@ mod subject_tests {
                         subject_revision: "head".into(),
                         evidence_at: start,
                         judged_claim_at: start,
+                        owes: true,
                         outcome: TurnDeliveryOutcome::Queued {
                             rung: TurnDeliveryRung::WarmSession,
                             queued_at: start,

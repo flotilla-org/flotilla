@@ -775,6 +775,7 @@ fn continuation_transitions_keep_started_at_and_clear_finished_at() {
                         subject_revision: "abc123".to_string(),
                         evidence_at: ts(30),
                         judged_claim_at: ts(20),
+                        owes: true,
                         outcome: TurnDeliveryOutcome::Delivered { rung: TurnDeliveryRung::WarmSession, delivered_at: ts(30) },
                     },
                     vessel: "implement".to_string(),
@@ -976,6 +977,7 @@ fn ledger_admission_digest_survives_duplicates_and_resets_for_new_turns(tc: hege
                 subject_revision: "new-head".into(),
                 evidence_at: ts(40),
                 judged_claim_at: ts(20),
+                owes: true,
                 outcome: TurnDeliveryOutcome::Delivered { rung: TurnDeliveryRung::WarmSession, delivered_at: ts(40) },
             },
             vessel: "implement".into(),
@@ -1003,6 +1005,7 @@ fn suppressed_message_admission_does_not_open_another_workflow_turn() {
         subject_revision: "head".into(),
         evidence_at: ts(30),
         judged_claim_at: ts(20),
+        owes: true,
         outcome: TurnDeliveryOutcome::MessageAccepted {
             new_turn: false,
             message: flotilla_protocol::ResourceRef::new("flotilla.work/v1", "Message", "flotilla", "canonical"),

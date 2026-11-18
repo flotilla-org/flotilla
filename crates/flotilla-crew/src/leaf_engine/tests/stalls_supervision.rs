@@ -112,6 +112,7 @@ async fn deliver_review_fix(case: &Case) {
                 subject_revision: "review-1".into(),
                 evidence_at: accepted_at,
                 judged_claim_at: accepted_at,
+                owes: true,
                 outcome: TurnDeliveryOutcome::MessageAccepted {
                     new_turn: true,
                     message: flotilla_protocol::ResourceRef::new("flotilla.work/v1", "Message", "flotilla", "review-fix"),

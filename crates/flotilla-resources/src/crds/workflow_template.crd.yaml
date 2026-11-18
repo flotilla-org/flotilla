@@ -72,6 +72,8 @@ spec:
                       brief:
                         type: string
                         minLength: 1
+                      owes:
+                        type: string
                       hold:
                         type: object
                         required:

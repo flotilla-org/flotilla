@@ -396,35 +396,97 @@ async fn a_seat_that_resubmits_after_a_review_fix_is_not_nudged() {
     assert_eq!(crew_messages(&daemon, "flotilla").await.len(), nudges, "no nudge after the resubmission");
 }
 
+// Run 4: a turn that only informs asks nothing of a seat that has submitted its PR. The checks
+// turn that follows a PR's submission when its checks pass does not arm the idle coder.
+#[tokio::test]
+async fn a_checks_passed_turn_after_submission_does_not_nudge_the_idle_seat() {
+    let coder = coder().await;
+    submit_pr(&coder).await;
+    deliver_rule_turn(&coder, CHECKS_RULE, CHECKS_BRIEF, "head-1@pass", false).await;
+    let Coder { daemon, backend, probe, clock, launch, .. } = coder;
+    let convoys = backend.clone().using::<ResourceConvoy>("flotilla");
+    let nudges = crew_messages(&daemon, "flotilla").await.len();
+
+    clock.advance(chrono::Duration::seconds(1));
+    idle_coder(&daemon, &probe, &clock, &launch);
+    daemon.reconcile_crew_stalls_once("flotilla").await.expect("stall judgement");
+    let status = convoys.get(&probe.convoy).await.expect("convoy").status.expect("status");
+    assert!(
+        !status.stalls.iter().any(|stalled| matches!(stalled.maker, Some(flotilla_resources::LeafMaker::Actor { .. }))),
+        "{:?}",
+        status.stalls
+    );
+    assert_eq!(crew_messages(&daemon, "flotilla").await.len(), nudges, "no nudge for a checks-passed turn");
+}
+
+// Run 4: a checks-failed turn after submission asks the coder to fix its PR. Idle, it is nudged,
+// and the nudge names that turn rather than telling it to submit the PR it has submitted.
+#[tokio::test]
+async fn a_checks_failed_turn_after_submission_nudges_the_idle_seat_naming_the_turn() {
+    use flotilla_resources::StallRung;
+
+    let coder = coder().await;
+    submit_pr(&coder).await;
+    deliver_rule_turn(&coder, CHECKS_RULE, CHECKS_BRIEF, "head-1@fail", true).await;
+    let Coder { daemon, backend, probe, clock, launch, .. } = coder;
+    let convoys = backend.clone().using::<ResourceConvoy>("flotilla");
+    let before: BTreeSet<String> = crew_messages(&daemon, "flotilla").await.into_iter().map(|message| message.metadata.name).collect();
+
+    clock.advance(chrono::Duration::seconds(1));
+    idle_coder(&daemon, &probe, &clock, &launch);
+    daemon.reconcile_crew_stalls_once("flotilla").await.expect("stall judgement");
+    let status = convoys.get(&probe.convoy).await.expect("convoy").status.expect("status");
+    assert_eq!(status.stalls.about(Some(("work", "coder"))).expect("the seat is stalled").rung, StallRung::Nudge);
+    let nudges: Vec<_> = crew_messages(&daemon, "flotilla")
+        .await
+        .into_iter()
+        .filter(|message| !before.contains(&message.metadata.name))
+        .map(|message| message.spec.body)
+        .collect();
+    assert_eq!(nudges.len(), 1, "{nudges:?}");
+    assert!(nudges[0].contains(&format!("you have not answered the `{CHECKS_RULE}` turn")), "{}", nudges[0]);
+    assert!(nudges[0].contains(CHECKS_BRIEF.lines().next().expect("first line")), "{}", nudges[0]);
+    assert!(!nudges[0].contains("submit your PR"), "{}", nudges[0]);
+}
+
 /// The review rule fires while the coder's PR waits on the forge, as turn delivery does it: the
 /// turn is delivered through the crew's actuator, its episode noted on the convoy, and the coder
 /// receives it.
 async fn deliver_review_fix(coder: &Coder) {
+    deliver_rule_turn(coder, REVIEW_RULE, "Address the actionable review and push the fix.", "head-1", true).await;
+}
+
+/// Rule `source` fires while the coder's PR waits on the forge, as turn delivery does it: the turn
+/// is delivered through the crew's actuator, its episode noted on the convoy with `owes` (whether
+/// it asked the coder to act, as delivery reads the rule's `owes` at firing), and the coder
+/// receives it.
+async fn deliver_rule_turn(coder: &Coder, source: &str, brief: &str, revision: &str, owes: bool) {
     use flotilla_resources::{Clock, TurnDeliveryEpisode, TurnDeliveryOutcome};
 
     let Coder { daemon, backend, probe, clock, .. } = coder;
     let convoys = backend.clone().using::<ResourceConvoy>("flotilla");
     clock.advance(chrono::Duration::seconds(1));
-    let review = flotilla_crew::leaf_engine::CrewTurnIntent::builder()
+    let turn = flotilla_crew::leaf_engine::CrewTurnIntent::builder()
         .namespace("flotilla".into())
         .convoy(probe.convoy.clone())
-        .source(REVIEW_RULE.into())
+        .source(source.into())
         .vessel("work".into())
         .role("coder".into())
-        .brief("Address the actionable review and push the fix.".into())
-        .subject_revision("head-1".into())
+        .brief(brief.into())
+        .subject_revision(revision.into())
         .sender(flotilla_crew::leaf_engine::Party::fleet("turn-rules"))
         .build();
-    let admission = daemon.crew.deliver_turn(&review).await.expect("deliver the review fix");
+    let admission = daemon.crew.deliver_turn(&turn).await.expect("deliver the turn");
+    let record = admission.message.name.clone();
     let engine_path = daemon.convoy_engine_path();
     flotilla_store::note_convoy(
         &engine_path,
         &convoys,
         &probe.convoy,
         &flotilla_resources::external_patches::record_turn_delivery(
-            REVIEW_RULE.into(),
+            source.into(),
             TurnDeliveryEpisode {
-                subject_revision: "head-1".into(),
+                subject_revision: revision.into(),
                 evidence_at: clock.now(),
                 judged_claim_at: clock.now(),
                 outcome: TurnDeliveryOutcome::MessageAccepted {
@@ -433,16 +495,18 @@ async fn deliver_review_fix(coder: &Coder) {
                     message: admission.message,
                     accepted_at: clock.now(),
                 },
+                owes,
             },
             "work".into(),
             "coder".into(),
-            review.brief.clone(),
+            turn.brief.clone(),
         ),
     )
     .await
     .expect("note the delivery");
-    let turn = crew_messages(daemon, "flotilla").await.remove(0);
-    receive_turn(daemon, &turn.spec.receiver, &turn.metadata.name, "resume-staging-session", clock.now()).await;
+    let message =
+        crew_messages(daemon, "flotilla").await.into_iter().find(|message| message.metadata.name == record).expect("the turn's message");
+    receive_turn(daemon, &message.spec.receiver, &message.metadata.name, "resume-staging-session", clock.now()).await;
 }
 
 // F4 (run 3): a nudge is not a turn the seat owes after its submission. A coder nudged while its
@@ -482,6 +546,10 @@ async fn a_seat_nudged_before_its_submission_is_not_nudged_after_it() {
 
 /// The review rule `coder` declares; turn delivery records its episodes under this source.
 const REVIEW_RULE: &str = "review-fix";
+
+/// The checks rule `coder` declares, and its brief's first line, which a nudge about it names.
+const CHECKS_RULE: &str = "checks-settled";
+const CHECKS_BRIEF: &str = "Inspect checks at the bound head and fix failures caused by this PR.\nThen continue shepherding.";
 
 struct Coder {
     daemon: Arc<InProcessDaemon>,
@@ -550,6 +618,17 @@ async fn coder() -> Coder {
                     .to(flotilla_resources::TurnDeliveryTarget::builder().vessel("work".to_string()).role("coder".to_string()).build())
                     .brief("Address the actionable review and push the fix.".to_string())
                     .hold(flotilla_resources::HoldAct::State)
+                    .build(),
+            );
+            // As the stock rule declares it: its turns ask the coder to act only on failing checks.
+            snapshot.turn_delivery.insert(
+                CHECKS_RULE.to_string(),
+                flotilla_resources::TurnDeliveryRule::builder()
+                    .on(flotilla_resources::parse_leaf_template("$cr.checks != pending").expect("checks leaf"))
+                    .to(flotilla_resources::TurnDeliveryTarget::builder().vessel("work".to_string()).role("coder".to_string()).build())
+                    .brief(CHECKS_BRIEF.to_string())
+                    .hold(flotilla_resources::HoldAct::State)
+                    .owes(flotilla_resources::parse_leaf_template("$cr.checks == fail").expect("checks-failed leaf"))
                     .build(),
             );
         })

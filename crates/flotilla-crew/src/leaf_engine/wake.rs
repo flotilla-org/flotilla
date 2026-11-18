@@ -1281,15 +1281,28 @@ fn latest_submission(
 /// Whether a turn rule targeting seat `vessel`/`role` admitted a new turn to it after `latest`,
 /// its latest submission. Stall nudges and hand-offs record no turn delivery, so they never count.
 fn turn_delivered_since(status: &flotilla_resources::ConvoyStatus, vessel: &str, role: &str, latest: DateTime<Utc>) -> bool {
-    let Some(snapshot) = &status.workflow_snapshot else { return false };
-    snapshot
-        .turn_delivery
+    owed_turns(status, vessel, role).any(|(_, accepted_at)| accepted_at > latest)
+}
+
+/// The new turns a turn rule targeting seat `vessel`/`role` admitted that asked it to act (run 4),
+/// each with its rule's source and when it was accepted. A turn that only informed (checks
+/// passed) is not among them.
+pub(super) fn owed_turns<'a>(
+    status: &'a flotilla_resources::ConvoyStatus,
+    vessel: &'a str,
+    role: &'a str,
+) -> impl Iterator<Item = (&'a str, DateTime<Utc>)> + 'a {
+    status
+        .workflow_snapshot
         .iter()
-        .filter(|(_, rule)| rule.to.vessel == vessel && rule.to.role == role)
-        .filter_map(|(source, _)| status.turn_deliveries.get(source))
-        .flat_map(|delivery| &delivery.episodes)
-        .any(|episode| {
-            matches!(episode.outcome, TurnDeliveryOutcome::MessageAccepted { new_turn: true, accepted_at, .. } if accepted_at > latest)
+        .flat_map(|snapshot| &snapshot.turn_delivery)
+        .filter(move |(_, rule)| rule.to.vessel == vessel && rule.to.role == role)
+        .filter_map(|(source, _)| status.turn_deliveries.get(source).map(|delivery| (source.as_str(), delivery)))
+        .flat_map(|(source, delivery)| delivery.episodes.iter().map(move |episode| (source, episode)))
+        .filter(|(_, episode)| episode.owes)
+        .filter_map(|(source, episode)| match episode.outcome {
+            TurnDeliveryOutcome::MessageAccepted { new_turn: true, accepted_at, .. } => Some((source, accepted_at)),
+            _ => None,
         })
 }
 

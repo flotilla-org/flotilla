@@ -66,6 +66,7 @@ pub async fn convoy_explain_surfaces_queued_turn_age_and_blocker(factory: &dyn E
                     subject_revision: "head".into(),
                     evidence_at: queued_at,
                     judged_claim_at: queued_at,
+                    owes: true,
                     outcome: flotilla_resources::TurnDeliveryOutcome::Queued {
                         rung: flotilla_resources::TurnDeliveryRung::WarmSession,
                         queued_at,

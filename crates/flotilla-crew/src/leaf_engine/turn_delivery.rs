@@ -6,9 +6,10 @@ use chrono::{DateTime, Utc};
 use flotilla_protocol::{Leaf, LeafAddress};
 use flotilla_resources::{
     address::{artifact_address, leaf_address, leaf_condition, leaf_record_name},
-    evaluate_leaf, expected_change_request_leaves, external_patches, Artifact, ArtifactLeafSubject, ChangeRequest, Convoy, ConvoyAttention,
-    HoldAct, Issue, ObservedChecks, ResourceError, ResourceObject, StatusPatch, TerminalSession, TerminalSessionSource, ThreeValue,
-    TurnDeliveryEpisode, TurnDeliveryOutcome, TurnDeliveryRule, CONVOY_LABEL, ROLE_LABEL, VESSEL_LABEL,
+    evaluate_leaf, expected_change_request_leaves, external_patches, template_leaf, Artifact, ArtifactLeafSubject, ChangeRequest,
+    ChangeRequestLeafSubject, Convoy, ConvoyAttention, HoldAct, Issue, IssueLeafSubject, LeafSubject, ObservedChecks, ResourceError,
+    ResourceObject, StatusPatch, TerminalSession, TerminalSessionSource, ThreeValue, TurnDeliveryEpisode, TurnDeliveryOutcome,
+    TurnDeliveryRule, CONVOY_LABEL, ROLE_LABEL, VESSEL_LABEL,
 };
 
 use super::stalls::{is_active_change_request_probe, is_conflict_probe, is_merged_settlement_probe, launch_underway};
@@ -284,7 +285,7 @@ impl LeafSubscriptionTable {
         // `progress` is the revision the crew can advance (a PR head, an issue
         // update, an artifact's subject); `subject_revision` also names what
         // distinguishes repeat firings at it (an artifact digest).
-        let (subject_revision, progress, evidence_at, brief, message_subject) = match &leaf.address {
+        let (subject_revision, progress, evidence_at, brief, message_subject, owes) = match &leaf.address {
             LeafAddress::ChangeRequest { number, .. } => {
                 let record_name = leaf_record_name(&leaf.address, &forges)?;
                 let record = self
@@ -386,7 +387,12 @@ impl LeafSubscriptionTable {
                 // The change request at its head; at its observation's revision while the head is unknown.
                 let at = cr.head_sha.value.clone().unwrap_or_else(|| record.object.metadata.resource_version.clone());
                 let subject = subject_reference(leaf_address(&leaf.address, &forges)?, at)?;
-                (revision.clone(), revision, evidence_at, brief, Some(subject))
+                let owes = asks_to_act(
+                    rule,
+                    &leaf.address,
+                    &ChangeRequestLeafSubject { change_request: &record.object, now: Utc::now(), stale_after: std::time::Duration::MAX },
+                )?;
+                (revision.clone(), revision, evidence_at, brief, Some(subject), owes)
             }
             LeafAddress::Issue { .. } => {
                 let record_name = leaf_record_name(&leaf.address, &forges)?;
@@ -431,12 +437,18 @@ impl LeafSubscriptionTable {
                     })
                     .unwrap_or_default();
                 let revision = format!("{}@{}", leaf.address, updated_at.to_rfc3339());
+                let owes = asks_to_act(
+                    rule,
+                    &leaf.address,
+                    &IssueLeafSubject { issue: &record.object, now: Utc::now(), stale_after: std::time::Duration::MAX },
+                )?;
                 (
                     revision.clone(),
                     revision,
                     evidence_at,
                     brief,
                     Some(subject_reference(leaf_address(&leaf.address, &forges)?, updated_at.to_rfc3339())?),
+                    owes,
                 )
             }
             LeafAddress::Artifact { convoy: artifact_convoy, producer, kind, subject } => {
@@ -507,6 +519,7 @@ impl LeafSubscriptionTable {
                         )
                     })
                     .unwrap_or_default();
+                let owes = asks_to_act(rule, &bound_leaf.address, &ArtifactLeafSubject(&artifact))?;
                 (
                     format!("{subject}@{}", artifact.spec.digest),
                     subject.clone(),
@@ -516,6 +529,7 @@ impl LeafSubscriptionTable {
                         artifact_address(&artifact.spec.convoy, &artifact.spec.producer, &artifact.spec.kind, &artifact.spec.subject)?,
                         artifact.spec.digest.clone(),
                     )?),
+                    owes,
                 )
             }
             _ => return Err(DeliveryError::permanent("turn-delivery leaf is not externally observed")),
@@ -585,6 +599,7 @@ impl LeafSubscriptionTable {
                     evidence_at,
                     judged_claim_at: judged_at,
                     outcome: TurnDeliveryOutcome::Refused { reason: reason.clone(), refused_at: now, hold_executed: true },
+                    owes,
                 },
                 ConvoyAttention { source: source.to_string(), reason, raised_at: now },
             )
@@ -617,6 +632,7 @@ impl LeafSubscriptionTable {
                         message: admission.message,
                         accepted_at: Utc::now(),
                     },
+                    owes,
                 },
                 rule.to.vessel.clone(),
                 rule.to.role.clone(),
@@ -633,6 +649,15 @@ impl LeafSubscriptionTable {
         Ok(())
     }
 }
+/// Whether a turn of `rule` firing on the subject at `address`, observed as `subject`, asks its
+/// target to act: its [`owes`](TurnDeliveryRule::owes) condition, read from the observation the
+/// turn fired on. A rule without one always asks; an observation that cannot answer may ask, so
+/// it counts as asking.
+fn asks_to_act(rule: &TurnDeliveryRule, address: &LeafAddress, subject: &dyn LeafSubject) -> Result<bool, String> {
+    let Some(owes) = &rule.owes else { return Ok(true) };
+    Ok(evaluate_leaf(&template_leaf(owes, address.clone()), Some(subject), None)?.result != ThreeValue::False)
+}
+
 /// True when an episode's recorded revision is `progress` itself or a repeat
 /// firing at it (`{progress}@{discriminator}`). Progress values never contain
 /// `@` themselves where a discriminator follows: PR heads are SHAs, and

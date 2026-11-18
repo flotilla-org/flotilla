@@ -215,11 +215,16 @@ mod tests {
     }
 
     // Behaviour (ADR 0047): bytes the first generation wrote still decode to the same document
-    // and re-encode unchanged.
+    // and re-encode unchanged. They predate turn rules' `owes` (run 4): their frozen rules ask
+    // the crew to act on every turn, as they did.
     #[test]
     fn the_first_generations_bytes_still_decode() {
         let decoded = AdmissionDocument::decode("c", PINNED).expect("pinned document decodes");
-        assert_eq!(decoded, document());
+        let mut first = document();
+        for rule in first.workflow_snapshot.turn_delivery.values_mut() {
+            rule.owes = None;
+        }
+        assert_eq!(decoded, first);
         assert_eq!(decoded.encode().expect("canonical"), PINNED);
     }
 

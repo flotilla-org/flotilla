@@ -380,6 +380,35 @@ fn declared_seat_stalled(status: &ConvoyStatus, stall: &StalledCondition) -> boo
     stall.seat().and_then(|(vessel, role)| status.crew_work.get(vessel)?.get(role)).is_some_and(|work| work.phase == CrewWorkPhase::Stalled)
 }
 
+/// What seat `vessel`/`role` owes, for its nudge (run 4): the promises it has yet to submit, or,
+/// when every open promise is submitted, the newest turn that asked it to act. `None` when its
+/// status names neither, and the nudge says what the leaf it is armed on does.
+fn owed_now(status: &ConvoyStatus, vessel: &str, role: &str) -> Option<String> {
+    const BLOCKED: &str = "Run `crew stall --reason <infra|scope|decision|access|other> --message …` if blocked.";
+    let unsubmitted: Vec<String> = flotilla_resources::promises::owned(status, vessel, role)
+        .iter()
+        .filter(|promise| promise.state == flotilla_resources::promises::PromiseState::Open)
+        .map(|promise| format!("`{}` ({})", promise.id, promise.kind.as_str()))
+        .collect();
+    if !unsubmitted.is_empty() {
+        return Some(format!(
+            "You owe deliverables for {vessel}/{role}: submit {}; your part ends when your promises are kept. {BLOCKED}",
+            unsubmitted.join(", ")
+        ));
+    }
+    let (source, accepted_at) = super::wake::owed_turns(status, vessel, role).max_by_key(|(_, accepted_at)| *accepted_at)?;
+    let asked = status
+        .workflow_snapshot
+        .as_ref()
+        .and_then(|snapshot| snapshot.turn_delivery.get(source))
+        .and_then(|rule| rule.brief.lines().map(str::trim).find(|line| !line.is_empty()))
+        .unwrap_or_default();
+    Some(format!(
+        "You owe deliverables for {vessel}/{role}: you have not answered the `{source}` turn delivered at {}: {asked} Your submitted promises wait on it; act on it, and submit again where it changes them. {BLOCKED}",
+        accepted_at.to_rfc3339()
+    ))
+}
+
 /// The stall crew `role@vessel` declared, while its note is open.
 pub(super) fn declared_stall<'a>(status: &'a ConvoyStatus, vessel: &str, role: &str) -> Option<&'a StalledCondition> {
     status.stalls.about(Some((vessel, role))).filter(|stall| stall.source == StallEvidenceSource::Crew)
@@ -1904,7 +1933,8 @@ impl ReconcilerWake {
         Ok(condition)
     }
 
-    /// Delivers a stall nudge to an idle actor; the inner error is a failed delivery.
+    /// Delivers a stall nudge to an idle actor, naming what it owes; the inner error is a failed
+    /// delivery.
     async fn deliver_stall_nudge(
         &self,
         tick: StallTick<'_>,
@@ -1915,7 +1945,9 @@ impl ReconcilerWake {
         nudges: usize,
     ) -> Result<Result<(), String>, String> {
         let StallTick { namespace, now, .. } = tick;
+        // The leaf's phrasing is the armability check; the nudge names what the seat owes.
         let obligation = actor_obligation(leaf)?;
+        let obligation = convoy.status.as_ref().and_then(|status| owed_now(status, vessel, role)).unwrap_or(obligation);
         let brief =
             format!("For {role}@{vessel} in {} (resource ref: {}):\n{obligation}", convoy_message_address(convoy), convoy.metadata.name);
         // A condition or reference that names nothing fails this delivery like any other.

@@ -145,6 +145,7 @@ fn queued_turn(
             subject_revision: "head".into(),
             evidence_at,
             judged_claim_at: evidence_at,
+            owes: true,
             outcome: TurnDeliveryOutcome::Queued {
                 rung,
                 queued_at,
@@ -1215,6 +1216,37 @@ async fn four_review_rounds_deliver_the_green_checks_on_the_last_round() {
     assert_eq!(status.turn_deliveries["checks-settled"].episodes.len(), 5);
     assert!(status.turn_delivery_holds().is_empty());
     assert!(status.attention.is_none());
+}
+
+// Run 4: the stock checks rule's turns ask the crew to act only when checks fail. Delivery reads
+// the rule's `owes` from the observation it fires on and records it on the episode, so a
+// checks-passed turn leaves a seat that has submitted its PR owing nothing.
+#[tokio::test]
+async fn a_checks_turn_asks_to_act_only_when_checks_fail() {
+    let Rounds { backend, wake, name, launch, .. } = review_rounds_fixture(CrewWorkPhase::Working, None).await;
+    let records = backend.using::<ChangeRequest>("flotilla");
+    let checks = turn_row(&wake, "checks-settled").await;
+    for checks_now in [ObservedChecks::Fail, ObservedChecks::Pass] {
+        let current = records.get(&name).await.expect("record");
+        let observed_at = Utc::now();
+        let observed = flotilla_resources::ChangeRequestStatus {
+            title: Default::default(),
+            author: Default::default(),
+            review_decision: Default::default(),
+            review_requested_from_owner: Default::default(),
+            state: Observation::known(ObservedChangeRequestState::Open, observed_at),
+            head_sha: Observation::known("ae5be374".to_string(), observed_at),
+            checks: Observation::known(checks_now, observed_at),
+            review: flotilla_resources::ChangeRequestReviewObservation { actionable_at_head: Observation::known(false, observed_at) },
+            mergeable: Observation::known(ObservedMergeability::Mergeable, observed_at),
+        };
+        records.update_status(&name, &current.metadata.resource_version, &observed).await.expect("observe checks");
+        fire_turn_row(&wake, &launch, &checks).await;
+    }
+    let status = backend.using::<Convoy>("flotilla").get(&launch).await.expect("convoy").status.expect("status");
+    let episodes: Vec<_> =
+        status.turn_deliveries["checks-settled"].episodes.iter().map(|episode| (episode.subject_revision.as_str(), episode.owes)).collect();
+    assert_eq!(episodes, [("ae5be374@fail", true), ("ae5be374@pass", false)]);
 }
 
 // Custom checks predicates may request Pending too; outcome-aware identity must

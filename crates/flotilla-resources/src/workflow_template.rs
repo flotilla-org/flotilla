@@ -106,6 +106,12 @@ pub struct TurnDeliveryRule {
     pub to: TurnDeliveryTarget,
     pub brief: String,
     pub hold: HoldAct,
+    /// When a turn of this rule asks its target to act: a condition on the subject `on` fired
+    /// on, read as it fires (run 4). A turn delivered while it is false only informs (checks
+    /// passed), so a seat that has submitted every promise owes nothing for it. Absent, every
+    /// turn asks to act, as before the field; a snapshot frozen without it keeps that.
+    #[serde(default, skip_serializing_if = "Option::is_none", with = "legacy_template::optional")]
+    pub owes: Option<Template>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, bon::Builder)]
@@ -334,6 +340,25 @@ mod legacy_template {
     impl<'de> Deserialize<'de> for Decoded {
         fn deserialize<D: Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
             deserialize(deserializer).map(Self)
+        }
+    }
+
+    /// An optional stored leaf template.
+    pub mod optional {
+        use flotilla_address::Template;
+        use serde::{Deserialize, Deserializer, Serializer};
+
+        use super::{Decoded, Stored};
+
+        pub fn serialize<S: Serializer>(template: &Option<Template>, serializer: S) -> Result<S::Ok, S::Error> {
+            match template {
+                Some(template) => serializer.serialize_some(&Stored(template)),
+                None => serializer.serialize_none(),
+            }
+        }
+
+        pub fn deserialize<'de, D: Deserializer<'de>>(deserializer: D) -> Result<Option<Template>, D::Error> {
+            Ok(Option::<Decoded>::deserialize(deserializer)?.map(|template| template.0))
         }
     }
 
@@ -806,6 +831,8 @@ pub fn implement_review_workflow_spec() -> WorkflowTemplateSpec {
     ] {
         let mut rule = reviewer_turns.shift_remove(source).expect("stock review rule");
         rule.brief = brief.to_string();
+        // The reviewer signs off on passing checks: every turn asks it to act.
+        rule.owes = None;
         turn_delivery.insert(format!("reviewer-{source}"), rule);
     }
     WorkflowTemplateSpec::builder()
@@ -844,6 +871,8 @@ fn standard_review_turn_delivery(vessel: &str, role: &str) -> IndexMap<String, T
                 .to(target())
                 .brief("Inspect checks and reviews at the bound head. Fix failures caused by this PR and continue shepherding; inspect your open promises after checks pass, review findings are handled, and the PR is mergeable. Submit the PR against its promise and continue until every promise is kept or retracted.".to_string())
                 .hold(HoldAct::State)
+                // Passing checks ask nothing of a seat that has submitted its PR (run 4).
+                .owes(parse_leaf_template("$cr.checks == fail").expect("valid stock checks-failed leaf"))
                 .build(),
         ),
         (
@@ -1062,28 +1091,35 @@ fn validate_turn_delivery(
     errors: &mut Vec<ValidationError>,
 ) {
     for (source, rule) in &spec.turn_delivery {
-        let subject = SubjectVariable::of(&rule.on);
-        let field_path = legacy_field_path(&rule.on.path);
-        let admitted = (subject == Ok(SubjectVariable::ChangeRequest)
-            && matches!(field_path.as_str(), ".state" | ".checks" | ".review.actionable-at-head" | ".mergeable")
-            || subject == Ok(SubjectVariable::Issue)
-                && (matches!(field_path.as_str(), ".state" | ".updated-at") || field_path.starts_with(".labels."))
-            || matches!(subject, Ok(SubjectVariable::Artifact { .. })) && (field_path == ".exists" || field_path.starts_with(".summary.")))
-            && (field_path == ".updated-at" || matches!(rule.on.operator, Operator::Equal | Operator::NotEqual));
-        let template = template_text(&rule.on);
-        match subject {
-            Ok(subject) if admitted => {
-                let kind = match subject {
-                    SubjectVariable::ChangeRequest => LeafKind::ChangeRequest,
-                    SubjectVariable::Issue => LeafKind::Issue,
-                    SubjectVariable::Artifact { .. } => LeafKind::Artifact,
-                };
-                if let Err(reason) = legacy_template_text(&rule.on).and_then(|_| validate_leaf_literal(kind, &field_path, &rule.on.literal))
-                {
-                    push_error(errors, ValidationError::InvalidTurnDeliveryLiteral { source: source.clone(), template, reason });
+        // `owes` is read from the subject `on` fired on, so it takes the same leaves and names
+        // the same subject.
+        for template in std::iter::once(&rule.on).chain(rule.owes.as_ref()) {
+            let subject = SubjectVariable::of(template);
+            let field_path = legacy_field_path(&template.path);
+            let admitted = (subject == Ok(SubjectVariable::ChangeRequest)
+                && matches!(field_path.as_str(), ".state" | ".checks" | ".review.actionable-at-head" | ".mergeable")
+                || subject == Ok(SubjectVariable::Issue)
+                    && (matches!(field_path.as_str(), ".state" | ".updated-at") || field_path.starts_with(".labels."))
+                || matches!(subject, Ok(SubjectVariable::Artifact { .. }))
+                    && (field_path == ".exists" || field_path.starts_with(".summary.")))
+                && (field_path == ".updated-at" || matches!(template.operator, Operator::Equal | Operator::NotEqual))
+                && (std::ptr::eq(template, &rule.on) || subject == SubjectVariable::of(&rule.on));
+            let text = template_text(template);
+            match subject {
+                Ok(subject) if admitted => {
+                    let kind = match subject {
+                        SubjectVariable::ChangeRequest => LeafKind::ChangeRequest,
+                        SubjectVariable::Issue => LeafKind::Issue,
+                        SubjectVariable::Artifact { .. } => LeafKind::Artifact,
+                    };
+                    if let Err(reason) =
+                        legacy_template_text(template).and_then(|_| validate_leaf_literal(kind, &field_path, &template.literal))
+                    {
+                        push_error(errors, ValidationError::InvalidTurnDeliveryLiteral { source: source.clone(), template: text, reason });
+                    }
                 }
+                _ => push_error(errors, ValidationError::InvalidTurnDeliveryLeaf { source: source.clone(), template: text }),
             }
-            _ => push_error(errors, ValidationError::InvalidTurnDeliveryLeaf { source: source.clone(), template }),
         }
         if rule.brief.trim().is_empty() {
             push_error(errors, ValidationError::EmptyTurnDeliveryBrief { source: source.clone() });
