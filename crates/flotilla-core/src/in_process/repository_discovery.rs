@@ -4,7 +4,7 @@ use flotilla_discovery_api::EnvironmentBag;
 use flotilla_forge_forgejo::FORGEJO_AUTH_PROVIDER;
 use flotilla_observation::forge_observation::ForgeReads;
 use flotilla_vcs::{
-    forge_credentials::{GitHttpCredential, GitHttpCredentials},
+    forge_credentials::{GitHttpCredential, GitHttpCredentials, GitHttpIdentity, GitHttpRefusal},
     providers::detection::remote_assertion,
 };
 pub(super) async fn discover_repository_change_request_with(
@@ -125,12 +125,7 @@ async fn daemon_forgejo_identity(
         .map_err(|error| format!("daemon Forgejo credential {name}: {error}"))?;
     match (&credential.spec.consumer, &credential.spec.source) {
         (CredentialConsumer::Forgejo { forge_ref, username }, CredentialSource::File { path }) if forge_ref == &forge.forge_id => {
-            let host = forge
-                .https_url
-                .strip_prefix("https://")
-                .and_then(|front| front.split('/').next())
-                .ok_or_else(|| format!("Forge {} https_url names no host", forge.forge_id))?;
-            Ok(Some(GitHttpCredential { host: host.to_string(), username: username.clone(), token_file: path.clone() }))
+            Ok(Some(GitHttpCredential { url: forge.https_url.clone(), username: username.clone(), token_file: path.clone() }))
         }
         _ => Err(format!("daemon Forgejo credential {name} must use a file source and target Forge {}", forge.forge_id)),
     }
@@ -147,7 +142,7 @@ pub(super) struct DaemonForgeCredentials {
 
 #[async_trait::async_trait]
 impl GitHttpCredentials for DaemonForgeCredentials {
-    async fn current(&self) -> Result<Vec<GitHttpCredential>, String> {
+    async fn current(&self) -> Result<Vec<GitHttpIdentity>, String> {
         let daemon = self.config.load_daemon_config()?;
         if daemon.credentials.forgejo.is_empty() {
             return Ok(Vec::new());
@@ -160,11 +155,15 @@ impl GitHttpCredentials for DaemonForgeCredentials {
                 Err(ResourceError::NotFound { .. }) => continue,
                 Err(error) => return Err(format!("Forge {forge_id}: {error}")),
             };
-            // A bad mapping costs only its own forge's Git the identity; that forge's repositories
-            // report the error from discovery, and Git elsewhere goes on.
+            // A bad mapping fails only its own forge's Git, with the reason; it never runs without
+            // the identity it is mapped to. Git elsewhere goes on.
             match daemon_forgejo_identity(&self.resource_backend, &daemon, &namespace, &forge).await {
-                Ok(identity) => identities.extend(identity),
-                Err(error) => tracing::warn!(forge = %forge_id, %error, "daemon forge identity unusable; its Git runs without it"),
+                Ok(identity) => identities.extend(identity.map(GitHttpIdentity::Usable)),
+                Err(error) => {
+                    let reason = format!("forge {forge_id}: {error}");
+                    tracing::warn!(forge = %forge_id, %error, "daemon forge identity unusable; its Git is refused");
+                    identities.push(GitHttpIdentity::Unusable(GitHttpRefusal { url: forge.https_url.clone(), reason }));
+                }
             }
         }
         Ok(identities)

@@ -7,6 +7,8 @@ use flotilla_fake_forge::{serve, Config as FakeForgeConfig, ForgeSettings, Syste
 use flotilla_vcs::checkout_integration::{inspect_recorded_checkout_integration, ChangeRequestIntegrationInput, RecordedAssociation};
 
 const LAB_TOKEN: &str = "lab-daemon-token";
+/// A second forge on the fake's host, beside `lab` under its own path.
+const LAB2_TOKEN: &str = "lab2-daemon-token";
 
 fn fake_forge_fixture(name: &str) -> PathBuf {
     Path::new(env!("CARGO_MANIFEST_DIR")).join("../flotilla-fake-forge/tests/fixtures").join(name)
@@ -80,8 +82,19 @@ struct LabForge {
 impl LabForge {
     /// Map the lab forge to the daemon's identity in `daemon.toml`, or not.
     fn map_identity(&self, mapped: bool) {
-        let mapping = if mapped { "[credentials.forgejo]\nlab = \"lab-daemon\"\n" } else { "" };
-        fs::write(self.temp.path().join("daemon.toml"), format!("machine_id = \"forge-identity-test\"\n{mapping}")).expect("daemon config");
+        self.map_identities(if mapped { &["lab"] } else { &[] });
+    }
+
+    /// Map each of `forges` to its daemon identity, `<forge>-daemon`, in `daemon.toml`.
+    fn map_identities(&self, forges: &[&str]) {
+        let mut config = "machine_id = \"forge-identity-test\"\n".to_string();
+        if !forges.is_empty() {
+            config.push_str("[credentials.forgejo]\n");
+            for forge in forges {
+                config.push_str(&format!("{forge} = \"{forge}-daemon\"\n"));
+            }
+        }
+        fs::write(self.temp.path().join("daemon.toml"), config).expect("daemon config");
     }
 
     async fn clone(&self, target: &Path) -> Result<Option<String>, String> {
@@ -119,13 +132,15 @@ async fn lab_forge() -> LabForge {
     let head = ProcessCommand::new("git").args(["rev-parse", "HEAD"]).current_dir(&source).output().expect("head");
     let head = String::from_utf8_lossy(&head.stdout).trim().to_string();
     let root = temp.path().join("forge-git");
-    fs::create_dir_all(root.join("lab/acme")).expect("forge root");
-    let bare = root.join("lab/acme/widgets.git");
-    assert!(ProcessCommand::new("git")
-        .args(["clone", "-q", "--bare", source.to_str().expect("source"), bare.to_str().expect("bare")])
-        .status()
-        .expect("bare repository")
-        .success());
+    for repository in ["lab/acme/widgets.git", "lab2/acme/gadgets.git"] {
+        let bare = root.join(repository);
+        fs::create_dir_all(bare.parent().expect("owner")).expect("forge root");
+        assert!(ProcessCommand::new("git")
+            .args(["clone", "-q", "--bare", source.to_str().expect("source"), bare.to_str().expect("bare")])
+            .status()
+            .expect("bare repository")
+            .success());
+    }
     let config = FakeForgeConfig {
         public_url: "https://localhost:3443".into(),
         listen: "127.0.0.1:0".parse().expect("addr"),
@@ -136,42 +151,49 @@ async fn lab_forge() -> LabForge {
         auto_merge_after: None,
         seed: None,
         git_root: Some(root),
-        forges: [("lab".to_string(), ForgeSettings { token: LAB_TOKEN.into(), login: "lab-bot".into() })].into(),
+        forges: [
+            ("lab".to_string(), ForgeSettings { token: LAB_TOKEN.into(), login: "lab-bot".into() }),
+            ("lab2".to_string(), ForgeSettings { token: LAB2_TOKEN.into(), login: "lab2-bot".into() }),
+        ]
+        .into(),
     };
     let fake = serve::build_forge(&config, Arc::new(SystemClock)).expect("fake forge");
     let running = serve::start(&config, fake).await.expect("serve the fake forge");
     let origin = format!("https://localhost:{}", running.api_addr().port());
 
-    let token_file = temp.path().join("lab-daemon-token");
-    fs::write(&token_file, format!("{LAB_TOKEN}\n")).expect("token file");
     let config = Arc::new(ConfigStore::with_base(temp.path()));
     let daemon =
         daemon_with_backend_and_runner(Vec::new(), Arc::clone(&config), flotilla_store_memory::engine_home_backend(), Arc::new(HostGit))
             .await;
     engine_environments(&daemon);
-    let forge = ForgeSpec::builder()
-        .forge_id("lab".to_string())
-        .kind(flotilla_resources::ForgeKind::Forgejo)
-        .hosts(BTreeSet::from(["localhost".to_string()]))
-        .https_url(format!("{origin}/lab"))
-        .git_ssh_host("localhost".to_string())
-        .build();
-    daemon.resource_backend().definitions::<Forge>(NAMESPACE).create(&empty_meta("lab"), &forge).await.expect("Forge");
-    daemon
-        .resource_backend()
-        .definitions::<CredentialSpec>(NAMESPACE)
-        .create(
-            &empty_meta("lab-daemon"),
-            &CredentialSpecSpec {
-                consumer: CredentialConsumer::Forgejo { forge_ref: "lab".into(), username: "lab-bot".into() },
-                source: CredentialSource::File { path: token_file.to_str().expect("token path").into() },
-                lifecycle: CredentialLifecycle::Static,
-                placement: CredentialPlacementRequirements::default(),
-                authorization_epoch: flotilla_resources::INITIAL_AUTHORIZATION_EPOCH,
-            },
-        )
-        .await
-        .expect("daemon identity");
+    // Each forge and the daemon's file-sourced identity on it: `lab`, and `lab2` beside it.
+    for (forge_id, token) in [("lab", LAB_TOKEN), ("lab2", LAB2_TOKEN)] {
+        let token_file = temp.path().join(format!("{forge_id}-daemon-token"));
+        fs::write(&token_file, format!("{token}\n")).expect("token file");
+        let forge = ForgeSpec::builder()
+            .forge_id(forge_id.to_string())
+            .kind(flotilla_resources::ForgeKind::Forgejo)
+            .hosts(BTreeSet::from(["localhost".to_string()]))
+            .https_url(format!("{origin}/{forge_id}"))
+            .git_ssh_host("localhost".to_string())
+            .build();
+        daemon.resource_backend().definitions::<Forge>(NAMESPACE).create(&empty_meta(forge_id), &forge).await.expect("Forge");
+        daemon
+            .resource_backend()
+            .definitions::<CredentialSpec>(NAMESPACE)
+            .create(
+                &empty_meta(&format!("{forge_id}-daemon")),
+                &CredentialSpecSpec {
+                    consumer: CredentialConsumer::Forgejo { forge_ref: forge_id.into(), username: format!("{forge_id}-bot") },
+                    source: CredentialSource::File { path: token_file.to_str().expect("token path").into() },
+                    lifecycle: CredentialLifecycle::Static,
+                    placement: CredentialPlacementRequirements::default(),
+                    authorization_epoch: flotilla_resources::INITIAL_AUTHORIZATION_EPOCH,
+                },
+            )
+            .await
+            .expect("daemon identity");
+    }
     let host_id = daemon.local_host_id().expect("local host ID").to_string();
     let host_direct = flotilla_resources::host_direct_environment_name(&host_id);
     let state = ControllerRuntimeState::new(Arc::clone(&daemon), config, passthrough_registry(), None, host_id, host_direct);
@@ -221,6 +243,30 @@ async fn a_fresh_host_reads_a_forge_repositorys_default_branch_from_its_remote_a
 
     forge.map_identity(true);
     assert_eq!(resolver.default_branch(&repository).await.expect("read as the daemon").as_deref(), Some("main"));
+    forge.running.shutdown().await;
+}
+
+// F1 (run 3): a forge mapped to a daemon identity that is unusable (here, its CredentialSpec is
+// not declared) refuses its Git with the reason. It never goes on without the identity, as if the
+// forge needed none. Another forge on the same host still signs in as its own identity.
+#[tokio::test]
+async fn an_unusable_daemon_identity_refuses_its_own_forges_git_with_the_reason() {
+    let forge = lab_forge().await;
+    let resolver = super::super::forge_default_branches(&forge.clones.state);
+    let on = |forge_id: &str, repository: &str| flotilla_resources::ForgeIdentity {
+        service_url: forge.service_url.replace("/lab", &format!("/{forge_id}")),
+        repository: repository.into(),
+    };
+    forge.map_identities(&["lab", "lab2"]);
+    forge.daemon.resource_backend().definitions::<CredentialSpec>(NAMESPACE).delete("lab-daemon").await.expect("withdraw lab's identity");
+
+    let refused = resolver.default_branch(&on("lab", "acme/widgets")).await.expect_err("lab's Git is refused");
+    assert!(refused.contains("forge lab: daemon Forgejo credential lab-daemon"), "{refused}");
+    assert!(!refused.contains("could not read Username"), "lab's Git went on without its identity: {refused}");
+    assert_eq!(
+        resolver.default_branch(&on("lab2", "acme/gadgets")).await.expect("lab2 signs in as its own identity").as_deref(),
+        Some("main")
+    );
     forge.running.shutdown().await;
 }
 
