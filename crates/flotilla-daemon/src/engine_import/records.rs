@@ -115,16 +115,16 @@ fn live_placement_references(source: &Source, carried: &Carried) -> BTreeMap<(St
 }
 
 /// Every namespace's at once: the engine has no namespaces.
-pub(super) fn artifacts(source: &Source, target: &mut Import, _: &mut Carried, report: &mut ImportReport) {
+pub(super) fn artifacts(source: &Source, target: &mut Import, carried: &mut Carried, report: &mut ImportReport) {
     let copies: Vec<_> = source
         .owned::<Artifact>("artifacts", None, "Artifact", target, report)
         .into_iter()
         .map(|copy| ArtifactCopy { namespace: copy.namespace, object: copy.object, home: copy.home })
         .collect();
-    import_artifacts(&copies, target, report);
+    import_artifacts(&copies, &carried.convoy_launches, target, report);
 }
 
-pub(super) fn accounts(source: &Source, target: &mut Import, _: &mut Carried, report: &mut ImportReport) {
+pub(super) fn accounts(source: &Source, target: &mut Import, carried: &mut Carried, report: &mut ImportReport) {
     for namespace in source.namespaces(&ACCOUNT_KINDS) {
         let bindings: Vec<_> = source
             .owned::<AccountBinding>("accountbindings", Some(namespace), "AccountBinding", target, report)
@@ -136,7 +136,7 @@ pub(super) fn accounts(source: &Source, target: &mut Import, _: &mut Carried, re
             .into_iter()
             .map(|provision| (provision.object, provision.home))
             .collect();
-        import_accounts(&bindings, &provisions, target, report);
+        import_accounts(&bindings, &provisions, &carried.convoy_launches, target, report);
     }
 }
 

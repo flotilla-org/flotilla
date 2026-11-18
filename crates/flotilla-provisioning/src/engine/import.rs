@@ -63,6 +63,7 @@ use flotilla_state_machines::{
 
 use flotilla_resources::{
     checkout_records::{launched, CheckoutHolder, Inspection},
+    convoy::engine::ImportedLaunches,
     vessel_resource_name, CONVOY_LABEL,
 };
 
@@ -144,6 +145,9 @@ pub struct ImportReport {
     pub rows: BTreeMap<&'static str, RowCounts>,
     /// The ledger's dropped rows, here and copies, by old kind and the reason they were dropped for.
     pub row_drops: BTreeMap<(&'static str, &'static str), usize>,
+    /// Counts an operator reads beside the rows, by kind and what they count (an imported
+    /// convoy's end, what holds it, a refusal's reason): never a name or a record's content.
+    pub tallies: BTreeMap<(&'static str, String), usize>,
 }
 
 /// One old kind's rows, by what became of them. A refused row is named in the refusals instead.
@@ -207,6 +211,11 @@ impl ImportReport {
     pub fn import_row(&mut self, kind: &'static str, label: &'static str) {
         *self.imported.entry((kind, label)).or_default() += 1;
         self.rows(kind, RowOutcome::Imported, 1);
+    }
+
+    /// Counts one more of `what` for `kind` among the tallies.
+    pub fn tally(&mut self, kind: &'static str, what: impl Into<String>) {
+        *self.tallies.entry((kind, what.into())).or_default() += 1;
     }
 
     /// Counts `count` rows of `kind` dropped for `reason`, in the drops and in the ledger.
@@ -297,6 +306,7 @@ pub type VesselLaunches = BTreeMap<(String, String), String>;
 /// noted rather than refused: its home's vessel requester requests its work's launch.
 pub fn import_vessels(
     records: &[(ResourceObject<OldVessel>, String)],
+    convoys: &ImportedLaunches,
     target: &mut impl ImportTarget,
     report: &mut ImportReport,
 ) -> VesselLaunches {
@@ -330,7 +340,7 @@ pub fn import_vessels(
             // Not a state the old reconciler writes (see `vessel_state`): imported, and named.
             report.notes.push(format!("Vessel `{name}` is Pending with a recorded placement: imported as requested"));
         }
-        let result = import_vessel(vessel, home).and_then(|mut imported| {
+        let result = import_vessel(vessel, home, convoys).and_then(|mut imported| {
             let change = imported.change();
             write_imported(target, &mut imported, &change).map(|()| imported).map_err(|reason| ImportRefusal {
                 kind: VesselKind::NAME,
@@ -347,18 +357,23 @@ pub fn import_vessels(
 }
 
 /// Maps old Vessel `obj`, homed at `home`, onto its work's first launch: leased on the host its
-/// placement recorded, in the convoy homed where it was admitted.
-pub fn import_vessel(obj: &ResourceObject<OldVessel>, home: &str) -> Result<ImportedResource<VesselKind>, ImportRefusal> {
+/// placement recorded, in the launch its convoy imports as (`convoys`), at that launch's home.
+pub fn import_vessel(
+    obj: &ResourceObject<OldVessel>,
+    home: &str,
+    convoys: &ImportedLaunches,
+) -> Result<ImportedResource<VesselKind>, ImportRefusal> {
     let refuse = |reason: String| ImportRefusal { kind: VesselKind::NAME, record: obj.metadata.name.clone(), reason };
     let host = pinned_host(obj).ok_or_else(|| refuse("no recorded placement: no lease to import".to_owned()))?;
-    // The convoy is homed where it was admitted: the root a federated convoy's vessel records, or
-    // this home.
-    let convoy_home = obj.metadata.annotations.get(ACTUATOR_SOURCE_ROOT_ANNOTATION).map_or(home, String::as_str);
-    let launch_of = vessel_resource_name(flotilla_resources::convoy::launch_of(&obj.spec.convoy_ref), &obj.spec.vessel_name);
+    let convoy = convoys.get(&obj.metadata.namespace, &obj.spec.convoy_ref).ok_or_else(|| {
+        let reason = convoys.missing(&obj.metadata.namespace, &obj.spec.convoy_ref).map(|reason| reason.to_string()).unwrap_or_default();
+        refuse(format!("it {reason} (`{}`)", obj.spec.convoy_ref))
+    })?;
+    let launch_of = vessel_resource_name(&convoy.of, &obj.spec.vessel_name);
     let request = VesselSpec {
         launch_of: launch_of.clone(),
         launch: 0,
-        convoy: ConvoyId::new(obj.spec.convoy_ref.clone(), convoy_home),
+        convoy: ConvoyId::new(convoy.name(), convoy.home.clone()),
         class: VesselClass::new(PINNED_CLASS),
         shape: BTreeMap::new(),
         priority: Priority(0),
@@ -387,10 +402,10 @@ fn held_for_launch(holder: &str, home: &str, vessels: &VesselLaunches) -> String
 }
 
 /// [`import_vessels`] into a [`rehearsal`] of its own.
-pub fn rehearse_vessels(records: &[(ResourceObject<OldVessel>, String)], report: &mut ImportReport) {
+pub fn rehearse_vessels(records: &[(ResourceObject<OldVessel>, String)], convoys: &ImportedLaunches, report: &mut ImportReport) {
     match rehearsal() {
         Ok(mut rehearsal) => {
-            import_vessels(records, &mut rehearsal, report);
+            import_vessels(records, convoys, &mut rehearsal, report);
         }
         Err(reason) => report.refused.push(ImportRefusal { kind: "Vessel", record: "<all>".to_owned(), reason }),
     }

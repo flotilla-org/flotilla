@@ -30,7 +30,7 @@ pub(super) fn vessels(source: &Source, target: &mut Import, carried: &mut Carrie
             .into_iter()
             .map(|record| (record.object, record.home))
             .collect();
-        carried.vessels.extend(import_vessels(&vessels, target, report));
+        carried.vessels.extend(import_vessels(&vessels, &carried.convoy_launches, target, report));
     }
 }
 
@@ -116,8 +116,8 @@ fn namespace_lifecycles(source: &Source, namespace: &str, target: &mut Import, c
         })
         .collect();
     // Each checkout is held for the launch its convoy's record imported as, at the convoy's home,
-    // created under that launch's version. One whose convoy was not imported (ended, or staying on
-    // the old store) is not: nothing would release it.
+    // created under that launch's version. One whose convoy ended, or was not imported, is not:
+    // nothing would release it.
     let convoy_code = <Resource<EngineConvoy> as Kind>::CODE;
     for record in
         source.owned::<Checkout>("checkouts", namespace, "Checkout", target, report).into_iter().map(|record| (record.object, record.home))
@@ -131,8 +131,14 @@ fn namespace_lifecycles(source: &Source, namespace: &str, target: &mut Import, c
             let (launch, version) = carried.convoys.get(&(convoy_home.clone(), old.to_owned()))?;
             Some((Identity { kind: convoy_code, name: launch.clone(), home: convoy_home.clone() }, *version))
         };
-        if record.0.metadata.labels.get(CONVOY_LABEL).is_some_and(|convoy| holder(convoy).is_none()) {
-            report.drop_rows("Checkout", "held for a convoy that was not imported", 1);
+        if let Some(convoy) = record.0.metadata.labels.get(CONVOY_LABEL).filter(|convoy| holder(convoy).is_none()) {
+            // Nothing on the engine reacts to an imported end, so nothing would release it. The
+            // first-start counts say how many, by end.
+            let reason = match carried.ended.contains_key(&(convoy_home.clone(), convoy.clone())) {
+                true => "an orphaned worktree left on disk: held for an ended convoy",
+                false => "held for a convoy that was not imported",
+            };
+            report.drop_rows("Checkout", reason, 1);
             continue;
         }
         import_checkouts(std::slice::from_ref(&record), &holder, &clone_launches, target, report);

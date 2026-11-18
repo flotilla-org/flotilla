@@ -162,7 +162,8 @@ fn every_record_of_this_home_imports_under_its_convoys_launch() {
     let name = imported_name(&failed());
     assert!(target.holds::<AccessDeliverySpec>(&name, "alpha").expect("holds"));
     assert!(!target.holds::<AccessDeliverySpec>("access-b", "alpha").expect("holds"), "the old name is not written");
-    let mut read = target.store().read().expect("read");
+    let mut store = target.store();
+    let mut read = store.read().expect("read");
     let id = read.resolve(<AccessDeliverySpec as flotilla_schema::Kind>::CODE, &name, "alpha").expect("resolve").expect("held");
     let held = read.load::<AccessDeliverySpec>(id).expect("load").expect("held").value;
     let mut old: AccessDeliverySpec = serde_json::from_value(failed()).expect("spec");
@@ -170,6 +171,7 @@ fn every_record_of_this_home_imports_under_its_convoys_launch() {
     assert_eq!(held, old);
     assert_eq!(access_delivery::convoy_of_access(&held.access).as_deref(), Some("demo#4"));
     drop(read);
+    drop(store);
     assert!(!target.holds::<AccessDeliverySpec>("access-c", "beta").expect("holds"));
 }
 

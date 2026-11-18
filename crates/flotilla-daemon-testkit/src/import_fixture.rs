@@ -114,6 +114,24 @@ pub fn live_convoy(name: &str) -> Value {
     document("Convoy", name, serde_json::to_value(spec).expect("spec"), serde_json::to_value(status).expect("status"))
 }
 
+/// [`live_convoy`] `name` as it ended, in old `phase` at `finished`, with `fields` set in its
+/// status and every promise kept.
+pub fn ended_convoy(name: &str, phase: &str, finished: &str, fields: Value) -> Value {
+    let mut convoy = live_convoy(name);
+    let status = convoy["status"].as_object_mut().expect("status");
+    status.insert("phase".into(), json!(phase));
+    status.insert("finished_at".into(), json!(finished));
+    status.extend(fields.as_object().cloned().unwrap_or_default());
+    for crews in status.get_mut("promises").and_then(Value::as_object_mut).into_iter().flat_map(|vessels| vessels.values_mut()) {
+        for promises in crews.as_object_mut().into_iter().flat_map(|roles| roles.values_mut()) {
+            for promise in promises.as_array_mut().into_iter().flatten() {
+                promise["state"] = json!("kept");
+            }
+        }
+    }
+    convoy
+}
+
 pub fn clone(name: &str) -> Value {
     document(
         "Clone",
@@ -177,6 +195,7 @@ pub async fn populated(dir: &Path) -> SqliteBackend {
     own::<Artifact>(&backend, artifact("ours")).await;
     own::<CloneResource>(&backend, clone("clone-a")).await;
     own::<Convoy>(&backend, live_convoy("demo")).await;
+    own::<Convoy>(&backend, live_convoy("convoy-b")).await;
     own::<AccessDelivery>(&backend, access_delivery("access-delivered", false)).await;
     own::<AccessDelivery>(&backend, access_delivery("access-failed", true)).await;
     own::<Checkout>(
@@ -213,12 +232,7 @@ pub async fn populated(dir: &Path) -> SqliteBackend {
     own::<Convoy>(&backend, document("Convoy", "governor-1", json!({"workflow_ref": "w", "inputs": {}}), Value::Null)).await;
     own_retired(
         dir,
-        demand(
-            "reclaim-refusal-governor-1",
-            ("Convoy", "governor-1"),
-            &[(retired::RECLAIM_REFUSAL_REASON_ANNOTATION, "checkout is dirty")],
-            "raised",
-        ),
+        demand("reclaim-refusal-demo", ("Convoy", "demo"), &[(retired::RECLAIM_REFUSAL_REASON_ANNOTATION, "checkout is dirty")], "raised"),
     );
     let repository = json!({"forge": {"repository": "org/repo", "service_url": "https://github.com"},
         "identity": {"canonical_remote": "https://github.com/org/repo", "kind": "remote"}, "remotes": ["https://github.com/org/repo"]});

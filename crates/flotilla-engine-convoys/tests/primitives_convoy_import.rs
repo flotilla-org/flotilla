@@ -31,12 +31,17 @@ struct World {
 impl ConvoyImportWorld for World {
     fn message(&self, record: &str) -> Option<(MessageRef, Address)> {
         (record == "supervision-1").then(|| {
-            let inbox: Address = "project:fleet/convoy:c/role:bosun".parse().expect("inbox");
+            // As the message import maps it: under the launch convoy `c` imports as.
+            let inbox: Address = "project:fleet/convoy:c%231/role:bosun".parse().expect("inbox");
             (MessageRef::new(format!("{inbox}/message:supervision-1"), HOME), inbox)
         })
     }
     fn standing_ruled(&self) -> bool {
         self.standing_ruled
+    }
+    /// Every convoy here is its engine name's first launch.
+    fn launch(&self, _: &str) -> Option<u64> {
+        Some(1)
     }
 }
 
@@ -204,8 +209,8 @@ fn a_convoy_with_no_role_imports_known_by_its_name() {
 }
 
 // Behaviour: a finite, unfinished convoy with no promise is the named refusal NoObligations (its
-// only agent is done, so admission owes it no default ledger); an ended or unbootstrapped convoy
-// stays on the old path.
+// only agent is done, so admission owes it no default ledger); an ended convoy whose status lacks
+// what its end carries is refused by name; an unbootstrapped convoy stays on the old path.
 #[test]
 fn unfinished_convoys_without_promises_are_refused_by_name() {
     let mut idle = convoy("idle", ConvoyPhase::Active, vec![agent("reviewer", false)]);
@@ -214,7 +219,10 @@ fn unfinished_convoys_without_promises_are_refused_by_name() {
     status.crew_work.get_mut("work").and_then(|crew| crew.get_mut("reviewer")).expect("reviewer").phase = CrewWorkPhase::Done;
     assert_eq!(import_convoy(&idle, HOME, &[], &WORLD), Err(ConvoyImportRefusal::NoObligations { convoy: "idle".into() }));
     let landed = convoy("landed", ConvoyPhase::Landed, vec![agent("reviewer", false)]);
-    assert_eq!(import_convoy(&landed, HOME, &[], &WORLD), Ok(ImportOutcome::StaysOld(StaysOldReason::Ended(ConvoyPhase::Landed))));
+    assert_eq!(
+        import_convoy(&landed, HOME, &[], &WORLD),
+        Err(ConvoyImportRefusal::EndUnrecorded { convoy: "landed".into(), what: "disposition" })
+    );
     let mut fresh = convoy("fresh", ConvoyPhase::Pending, vec![agent("coder", true)]);
     fresh.status.as_mut().expect("status").workflow_snapshot = None;
     assert_eq!(import_convoy(&fresh, HOME, &[], &WORLD), Ok(ImportOutcome::StaysOld(StaysOldReason::NotBootstrapped)));
@@ -311,8 +319,8 @@ fn an_open_stall_becomes_the_seats_stall_record() {
     let convoy = imported(import_convoy(&old, HOME, &[], &WORLD));
     let record = convoy.stall.as_ref().expect("a stall record").spec.clone();
     assert_eq!(record.kind, "stall");
-    assert_eq!(record.subject.as_ref().map(Address::as_str), Some("project:fleet/convoy:c/role:coder"));
-    assert_eq!(record.recipient.as_str(), "project:fleet/convoy:c/role:bosun");
+    assert_eq!(record.subject.as_ref().map(Address::as_str), Some("project:fleet/convoy:c%231/role:coder"));
+    assert_eq!(record.recipient.as_str(), "project:fleet/convoy:c%231/role:bosun");
     // It carries the crew's declaration: its report, not the judge's evidence, and why.
     assert_eq!(record.report.as_deref(), Some("blocked"));
     assert_eq!(record.stall_reason, Some(awaiting_reply::StallReason::Scope));
@@ -329,14 +337,17 @@ fn an_open_stall_becomes_the_seats_stall_record() {
     earlier.metadata.name = "c-previous".into();
     earlier.spec.generation = 1;
     earlier.status.as_mut().unwrap().phase = ConvoyPhase::Landed;
+    ended(&mut earlier);
+    earlier.status.as_mut().unwrap().stalled = None;
     let folded = rehearse_all([&earlier, &standing], HOME, &[], &World { standing_ruled: true });
     assert!(folded.refused.is_empty(), "{:?}", folded.refused);
     assert!(folded.rehearsal.is_empty(), "{:?}", folded.rehearsal);
-    let folded = &folded.imported[0];
+    let folded = folded.imported.iter().find(|convoy| convoy.record == "c").expect("the live generation");
     assert_eq!(folded.resource.spec().promises.iter().next().unwrap().record.id.0, 0);
     let carried = &folded.stall.as_ref().unwrap().spec;
     assert_eq!(carried.message, record.message);
-    assert_eq!(carried.subject.as_ref().unwrap().as_str(), "project:fleet/convoy:coder/role:coder");
+    // The second generation is the role's second launch.
+    assert_eq!(carried.subject.as_ref().unwrap().as_str(), "project:fleet/convoy:coder%232/role:coder");
 
     let connection = rusqlite::Connection::open_in_memory().expect("connection");
     let mut store =
@@ -422,7 +433,8 @@ fn an_imported_convoy_is_created_at_its_old_creation_time() {
     let mut import = flotilla_engine_store::Import::in_memory(HOME, flotilla_engine_store::registry().expect("registry")).expect("import");
     let written = flotilla_engine_convoys::convoy_import::write_into(&mut import, &convoy).expect("written");
     assert!(import.imports(HOME));
-    let mut read = import.store().read().expect("read");
+    let mut store = import.store();
+    let mut read = store.read().expect("read");
     let id = read.resolve(Resource::<Engine>::CODE, written.name(), HOME).expect("resolve").expect("created");
     assert_eq!(read.creation_time(id).expect("created"), created, "write_into");
 }
@@ -535,19 +547,18 @@ fn the_stored_record_corpus_rehearses() {
     let named = |refusal: &ConvoyImportRefusal| match refusal {
         ConvoyImportRefusal::NoObligations { convoy }
         | ConvoyImportRefusal::StandingAwaitsRuling { convoy }
-        | ConvoyImportRefusal::Unmappable { convoy, .. } => names.contains(convoy),
+        | ConvoyImportRefusal::Unmappable { convoy, .. }
+        | ConvoyImportRefusal::EndUnrecorded { convoy, .. }
+        | ConvoyImportRefusal::EndRefused { convoy, .. } => names.contains(convoy),
     };
     assert!(report.refused.iter().all(named), "every refusal names a corpus convoy: {:?}", report.refused);
-    let unfinished = records
-        .iter()
-        .filter(|record| {
-            record.status.as_ref().is_some_and(|status| {
-                status.workflow_snapshot.is_some()
-                    && !matches!(status.phase, ConvoyPhase::Landed | ConvoyPhase::Failed | ConvoyPhase::Abandoned)
-            })
-        })
-        .count();
-    assert_eq!(report.imported.len() + report.refused.len(), unfinished, "every unfinished convoy is imported or listed");
+    let bootstrapped =
+        records.iter().filter(|record| record.status.as_ref().is_some_and(|status| status.workflow_snapshot.is_some())).count();
+    assert_eq!(
+        report.imported.len() + report.refused.len(),
+        bootstrapped,
+        "every bootstrapped convoy, ended or not, is imported or listed"
+    );
     eprintln!(
         "pre-roll rehearsal: {} imported, {} refused, {} stay old: {:?}",
         report.imported.len(),
@@ -572,9 +583,19 @@ fn several_convoys_rehearse_at_one_home() {
     assert_eq!(rehearse(&convoys), Vec::new());
 }
 
+/// `convoy` ended as the old store records an abandonment: its reason and when it finished. (A
+/// Landed one with its promises open, as these fixtures hold them, is no delivery the engine
+/// accepts.)
+fn ended(convoy: &mut ResourceObject<Convoy>) {
+    let status = convoy.status.as_mut().expect("status");
+    status.phase = ConvoyPhase::Abandoned;
+    status.message = Some("superseded by the next generation".into());
+    status.finished_at = Some(Utc::now());
+}
+
 // Behaviour: each standing generation is its own convoy, a launch of the role's engine name. The
-// live generation imports with its own promise ids and is numbered by the home sequence its
-// create takes; an ended one is dropped by the import, as any ended convoy is.
+// live generation imports with its own promise ids; an ended one imports with its end, as any
+// ended convoy does (#3108). Each is numbered in generation order, so the live one is the newest.
 #[test]
 fn a_standing_generation_imports_as_a_launch_of_its_role() {
     use flotilla_engine_convoys::convoy_import::{rehearse_all, write};
@@ -585,11 +606,15 @@ fn a_standing_generation_imports_as_a_launch_of_its_role() {
         record.spec.generation = generation;
         record.metadata.annotations.insert(ENSURED_FROM_ANNOTATION.into(), "ensure-governor".into());
     }
+    ended(&mut old);
     let report = rehearse_all([&live, &old], HOME, &[], &World { standing_ruled: true });
     assert!(report.refused.is_empty(), "{:?}", report.refused);
     assert!(report.rehearsal.is_empty(), "{:?}", report.rehearsal);
-    assert_eq!(report.stays_old.iter().map(|(name, _)| name.as_str()).collect::<Vec<_>>(), ["governor-1"]);
-    let [imported] = &report.imported[..] else { panic!("one generation imports: {:?}", report.imported) };
+    assert!(report.stays_old.is_empty(), "{:?}", report.stays_old);
+    // Each generation is a launch, numbered in record order: the ended one first, with its end.
+    let [ended, imported] = &report.imported[..] else { panic!("both generations import: {:?}", report.imported) };
+    assert_eq!((ended.record.as_str(), ended.launch, ended.end.is_some()), ("governor-1", 1, true));
+    assert_eq!(imported.launch, 2);
     assert_eq!(imported.resource.spec().launch_of, "project:fleet/convoy:governor");
     assert_eq!(imported.resource.spec().seats.len(), 1);
     assert_eq!(imported.resource.spec().promises.iter().next().unwrap().record.id.0, 0);
@@ -601,7 +626,7 @@ fn a_standing_generation_imports_as_a_launch_of_its_role() {
     let mut store =
         flotilla_schema_sqlite::Store::open(connection, HOME, flotilla_engine_store::registry().expect("registry")).expect("store");
     let written = write(&mut store, imported).expect("written");
-    // The import's change takes sequence 1 and the create 2, the launch's number.
+    // Named by the launch reserved for it, whatever sequence its create takes.
     assert_eq!(written.name(), "project:fleet/convoy:governor#2");
     assert_eq!(written.spec().launch, 2);
 
@@ -620,10 +645,10 @@ fn a_standing_import_refuses_an_earlier_live_generation() {
         record.spec.generation = generation;
         record.metadata.annotations.insert(ENSURED_FROM_ANNOTATION.into(), "ensure-governor".into());
     }
-    old.status.as_mut().unwrap().phase = ConvoyPhase::Landed;
+    ended(&mut old);
     let report = rehearse_all([&old, &live], HOME, &[], &World { standing_ruled: true });
     assert!(report.refused.is_empty(), "{:?}", report.refused);
-    assert_eq!(report.imported.len(), 1);
+    assert_eq!(report.imported.len(), 2, "the ended generation imports with its end");
     old.status.as_mut().unwrap().phase = ConvoyPhase::Active;
     live.status.as_mut().unwrap().phase = ConvoyPhase::Landed;
     let report = rehearse_all([&old, &live], HOME, &[], &World { standing_ruled: true });

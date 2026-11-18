@@ -23,19 +23,26 @@
 //! | a standing convoy | a convoy-lifetime duty per agent seat |
 //! | a standing role's generation | its own convoy, the next launch of the role's name |
 //! | a convoy's name | a launch `<engine name>#<n>`, n the home sequence its create takes |
-//! | a finite, unfinished convoy with no promise | refused: [`ConvoyImportRefusal::NoObligations`] |
+//! | a finite convoy with no promise | refused: [`ConvoyImportRefusal::NoObligations`] |
+//! | Landed, its disposition | created Open, then `Deliver` with that disposition at its `finished_at` ([`ImportedEnd`]) |
+//! | Failed, Abandoned, its message | created Open, then `Abandon` (cause Failed or Operator) with that reason at its `finished_at`, under the import's grant |
 //!
-//! A convoy that has ended (Landed, Failed, Abandoned) or not yet bootstrapped
-//! stays on the old path ([`ImportOutcome::StaysOld`]): an ended one is read
-//! as stored, and a new one is admitted at bootstrap (layer 6).
+//! An ended convoy's end is the log's, as a live end is: its end edge is written after its
+//! creation ([`end_into`]), and once every dependent is imported, one nothing holds retires
+//! ([`retire_into`]). A convoy not yet bootstrapped stays on the old path
+//! ([`ImportOutcome::StaysOld`]): a new one is admitted at bootstrap (layer 6).
 
 use std::collections::{BTreeMap, BTreeSet};
 
 use flotilla_address::{Address, Kind as AddressKind};
 use flotilla_engine_messages::awaiting::{stored_disposition, stored_reason};
 use flotilla_resources::{
-    convoy::reconcile::is_ensured, promises::PromiseState as OldState, Convoy as OldConvoy, ConvoyPhase, CrewSource, ForgeSpec,
-    ResourceObject, WorkCompletionAuthority,
+    convoy::{
+        engine::{launch_address, ImportedLaunches},
+        reconcile::is_ensured,
+    },
+    promises::PromiseState as OldState,
+    Convoy as OldConvoy, ConvoyPhase, CrewSource, ForgeSpec, ResourceObject, WorkCompletionAuthority,
 };
 use flotilla_schema::{CreatedAt, NewChange, Records, State, Timestamp};
 use flotilla_state_machines::{
@@ -43,12 +50,13 @@ use flotilla_state_machines::{
     machines::{
         awaiting_reply::{Awaited, AwaitingReply, AwaitingReplyLabel, AwaitingReplySpec, MemoryAwaitingReplyWorld},
         convoy::{
-            AdmittedPromise, Authority, Convoy, ConvoyRequest, ConvoySpec, ConvoyState, Duty, DutyId, DutyScope, Keep, MemoryConvoyWorld,
-            Priority, Progress, Promise, PromiseId, PromiseSource, Reject, Retract, Seat, SeatName, Submission, Submit, Terms,
+            Abandon, AbandonCause, AdmittedPromise, Authority, Convoy, ConvoyEdge, ConvoyRequest, ConvoySpec, ConvoyState, Deliver, Duty,
+            DutyId, DutyScope, Keep, MemoryConvoyWorld, Priority, Progress, Promise, PromiseId, PromiseSource, Reject, Retire, Retract,
+            Seat, SeatName, Submission, Submit, Terms,
         },
         message::MessageRef,
     },
-    Home, Ref, Resource, StoredState, Version,
+    Home, Ref, Resource, StoredState, Version, WriteError,
 };
 use serde::{Deserialize, Serialize};
 
@@ -69,6 +77,35 @@ pub enum ConvoyImportRefusal {
     StandingAwaitsRuling { convoy: String },
     /// Something the mapping cannot carry over, named.
     Unmappable { convoy: String, reason: String },
+    /// An ended convoy whose old status lacks what its end edge carries: `what` names it.
+    EndUnrecorded { convoy: String, what: &'static str },
+    /// The machine refuses an ended convoy's end edge, `edge`, from the record imported: the
+    /// refusal's name.
+    EndRefused { convoy: String, edge: &'static str, refusal: String },
+}
+
+impl ConvoyImportRefusal {
+    /// The old convoy refused.
+    pub fn convoy(&self) -> &str {
+        match self {
+            ConvoyImportRefusal::NoObligations { convoy }
+            | ConvoyImportRefusal::StandingAwaitsRuling { convoy }
+            | ConvoyImportRefusal::Unmappable { convoy, .. }
+            | ConvoyImportRefusal::EndUnrecorded { convoy, .. }
+            | ConvoyImportRefusal::EndRefused { convoy, .. } => convoy,
+        }
+    }
+
+    /// The refusal's reason with no name or record content in it, for counting refusals by reason.
+    pub fn class(&self) -> String {
+        match self {
+            ConvoyImportRefusal::NoObligations { .. } => "no obligations".into(),
+            ConvoyImportRefusal::StandingAwaitsRuling { .. } => "standing awaits ruling".into(),
+            ConvoyImportRefusal::Unmappable { .. } => "unmappable".into(),
+            ConvoyImportRefusal::EndUnrecorded { what, .. } => format!("ended with no {what}"),
+            ConvoyImportRefusal::EndRefused { edge, refusal, .. } => format!("{edge} refused: {refusal}"),
+        }
+    }
 }
 
 impl std::fmt::Display for ConvoyImportRefusal {
@@ -81,6 +118,10 @@ impl std::fmt::Display for ConvoyImportRefusal {
                 write!(f, "Convoy `{convoy}` refused: a standing convoy waits for the seat-growth ruling (#3587)")
             }
             ConvoyImportRefusal::Unmappable { convoy, reason } => write!(f, "Convoy `{convoy}` refused: {reason}"),
+            ConvoyImportRefusal::EndUnrecorded { convoy, what } => write!(f, "Convoy `{convoy}` refused: it ended with no {what} recorded"),
+            ConvoyImportRefusal::EndRefused { convoy, edge, refusal } => {
+                write!(f, "Convoy `{convoy}` refused: the machine refuses its {edge}: {refusal}")
+            }
         }
     }
 }
@@ -122,11 +163,73 @@ pub struct ImportedConvoy {
     /// is made at it and creates the convoy at it, so the convoy reads it as its creation time.
     pub created: CreatedAt,
     pub resource: Resource<Convoy>,
+    /// Its launch number: 1, or a standing generation's generation.
+    pub launch: u64,
     pub history: ClaimHistory,
     pub stall: Option<ImportedStall>,
     /// An open stall the import did not record, and why: an operator-level
     /// stall (no record until #3457), or one with no supervision message.
     pub unrecorded_stall: Option<String>,
+    /// How it ended, for an ended convoy.
+    pub end: Option<ImportedEnd>,
+}
+
+/// An ended convoy's end: the edge its old phase maps to, made at its old `finished_at`.
+#[derive(Debug, Clone, PartialEq)]
+pub struct ImportedEnd {
+    pub edge: ConvoyEdge,
+    pub at: Timestamp,
+    /// The old phase it ended in.
+    pub phase: ConvoyPhase,
+}
+
+impl ImportedEnd {
+    /// The old phase's name.
+    pub fn label(&self) -> &'static str {
+        match self.phase {
+            ConvoyPhase::Landed => "landed",
+            ConvoyPhase::Failed => "failed",
+            _ => "abandoned",
+        }
+    }
+
+    /// Grants, in `world`, the authority the import's end edge names: the import's own, which
+    /// the edge's entry records among its reads.
+    fn grant(&self, world: &mut MemoryConvoyWorld) {
+        if let ConvoyEdge::Abandon(abandon) = &self.edge {
+            world.authority.put(&abandon.authority, true);
+        }
+    }
+}
+
+/// The authority an imported end is made under: the import's, for convoy `launch_of`.
+fn import_grant(launch_of: &str) -> Ref<flotilla_state_machines::machines::convoy::Authorisation> {
+    Ref::new(format!("{launch_of}/{}", flotilla_engine_store::IMPORT_WRITER))
+}
+
+/// The end edge old convoy `convoy`'s ended `status` maps to, at its `finished_at`; `None` while it runs.
+fn ending(convoy: &str, launch_of: &str, status: &flotilla_resources::ConvoyStatus) -> Result<Option<ImportedEnd>, ConvoyImportRefusal> {
+    let unrecorded = |what| ConvoyImportRefusal::EndUnrecorded { convoy: convoy.to_owned(), what };
+    let edge = match status.phase {
+        ConvoyPhase::Landed => {
+            let disposition =
+                status.disposition.clone().filter(|disposition| !disposition.is_empty()).ok_or_else(|| unrecorded("disposition"))?;
+            ConvoyEdge::Deliver(Deliver { disposition })
+        }
+        ConvoyPhase::Failed | ConvoyPhase::Abandoned => {
+            let reason = status.message.clone().filter(|reason| !reason.is_empty()).ok_or_else(|| unrecorded("reason"))?;
+            let cause = if status.phase == ConvoyPhase::Failed { AbandonCause::Failed } else { AbandonCause::Operator };
+            ConvoyEdge::Abandon(Abandon {
+                by: SeatName::new("operator", flotilla_engine_store::IMPORT_WRITER),
+                cause,
+                reason,
+                authority: import_grant(launch_of),
+            })
+        }
+        _ => return Ok(None),
+    };
+    let at = status.finished_at.as_ref().map(timestamp).ok_or_else(|| unrecorded("finish time"))?;
+    Ok(Some(ImportedEnd { edge, at, phase: status.phase }))
 }
 
 impl ImportedConvoy {
@@ -140,7 +243,7 @@ impl ImportedConvoy {
 #[derive(Debug, Clone, PartialEq)]
 pub enum ImportOutcome {
     Imported(Box<ImportedConvoy>),
-    /// Not the import's: ended or not yet bootstrapped.
+    /// Not the import's: not yet bootstrapped.
     StaysOld(StaysOldReason),
 }
 
@@ -149,16 +252,13 @@ pub enum ImportOutcome {
 pub enum StaysOldReason {
     /// No workflow snapshot yet: a new convoy is admitted at bootstrap.
     NotBootstrapped,
-    /// Ended in this phase: read as stored.
-    Ended(ConvoyPhase),
 }
 
 impl StaysOldReason {
-    /// The reason's name, the same for every ended phase.
+    /// The reason's name.
     pub fn label(self) -> &'static str {
         match self {
             Self::NotBootstrapped => "never bootstrapped",
-            Self::Ended(_) => "ended",
         }
     }
 }
@@ -167,7 +267,6 @@ impl std::fmt::Display for StaysOldReason {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             Self::NotBootstrapped => f.write_str("not bootstrapped: admitted at bootstrap"),
-            Self::Ended(phase) => write!(f, "ended ({phase:?}): read as stored"),
         }
     }
 }
@@ -177,6 +276,9 @@ pub trait ConvoyImportWorld {
     /// The engine message an old Message record names, and the inbox it was
     /// sent to: the supervision message an open stall awaits.
     fn message(&self, record: &str) -> Option<(MessageRef, Address)>;
+    /// The launch number of old record `record`: every record naming it names that launch. None
+    /// refuses it.
+    fn launch(&self, record: &str) -> Option<u64>;
     /// Whether this rehearsal permits standing import. The owner ruling enables
     /// production by default; an explicit false still exercises the refusal gate.
     fn standing_ruled(&self) -> bool {
@@ -200,14 +302,15 @@ pub fn import_convoy(
     let Some(status) = convoy.status.as_ref().filter(|status| status.workflow_snapshot.is_some()) else {
         return Ok(ImportOutcome::StaysOld(StaysOldReason::NotBootstrapped));
     };
-    if matches!(status.phase, ConvoyPhase::Landed | ConvoyPhase::Failed | ConvoyPhase::Abandoned) {
-        return Ok(ImportOutcome::StaysOld(StaysOldReason::Ended(status.phase)));
-    }
     let standing = is_ensured(convoy);
     let crews = Crews::of(status);
-    let supervised_by = map::supervisor(convoy).map_err(refuse)?;
-    let target = map::address(convoy).map_err(refuse)?;
+    // A launch of its engine name, at its number: what every record naming it names.
+    let launch_of = map::engine_name(convoy).map_err(refuse)?;
+    let launch_number = world.launch(&name).ok_or_else(|| refuse("it has no launch number".into()))?;
+    let launch = flotilla_state_machines::launch_name(&launch_of, launch_number);
     let project = map::project(convoy).map_err(refuse)?;
+    let target = launch_address(&project, &launch).map_err(refuse)?;
+    let supervised_by = map::supervisor(convoy, &target).map_err(refuse)?;
     let since = timestamp(&status.started_at.unwrap_or(convoy.metadata.creation_timestamp));
 
     // The status's promises, then those admission owes that the status lacks: an agent seat owing
@@ -250,7 +353,7 @@ pub fn import_convoy(
         let label = map::imported_label(&owner, &old.id, counts.get(old.id.as_str()).is_some_and(|count| *count > 1));
         let mut submissions = Records::new();
         for submitted in &old.submissions {
-            let (address, revision) = map::submission(&name, role, old.kind, submitted, forges)
+            let (address, revision) = map::submission(&launch, role, old.kind, submitted, forges)
                 .map_err(|error| refuse(format!("promise `{}`: submission `{}`: {error}", old.id, submitted.reference)))?;
             submissions
                 .append(1, Submission { address, revision, by: owner.clone() })
@@ -344,8 +447,7 @@ pub fn import_convoy(
     let used: BTreeSet<&str> = promises.iter().map(|row| row.record.kind.as_str()).collect();
     let kinds = Catalog::resolve(&stock(), &[]).and_then(|catalog| catalog.freeze(used)).map_err(|error| refuse(error.to_string()))?;
     let (workflow_ref, admission) = map::admission(convoy).map_err(refuse)?;
-    // A launch of its engine name, numbered when it is written.
-    let launch_of = map::engine_name(convoy).map_err(refuse)?;
+    let end = ending(&name, &launch_of, status)?;
     let spec = ConvoySpec {
         launch_of: launch_of.clone(),
         launch: 0,
@@ -361,7 +463,10 @@ pub fn import_convoy(
     };
     let state = StoredState::<Convoy>::new(ConvoyState::Open { quota: BTreeMap::new(), retired_duties: BTreeSet::new() }, since);
     let resource = Resource::stored(launch_of, spec, state, Version(1));
-    check(&resource).map_err(refuse)?;
+    verify(&resource, end.as_ref()).map_err(|failure| match failure {
+        Unverified::Differs(reason) => refuse(reason),
+        Unverified::EndRefused { edge, refusal } => ConvoyImportRefusal::EndRefused { convoy: name.clone(), edge, refusal },
+    })?;
 
     // History the old status cannot encode refuses the import: it is never
     // dropped silently.
@@ -424,9 +529,11 @@ pub fn import_convoy(
         record: convoy.metadata.name.clone(),
         created: CreatedAt::from_datetime(&convoy.metadata.creation_timestamp),
         resource,
+        launch: launch_number,
         history,
         stall,
         unrecorded_stall,
+        end,
     })))
 }
 
@@ -441,6 +548,44 @@ type PromiseShape = (PromiseId, String, SeatName, Progress, Vec<(Address, String
 /// submissions. Times are the import's, not the replay's, so they are not
 /// compared.
 pub fn check(resource: &Resource<Convoy>) -> Result<(), String> {
+    verify(resource, None).map_err(|failure| match failure {
+        Unverified::Differs(reason) => reason,
+        Unverified::EndRefused { edge, refusal } => format!("the machine refuses its {edge}: {refusal}"),
+    })
+}
+
+/// Why [`verify`] refused a record.
+enum Unverified {
+    /// The machine does not reach the record imported, or refuses a step on the way.
+    Differs(String),
+    /// The machine refuses the convoy's end edge from the record it reached.
+    EndRefused { edge: &'static str, refusal: String },
+}
+
+/// [`check`], then the end edge `end`, when the convoy ended, from the record the machine reached.
+fn verify(resource: &Resource<Convoy>, end: Option<&ImportedEnd>) -> Result<(), Unverified> {
+    let (mut home, name, mut world) = replayed(resource).map_err(Unverified::Differs)?;
+    let Some(end) = end else { return Ok(()) };
+    end.grant(&mut world);
+    let edge = match end.edge {
+        ConvoyEdge::Deliver(_) => "Deliver",
+        _ => "Abandon",
+    };
+    match home.apply(&name, end.edge.clone(), &world, Timestamp(3)) {
+        Ok(_) => Ok(()),
+        Err(WriteError::Refused(refusal)) => {
+            // The refusal's name alone: its fields name promises, seats and duties.
+            let refusal = format!("{refusal:?}");
+            let refusal = refusal.split(['(', ' ', '{']).next().unwrap_or_default().to_owned();
+            Err(Unverified::EndRefused { edge, refusal })
+        }
+        Err(error) => Err(Unverified::Differs(format!("the machine refuses its {edge}: {error:?}"))),
+    }
+}
+
+/// The fresh home the record replays into, the launch it created and the world it was replayed
+/// over, once the machine has reached the record imported.
+fn replayed(resource: &Resource<Convoy>) -> Result<(Home<Convoy>, String, MemoryConvoyWorld), String> {
     let spec = resource.spec();
     let mut world = MemoryConvoyWorld::default().with_project(&spec.project);
     let request = ConvoyRequest {
@@ -541,7 +686,7 @@ pub fn check(resource: &Resource<Convoy>) -> Result<(), String> {
     if seats(reached) != seats(spec) || reached.duties != spec.duties {
         return Err("the machine reaches other seats or duties than the import records".into());
     }
-    Ok(())
+    Ok((home, created, world))
 }
 
 /// The open stall record an imported convoy carries, as the machine creates
@@ -561,14 +706,13 @@ pub fn stall_record(convoy: &ImportedConvoy) -> Result<Option<Resource<AwaitingR
 /// path, with its open stall record if it has one: one transaction and one
 /// `import` change (#4024). The old claim history is not carried: no reader
 /// of the engine's log asks for it. The cut-over's importer writes each convoy
-/// so; the rehearsal does the same into a scratch store. The convoy is a launch, numbered by the
-/// home sequence its create takes, as any launch is; returns it as written.
+/// so; the rehearsal does the same into a scratch store. The convoy is its launch
+/// ([`ImportedConvoy::launch`]); returns it as written.
 pub fn write(store: &mut flotilla_schema_sqlite::Store, convoy: &ImportedConvoy) -> Result<Resource<Convoy>, String> {
     let stall = stall_record(convoy)?;
     let mut write = store.write().map_err(|error| error.to_string())?;
     let change = write.open_change(&convoy.change()).map_err(|error| error.to_string())?;
-    let next = write.last_sequence(&convoy.home).map_err(|error| error.to_string())? + 1;
-    let resource = convoy.resource.clone().numbered(next);
+    let resource = convoy.resource.clone().numbered(convoy.launch);
     write.insert_created(resource.name(), &resource, change, convoy.created).map_err(|error| error.to_string())?;
     if let Some(stall) = &stall {
         write.insert_created(stall.name(), stall, change, convoy.created).map_err(|error| format!("stall `{}`: {error}", stall.name()))?;
@@ -602,21 +746,61 @@ fn stamped(spec: &ConvoySpec, version: u64) -> ConvoySpec {
 pub fn write_into(target: &mut impl flotilla_engine_store::ImportTarget, convoy: &ImportedConvoy) -> Result<Resource<Convoy>, String> {
     let stall = stall_record(convoy)?;
     let change = convoy.change();
-    // A launch, numbered by the home sequence its create takes, as any launch is.
-    let (_, written) = target.write_named_with(&convoy.home, &change, convoy.resource.version().0, |version| {
+    // A launch at its number, as an admission's reserved launch is.
+    let (_, written) = target.write_launch(&convoy.home, &change, convoy.launch, |version| {
         let resource = Resource::stored(
             convoy.resource.name(),
             stamped(convoy.resource.spec(), version),
             convoy.resource.stored_state().clone(),
             Version(version),
         )
-        .numbered(version);
+        .numbered(convoy.launch);
         (resource.name().to_owned(), resource)
     })?;
     if let Some(stall) = &stall {
         target.write(&convoy.home, stall.name(), &change, stall).map_err(|error| format!("stall `{}`: {error}", stall.name()))?;
     }
     Ok(written)
+}
+
+/// Ends `written`, an ended convoy as [`write_into`] created it, with `end`: the edge is written
+/// through `target`'s log as its home writes one, by the import at the old `finished_at`, with
+/// the import's grant among its reads. The convoy as ended.
+pub fn end_into(target: &flotilla_engine_store::Import, written: &Resource<Convoy>, end: &ImportedEnd) -> Result<Resource<Convoy>, String> {
+    let mut home = importing(target)?;
+    home.restore(written.clone()).map_err(|error| format!("{error:?}"))?;
+    let mut world = MemoryConvoyWorld::default();
+    end.grant(&mut world);
+    home.apply(written.name(), end.edge.clone(), &world, end.at).map_err(|error| format!("the machine refuses its end: {error:?}"))?;
+    Ok(home.get(written.name()).cloned().expect("an applied edge leaves its resource"))
+}
+
+/// Retires `ended`, an imported convoy as [`end_into`] ended it, at `at` when nothing imported
+/// holds it: its holds are read from `target` as a home reads them ([`crate::holds::holds`]) and
+/// recorded with the edge. What holds it, empty once it has retired.
+pub fn retire_into(target: &flotilla_engine_store::Import, ended: &Resource<Convoy>, at: Timestamp) -> Result<BTreeSet<String>, String> {
+    let home_name = target.store().home().to_owned();
+    let held = {
+        let mut store = target.store();
+        let mut read = store.read().map_err(|error| error.to_string())?;
+        crate::holds::holds(&mut read, ended, &home_name).map_err(|error| error.to_string())?
+    };
+    if !held.is_empty() {
+        return Ok(held);
+    }
+    let mut home = importing(target)?;
+    home.restore(ended.clone()).map_err(|error| format!("{error:?}"))?;
+    let reference = format!("{}/holds", ended.name());
+    let mut world = MemoryConvoyWorld::default();
+    world.holds.put(&Ref::new(reference.as_str()), held.clone());
+    home.apply(ended.name(), Retire { holds: Ref::new(reference) }, &world, at)
+        .map_err(|error| format!("the machine refuses its retirement: {error:?}"))?;
+    Ok(held)
+}
+
+/// A home writing as the import through `target`'s log, holding nothing yet.
+fn importing(target: &flotilla_engine_store::Import) -> Result<Home<Convoy, flotilla_engine_store::StoreLog>, String> {
+    Home::with_log(flotilla_engine_store::IMPORT_WRITER, target.log()).map_err(|error| format!("{error:?}"))
 }
 
 /// A convoy the rehearsal refused, named.
@@ -627,67 +811,67 @@ pub struct RehearsalRefusal {
 }
 
 /// Writes every imported convoy through the creation path into a scratch
-/// store per home, with its claim history as the creation's log entry
-/// payload and its open stall record beside it, then reads each back and
-/// checks it against the machine again.
+/// store per home, as the import does: each convoy at its launch with its open stall record
+/// beside it. Reads each back and checks it against the machine again.
 pub fn rehearse(imported: &[ImportedConvoy]) -> Vec<RehearsalRefusal> {
-    use flotilla_schema::Kind;
     let refuse = |convoy: &ImportedConvoy, reason: String| RehearsalRefusal { convoy: convoy.resource.name().to_owned(), reason };
-    let mut stores: BTreeMap<String, flotilla_schema_sqlite::Store> = BTreeMap::new();
     let mut refusals = Vec::new();
+    let mut homes = BTreeMap::<&str, Vec<&ImportedConvoy>>::new();
     for convoy in imported {
-        let store = match stores.entry(convoy.home.clone()) {
-            std::collections::btree_map::Entry::Occupied(entry) => entry.into_mut(),
-            std::collections::btree_map::Entry::Vacant(entry) => {
-                let opened = flotilla_engine_store::registry().map_err(|error| format!("{error:?}")).and_then(|registry| {
-                    let connection = rusqlite::Connection::open_in_memory().map_err(|error| error.to_string())?;
-                    flotilla_schema_sqlite::Store::open(connection, &convoy.home, registry).map_err(|error| error.to_string())
-                });
-                match opened {
-                    Ok(store) => entry.insert(store),
-                    Err(error) => {
-                        refusals.push(refuse(convoy, error));
-                        continue;
-                    }
-                }
-            }
-        };
-        let written = match write(store, convoy) {
-            Ok(written) => written,
+        homes.entry(&convoy.home).or_default().push(convoy);
+    }
+    for (home, convoys) in homes {
+        let opened = flotilla_engine_store::registry()
+            .map_err(|error| format!("{error:?}"))
+            .and_then(|registry| flotilla_engine_store::Import::in_memory(home, registry));
+        let mut target = match opened {
+            Ok(target) => target,
             Err(error) => {
-                refusals.push(refuse(convoy, format!("the store refuses its creation: {error}")));
+                refusals.extend(convoys.iter().map(|convoy| refuse(convoy, error.clone())));
                 continue;
             }
         };
-        let read = store.read().and_then(|mut read| {
-            let id = read.resolve(Resource::<Convoy>::CODE, written.name(), &convoy.home)?;
-            id.map(|id| read.load::<Resource<Convoy>>(id)).transpose().map(Option::flatten)
-        });
-        match read {
-            Ok(Some(loaded)) if content(loaded.value.spec()) == content(written.spec()) => {
-                if let Err(reason) = check(&loaded.value) {
-                    refusals.push(refuse(convoy, reason));
-                }
+        for convoy in convoys {
+            if let Err(error) = write_into(&mut target, convoy) {
+                refusals.push(refuse(convoy, format!("the store refuses its creation: {error}")));
+                continue;
             }
-            Ok(Some(_)) => refusals.push(refuse(convoy, "the store reads back another convoy".into())),
-            Ok(None) => refusals.push(refuse(convoy, "the created convoy is missing".into())),
-            Err(error) => refusals.push(refuse(convoy, error.to_string())),
-        }
-        if let Some(stall) = &convoy.stall {
-            let name = flotilla_engine_messages::awaiting::record_name(&stall.spec.message);
-            let read = store.read().and_then(|mut read| {
-                let id = read.resolve(Resource::<AwaitingReply>::CODE, &name, &convoy.home)?;
-                id.map(|id| read.load::<Resource<AwaitingReply>>(id)).transpose().map(Option::flatten)
-            });
-            match read {
-                Ok(Some(loaded)) if *loaded.value.spec() == stall.spec && loaded.value.label() == AwaitingReplyLabel::Open => {}
-                Ok(Some(_)) => refusals.push(refuse(convoy, format!("the store reads back another stall `{name}`"))),
-                Ok(None) => refusals.push(refuse(convoy, format!("the stall `{name}` is missing"))),
-                Err(error) => refusals.push(refuse(convoy, format!("stall `{name}`: {error}"))),
-            }
+            let mut store = target.store();
+            refusals.extend(read_back(&mut store, convoy).err().map(|reason| refuse(convoy, reason)));
         }
     }
     refusals
+}
+
+/// Reads `convoy` back from `store` as [`rehearse`] wrote it, with its stall record, and checks
+/// it against the machine again.
+fn read_back(store: &mut flotilla_schema_sqlite::Store, convoy: &ImportedConvoy) -> Result<(), String> {
+    use flotilla_schema::Kind;
+    let launch = convoy.resource.clone().numbered(convoy.launch);
+    let read = store.read().and_then(|mut read| {
+        let id = read.resolve(Resource::<Convoy>::CODE, launch.name(), &convoy.home)?;
+        id.map(|id| read.load::<Resource<Convoy>>(id)).transpose().map(Option::flatten)
+    });
+    match read {
+        Ok(Some(loaded)) if content(loaded.value.spec()) == content(launch.spec()) => check(&loaded.value)?,
+        Ok(Some(_)) => return Err("the store reads back another convoy".into()),
+        Ok(None) => return Err("the created convoy is missing".into()),
+        Err(error) => return Err(error.to_string()),
+    }
+    if let Some(stall) = &convoy.stall {
+        let name = flotilla_engine_messages::awaiting::record_name(&stall.spec.message);
+        let read = store.read().and_then(|mut read| {
+            let id = read.resolve(Resource::<AwaitingReply>::CODE, &name, &convoy.home)?;
+            id.map(|id| read.load::<Resource<AwaitingReply>>(id)).transpose().map(Option::flatten)
+        });
+        match read {
+            Ok(Some(loaded)) if *loaded.value.spec() == stall.spec && loaded.value.label() == AwaitingReplyLabel::Open => {}
+            Ok(Some(_)) => return Err(format!("the store reads back another stall `{name}`")),
+            Ok(None) => return Err(format!("the stall `{name}` is missing")),
+            Err(error) => return Err(format!("stall `{name}`: {error}")),
+        }
+    }
+    Ok(())
 }
 
 /// The pre-roll rehearsal's report: every old convoy's outcome, the
@@ -700,16 +884,44 @@ pub struct RehearsalReport {
     pub rehearsal: Vec<RehearsalRefusal>,
 }
 
-/// Imports and rehearses every old convoy of one home.
+/// Imports and rehearses every old convoy of one home, each at the launch the import numbers it
+/// ([`ImportedLaunches`]) rather than `world`'s.
 pub fn rehearse_all<'a>(
     convoys: impl IntoIterator<Item = &'a ResourceObject<OldConvoy>>,
     home: &str,
     forges: &[ForgeSpec],
     world: &dyn ConvoyImportWorld,
 ) -> RehearsalReport {
-    let mut report = import_all(convoys, home, forges, world);
+    let convoys: Vec<_> = convoys.into_iter().collect();
+    let launches = ImportedLaunches::number(convoys.iter().map(|convoy| (home, *convoy)));
+    let numbered = Numbered {
+        world,
+        launches: convoys
+            .iter()
+            .filter_map(|convoy| Some((convoy.metadata.name.clone(), launches.get(&convoy.metadata.namespace, &convoy.metadata.name)?.n)))
+            .collect(),
+    };
+    let mut report = import_all(convoys, home, forges, &numbered);
     report.rehearsal = rehearse(&report.imported);
     report
+}
+
+/// `world`, with each record's launch as [`ImportedLaunches`] numbers it.
+struct Numbered<'a> {
+    world: &'a dyn ConvoyImportWorld,
+    launches: BTreeMap<String, u64>,
+}
+
+impl ConvoyImportWorld for Numbered<'_> {
+    fn message(&self, record: &str) -> Option<(MessageRef, Address)> {
+        self.world.message(record)
+    }
+    fn launch(&self, record: &str) -> Option<u64> {
+        self.launches.get(record).copied()
+    }
+    fn standing_ruled(&self) -> bool {
+        self.world.standing_ruled()
+    }
 }
 
 /// Maps every old convoy of `convoys`, homed at `home`, onto the engine, each alone: a standing

@@ -15,7 +15,10 @@ use flotilla_provisioning::{
     },
     stored::artifact as stored,
 };
-use flotilla_resources::{Artifact, ArtifactSpec, ArtifactStatus, ObjectMeta, ResourceObject};
+use flotilla_resources::{
+    convoy::engine::{ImportedLaunch, ImportedLaunches},
+    Artifact, ArtifactSpec, ArtifactStatus, ObjectMeta, ResourceObject,
+};
 use flotilla_schema::render_view;
 use flotilla_schema_sqlite::{schema_ddl, DdlMode, Store};
 use hegel::generators as gs;
@@ -99,6 +102,18 @@ fn copy(object: ResourceObject<Artifact>, namespace: &str, home: &str) -> Artifa
     ArtifactCopy { namespace: namespace.into(), object, home: home.into() }
 }
 
+/// Every convoy `copies` name, each as its own name's first launch at its copy's home.
+fn launches(copies: &[ArtifactCopy]) -> ImportedLaunches {
+    copies.iter().filter(|copy| !copy.object.spec.convoy.is_empty()).fold(ImportedLaunches::default(), |launches, copy| {
+        let convoy = &copy.object.spec.convoy;
+        launches.with(
+            &copy.namespace,
+            convoy,
+            ImportedLaunch { home: copy.home.clone(), project: copy.namespace.clone(), of: convoy.clone(), n: 1 },
+        )
+    })
+}
+
 fn micros(time: DateTime<Utc>) -> DateTime<Utc> {
     DateTime::from_timestamp_micros(time.timestamp_micros()).expect("in range")
 }
@@ -149,10 +164,54 @@ fn every_storable_artifact_imports_and_reads_back(tc: hegel::TestCase) {
     expected.expires_at = micros(old.expires_at);
     assert_eq!(record.spec().expect("reads as a spec"), expected);
     let mut report = ImportReport::default();
-    rehearse_artifacts(&[copy(object, "flotilla", "alpha")], &mut report);
+    let copies = [copy(object, "flotilla", "alpha")];
+    rehearse_artifacts(&copies, &launches(&copies), &mut report);
     assert!(report.refused.is_empty(), "{report:?}");
     assert_eq!(report.imported.values().sum::<usize>(), 1);
     assert_eq!(report.dropped.values().sum::<usize>(), usize::from(reserved), "{report:?}");
+}
+
+// Behaviour (#3108): an imported artifact belongs to the launch its convoy imports as, which
+// retention reads; one whose convoy imports as no launch is refused with why, never stored under
+// the old name.
+#[test]
+fn an_artifact_belongs_to_its_convoys_launch() {
+    use flotilla_engine_store::Import;
+    use flotilla_provisioning::engine::artifact_import::import_artifacts;
+    use flotilla_resources::address::artifact_slot_record_name;
+    use flotilla_schema::Kind;
+    let kept = copy(object("kept", spec(BTreeMap::new())), "flotilla", "alpha");
+    let mut ledger = spec(BTreeMap::new());
+    ledger.subject = "demo".into();
+    let old_slot = artifact_slot_record_name("demo", "coder", "decision-ledger", "demo").expect("slot");
+    let ledger = copy(object(&old_slot, ledger), "flotilla", "alpha");
+    let mut orphan = spec(BTreeMap::new());
+    orphan.convoy = "gone".into();
+    let orphan = copy(object("orphan", orphan), "flotilla", "alpha");
+    let convoys = ImportedLaunches::default().with(
+        "flotilla",
+        "demo",
+        ImportedLaunch { home: "alpha".into(), project: "flotilla".into(), of: "demo".into(), n: 3 },
+    );
+    let mut target = Import::in_memory("alpha", stored::registry().expect("registry")).expect("import");
+    let mut report = ImportReport::default();
+    import_artifacts(&[kept, ledger, orphan], &convoys, &mut target, &mut report);
+    assert!(report.dropped.is_empty(), "{report:?}");
+    let refused: Vec<_> = report.refused.iter().map(|refusal| (refusal.record.as_str(), refusal.reason.as_str())).collect();
+    assert_eq!(refused, [("orphan", "at `alpha`: names a convoy not in this host's replica (`gone`)")]);
+
+    let mut store = target.store();
+    let mut read = store.read().expect("read");
+    let id = read.resolve(stored::ArtifactRecord::CODE, "kept", "alpha").expect("resolve").expect("stored");
+    let record = read.load::<stored::ArtifactRecord>(id).expect("load").expect("record").value;
+    assert_eq!(record.convoy, "demo#3");
+    // A ledger named for its slot is named for the launch's, where a submission's address finds it.
+    let slot = artifact_slot_record_name("demo#3", "coder", "decision-ledger", "demo#3").expect("slot");
+    let id = read.resolve(stored::ArtifactRecord::CODE, &slot, "alpha").expect("resolve").expect("stored at the launch's slot");
+    let record = read.load::<stored::ArtifactRecord>(id).expect("load").expect("record").value;
+    assert_eq!((record.convoy.as_str(), record.subject.as_str()), ("demo#3", "demo#3"));
+    assert_eq!(read.resolve(stored::ArtifactRecord::CODE, &old_slot, "alpha").expect("resolve"), None);
+    assert_eq!(read.resolve(stored::ArtifactRecord::CODE, "orphan", "alpha").expect("resolve"), None);
 }
 
 // Behaviour (ADR 0047): the corpus's artifacts import; a deleted copy drops, as does one whose
@@ -195,7 +254,7 @@ fn copies_the_engine_cannot_hold_are_dropped_or_refused() {
         copy(gone_elsewhere, "other", "delta"),
     ]);
     let mut report = ImportReport::default();
-    rehearse_artifacts(&copies, &mut report);
+    rehearse_artifacts(&copies, &launches(&copies), &mut report);
     assert_eq!(report.imported.values().sum::<usize>(), imported, "{report:?}");
     assert_eq!(report.dropped.values().sum::<usize>(), 3, "{report:?}");
     assert_eq!(report.dropped.get(&("Artifact", "names no blob")), Some(&1), "{report:?}");

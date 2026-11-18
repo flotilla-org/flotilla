@@ -269,6 +269,26 @@ pub trait ImportTarget {
 
     /// Whether a live `K` named `name` at `home` was written: a reference's target, say.
     fn holds<K: Kind>(&mut self, name: &str, home: &str) -> Result<bool, String>;
+
+    /// Raises `home`'s sequence to at least `n` by empty changes made as `change`, as reservations
+    /// never created leave it: a launch reserved there afterwards is numbered above `n`. A target
+    /// that numbers nothing raises nothing.
+    fn raise_launches(&mut self, home: &str, n: u64, change: &NewChange) -> Result<(), String> {
+        let _ = (home, n, change);
+        Ok(())
+    }
+
+    /// [`Self::write_named_with`] for launch number `n`, the number the import gives it: `make`
+    /// names the launch `n` and is given the version its create takes.
+    fn write_launch<K: Kind + PartialEq>(
+        &mut self,
+        home: &str,
+        change: &NewChange,
+        n: u64,
+        make: impl FnOnce(u64) -> (String, K),
+    ) -> Result<(String, K), String> {
+        self.write_named_with(home, change, n, make)
+    }
 }
 
 fn read_back<K: Kind + PartialEq>(store: &mut Store, home: &str, name: &str, value: &K) -> Result<(), String> {
@@ -363,9 +383,11 @@ impl ImportTarget for Rehearsal {
 
 /// The cut-over import's writes into an engine store: each record homed at the store's home is
 /// created through its change, as the write path creates one, so its log entry carries the
-/// change's time and replicates to peers like any other create.
+/// change's time and replicates to peers like any other create. A record's later edges (an
+/// imported convoy's end, its retirement) go through [`Import::log`], as a home writes them.
 pub struct Import {
-    store: Store,
+    store: Arc<StoreHandle>,
+    home: String,
 }
 
 impl Import {
@@ -373,23 +395,34 @@ impl Import {
     /// so that, once dropped, it is whole in that one file.
     pub fn create(path: &std::path::Path, home: &str, kinds: KindRegistry) -> Result<Self, String> {
         let connection = rusqlite::Connection::open(path).map_err(|error| format!("open {}: {error}", path.display()))?;
-        Ok(Self { store: Store::open(connection, home, kinds).map_err(|error| format!("open {}: {error}", path.display()))? })
+        Ok(Self::over(Store::open(connection, home, kinds).map_err(|error| format!("open {}: {error}", path.display()))?))
     }
 
     /// An engine store in memory over `kinds`, homed at `home`: a rehearsal of what an import there writes.
     pub fn in_memory(home: &str, kinds: KindRegistry) -> Result<Self, String> {
         let connection = rusqlite::Connection::open_in_memory().map_err(|error| error.to_string())?;
-        Ok(Self { store: Store::open(connection, home, kinds).map_err(|error| error.to_string())? })
+        Ok(Self::over(Store::open(connection, home, kinds).map_err(|error| error.to_string())?))
     }
 
-    pub fn store(&mut self) -> &mut Store {
-        &mut self.store
+    fn over(store: Store) -> Self {
+        let home = store.home().to_owned();
+        Self { store: Arc::new(StoreHandle::new(store)), home }
+    }
+
+    pub fn store(&self) -> StoreGuard<'_> {
+        lock_store(&self.store)
+    }
+
+    /// The store's log at its home: a home writing through it logs each edge under the change
+    /// its writer and the edge's time make.
+    pub fn log(&self) -> StoreLog {
+        StoreLog::new(Arc::clone(&self.store))
     }
 }
 
 impl ImportTarget for Import {
     fn imports(&self, home: &str) -> bool {
-        home == self.store.home()
+        home == self.home
     }
 
     fn write_named_with<K: Kind + PartialEq>(
@@ -402,7 +435,8 @@ impl ImportTarget for Import {
         if !self.imports(home) {
             return Err(format!("homed at `{home}`, another home's to import"));
         }
-        let mut write = self.store.write().map_err(|error| error.to_string())?;
+        let mut store = lock_store(&self.store);
+        let mut write = store.write().map_err(|error| error.to_string())?;
         let opened = write.open_change(change).map_err(|error| error.to_string())?;
         let version = write.last_sequence(home).map_err(|error| error.to_string())? + 1;
         let (name, value) = make(version);
@@ -413,12 +447,26 @@ impl ImportTarget for Import {
         }
         .map_err(|error| error.to_string())?;
         write.commit().map_err(|error| error.to_string())?;
-        read_back(&mut self.store, home, &name, &value)?;
+        read_back(&mut store, home, &name, &value)?;
         Ok((name, value))
     }
 
     fn holds<K: Kind>(&mut self, name: &str, home: &str) -> Result<bool, String> {
-        holds::<K>(&mut self.store, name, home)
+        holds::<K>(&mut lock_store(&self.store), name, home)
+    }
+
+    /// Empty changes, each taking the next home sequence as a reservation never created does,
+    /// until the home's sequence reaches `n`; all in one transaction.
+    fn raise_launches(&mut self, home: &str, n: u64, change: &NewChange) -> Result<(), String> {
+        if !self.imports(home) {
+            return Err(format!("homed at `{home}`, another home's to import"));
+        }
+        let mut store = lock_store(&self.store);
+        let mut write = store.write().map_err(|error| error.to_string())?;
+        while write.last_sequence(home).map_err(|error| error.to_string())? < n {
+            write.open_change(change).map_err(|error| error.to_string())?;
+        }
+        write.commit().map_err(|error| error.to_string())
     }
 }
 

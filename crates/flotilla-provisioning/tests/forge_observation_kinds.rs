@@ -143,13 +143,15 @@ fn import_at(home: &str) -> Import {
 }
 
 fn load<K: Kind>(target: &mut Import, name: &str, home: &str) -> Option<K> {
-    let mut read = target.store().read().expect("read");
+    let mut store = target.store();
+    let mut read = store.read().expect("read");
     let id = read.resolve(K::CODE, name, home).expect("resolve")?;
     read.load::<K>(id).expect("load").map(|loaded| loaded.value)
 }
 
 fn names<K: Kind>(target: &mut Import, home: &str) -> Vec<String> {
-    let mut read = target.store().read().expect("read");
+    let mut store = target.store();
+    let mut read = store.read().expect("read");
     let page = read.scan::<K>(home, None, 64).expect("scan");
     page.ids.into_iter().filter_map(|id| read.load::<K>(id).expect("load").map(|loaded| loaded.name)).collect()
 }

@@ -5,7 +5,7 @@
 use std::collections::BTreeSet;
 
 use flotilla_core::primitives::{
-    convert::Conversion,
+    convert::{AtLaunches, Conversion},
     import::{import_all, write_messages, Imported, OldMessage, ReadRecords},
 };
 use flotilla_engine_messages::{roles::FleetRoles, OldStoreRecords};
@@ -57,7 +57,8 @@ fn namespace_messages(source: &Source, namespace: &str, target: &mut Import, car
         })
         .collect();
     let records = old_store_records(source, namespace, terminals.into_iter().map(|terminal| terminal.object).collect());
-    let conversion = Conversion { roles: &roles, forges: &records.forges, records: &records };
+    let launched = AtLaunches { records: &records, launches: &carried.convoy_launches, namespace };
+    let conversion = Conversion { roles: &roles, forges: &records.forges, records: &launched };
     let world = ReadRecords {
         messages: messages.iter().map(|(record, home)| (record.metadata.name.clone(), (record, home.clone()))).collect(),
         sessions,

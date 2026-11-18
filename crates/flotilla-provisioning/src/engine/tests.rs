@@ -565,6 +565,14 @@ fn the_import_maps_live_cloud_sandboxes_and_drops_deleted_gone_ones() {
     }
 }
 
+/// The launches `convoys` import as at [`HOME`]: each its own name's, numbered in order.
+fn convoy_launches(convoys: &[&str]) -> flotilla_resources::convoy::engine::ImportedLaunches {
+    use flotilla_resources::convoy::engine::{ImportedLaunch, ImportedLaunches};
+    convoys.iter().zip(1..).fold(ImportedLaunches::default(), |launches, (convoy, n)| {
+        launches.with("flotilla", convoy, ImportedLaunch { home: HOME.into(), project: "flotilla".into(), of: (*convoy).into(), n })
+    })
+}
+
 fn vessel_object() -> ResourceObject<flotilla_resources::Vessel> {
     use flotilla_resources::VesselSpec;
     ResourceObject {
@@ -703,7 +711,10 @@ fn every_vessel_phase_imports_as_its_lease() {
     use flotilla_resources::{VesselPhase, VesselStatus};
     use flotilla_state_machines::placement::Host;
 
+    use flotilla_state_machines::machines::convoy::ConvoyId;
+
     use super::import::{import_vessel, label, rehearse_vessels, ImportReport};
+    let convoys = convoy_launches(&["convoy-a"]);
     let placed = |phase| {
         let mut vessel = vessel_object();
         placed_on(&mut vessel, "feta");
@@ -721,7 +732,7 @@ fn every_vessel_phase_imports_as_its_lease() {
         (VesselPhase::Lost, "gone"),
         (VesselPhase::Failed, "gone"),
     ] {
-        let imported = import_vessel(&placed(phase), HOME).expect("imported");
+        let imported = import_vessel(&placed(phase), HOME, &convoys).expect("imported");
         match phase {
             VesselPhase::Lost => assert_eq!(
                 imported.resource.state(),
@@ -738,10 +749,11 @@ fn every_vessel_phase_imports_as_its_lease() {
         assert_eq!(label(imported.resource.state()), expected, "{phase:?}");
         assert_eq!(imported.resource.spec().host, Host::new("feta"));
         assert_eq!(imported.resource.spec().launch_of, "convoy-a-implement", "a launch of its work");
+        assert_eq!(imported.resource.spec().convoy, ConvoyId::new("convoy-a#1", HOME), "in the launch its convoy imports as");
     }
     let mut nameless = placed(VesselPhase::Ready);
     nameless.status.as_mut().expect("status").environment_ref = None;
-    let refused = import_vessel(&nameless, HOME).err().expect("a ready vessel runs in an environment");
+    let refused = import_vessel(&nameless, HOME, &convoys).err().expect("a ready vessel runs in an environment");
     assert!(refused.reason.contains("no environment"), "{refused}");
     let mut unplaced = vessel_object();
     unplaced.metadata.name = "convoy-b-implement".into();
@@ -768,7 +780,7 @@ fn every_vessel_phase_imports_as_its_lease() {
     .collect();
     records.extend([(unplaced, HOME.to_owned()), (odd, HOME.to_owned())]);
     let mut report = ImportReport::default();
-    rehearse_vessels(&records, &mut report);
+    rehearse_vessels(&records, &convoy_launches(&["convoy-p", "convoy-r", "convoy-l", "convoy-q", "convoy-b", "convoy-c"]), &mut report);
     assert_eq!(report.imported.get(&("Vessel", "requested")), Some(&2), "{report:?}");
     for label in ["realised", "gone"] {
         assert_eq!(report.imported.get(&("Vessel", label)), Some(&1), "{label}: {report:?}");

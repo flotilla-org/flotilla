@@ -250,12 +250,26 @@ fn reason(record: &RetiredDemand, annotation: &str, otherwise: impl FnOnce() -> 
     record.metadata.annotations.get(annotation).cloned().unwrap_or_else(otherwise)
 }
 
+/// What a demand's attention reads of `convoy`: the launch it imports as. Refused when it imports
+/// as no launch (one never bootstrapped).
 fn convoy_read(convoy: &ResourceObject<Convoy>, conversion: &Conversion<'_>) -> Result<Read, String> {
     let reference = MessageReference::ControlRecord {
         resource: ResourceRef::new("flotilla.work/v1", "Convoy", &convoy.metadata.namespace, &convoy.metadata.name),
         revision: convoy.metadata.resource_version.clone(),
     };
-    Ok(Read { address: conversion.records.address(&reference)?, revision: convoy.metadata.resource_version.clone() })
+    let address = conversion.records.launched(conversion.records.address(&reference)?)?;
+    Ok(Read { address, revision: convoy.metadata.resource_version.clone() })
+}
+
+/// What a standing role's attention reads of its generation `held`: the role's launch numbered by
+/// the generation (`<standing name>#<generation>`), as the ensure pass raises and clears the
+/// attention, whether or not the generation bootstrapped and so has a launch.
+fn generation_read(held: &ResourceObject<Convoy>, ensure: &ResourceObject<ConvoyEnsure>) -> Result<Read, String> {
+    let launch = format!("{}#{}", standing_name(&ensure.spec.project_ref, &ensure.spec.role)?, held.spec.generation);
+    Ok(Read {
+        address: convoy_reference_address(&launch, held.spec.project_ref.as_deref())?,
+        revision: held.metadata.resource_version.clone(),
+    })
 }
 
 fn child(parent: &Address, kind: Kind, name: &str) -> Result<Address, String> {
@@ -292,12 +306,9 @@ fn map(
             Ok(attention(Cause::DeliveryHeld { role }, reason, held))
         }
         Writer::Hold { ensure, convoy: target } => {
-            let Some((held, read)) = convoy(target)? else { return gone() };
+            let Some(held) = records.convoys.get(target) else { return gone() };
             let Some(ensure) = records.ensures.get(ensure) else { return Ok(Mapped::Dropped("its ConvoyEnsure is gone")) };
-            // The hold is on the role's generation by its launch name, as the ensure pass raises and
-            // clears it: `<standing name>#<generation>`.
-            let launch = format!("{}#{}", standing_name(&ensure.spec.project_ref, &ensure.spec.role)?, held.spec.generation);
-            let read = Read { address: convoy_reference_address(&launch, held.spec.project_ref.as_deref())?, revision: read.revision };
+            let read = generation_read(held, ensure)?;
             let reason = reason(record, ENSURE_HOLD_REASON_ANNOTATION, || format!("Standing convoy `{target}` is held."));
             Ok(attention(Cause::Hold { convoy: read }, reason, held))
         }
@@ -307,8 +318,9 @@ fn map(
             Ok(attention(Cause::ReclaimRefused { convoy: read }, reason, held))
         }
         Writer::Drift { ensure, convoy: target } => {
-            let Some((held, read)) = convoy(target)? else { return gone() };
+            let Some(held) = records.convoys.get(target) else { return gone() };
             let Some(ensure) = records.ensures.get(ensure) else { return Ok(Mapped::Dropped("its ConvoyEnsure is gone")) };
+            let read = generation_read(held, ensure)?;
             let project =
                 Address::project(&ensure.spec.project_ref).map_err(|error| format!("project `{}`: {error}", ensure.spec.project_ref))?;
             let role =

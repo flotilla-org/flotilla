@@ -216,7 +216,12 @@ fn old_account_records_rehearse_onto_the_engine() {
         (object("prov-2", provision("unlisted", "node-b", None)), "local".to_owned()),
     ];
     let mut report = ImportReport::default();
-    rehearse_accounts(&bindings, &provisions, &mut report);
+    let convoys = flotilla_resources::convoy::engine::ImportedLaunches::default().with(
+        NS,
+        "convoy-a",
+        flotilla_resources::convoy::engine::ImportedLaunch { home: "local".into(), project: NS.into(), of: "convoy-a".into(), n: 1 },
+    );
+    rehearse_accounts(&bindings, &provisions, &convoys, &mut report);
     assert_eq!(
         report.imported,
         BTreeMap::from([(("AccountBinding", "closed"), 1), (("AccountBinding", "open"), 1), (("AccountProvision", "delivered"), 1)])
@@ -241,6 +246,16 @@ async fn an_engine_rebind_that_cannot_open_leaves_the_binding_open() {
     let bound = accounts.requester_binding(NS, "convoy-a", "coder", &access()).await.expect("read").expect("bound");
     assert!(bound.spec.state.value.is_open());
     assert_eq!(bound.spec.credential.0, "cred-1");
+}
+
+/// Convoy-a imports as its first launch at udder.
+fn convoy_launches() -> flotilla_resources::convoy::engine::ImportedLaunches {
+    use flotilla_resources::convoy::engine::{ImportedLaunch, ImportedLaunches};
+    ImportedLaunches::default().with(
+        NS,
+        "convoy-a",
+        ImportedLaunch { home: "udder".into(), project: NS.into(), of: "convoy-a".into(), n: 1 },
+    )
 }
 
 fn engine_home(home: &str) -> flotilla_engine_store::Import {
@@ -269,8 +284,8 @@ fn a_provision_naming_another_homes_binding_imports_at_both_homes() {
     let mut feta = engine_home("feta");
     let mut udder_report = ImportReport::default();
     let mut feta_report = ImportReport::default();
-    import_accounts(&bindings, &provisions, &mut udder, &mut udder_report);
-    import_accounts(&bindings, &provisions, &mut feta, &mut feta_report);
+    import_accounts(&bindings, &provisions, &convoy_launches(), &mut udder, &mut udder_report);
+    import_accounts(&bindings, &provisions, &convoy_launches(), &mut feta, &mut feta_report);
 
     assert_eq!(udder_report.imported, BTreeMap::from([(("AccountBinding", "open"), 1)]));
     assert!(udder_report.refused.is_empty(), "{:?}", udder_report.refused);
@@ -278,16 +293,24 @@ fn a_provision_naming_another_homes_binding_imports_at_both_homes() {
     let refused: Vec<_> = feta_report.refused.iter().map(|refusal| (refusal.kind, refusal.record.as_str())).collect();
     assert_eq!(refused, [("AccountProvision", "prov-2")]);
 
-    let mut feta_read = feta.store().read().expect("read");
+    let mut feta_store = feta.store();
+    let mut feta_read = feta_store.read().expect("read");
     let id = feta_read.resolve(ProvisionSpec::CODE, "prov-1", "feta").expect("resolve").expect("provision imported");
     let reference = feta_read.load::<ProvisionSpec>(id).expect("load").expect("provision").value.binding;
     let identity = feta_read.resolve(Binding::CODE, &reference.name, &reference.home).expect("resolve");
     assert!(identity.is_some(), "the reference holds the binding's identity");
     drop(feta_read);
+    drop(feta_store);
     assert!(!feta.holds::<Binding>(&reference.name, &reference.home).expect("holds"), "the binding arrives by replication");
 
-    let mut udder_read = udder.store().read().expect("read");
+    let mut udder_store = udder.store();
+    let mut udder_read = udder_store.read().expect("read");
     let id = udder_read.resolve(Binding::CODE, &reference.name, &reference.home).expect("resolve").expect("binding at the reference");
-    assert!(udder_read.load::<Binding>(id).expect("load").is_some());
+    let binding = udder_read.load::<Binding>(id).expect("load").expect("binding").value;
+    assert_eq!(
+        binding.spec().requester,
+        requester_address(Some("demo"), "convoy-a#1", "coder").expect("requester"),
+        "its requester names the launch its convoy imported as (#3108)"
+    );
     assert_eq!(udder_read.resolve(ProvisionSpec::CODE, "prov-1", "feta").expect("resolve"), None);
 }

@@ -444,6 +444,11 @@ fn print_import(summary: &engine_import::Summary) {
             rows.rows, rows.imported, rows.dropped, rows.other_home, rows.unaccounted
         );
     }
+    for (kind, tallies) in &summary.tallies {
+        for (what, count) in tallies {
+            println!("import rehearsal: {kind} tally: {what}: {count}");
+        }
+    }
     for note in &summary.notes {
         println!("import rehearsal: note: {note}");
     }

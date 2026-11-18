@@ -26,6 +26,9 @@ impl ConvoyImportWorld for NoMessages {
     fn message(&self, _: &str) -> Option<(MessageRef, Address)> {
         None
     }
+    fn launch(&self, _: &str) -> Option<u64> {
+        Some(1)
+    }
 }
 
 fn old(n: usize) -> ResourceObject<Convoy> {

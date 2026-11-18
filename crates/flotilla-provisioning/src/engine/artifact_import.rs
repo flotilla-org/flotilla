@@ -8,6 +8,7 @@
 //! | A summary value that is null, an array or an object | refused: a put accepts only strings, numbers and booleans |
 //! | A `size` above `i64::MAX` | refused: stored integers are signed and never wrap |
 //! | `status.ledger_comment_creations` | dropped: nothing asks for a reservation any more |
+//! | `spec.convoy` | the launch the convoy imports as, as is a subject naming the convoy, and a slot-named record is named for the launch's slot; dropped when it imports as none |
 //! | Owner references, labels and annotations | dropped (#3212) |
 //!
 //! Each copy imports at the home that wrote it. The engine has no namespaces, so one name a home
@@ -15,7 +16,9 @@
 
 use std::collections::{BTreeMap, BTreeSet};
 
-use flotilla_resources::{artifact::is_blob_digest, Artifact, ResourceObject};
+use flotilla_resources::{
+    address::artifact_slot_record_name, artifact::is_blob_digest, convoy::engine::ImportedLaunches, Artifact, ResourceObject,
+};
 
 use flotilla_engine_store::ImportTarget;
 
@@ -49,17 +52,42 @@ pub fn import_artifact(old: &ResourceObject<Artifact>) -> Result<Imported, Strin
     ArtifactRecord::from_spec(&old.spec).map(|record| Imported::Record(Box::new(record)))
 }
 
+/// `imported`, old record `name`, with its convoy named by the launch it imports as in
+/// `namespace` (#3108), as is a subject naming the convoy; one named for its slot is named for the
+/// launch's slot, as an artifact put now is. One whose convoy imports as no launch is refused.
+/// The name the record takes beside it.
+fn at_launch(imported: Imported, name: &str, namespace: &str, convoys: &ImportedLaunches) -> Result<(Imported, String), String> {
+    let mut record = match imported {
+        Imported::Record(record) if !record.convoy.is_empty() => record,
+        imported => return Ok((imported, name.to_owned())),
+    };
+    let Some(launch) = convoys.name(namespace, &record.convoy) else {
+        let reason = convoys.missing(namespace, &record.convoy).map(|reason| reason.to_string()).unwrap_or_default();
+        return Err(format!("{reason} (`{}`)", record.convoy));
+    };
+    let slot = artifact_slot_record_name(&record.convoy, &record.producer, &record.artifact_kind, &record.subject)?;
+    if record.subject == record.convoy {
+        record.subject = launch.clone();
+    }
+    record.convoy = launch;
+    let name = match slot == name {
+        true => artifact_slot_record_name(&record.convoy, &record.producer, &record.artifact_kind, &record.subject)?,
+        false => name.to_owned(),
+    };
+    Ok((Imported::Record(record), name))
+}
+
 /// [`import_artifacts`] into a temporary store of their own.
-pub fn rehearse_artifacts(copies: &[ArtifactCopy], report: &mut ImportReport) {
+pub fn rehearse_artifacts(copies: &[ArtifactCopy], convoys: &ImportedLaunches, report: &mut ImportReport) {
     match stored::registry().map_err(|error| format!("registry: {error:?}")).and_then(flotilla_engine_store::Rehearsal::open) {
-        Ok(mut rehearsal) => import_artifacts(copies, &mut rehearsal, report),
+        Ok(mut rehearsal) => import_artifacts(copies, convoys, &mut rehearsal, report),
         Err(reason) => report.refused.push(ImportRefusal { kind: KIND, record: "<all>".to_owned(), reason }),
     }
 }
 
 /// Maps every copy at a home `target` imports onto the engine and writes the records, counted as
 /// `stored`, each at its copy's creation time; drops are counted and refusals named in `report`.
-pub fn import_artifacts(copies: &[ArtifactCopy], target: &mut impl ImportTarget, report: &mut ImportReport) {
+pub fn import_artifacts(copies: &[ArtifactCopy], convoys: &ImportedLaunches, target: &mut impl ImportTarget, report: &mut ImportReport) {
     let copies: Vec<_> = copies.iter().filter(|copy| target.imports(&copy.home)).collect();
     let mut namespaces = BTreeMap::<(&str, &str), BTreeSet<&str>>::new();
     for copy in copies.iter().filter(|copy| copy.object.metadata.deletion_timestamp.is_none()) {
@@ -74,9 +102,9 @@ pub fn import_artifacts(copies: &[ArtifactCopy], target: &mut impl ImportTarget,
             report.refused.push(refuse(format!("held in namespaces `{}`, and the engine has no namespaces", held.join("`, `"))));
             continue;
         }
-        match import_artifact(&copy.object) {
+        match import_artifact(&copy.object).and_then(|imported| at_launch(imported, name, &copy.namespace, convoys)) {
             // Each record starts at its home as a fresh write; its old versions are not carried.
-            Ok(Imported::Record(record)) => match target.write(&copy.home, name, &created(&copy.object), &*record) {
+            Ok((Imported::Record(record), name)) => match target.write(&copy.home, &name, &created(&copy.object), &*record) {
                 Ok(()) => {
                     report.import_row(KIND, "stored");
                     if copy.object.status.as_ref().is_some_and(|status| !status.ledger_comment_creations.is_empty()) {
@@ -85,7 +113,7 @@ pub fn import_artifacts(copies: &[ArtifactCopy], target: &mut impl ImportTarget,
                 }
                 Err(reason) => report.refused.push(refuse(reason)),
             },
-            Ok(Imported::Dropped(reason)) => report.drop_rows(KIND, reason, 1),
+            Ok((Imported::Dropped(reason), _)) => report.drop_rows(KIND, reason, 1),
             Err(reason) => report.refused.push(refuse(reason)),
         }
     }

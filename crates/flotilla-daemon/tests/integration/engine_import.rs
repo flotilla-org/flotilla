@@ -14,7 +14,7 @@ use flotilla_daemon::{
 };
 use flotilla_daemon_testkit::{
     daemon::{OldStoreImport, OldStoreMode, TestDaemon},
-    import_fixture::{demand, designation, document, own, own_retired, populated},
+    import_fixture::{demand, designation, document, ended_convoy, live_convoy, message, own, own_retired, populated},
 };
 use flotilla_discovery_testkit::fake_discovery;
 use flotilla_protocol::{HostName, NodeId};
@@ -25,7 +25,7 @@ use flotilla_resources::{
         MATERIALIZED_PROJECT_ANNOTATION, SOURCE_COMMIT_ANNOTATION, SOURCE_ENTRY_PATH_ANNOTATION, SOURCE_REPOSITORY_ANNOTATION,
     },
     definitions::{origin, DefinitionOrigin},
-    Artifact, ConvoyEnsure, FleetDesignation, InputMeta, Project, Repository, RepositorySpec, Resource, TerminalSession,
+    Artifact, Convoy, ConvoyEnsure, FleetDesignation, InputMeta, Message, Project, Repository, RepositorySpec, Resource, TerminalSession,
 };
 use flotilla_schema::Kind;
 use flotilla_schema_sqlite::Snapshot;
@@ -115,6 +115,14 @@ impl Host {
     }
 
     async fn start(&self) -> Result<DaemonRuntime, String> {
+        self.compose().await?;
+        let options = RuntimeOptions { namespace: NS.into(), ..RuntimeOptions::default() };
+        DaemonRuntime::start_with_options(Arc::clone(self.daemon()), Arc::clone(&self.config), None, options).await
+    }
+
+    /// Composes the daemon, importing the old store at its first start, with no runtime running
+    /// its controllers.
+    async fn compose(&self) -> Result<(), String> {
         let daemon_config: DaemonConfig = self.config.load_daemon_config().expect("daemon config");
         let mut discovery = fake_discovery(false);
         let fleet = install_dummy_fleet(&daemon_config, self.config.state_dir().as_path(), &mut discovery)
@@ -133,9 +141,8 @@ impl Host {
         .await?;
         assert_eq!(daemon.node_id(), &self.node, "the daemon is homed where its host's records are");
         attach_dummy_fleet(&fleet, &daemon).expect("attach fleet");
-        let daemon = self.daemon.get_or_init(|| daemon);
-        let options = RuntimeOptions { namespace: NS.into(), ..RuntimeOptions::default() };
-        DaemonRuntime::start_with_options(Arc::clone(daemon), Arc::clone(&self.config), None, options).await
+        self.daemon.get_or_init(|| daemon);
+        Ok(())
     }
 
     fn snapshot<K: Kind>(&self, name: &str, home: &str) -> Option<Snapshot> {
@@ -151,9 +158,10 @@ impl Host {
     }
 }
 
-fn artifact(name: &str) -> Value {
-    json!({"convoy": "demo", "producer": "coder", "kind": "brief", "subject": name, "summary": {}, "digest": "ef37".repeat(16), "size": 1,
-        "media_type": "text/markdown", "expires_at": "2026-11-19T00:00:00Z"})
+/// An artifact by convoy `convoy`'s coder about `subject`.
+fn artifact(convoy: &str, subject: &str) -> Value {
+    json!({"convoy": convoy, "producer": "coder", "kind": "brief", "subject": subject, "summary": {}, "digest": "ef37".repeat(16),
+        "size": 1, "media_type": "text/markdown", "expires_at": "2026-11-19T00:00:00Z"})
 }
 
 fn repository() -> (String, Value) {
@@ -162,8 +170,9 @@ fn repository() -> (String, Value) {
     (serde_json::from_value::<RepositorySpec>(spec.clone()).expect("repository").key().0, spec)
 }
 
-/// Hosts whose old stores each hold an artifact of their own, their own copy of one repository,
-/// and copies of every other host's records, as the old replicator left them.
+/// Hosts whose old stores each hold a live convoy of their own and an artifact by it, their own
+/// copy of one repository, and copies of every other host's records, as the old replicator left
+/// them.
 async fn fleet(names: &[&str]) -> Vec<Host> {
     let mut hosts = Vec::new();
     for name in names {
@@ -171,15 +180,19 @@ async fn fleet(names: &[&str]) -> Vec<Host> {
     }
     let (key, spec) = repository();
     let mut written = Vec::new();
-    for host in &hosts {
-        let artifact = host.own::<Artifact>(&format!("artifact-{}", host.home()), artifact(&host.home()), Value::Null).await;
+    for (index, host) in hosts.iter().enumerate() {
+        let name = format!("demo-{index}");
+        let live = live_convoy(&name);
+        let convoy = host.own::<Convoy>(&name, live["spec"].clone(), live["status"].clone()).await;
+        let artifact = host.own::<Artifact>(&format!("artifact-{}", host.home()), artifact(&name, &host.home()), Value::Null).await;
         let repository = host.own::<Repository>(&key, spec.clone(), json!({"default_branch": "main"})).await;
-        written.push((artifact, repository));
+        written.push((convoy, artifact, repository));
     }
     for (index, origin) in hosts.iter().enumerate() {
         for holder in hosts.iter().filter(|holder| holder.home() != origin.home()) {
-            holder.replica::<Artifact>(origin, written[index].0.clone()).await;
-            holder.replica::<Repository>(origin, written[index].1.clone()).await;
+            holder.replica::<Convoy>(origin, written[index].0.clone()).await;
+            holder.replica::<Artifact>(origin, written[index].1.clone()).await;
+            holder.replica::<Repository>(origin, written[index].2.clone()).await;
         }
     }
     hosts
@@ -332,6 +345,75 @@ async fn held_role(host: &Host, role: &str, failures: u64, reason: &str) {
         host.dir.path(),
         demand(&format!("ensure-attention-standing-{role}"), ("Convoy", &held), &[(ENSURE_HOLD_REASON_ANNOTATION, reason)], "escalated"),
     );
+}
+
+// #3108 import (ruling (a)): imported history sets nothing off. A daemon started over an old store
+// holding ended convoys, two held by a pending message to their crew (one delivered, one
+// abandoned) and two held by nothing, imports the held two ended and the others retired; with its
+// controllers running, and a convoy reconciler pass over each, none fails and nothing but the
+// import has written any of them.
+#[tokio::test]
+async fn imported_ended_convoys_pass_the_convoy_reconciler_and_write_nothing() {
+    use flotilla_state_machines::machines::convoy::Convoy as EngineConvoy;
+    use flotilla_store::controller::Reconciler as _;
+
+    let host = Host::new("ended").await;
+    own::<FleetDesignation>(&host.backend, designation()).await;
+    let ended = [
+        ("delivered-held", "Landed", json!({"disposition": "merged"})),
+        ("abandoned-held", "Abandoned", json!({"message": "stopped by an operator"})),
+        ("delivered", "Landed", json!({"disposition": "merged"})),
+        ("failed", "Failed", json!({"message": "vessel failed"})),
+    ];
+    for (name, phase, fields) in &ended {
+        let convoy = ended_convoy(name, phase, "2026-10-19T01:00:00Z", fields.clone());
+        host.own::<Convoy>(name, convoy["spec"].clone(), convoy["status"].clone()).await;
+    }
+    for held in ["delivered-held", "abandoned-held"] {
+        let mut waiting = message(&format!("for-{held}"));
+        waiting["spec"]["receiver"] = json!(format!("flotilla/{held}/implement/coder"));
+        own::<Message>(&host.backend, waiting).await;
+    }
+    // The running daemon's controllers act on what it imported as they would on their own.
+    let _runtime = host.start().await.expect("runtime");
+    let daemon = host.daemon();
+    let home = host.home();
+
+    let backend = daemon.resource_backend();
+    let reconciler = flotilla_crew::convoy::ConvoyReconciler::new(daemon.lifecycle_reads())
+        .with_engine(daemon.convoy_engine_path())
+        .with_messages(daemon.crew_message_path())
+        .with_vessels(backend.including_replicas::<flotilla_resources::Vessel>(NS))
+        .with_prepared_snapshot_gc(flotilla_store::PreparedSnapshotGarbageCollector::new(backend.clone(), NS));
+    let convoys = backend.using::<Convoy>(NS);
+    let mut listed: Vec<String> = convoys.list().await.expect("list").items.into_iter().map(|convoy| convoy.metadata.name).collect();
+    listed.sort();
+    assert_eq!(listed.len(), 2, "the held two are listed and the others retired: {listed:?}");
+    for (name, _, _) in &ended {
+        // Each is one of this home's first launches, read by name whether retired or not.
+        let mut found = None;
+        for n in 1..=ended.len() {
+            if let Ok(convoy) = convoys.get(&format!("{name}#{n}")).await {
+                found = Some(convoy);
+            }
+        }
+        let convoy = found.unwrap_or_else(|| panic!("{name} imports as a launch"));
+        let launch = convoy.metadata.name.clone();
+        assert_eq!(listed.contains(&launch), name.ends_with("-held"), "{launch}: listed while held");
+        reconciler.prepare(&convoy).await.unwrap_or_else(|error| panic!("{launch}: {error}"));
+        // Nothing but the import has written the launch: no pass has ended, failed or changed it.
+        let writer = daemon
+            .decided_store()
+            .expect("engine store")
+            .with_store(|store| {
+                let mut read = store.read()?;
+                let id =
+                    read.resolve(<flotilla_state_machines::Resource<EngineConvoy> as Kind>::CODE, &launch, &home)?.expect("the launch");
+                Ok(read.last_change(id)?.expect("its last change").writer)
+            })
+            .expect("read");
+        assert_eq!(writer, flotilla_engine_store::IMPORT_WRITER, "{launch}");
+    }
 }
 
 // #3108: an imported hold on a standing role is the one its ensure pass raises and clears. A role
@@ -613,10 +695,17 @@ async fn a_daemon_started_over_a_real_old_store_reads_back_what_it_imported() {
             println!("dropped {count} {kind}: {reason}");
         }
     }
+    // A reason names its records between backticks: the rehearsal prints none.
+    let unnamed = |reason: &str| reason.split('`').enumerate().map(|(at, part)| if at % 2 == 1 { "`…`" } else { part }).collect::<String>();
     let mut reasons = BTreeMap::<(String, String), usize>::new();
     for refusal in read.report["refusals"].as_array().expect("refusals") {
-        let key = (refusal["kind"].as_str().unwrap_or_default().to_owned(), refusal["reason"].as_str().unwrap_or_default().to_owned());
+        let key = (refusal["kind"].as_str().unwrap_or_default().to_owned(), unnamed(refusal["reason"].as_str().unwrap_or_default()));
         *reasons.entry(key).or_default() += 1;
+    }
+    for (kind, tallies) in read.report["tallies"].as_object().expect("tallies") {
+        for (what, count) in tallies.as_object().expect("tally") {
+            println!("tally {kind}: {what}: {count}");
+        }
     }
     for ((kind, reason), count) in reasons {
         println!("refused {count} {kind}: {reason}");

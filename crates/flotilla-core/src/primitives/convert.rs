@@ -15,6 +15,7 @@ use flotilla_messaging::{Intent, IntentExpectation, IntentReference};
 use flotilla_protocol::Leaf;
 use flotilla_resources::{
     address::{leaf_condition, stored_change_request_address, stored_issue_address, stored_repository_address},
+    convoy::engine::ImportedLaunches,
     ForgeSpec, MessageExpectation, MessageReference, MessageSpec as OldSpec,
 };
 use flotilla_state_machines::machines::message::{MessageRef, MessageReference as Reference, MessageSpec};
@@ -45,6 +46,43 @@ pub trait ReferenceAddresses: Send + Sync {
     /// (`role_definitions.<role>.principal`), by name.
     fn principal_roles(&self, _project: &str, _principal: &str) -> Vec<String> {
         Vec::new()
+    }
+
+    /// `address` naming the launch its convoy imports as (#3108). With no launches to read, an
+    /// address naming a convoy is refused: an imported record names a convoy only by its launch.
+    fn launched(&self, address: Address) -> Result<Address, String> {
+        match address.get(Kind::Convoy) {
+            Some(convoy) => Err(format!("`{address}` names convoy `{convoy}`, and this mapping knows no launches")),
+            None => Ok(address),
+        }
+    }
+}
+
+/// `records`, with each convoy an address names read as the launch it imports as in `namespace`.
+pub struct AtLaunches<'a> {
+    pub records: &'a dyn ReferenceAddresses,
+    pub launches: &'a ImportedLaunches,
+    pub namespace: &'a str,
+}
+
+impl ReferenceAddresses for AtLaunches<'_> {
+    fn address(&self, reference: &MessageReference) -> Result<Address, String> {
+        self.records.address(reference)
+    }
+    fn missing(&self, reference: &MessageReference) -> Option<&'static str> {
+        self.records.missing(reference)
+    }
+    fn convoy_project(&self, convoy: &str) -> Option<String> {
+        self.records.convoy_project(convoy)
+    }
+    fn convoy_ended(&self, convoy: &str) -> bool {
+        self.records.convoy_ended(convoy)
+    }
+    fn principal_roles(&self, project: &str, principal: &str) -> Vec<String> {
+        self.records.principal_roles(project, principal)
+    }
+    fn launched(&self, address: Address) -> Result<Address, String> {
+        self.launches.address(self.namespace, &address)
     }
 }
 
@@ -123,14 +161,25 @@ impl Conversion<'_> {
         if party.starts_with("principal:") {
             return self.person(party, self.context(old).as_deref());
         }
-        self.inbox(party)
+        self.records.launched(self.inbox(party)?)
+    }
+
+    /// Why an old message's receiver or sender cannot be named: the convoy role it names is of a
+    /// convoy that imports as no launch. `None` when both name one, or no convoy.
+    pub fn unlaunched(&self, old: &OldSpec) -> Option<String> {
+        [&old.receiver, &old.sender]
+            .into_iter()
+            .filter_map(|party| self.inbox(party).ok().filter(|inbox| inbox.get(Kind::Convoy).is_some()))
+            .find_map(|inbox| self.records.launched(inbox).err())
     }
 
     /// A Leaf as an ADR 0066 condition. A crew's progress addresses its role
     /// (ADR 0066 §8): `work/C/V .crew.R.<path>` is `project:P/convoy:C/role:R .<path>`,
-    /// under `project` when the receiver's project is known.
+    /// under `project` when the receiver's project is known, with the convoy as its launch.
     pub fn condition(&self, leaf: &Leaf, project: Option<&str>) -> Result<Condition, String> {
-        leaf_condition(leaf, project, self.forges)
+        let mut condition = leaf_condition(leaf, project, self.forges)?;
+        condition.address = self.records.launched(condition.address)?;
+        Ok(condition)
     }
 
     /// An old reference as an ADR 0066 reference at its revision.
@@ -151,7 +200,7 @@ impl Conversion<'_> {
             MessageReference::Commit { revision, .. }
             | MessageReference::Ref { revision, .. }
             | MessageReference::Artifact { revision, .. }
-            | MessageReference::ControlRecord { revision, .. } => (self.records.address(reference)?, revision),
+            | MessageReference::ControlRecord { revision, .. } => (self.records.launched(self.records.address(reference)?)?, revision),
         };
         Ok(Reference { address, revision: revision.clone(), subject })
     }
@@ -249,10 +298,12 @@ mod tests {
             ("flotilla", "principal:eve", "owner"),
             ("flotilla", "principal:eve", "lead"),
         ]);
-        let map = Conversion { roles: &roles, forges: &[], records: &charter };
+        let launches = demo_launch();
+        let launched = AtLaunches { records: &charter, launches: &launches, namespace: "flotilla" };
+        let map = Conversion { roles: &roles, forges: &[], records: &launched };
         let to_crew = message("principal:alice", "flotilla/demo/work/coder");
         assert_eq!(map.sender_of(&to_crew).expect("operator").as_str(), "project:flotilla/role:operator");
-        assert_eq!(map.receiver(&to_crew).expect("crew").as_str(), "project:flotilla/convoy:demo/role:coder");
+        assert_eq!(map.receiver(&to_crew).expect("crew").as_str(), "project:flotilla/convoy:demo%232/role:coder");
         let escalated = message("flotilla/demo/work/coder", "principal:operator");
         assert_eq!(map.receiver(&escalated).expect("operator").as_str(), "project:flotilla/role:operator");
         assert_eq!(
@@ -272,17 +323,29 @@ mod tests {
         assert_eq!(map.receiver(&about).expect("convoy's project").as_str(), "project:widgets/role:operator");
     }
 
-    // Behaviour: a crew-progress leaf addresses the role (ADR 0066 §8); a
-    // change request leaf keeps its address; the print is canonical.
+    /// Convoy `demo` imports as its second launch.
+    fn demo_launch() -> ImportedLaunches {
+        let launch =
+            flotilla_resources::convoy::engine::ImportedLaunch { home: "home".into(), project: "flotilla".into(), of: "demo".into(), n: 2 };
+        ImportedLaunches::default().with("flotilla", "demo", launch)
+    }
+
+    // Behaviour: a crew-progress leaf addresses the role (ADR 0066 §8) of the launch its convoy
+    // imports as (#3108), and without launches to read it is refused; a change request leaf keeps
+    // its address; the print is canonical.
     #[test]
     fn leaves_become_canonical_conditions() {
         let roles = FleetRoles::declared("fleet").expect("roles");
-        let map = Conversion { roles: &roles, forges: &[], records: &NoRecords };
+        let launches = demo_launch();
+        let launched = AtLaunches { records: &NoRecords, launches: &launches, namespace: "flotilla" };
+        let map = Conversion { roles: &roles, forges: &[], records: &launched };
         let work: Leaf = "work/demo/work .crew.coder.phase == Done".parse().expect("leaf");
         assert_eq!(
             map.condition(&work, Some("flotilla")).expect("work").to_string(),
-            "project:flotilla/convoy:demo/role:coder .phase == Done"
+            "project:flotilla/convoy:demo%232/role:coder .phase == Done"
         );
+        let unlaunched = Conversion { roles: &roles, forges: &[], records: &NoRecords };
+        assert!(unlaunched.condition(&work, Some("flotilla")).expect_err("no launches").contains("knows no launches"));
         let cr: Leaf = "cr/github.com/flotilla-org/flotilla/42 .checks == passing".parse().expect("leaf");
         assert_eq!(map.condition(&cr, None).expect("cr").to_string(), "forge:github/repo:flotilla-org%2Fflotilla/cr:42 .checks == passing");
         let other_work: Leaf = "work/demo/work .status == Done".parse().expect("leaf");

@@ -191,6 +191,10 @@ fn convert(
             return Err(missing(reason, conversion.records.address(reference).err().unwrap_or_else(|| reason.to_owned())));
         }
     }
+    // Refused even when settled: a record naming a convoy is never dropped for its launch.
+    if let Some(detail) = conversion.unlaunched(&old.record.spec) {
+        return Err(Unimported::Refused(detail));
+    }
     let reference = |name: &str| -> Result<MessageRef, String> {
         let other = world.message(name).ok_or_else(|| format!("referenced message `{name}` was not read"))?;
         let inbox = conversion.receiver(&other.record.spec)?;

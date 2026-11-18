@@ -237,16 +237,15 @@ pub fn address(convoy: &ResourceObject<OldConvoy>) -> Result<Address, String> {
 
 /// Who supervises the convoy's seats: the workflow's first supervision
 /// target, else the project's operator role (#3587 seat-relations ruling:
-/// the convoy's supervisor role, absent a template override or a parent).
-pub fn supervisor(convoy: &ResourceObject<OldConvoy>) -> Result<Address, String> {
+/// the convoy's supervisor role, absent a template override or a parent). A role of the convoy's
+/// own crew is read under `at`, the convoy's address.
+pub fn supervisor(convoy: &ResourceObject<OldConvoy>, at: &Address) -> Result<Address, String> {
     let project = project(convoy)?;
     let operator = || project.child(AddressKind::Role, "operator").map_err(|error| error.to_string());
     let target =
         convoy.status.as_ref().and_then(|status| status.workflow_snapshot.as_ref()).and_then(|snapshot| snapshot.supervision.as_ref());
     match target.and_then(|targets| targets.first()) {
-        Some(SupervisionTarget::ConvoyCrew { role, .. }) => {
-            address(convoy)?.child(AddressKind::Role, role).map_err(|error| error.to_string())
-        }
+        Some(SupervisionTarget::ConvoyCrew { role, .. }) => at.child(AddressKind::Role, role).map_err(|error| error.to_string()),
         Some(SupervisionTarget::ProjectCrew { convoy_role, .. }) => {
             project.child(AddressKind::Role, convoy_role).map_err(|error| error.to_string())
         }
@@ -323,8 +322,8 @@ pub fn declarations(convoy: &ResourceObject<OldConvoy>, status: &ConvoyStatus) -
 pub fn request(convoy: &ResourceObject<OldConvoy>) -> Result<ConvoyRequest, String> {
     let status = convoy.status.as_ref().ok_or_else(|| format!("convoy `{}` has no status", convoy.metadata.name))?;
     let crews = Crews::of(status);
-    let supervised_by = supervisor(convoy)?;
     let target = address(convoy)?;
+    let supervised_by = supervisor(convoy, &target)?;
     let declared = declarations(convoy, status);
     let mut promises = BTreeMap::new();
     for (index, declaration) in declared.iter().enumerate() {

@@ -3,7 +3,7 @@
 use std::collections::BTreeMap;
 
 use chrono::{DateTime, TimeZone, Utc};
-use flotilla_core::primitives::convert::Conversion;
+use flotilla_core::primitives::convert::{AtLaunches, Conversion};
 use flotilla_core::primitives::{
     demand_import::{
         import_demands,
@@ -17,7 +17,10 @@ use flotilla_core::primitives::{
 };
 use flotilla_engine_messages::{roles::FleetRoles, OldStoreRecords};
 use flotilla_protocol::{PrincipalRef, ResourceRef};
-use flotilla_resources::{Convoy, ConvoyEnsure, ConvoySpec, ObjectMeta, ResourceObject, TerminalSession, Vessel, CONVOY_LABEL, ROLE_LABEL};
+use flotilla_resources::{
+    Convoy, ConvoyEnsure, ConvoySpec, ConvoyStatus, ObjectMeta, ResourceObject, TerminalSession, Vessel, WorkflowSnapshot, CONVOY_LABEL,
+    ROLE_LABEL,
+};
 use flotilla_state_machines::machines::message::MessageState;
 use hegel::{generators as gs, generators::Generator, TestCase};
 use serde_json::json;
@@ -137,7 +140,18 @@ fn every_generated_demand_is_converted_dropped_or_refused_once(tc: TestCase) {
         vec![ResourceObject {
             metadata: meta("demo"),
             spec: ConvoySpec::builder().workflow_ref("w".into()).project_ref("flotilla".into()).build(),
-            status: None,
+            // Bootstrapped, so it imports as a launch.
+            status: Some(ConvoyStatus {
+                workflow_snapshot: Some(WorkflowSnapshot {
+                    cascade: None,
+                    exit: None,
+                    turn_delivery: Default::default(),
+                    stall_nudges: Default::default(),
+                    supervision: None,
+                    vessels: Vec::new(),
+                }),
+                ..Default::default()
+            }),
         }]
     } else {
         Vec::new()
@@ -161,7 +175,9 @@ fn every_generated_demand_is_converted_dropped_or_refused_once(tc: TestCase) {
     let roles = FleetRoles::declared("lab").expect("roles");
     let old_store =
         OldStoreRecords::from_records("flotilla", Vec::new(), convoys.clone(), terminals.clone(), Vec::new(), Vec::new(), Vec::new());
-    let conversion = Conversion { roles: &roles, forges: &[], records: &old_store };
+    let launches = flotilla_resources::convoy::engine::ImportedLaunches::number(convoys.iter().map(|convoy| (HOME, convoy)));
+    let launched = AtLaunches { records: &old_store, launches: &launches, namespace: "flotilla" };
+    let conversion = Conversion { roles: &roles, forges: &[], records: &launched };
     let records = DemandRecords {
         convoys: convoys.iter().map(|convoy| (convoy.metadata.name.clone(), convoy)).collect(),
         ensures: ensures.iter().map(|ensure| (ensure.metadata.name.clone(), ensure)).collect(),
@@ -217,6 +233,15 @@ fn every_generated_demand_is_converted_dropped_or_refused_once(tc: TestCase) {
                 assert_eq!(message.resource.spec().sender.as_str(), format!("fleet:lab/role:{sender}"));
                 assert_eq!(message.resource.spec().inbox.as_str(), "project:flotilla/role:operator");
                 assert!(message.resource.spec().subject().is_some(), "one subject");
+                // #3108: the convoy is named by the launch it imports as. A standing role's attention
+                // names its generation by the role's launch name instead, which the daemon's import
+                // tests cover with a real generation.
+                let standing = matches!(drawn.writer, Writer::Hold | Writer::Drift);
+                for reference in message.resource.spec().references.iter().filter(|_| !standing) {
+                    if let Some(convoy) = reference.address.get(flotilla_resources::address::AddressKind::Convoy) {
+                        assert_eq!(convoy, "demo#1", "{}", reference.address);
+                    }
+                }
                 credential_messages += usize::from(drawn.writer == Writer::Credential);
                 versions.push(message.resource.version().0);
             }

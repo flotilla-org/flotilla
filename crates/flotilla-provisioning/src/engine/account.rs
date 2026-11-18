@@ -22,12 +22,12 @@ use flotilla_engine_store::{
     StoreLog,
 };
 use flotilla_resources::account_access::{
-    binding_name, requester_parts, AccessName, AccountBindingSpec, AccountChange, AccountProvisionSpec, AccountRecords, BindingRecord,
-    BindingState as OldState, EpochEntry, GrantName, GrantScope, PendingBinding, ProvisionRecord, ProvisionWrite, ACCOUNT_BINDING_LABEL,
-    ACCOUNT_CREDENTIAL_LABEL,
+    binding_name, requester_address, requester_parts, AccessName, AccountBindingSpec, AccountChange, AccountProvisionSpec, AccountRecords,
+    BindingRecord, BindingState as OldState, EpochEntry, GrantName, GrantScope, PendingBinding, ProvisionRecord, ProvisionWrite,
+    ACCOUNT_BINDING_LABEL, ACCOUNT_CREDENTIAL_LABEL,
 };
 use flotilla_resources::engine_records::{CommitMark, KindRecords, LogPosition, Record, Since, Ticks, WriteError as RecordWriteError};
-use flotilla_resources::CONVOY_LABEL;
+use flotilla_resources::{address::AddressKind, convoy::engine::ImportedLaunches, CONVOY_LABEL};
 use flotilla_schema::{CreatedAt, Identity, Kind, KindCode, NewChange, Ref, State, Timestamp};
 use flotilla_schema_sqlite::{stream::Service, Read, StoreError};
 use flotilla_state_machines::{Home, Resource, WriteError};
@@ -619,6 +619,18 @@ pub fn requester_name(binding: &BindingSpec) -> Option<String> {
     requester_parts(&binding.requester).map(|(convoy, role)| binding_name(&convoy, &role, &binding.requirement))
 }
 
+/// `spec` with its requester's convoy named by the launch it imports as (#3108), in `namespace`.
+fn at_launch(mut spec: BindingSpec, namespace: &str, convoys: &ImportedLaunches) -> Result<BindingSpec, String> {
+    let (convoy, role) =
+        requester_parts(&spec.requester).ok_or_else(|| format!("requester `{}` names no convoy and role", spec.requester))?;
+    let launch = convoys.name(namespace, &convoy).ok_or_else(|| {
+        let reason = convoys.missing(namespace, &convoy).map(|reason| reason.to_string()).unwrap_or_default();
+        format!("its requester {reason} (`{convoy}`)")
+    })?;
+    spec.requester = requester_address(spec.requester.get(AddressKind::Project), &launch, &role)?;
+    Ok(spec)
+}
+
 /// The engine name an old binding at `home` imports as, unless another of `taken` holds it.
 fn imported_binding_name(spec: &BindingSpec, home: &str, taken: &mut BTreeSet<(String, String)>) -> Result<String, String> {
     let requester = requester_name(spec).ok_or_else(|| format!("requester `{}` names no convoy and role", spec.requester))?;
@@ -633,6 +645,7 @@ fn imported_binding_name(spec: &BindingSpec, home: &str, taken: &mut BTreeSet<(S
 pub fn rehearse_accounts(
     bindings: &[(flotilla_resources::ResourceObject<flotilla_resources::AccountBinding>, String)],
     provisions: &[(flotilla_resources::ResourceObject<flotilla_resources::AccountProvision>, String)],
+    convoys: &ImportedLaunches,
     report: &mut super::import::ImportReport,
 ) {
     use super::import::ImportRefusal;
@@ -641,7 +654,7 @@ pub fn rehearse_accounts(
         .map_err(|error| format!("registry: {error:?}"))
         .and_then(|()| flotilla_engine_store::Rehearsal::open(kinds));
     match rehearsal {
-        Ok(mut rehearsal) => import_accounts(bindings, provisions, &mut rehearsal, report),
+        Ok(mut rehearsal) => import_accounts(bindings, provisions, convoys, &mut rehearsal, report),
         Err(reason) => {
             let refuse = |kind, record: &str| ImportRefusal { kind, record: record.to_owned(), reason: reason.clone() };
             report.refused.extend(bindings.iter().map(|(binding, _)| refuse("AccountBinding", &binding.metadata.name)));
@@ -659,6 +672,7 @@ pub fn rehearse_accounts(
 pub fn import_accounts(
     bindings: &[(flotilla_resources::ResourceObject<flotilla_resources::AccountBinding>, String)],
     provisions: &[(flotilla_resources::ResourceObject<flotilla_resources::AccountProvision>, String)],
+    convoys: &ImportedLaunches,
     target: &mut impl flotilla_engine_store::ImportTarget,
     report: &mut super::import::ImportReport,
 ) {
@@ -674,14 +688,15 @@ pub fn import_accounts(
         let refuse = |reason: String| ImportRefusal { kind: "AccountBinding", record: old.metadata.name.clone(), reason };
         // An r879 binding's home-key label (#3953) is dropped (ADR 0047).
         let spec = binding_spec(&old.spec);
-        let named = imported_binding_name(&spec, home, &mut taken);
+        let named = at_launch(spec, &old.metadata.namespace, convoys)
+            .and_then(|spec| imported_binding_name(&spec, home, &mut taken).map(|name| (name, spec)));
         let imported = target.imports(home);
-        let name = match named {
-            Ok(name) if !imported => {
-                renamed.insert((home.clone(), old.metadata.name.clone()), (home.clone(), name));
+        let (name, spec) = match named {
+            Ok(named) if !imported => {
+                renamed.insert((home.clone(), old.metadata.name.clone()), (home.clone(), named.0));
                 continue;
             }
-            Ok(name) => name,
+            Ok(named) => named,
             Err(reason) => {
                 if imported {
                     report.refused.push(refuse(reason));

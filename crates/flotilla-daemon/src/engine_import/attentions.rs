@@ -2,7 +2,7 @@
 //! admitted at the demand's home after the messages imported there.
 
 use flotilla_core::primitives::{
-    convert::Conversion,
+    convert::{AtLaunches, Conversion},
     demand_import::{
         import_demands,
         retired::{RetiredDemand, KIND, PLURAL},
@@ -47,7 +47,8 @@ fn namespace_attentions(source: &Source, namespace: &str, target: &mut Import, c
     let vessels = source.context::<Vessel>("vessels", Some(namespace));
     let terminals = source.context::<TerminalSession>("terminalsessions", Some(namespace));
     let records = old_store_records(source, namespace, terminals.iter().map(|terminal| terminal.object.clone()).collect());
-    let conversion = Conversion { roles: &roles, forges: &records.forges, records: &records };
+    let launched = AtLaunches { records: &records, launches: &carried.convoy_launches, namespace };
+    let conversion = Conversion { roles: &roles, forges: &records.forges, records: &launched };
     let named = DemandRecords {
         convoys: convoys.iter().map(|convoy| (convoy.object.metadata.name.clone(), &convoy.object)).collect(),
         ensures: ensures.iter().map(|ensure| (ensure.object.metadata.name.clone(), &ensure.object)).collect(),

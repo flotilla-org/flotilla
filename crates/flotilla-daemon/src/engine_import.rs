@@ -13,6 +13,7 @@
 mod attentions;
 mod convoys;
 mod definitions;
+mod first_start;
 mod lifecycle;
 mod messages;
 mod observations;
@@ -27,7 +28,10 @@ use std::{
 use flotilla_core::in_process::DEFAULT_PROVISIONING_NAMESPACE;
 use flotilla_engine_store::{Import, ImportTarget};
 use flotilla_provisioning::engine::import::{ImportReport, RowCounts};
-use flotilla_resources::{K8sResourceObject, Resource, ResourceObject};
+use flotilla_resources::{
+    convoy::engine::{ImportedLaunches, NoLaunch},
+    K8sResourceObject, Resource, ResourceObject,
+};
 use flotilla_store::REGISTERED_RESOURCE_KINDS;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
@@ -195,14 +199,26 @@ impl Source {
 /// What the import read beside each record, carried from one step to a later one.
 #[derive(Default)]
 struct Carried {
+    /// The launch each old convoy record imports as, every home's: what a record naming the
+    /// convoy names.
+    convoy_launches: ImportedLaunches,
     /// Each imported message's engine reference and inbox, by namespace and old record name.
     messages: BTreeMap<(String, String), (flotilla_state_machines::machines::message::MessageRef, flotilla_address::Address)>,
     /// The last admission sequence the imported messages took, by home.
     admitted: BTreeMap<String, u64>,
-    /// The launch each imported old Convoy became, and its version as written, by home and old
-    /// record name: the checkouts held for the old record are held for that launch, created under
-    /// that version.
+    /// The launch each imported live old Convoy became, and its version as written, by home and
+    /// old record name: the checkouts held for the old record are held for that launch, created
+    /// under that version.
     convoys: BTreeMap<(String, String), (String, u64)>,
+    /// Each imported convoy that ended, as ended, with its end's time, by home and old record
+    /// name: once its dependents are imported, one nothing holds retires then. What was held for
+    /// it is not held for its launch: nothing on the engine reacts to an imported end.
+    ended: BTreeMap<
+        (String, String),
+        (flotilla_state_machines::Resource<flotilla_state_machines::machines::convoy::Convoy>, flotilla_schema::Timestamp),
+    >,
+    /// The ended convoys the import retired, by home and old record name.
+    retired: BTreeSet<(String, String)>,
     /// The launch each imported TerminalSession became, by home and old name: a message delivered
     /// to the session names that launch's consumer.
     launches: BTreeMap<(String, String), String>,
@@ -245,6 +261,12 @@ pub const STEPS: &[Step] = &[
     Step { name: "fulfilment kinds", kinds: &records::PLACEMENT_KINDS, run: records::placement },
     Step { name: "access deliveries", kinds: &["accessdeliveries"], run: records::access_deliveries },
     Step { name: "lifecycles", kinds: &lifecycle::KINDS, run: lifecycle::lifecycles },
+    // Last: an ended convoy retires once every record that could hold it is imported.
+    Step { name: "retirements", kinds: &[], run: convoys::retirements },
+    // After every write: a launch made here next numbers above every imported one.
+    Step { name: "launch numbers", kinds: &[], run: convoys::launch_numbers },
+    // Writes nothing: counts what the first start would do to the history imported.
+    Step { name: "first start", kinds: &[], run: first_start::first_start },
 ];
 
 /// One kind's counts in the report.
@@ -287,6 +309,8 @@ pub struct Summary {
     pub refusals: Vec<Refusal>,
     /// Imported, but on an assumption worth reading, or kept in the old store by design.
     pub notes: Vec<String>,
+    /// Counts beside the rows, by kind and what they count: never a name.
+    pub tallies: BTreeMap<String, BTreeMap<String, usize>>,
     ledger: BTreeMap<String, RowCounts>,
     /// The ledger's dropped rows by old kind and reason.
     drops: BTreeMap<String, BTreeMap<String, usize>>,
@@ -312,7 +336,14 @@ impl Summary {
             self.kinds.entry(kind.to_owned()).or_default().dropped += count;
         }
         for refusal in report.refused {
+            // A record naming a convoy that imports as no launch, counted by why: the work list.
+            if let Some(class) = NoLaunch::class_in(&refusal.reason) {
+                *self.tallies.entry(refusal.kind.to_owned()).or_default().entry(format!("refused: {class}")).or_default() += 1;
+            }
             self.refuse(refusal.kind, refusal.record, refusal.reason);
+        }
+        for ((kind, what), count) in report.tallies {
+            *self.tallies.entry(kind.to_owned()).or_default().entry(what).or_default() += count;
         }
         self.notes.extend(report.notes);
     }
@@ -412,7 +443,9 @@ pub fn import(source: &Source, target: &mut Import) -> Summary {
     let mut summary = Summary::default();
     namespace_rows(source, &mut summary);
     plan_rows(source, target, &mut summary);
-    let mut carried = Carried::default();
+    let convoys = source.context::<flotilla_resources::Convoy>("convoys", None);
+    let launches = ImportedLaunches::number(convoys.iter().map(|convoy| (convoy.home.as_str(), &convoy.object)));
+    let mut carried = Carried { convoy_launches: launches, ..Carried::default() };
     for step in STEPS {
         let mut report = ImportReport::default();
         (step.run)(source, target, &mut carried, &mut report);
@@ -456,6 +489,8 @@ pub struct Report {
     /// Every old row, by its old kind.
     pub rows: BTreeMap<String, Rows>,
     pub refusals: Vec<Refusal>,
+    /// Counts beside the rows, by kind and what they count.
+    pub tallies: BTreeMap<String, BTreeMap<String, usize>>,
     /// The home sequence of the import's last write: every log entry after it is the daemon's own.
     pub last_sequence: u64,
 }
@@ -470,6 +505,7 @@ impl Report {
             rows: summary.rows.clone(),
             last_sequence,
             refusals: summary.refusals.clone(),
+            tallies: summary.tallies.clone(),
         }
     }
 }
@@ -500,6 +536,11 @@ fn write_report(state_dir: &Path, report: &Report) -> Result<PathBuf, String> {
 fn log_summary(summary: &Summary, report: &Path) {
     for (kind, counts) in &summary.kinds {
         tracing::info!(kind, imported = counts.imported, dropped = counts.dropped, refused = counts.refused, "engine import");
+    }
+    for (kind, tallies) in &summary.tallies {
+        for (what, count) in tallies {
+            tracing::info!(kind, what, count, "engine import tally");
+        }
     }
     for note in &summary.notes {
         tracing::info!(%note, "engine import note");
