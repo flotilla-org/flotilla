@@ -30,7 +30,7 @@ use tokio::sync::{broadcast, OnceCell};
 
 use super::schedule::StallSchedule;
 use super::sources::{change_request_sources, freshest_change_requests};
-use super::stalls::{is_active_change_request_probe, is_merged_settlement_probe, launch_underway};
+use super::stalls::{declared_stall, is_active_change_request_probe, is_merged_settlement_probe, launch_underway};
 use super::{EpisodeKeyFields, LeafSubscriptionRow, LeafSubscriptionTable, LeafWatcher, UnableEvidenceKey};
 use flotilla_resources::{queued_message_evidence, queued_session_evidence, queued_turn_session};
 
@@ -811,6 +811,24 @@ impl ReconcilerWake {
                             {
                                 continue;
                             }
+                            // A seat whose every open promise is submitted has handed over all it
+                            // owes: each promise waits on its kept rule's observation (a PR on its
+                            // merge or close), not on the seat, which is not nudged for it. A turn a
+                            // rule delivered after those submissions (a review fix) is work the seat
+                            // owes whatever its promises, and a rejection opens the promise again.
+                            // The seat's own stall declaration stays an obligation; a stall judged
+                            // from its idleness (a nudge) does not, or one nudge would keep it armed.
+                            let open: Vec<_> = flotilla_resources::promises::owned(status, vessel, role)
+                                .iter()
+                                .filter(|promise| !promise.state.terminal())
+                                .collect();
+                            if declared_stall(status, vessel, role).is_none()
+                                && !open.is_empty()
+                                && open.iter().all(|promise| promise.state == flotilla_resources::promises::PromiseState::Submitted)
+                                && !turn_delivered_since_submission(status, vessel, role, &open)
+                            {
+                                continue;
+                            }
                             if status.stalls.iter().any(|stalled| {
                                 stalled.supervisor.is_some()
                                     && stalled.leaves.iter().any(|leaf| {
@@ -1203,6 +1221,32 @@ impl ReconcilerWake {
         Ok(())
     }
 }
+
+/// Whether a turn rule targeting seat `vessel`/`role` admitted a new turn to it after the latest
+/// submission of its `submitted` promises. Stall nudges and hand-offs record no turn delivery, so
+/// they never count.
+fn turn_delivered_since_submission(
+    status: &flotilla_resources::ConvoyStatus,
+    vessel: &str,
+    role: &str,
+    submitted: &[&flotilla_resources::promises::Promise],
+) -> bool {
+    let Some(latest) = submitted.iter().filter_map(|promise| promise.submissions.last()).map(|submission| submission.submitted_at).max()
+    else {
+        return false;
+    };
+    let Some(snapshot) = &status.workflow_snapshot else { return false };
+    snapshot
+        .turn_delivery
+        .iter()
+        .filter(|(_, rule)| rule.to.vessel == vessel && rule.to.role == role)
+        .filter_map(|(source, _)| status.turn_deliveries.get(source))
+        .flat_map(|delivery| &delivery.episodes)
+        .any(|episode| {
+            matches!(episode.outcome, TurnDeliveryOutcome::MessageAccepted { new_turn: true, accepted_at, .. } if accepted_at > latest)
+        })
+}
+
 /// The reverse-dependency key under which a convoy's rows depend on clone `clone`, kept apart from
 /// the stored records' names.
 fn clone_dependency(clone: &str) -> String {

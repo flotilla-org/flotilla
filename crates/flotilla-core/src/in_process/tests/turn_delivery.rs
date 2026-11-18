@@ -261,6 +261,282 @@ async fn idle_crew_nudges_are_bounded_and_credential_staged() {
     }
 }
 
+// F4 (run 3): an idle seat whose every open promise is submitted owes nothing it can do: its PR
+// waits on the forge's merge or close. It is not nudged to submit what it has submitted. Once the
+// forge rejects the submission the promise is open again, and the idle seat is nudged.
+#[tokio::test]
+async fn an_idle_seat_whose_open_promises_are_all_submitted_is_not_nudged() {
+    use flotilla_resources::{
+        convoy::engine::Actor,
+        promises::{owned, PromiseOperation, PromiseState, SubmissionVerdict},
+        Clock, StallRung,
+    };
+
+    let coder = coder().await;
+    let pr = submit_pr(&coder).await;
+    let Coder { daemon, backend, probe, clock, launch, .. } = coder;
+    let convoys = backend.clone().using::<ResourceConvoy>("flotilla");
+    let engine = super::convoy_engine(&daemon);
+
+    // The coder goes idle, waiting on the forge.
+    idle_coder(&daemon, &probe, &clock, &launch);
+    daemon.reconcile_crew_stalls_once("flotilla").await.expect("stall judgement");
+    // This fixture has no forge, so its change request's observation may stall on its own; the
+    // seat is not stalled and not nudged.
+    let status = convoys.get(&probe.convoy).await.expect("convoy").status.expect("status");
+    assert!(status.stalls.about(Some(("work", "coder"))).is_none(), "{:?}", status.stalls);
+    assert!(
+        !status.stalls.iter().any(|stalled| matches!(stalled.maker, Some(flotilla_resources::LeafMaker::Actor { .. }))),
+        "{:?}",
+        status.stalls
+    );
+    assert!(crew_messages(&daemon, "flotilla").await.is_empty(), "no nudge to submit what is submitted");
+
+    // The forge closes the PR unmerged: the submission is rejected and the promise open again.
+    let submission = pr.submissions.last().expect("the submission");
+    let rejected = PromiseOperation::Verdict {
+        id: pr.id.clone(),
+        reference: submission.reference.clone(),
+        submitted_at: submission.submitted_at,
+        verdict: SubmissionVerdict { accepted: false, who: "forge".into(), at: clock.now(), why: "PR closed without merging".into() },
+    };
+    let current = convoys.get(&probe.convoy).await.expect("convoy");
+    engine.promise(&current, "work", "coder", &rejected, Actor::Observer).await.expect("reject the submission");
+    let status = convoys.get(&probe.convoy).await.expect("convoy").status.expect("status");
+    assert_eq!(
+        owned(&status, "work", "coder").iter().find(|promise| promise.id == pr.id).expect("the PR promise").state,
+        PromiseState::Open
+    );
+    clock.advance(chrono::Duration::seconds(1));
+    idle_coder(&daemon, &probe, &clock, &launch);
+    daemon.reconcile_crew_stalls_once("flotilla").await.expect("stall judgement after the rejection");
+    let status = convoys.get(&probe.convoy).await.expect("convoy").status.expect("status");
+    let stalled = status.stalls.about(Some(("work", "coder"))).expect("the seat is stalled");
+    assert_eq!(stalled.rung, StallRung::Nudge);
+    assert!(crew_messages(&daemon, "flotilla")
+        .await
+        .iter()
+        .any(|message| message.spec.body.contains("You owe deliverables for work/coder")));
+}
+
+// F4 (run 3): a submitted PR does not excuse a turn delivered after it. A coder a review rule hands
+// a fix while its PR is submitted owes that work, and is nudged when it goes idle.
+#[tokio::test]
+async fn an_idle_seat_given_a_turn_after_its_submission_is_nudged() {
+    use flotilla_resources::{
+        promises::{owned, PromiseState},
+        Clock, StallRung, TurnDeliveryEpisode, TurnDeliveryOutcome,
+    };
+
+    let coder = coder().await;
+    let pr = submit_pr(&coder).await;
+    let Coder { daemon, backend, probe, clock, launch, .. } = coder;
+    let convoys = backend.clone().using::<ResourceConvoy>("flotilla");
+
+    // The review rule fires while the PR waits on the forge, as turn delivery does it: the turn is
+    // delivered through the crew's actuator, then its episode is noted on the convoy.
+    clock.advance(chrono::Duration::seconds(1));
+    let review = flotilla_crew::leaf_engine::CrewTurnIntent::builder()
+        .namespace("flotilla".into())
+        .convoy(probe.convoy.clone())
+        .source(REVIEW_RULE.into())
+        .vessel("work".into())
+        .role("coder".into())
+        .brief("Address the actionable review and push the fix.".into())
+        .subject_revision("head-1".into())
+        .sender(flotilla_crew::leaf_engine::Party::fleet("turn-rules"))
+        .build();
+    let admission = daemon.crew.deliver_turn(&review).await.expect("deliver the review fix");
+    let engine_path = daemon.convoy_engine_path();
+    flotilla_store::note_convoy(
+        &engine_path,
+        &convoys,
+        &probe.convoy,
+        &flotilla_resources::external_patches::record_turn_delivery(
+            REVIEW_RULE.into(),
+            TurnDeliveryEpisode {
+                subject_revision: "head-1".into(),
+                evidence_at: clock.now(),
+                judged_claim_at: clock.now(),
+                outcome: TurnDeliveryOutcome::MessageAccepted {
+                    new_turn: admission.new_turn,
+                    rung: admission.rung,
+                    message: admission.message,
+                    accepted_at: clock.now(),
+                },
+            },
+            "work".into(),
+            "coder".into(),
+            review.brief.clone(),
+        ),
+    )
+    .await
+    .expect("note the delivery");
+    let turn = crew_messages(&daemon, "flotilla").await.remove(0);
+    receive_turn(&daemon, &turn.spec.receiver, &turn.metadata.name, "resume-staging-session", clock.now()).await;
+    let status = convoys.get(&probe.convoy).await.expect("convoy").status.expect("status");
+    assert_eq!(
+        owned(&status, "work", "coder").iter().find(|promise| promise.id == pr.id).expect("the PR promise").state,
+        PromiseState::Submitted
+    );
+
+    clock.advance(chrono::Duration::seconds(1));
+    idle_coder(&daemon, &probe, &clock, &launch);
+    daemon.reconcile_crew_stalls_once("flotilla").await.expect("stall judgement");
+    let status = convoys.get(&probe.convoy).await.expect("convoy").status.expect("status");
+    let stalled = status.stalls.about(Some(("work", "coder"))).expect("the seat is stalled");
+    assert_eq!(stalled.rung, StallRung::Nudge);
+    assert!(crew_messages(&daemon, "flotilla")
+        .await
+        .iter()
+        .any(|message| message.spec.body.contains("You owe deliverables for work/coder")));
+}
+
+// F4 (run 3): a nudge is not a turn the seat owes after its submission. A coder nudged while its
+// ledger was open, which then submits its PR and keeps its ledger, is not nudged again.
+#[tokio::test]
+async fn a_seat_nudged_before_its_submission_is_not_nudged_after_it() {
+    use flotilla_resources::{Clock, StallRung};
+
+    let coder = coder().await;
+    {
+        let Coder { daemon, backend, probe, clock, launch, .. } = &coder;
+        idle_coder(daemon, probe, clock, launch);
+        daemon.reconcile_crew_stalls_once("flotilla").await.expect("stall judgement before the submission");
+        let status = backend.clone().using::<ResourceConvoy>("flotilla").get(&probe.convoy).await.expect("convoy").status.expect("status");
+        assert_eq!(status.stalls.about(Some(("work", "coder"))).expect("the seat is stalled").rung, StallRung::Nudge);
+        for nudge in crew_messages(daemon, "flotilla").await {
+            receive_turn(daemon, &nudge.spec.receiver, &nudge.metadata.name, "resume-staging-session", clock.now()).await;
+        }
+    }
+    submit_pr(&coder).await;
+    let Coder { daemon, backend, probe, clock, launch, .. } = coder;
+    let convoys = backend.clone().using::<ResourceConvoy>("flotilla");
+    let nudges = crew_messages(&daemon, "flotilla").await.len();
+    assert!(convoys.get(&probe.convoy).await.expect("convoy").status.expect("status").crew_work["work"]["coder"].task_assigned);
+
+    clock.advance(chrono::Duration::seconds(1));
+    idle_coder(&daemon, &probe, &clock, &launch);
+    daemon.reconcile_crew_stalls_once("flotilla").await.expect("stall judgement after the submission");
+    let status = convoys.get(&probe.convoy).await.expect("convoy").status.expect("status");
+    assert!(
+        !status.stalls.iter().any(|stalled| matches!(stalled.maker, Some(flotilla_resources::LeafMaker::Actor { .. }))),
+        "{:?}",
+        status.stalls
+    );
+    assert_eq!(crew_messages(&daemon, "flotilla").await.len(), nudges, "no nudge after the submission");
+}
+
+/// The review rule `coder` declares; turn delivery records its episodes under this source.
+const REVIEW_RULE: &str = "review-fix";
+
+struct Coder {
+    daemon: Arc<InProcessDaemon>,
+    backend: flotilla_store::ResourceBackend,
+    probe: Arc<super::support::SessionStagingProbe>,
+    clock: Arc<flotilla_store_testkit::VirtualClock>,
+    launch: String,
+    context: flotilla_protocol::CrewCommandContext,
+}
+
+/// The coder submits its PR and its ledger is kept: every promise it holds is kept or submitted.
+async fn submit_pr(coder: &Coder) -> flotilla_resources::promises::Promise {
+    use flotilla_resources::promises::{owned, PromiseKind, PromiseState};
+
+    let convoys = coder.backend.clone().using::<ResourceConvoy>("flotilla");
+    coder
+        .daemon
+        .crew
+        .promise(
+            &coder.context,
+            flotilla_protocol::commands::CrewPromiseOperation::Submit {
+                promise: None,
+                kind: "pr".into(),
+                reference: "https://github.com/flotilla-org/flotilla/pull/2200".into(),
+                metadata: Default::default(),
+            },
+        )
+        .await
+        .expect("submit the PR");
+    let current = convoys.get(&coder.probe.convoy).await.expect("convoy");
+    super::convoy_engine(&coder.daemon)
+        .verdict(&current, "template/decision-ledger", true, "operator", "ledger seen")
+        .await
+        .expect("ledger kept");
+    let status = convoys.get(&coder.probe.convoy).await.expect("convoy").status.expect("status");
+    let pr = owned(&status, "work", "coder").iter().find(|promise| promise.kind == PromiseKind::Pr).expect("the PR promise").clone();
+    assert_eq!(pr.state, PromiseState::Submitted);
+    pr
+}
+
+/// A coder at work in a convoy with a standard exit and a review rule targeting it. It owes its
+/// decision ledger, and its idle nudges have no grace.
+async fn coder() -> Coder {
+    use flotilla_store_testkit::VirtualClock;
+
+    let clock = Arc::new(VirtualClock::new(Utc::now() + chrono::Duration::hours(1)));
+    let (daemon, backend, probe) =
+        super::support::resume_staging_fixture_shaped(engine_home_backend(), clock.clone(), false, |spec, snapshot| {
+            spec.repositories = vec![flotilla_resources::ConvoyRepositorySpec::builder()
+                .url("https://github.com/flotilla-org/flotilla".to_string())
+                .repo_ref(flotilla_resources::RepositoryKey("flotilla".to_string()))
+                .source_ref("feature".to_string())
+                .target_ref("main".to_string())
+                .workspace_slug("flotilla".to_string())
+                .subpaths(Vec::new())
+                .build()];
+            snapshot.exit = Some(flotilla_resources::ExitDeclaration::standard_table());
+            snapshot.stall_nudges.insert(
+                "work/coder".to_string(),
+                flotilla_resources::StallNudgePolicy { max_per_episode: 2, max_refusals: None, idle_grace_seconds: Some(0) },
+            );
+            snapshot.turn_delivery.insert(
+                REVIEW_RULE.to_string(),
+                flotilla_resources::TurnDeliveryRule::builder()
+                    .on(flotilla_resources::parse_leaf_template("$cr.review.actionable-at-head == true").expect("review leaf"))
+                    .to(flotilla_resources::TurnDeliveryTarget::builder().vessel("work".to_string()).role("coder".to_string()).build())
+                    .brief("Address the actionable review and push the fix.".to_string())
+                    .hold(flotilla_resources::HoldAct::State)
+                    .build(),
+            );
+        })
+        .await;
+    probe.fail_next.store(false, std::sync::atomic::Ordering::SeqCst);
+    let vessel = ensure_vessel(&probe.engine, &probe.convoy, "work");
+    probe.engine.vessels.ready(&vessel, "resume-env");
+    let launch = probe.engine.terminals.record("resume-staging-session").name;
+    probe.engine.terminals.ready(&launch, "resume-staging-pool-session", &Default::default());
+    let context = flotilla_protocol::CrewCommandContext {
+        crew_id: None,
+        namespace: Some("flotilla".to_string()),
+        convoy: Some(probe.convoy.clone()),
+        vessel_ref: Some(vessel),
+        role: Some("coder".to_string()),
+    };
+    Coder { daemon, backend, probe, clock, launch, context }
+}
+
+/// The coder's terminal and its agent hook both report it idle now.
+fn idle_coder(
+    daemon: &Arc<InProcessDaemon>,
+    probe: &super::support::SessionStagingProbe,
+    clock: &flotilla_store_testkit::VirtualClock,
+    launch: &str,
+) {
+    use flotilla_resources::Clock;
+    use flotilla_state_machines::machines::agent_session::Activity;
+
+    let now = clock.now();
+    observe_attention(
+        &probe.engine,
+        launch,
+        TerminalAttention { state: TerminalAttentionState::Idle, as_of: now, source: TerminalAttentionSource::Hook },
+    );
+    super::support::agent_sessions(daemon)
+        .observe(launch, Activity::Idle, "Stop".into(), super::support::engine_at(now))
+        .expect("hook activity");
+}
+
 /// The coder's inbox in launch `convoy` of project flotilla.
 fn crew_inbox(convoy: &str) -> String {
     let project = flotilla_address::Address::project("flotilla").expect("project");

@@ -101,6 +101,32 @@ async fn coder_promise(case: &Case, number: u64, state: PromiseState) {
     }
 }
 
+/// Records the `review-fix` rule's new turn to the coder, accepted now, as turn delivery notes it.
+async fn deliver_review_fix(case: &Case) {
+    let accepted_at = Utc::now();
+    case.note(|status| {
+        flotilla_resources::ConvoyStatusPatch::RecordTurnDelivery {
+            source: "review-fix".into(),
+            episode: TurnDeliveryEpisode {
+                subject_revision: "review-1".into(),
+                evidence_at: accepted_at,
+                judged_claim_at: accepted_at,
+                outcome: TurnDeliveryOutcome::MessageAccepted {
+                    new_turn: true,
+                    message: flotilla_protocol::ResourceRef::new("flotilla.work/v1", "Message", "flotilla", "review-fix"),
+                    rung: TurnDeliveryRung::WarmSession,
+                    accepted_at,
+                },
+            },
+            vessel: "work".into(),
+            role: "coder".into(),
+            prompt: "Address the review.".into(),
+        }
+        .apply(status)
+    })
+    .await;
+}
+
 /// Launches generation `generation` of wheelhouse's governor role at `home`, as `name`, its
 /// `govern` vessel crewed by a governor at work; returns the launch. With `ensure`, the launch is
 /// a generation of the standing role ensured from it.
@@ -1433,11 +1459,23 @@ async fn settlement_claim_arming_respects_exit_and_pending_promises() {
                         workflow.vessels[0].crew[0].completion_conditions =
                             supervised_workflow().vessels[0].crew[0].completion_conditions.clone();
                     }
+                    // The task is a review fix a turn rule delivered after the coder's promises.
+                    workflow.turn_delivery.insert(
+                        "review-fix".into(),
+                        TurnDeliveryRule::builder()
+                            .on(flotilla_resources::parse_leaf_template("$issue.state == closed").expect("issue rule"))
+                            .to(flotilla_resources::TurnDeliveryTarget::builder().vessel("work".into()).role("coder".into()).build())
+                            .brief("Address the review.".into())
+                            .hold(HoldAct::State)
+                            .build(),
+                    );
                     let case = working_coder(workflow).await;
                     resume_coder(&case);
-                    case.note(|status| status.crew_work.get_mut("work").unwrap().get_mut("coder").unwrap().task_assigned = task).await;
                     for number in 1..=count as u64 {
                         coder_promise(&case, number, state).await;
+                    }
+                    if task {
+                        deliver_review_fix(&case).await;
                     }
                     sync_work_rows(&case).await;
                     let phase = case.status().await.crew_work["work"]["coder"].phase;
@@ -1448,9 +1486,12 @@ async fn settlement_claim_arming_respects_exit_and_pending_promises() {
                         !done || (count > 0 && matches!(state, PromiseState::Kept | PromiseState::Retracted)),
                         "only settled promises finish the seat: {state:?}, {count}"
                     );
-                    let expected = !standing
-                        && !done
-                        && (task || completion || (count > 0 && matches!(state, PromiseState::Open | PromiseState::Submitted)));
+                    // A seat whose every open promise is submitted waits on its kept rules'
+                    // observations, not on itself, unless a rule delivered it a turn since: that is
+                    // work it owes whatever its promises (run 3 F4).
+                    let all_submitted = count > 0 && state == PromiseState::Submitted;
+                    let expected =
+                        !standing && !done && (task || (!all_submitted && (completion || (count > 0 && state == PromiseState::Open))));
                     let armed = actor_armed(&case).await;
                     assert_eq!(
                         armed, expected,

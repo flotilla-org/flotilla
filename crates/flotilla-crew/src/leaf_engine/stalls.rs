@@ -381,7 +381,7 @@ fn declared_seat_stalled(status: &ConvoyStatus, stall: &StalledCondition) -> boo
 }
 
 /// The stall crew `role@vessel` declared, while its note is open.
-fn declared_stall<'a>(status: &'a ConvoyStatus, vessel: &str, role: &str) -> Option<&'a StalledCondition> {
+pub(super) fn declared_stall<'a>(status: &'a ConvoyStatus, vessel: &str, role: &str) -> Option<&'a StalledCondition> {
     status.stalls.about(Some((vessel, role))).filter(|stall| stall.source == StallEvidenceSource::Crew)
 }
 
