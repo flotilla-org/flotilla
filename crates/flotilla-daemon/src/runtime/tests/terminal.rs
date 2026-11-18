@@ -271,9 +271,13 @@ async fn terminal_teardown_kills_a_persisted_session_after_runtime_restart() {
         .build()])
         .await;
 
+    // Ending a running session is every convoy's routine teardown: nothing at WARN (d9).
+    let (logging, logs) = flotilla_log_testkit::capture(tracing::Level::WARN);
+    let _logging = tracing::dispatcher::set_default(&logging);
     runtime.kill_session(session_name, (&spec).into()).await.expect("teardown should resolve the persisted session pool");
 
     assert_eq!(pool.killed.lock().await.as_slice(), &[session_name.to_string()]);
+    assert!(!logs.text().contains("terminal session"), "routine teardown warned: {}", logs.text());
 }
 
 #[tokio::test]

@@ -808,11 +808,12 @@ impl TerminalControllerRuntime {
                     let Some(session) = sessions.iter().find(|session| session.session_name == session_id) else {
                         return Ok(());
                     };
+                    // Every convoy's end kills its still-running sessions: routine, not a warning.
                     if session.status == TerminalStatus::Running {
                         if let TerminalSessionSource::Agent { context, .. } = &spec.source {
-                            warn!(%session_id, convoy = %context.convoy, vessel = %context.vessel_ref, "convoy teardown is terminating an attached terminal session");
+                            debug!(%session_id, convoy = %context.convoy, vessel = %context.vessel_ref, "teardown is ending a running terminal session");
                         } else {
-                            warn!(%session_id, "convoy teardown is terminating an attached terminal session");
+                            debug!(%session_id, "teardown is ending a running terminal session");
                         }
                     }
                 }
