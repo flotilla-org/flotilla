@@ -1480,3 +1480,71 @@ async fn an_undelivered_turn_holds_delivery() {
         }
     }
 }
+
+/// A clock that moves a millisecond on with every reading, as a real one moves between reads.
+struct TickingClock(std::sync::atomic::AtomicI64);
+
+impl flotilla_resources::Clock for TickingClock {
+    fn now(&self) -> chrono::DateTime<chrono::Utc> {
+        chrono::DateTime::UNIX_EPOCH
+            + chrono::Duration::days(20_000)
+            + chrono::Duration::milliseconds(self.0.fetch_add(1, std::sync::atomic::Ordering::SeqCst))
+    }
+}
+
+// Behaviour: a landing convoy whose change request this home observes settles on what it reads.
+// That observation is confirmed as it is read, so the pass ages it against a clock read after the
+// read: a request closed unmerged, whose state can still change and so can age, settles the
+// convoy, never reading as stale.
+#[tokio::test]
+async fn a_closed_change_request_this_home_observes_settles_landing() {
+    let clock: Arc<dyn flotilla_resources::Clock> = Arc::new(TickingClock(Default::default()));
+    let observed = flotilla_provisioning_testkit::EngineBackend::open_with("home-a", NAMESPACE, Arc::clone(&clock));
+    let requests = observed.backend.clone().using::<ChangeRequest>(NAMESPACE);
+    let name = change_request_name(7);
+    let spec = ChangeRequestSpec::builder()
+        .service("github.com".into())
+        .scope("org/repo".into())
+        .number(7)
+        .observing_authority("home-a".into())
+        .build();
+    let created = requests.create(&InputMeta::builder().name(name.clone()).build(), &spec).await.expect("change request");
+    let status = ChangeRequestStatus {
+        state: Observation::known(ObservedChangeRequestState::Closed, clock.now()),
+        head_sha: Default::default(),
+        title: Default::default(),
+        author: Default::default(),
+        review_decision: Default::default(),
+        review_requested_from_owner: Default::default(),
+        checks: Default::default(),
+        mergeable: Default::default(),
+        review: ChangeRequestReviewObservation { actionable_at_head: Default::default() },
+    };
+    requests.update_status(&name, &created.metadata.resource_version, &status).await.expect("closed");
+
+    let backend = ResourceBackend::new(InMemoryBackend::default());
+    let mut convoy = ledger_convoy(&backend).await;
+    convoy.spec.subjects = vec![flotilla_resources::DeclaredSubject {
+        subject: flotilla_protocol::Subject {
+            kind: flotilla_protocol::SubjectKind::ChangeRequest,
+            source: flotilla_protocol::IssueSource { service: "github.com".into(), scope: "org/repo".into() },
+            id: "7".into(),
+        },
+        relationship: flotilla_protocol::Relationship::Produces,
+        issue: None,
+        change_request: None,
+    }];
+    let status = convoy.status.as_mut().expect("status");
+    status.phase = ConvoyPhase::Landing;
+    status.workflow_snapshot.as_mut().expect("snapshot").exit = Some(flotilla_resources::ExitDeclaration::standard_table());
+    for promise in status.promises.get_mut("work").and_then(|crew| crew.get_mut("coder")).expect("promises") {
+        promise.state = PromiseState::Kept;
+    }
+    status.crew_work.get_mut("work").and_then(|crew| crew.get_mut("coder")).expect("coder").phase = CrewWorkPhase::Done;
+    let engine = Arc::new(Recording { holds: true, ..Default::default() });
+    let reconciler = reconciler(&backend, Arc::clone(&engine))
+        .with_change_requests(observed.backend.including_replicas::<ChangeRequest>(NAMESPACE), std::time::Duration::from_secs(180))
+        .with_clock(clock);
+    reconciler.prepare(&convoy).await.expect("prepare");
+    assert_eq!(*engine.deliveries.lock().expect("deliveries"), 1, "the closed request settles the convoy");
+}

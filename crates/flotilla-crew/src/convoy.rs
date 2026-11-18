@@ -881,6 +881,9 @@ impl Reconciler for ConvoyReconciler {
             }
             _ => BTreeMap::new(),
         };
+        // Evidence is aged against a clock read after it is read: a change request this home
+        // observes is confirmed as it is read, and must not appear to come from the future.
+        let now = self.clock.now();
         let state_of = |subject: &Subject| {
             let address = flotilla_resources::address::subject_address(subject, &forges).ok()?;
             change_requests.get(&record_name(&address)?)?.status.as_ref()?.state.value
