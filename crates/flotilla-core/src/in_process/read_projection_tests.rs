@@ -445,9 +445,14 @@ mod tests {
     }
     impl ProjectionFixture {
         fn new() -> Self {
+            Self::with_clock(Arc::new(SystemClock))
+        }
+
+        /// The fixture with its engine and its explanations on one `clock`.
+        fn with_clock(clock: Arc<dyn Clock>) -> Self {
             let temp = tempfile::tempdir().expect("tempdir");
             let node_id = NodeId::new("local-node");
-            let home = flotilla_engine_convoys_testkit::EngineHome::open(node_id.as_str());
+            let home = flotilla_engine_convoys_testkit::EngineHome::open_with(node_id.as_str(), "flotilla", Arc::clone(&clock));
             let backend = home.backend().clone();
             let config = Arc::new(ConfigStore::with_base(temp.path()));
             let event_sink: Arc<dyn EventSink> = Arc::new(RecordingEventSink::default());
@@ -499,7 +504,7 @@ mod tests {
                 environments,
                 host_name,
                 node_id,
-                clock: Arc::new(SystemClock),
+                clock,
                 subscriptions,
                 fleet,
             }
@@ -1083,6 +1088,65 @@ mod tests {
             assert_eq!(observation.review.value.as_deref(), if missing { None } else { Some("approved") });
             assert_eq!(observation.review_actionable_at_head.value.as_deref(), if missing { None } else { Some("false") });
         }
+    }
+
+    /// A clock that moves a millisecond on with every reading, as a real one moves between reads.
+    struct TickingClock(std::sync::atomic::AtomicI64);
+
+    impl Clock for TickingClock {
+        fn now(&self) -> DateTime<Utc> {
+            let tick = self.0.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            Utc.with_ymd_and_hms(2026, 10, 2, 12, 0, 0).single().expect("time") + ChronoDuration::milliseconds(tick)
+        }
+    }
+
+    // A change request this home observes is confirmed as it is read, so explain ages it against a
+    // clock read after that read: just confirmed is fresh, never missing.
+    #[tokio::test]
+    async fn convoy_explanation_reports_a_just_confirmed_change_request_fresh() {
+        let fixture = ProjectionFixture::with_clock(Arc::new(TickingClock(Default::default())));
+        let subject = Subject {
+            kind: SubjectKind::ChangeRequest,
+            source: IssueSource { service: "github.com".into(), scope: "owner/one".into() },
+            id: "42".into(),
+        };
+        let launch = fixture
+            .admit(
+                "fresh",
+                ConvoySpec::builder()
+                    .workflow_ref("review".to_string())
+                    .subjects(vec![DeclaredSubject {
+                        subject: subject.clone(),
+                        relationship: Relationship::References,
+                        issue: None,
+                        change_request: None,
+                    }])
+                    .build(),
+                flotilla_engine_convoys_testkit::single_agent("coder"),
+            )
+            .await;
+        let requests = fixture.backend.using::<ChangeRequest>("flotilla");
+        let record = requests
+            .create(
+                &InputMeta::builder().name(cr_name("github.com", "owner/one", 42)).build(),
+                &ChangeRequestSpec::builder()
+                    .service("github.com".into())
+                    .scope("owner/one".into())
+                    .number(42)
+                    .observing_authority("local".into())
+                    .build(),
+            )
+            .await
+            .expect("request");
+        requests
+            .update_status(&record.metadata.name, &record.metadata.resource_version, &subject_status(fixture.clock.now()))
+            .await
+            .expect("status");
+        let explanation = fixture.projections().explain_convoy("flotilla", &launch).await.expect("explain");
+        let observation = explanation.subject_observations.iter().find(|row| row.subject == subject).expect("subject row");
+        assert_eq!(observation.state.value.as_deref(), Some("open"));
+        assert_eq!(observation.state.freshness, EvidenceFreshness::Fresh);
+        assert_eq!(observation.readiness.freshness, EvidenceFreshness::Fresh);
     }
 
     // Behaviour: subjects alone determine explain identities, even across repositories;

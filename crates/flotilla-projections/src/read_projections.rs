@@ -1319,7 +1319,6 @@ impl ReadProjections<'_> {
         let convoy_source = convoy_name.select(&convoy_sources.items)?.ok_or_else(|| format!("no convoy matches `{convoy_name}`"))?;
         // With the engine holding the convoy, the promises explained are the engine's (#3587 layer 8).
         let convoy = flotilla_resources::convoy::engine::viewed_read(self.convoy_engine, convoy_source)?;
-        let now = self.clock.now();
         let (receivers, project, receiver_aliases) =
             convoy_receiver_evidence(self.message_receivers, self.backend, namespace, &convoy_sources.items, &convoy).await?;
         let repositories = self
@@ -1385,38 +1384,16 @@ impl ReadProjections<'_> {
             .items;
         let selected_vessels = flotilla_resources::select_convoy_children(&convoy, &vessel_sources);
         let expected = expected_checkout_refs(&convoy, selected_checkouts.keys().map(String::as_str));
-        let checkouts = expected
+        // A worktree's clone is read at the checkout's home, which also holds the clone.
+        let checkout_clones = expected
             .iter()
-            .map(|checkout_name| {
-                let selected = selected_checkouts.get(checkout_name);
-                let provenance = selected.map(|checkout| checkout_provenance(checkout, self.node_id));
-                let lifecycle = selected.map(|checkout| checkout.reading.clone());
-                // A worktree's clone is read at the checkout's home, which also holds the clone.
-                let clone = match selected.map(|checkout| (&checkout.spec, checkout.home.as_str())) {
-                    Some((flotilla_resources::CheckoutSpec::Worktree(spec), home)) => self
-                        .lifecycles
-                        .clones()?
-                        .get(&spec.clone_ref, Some(home))?
-                        .map(|clone| ExplainedClone { name: clone.name, reading: clone.reading }),
-                    _ => None,
-                };
-                let integration = selected.and_then(|checkout| checkout.integration.as_ref());
-                let explain = |value: fn(&flotilla_resources::checkout_records::Inspection) -> (Option<bool>, &Vec<String>)| {
-                    integration.map(|integration| {
-                        let (judged, details) = value(&integration.inspection);
-                        explain_judgement(judged, details, integration, now, LANDING_EVIDENCE_TTL)
-                    })
-                };
-                Ok(ExplainedCheckout {
-                    name: checkout_name.clone(),
-                    observed: selected.is_some(),
-                    provenance,
-                    clean: explain(|inspection| (inspection.clean, &inspection.clean_details)),
-                    pushed: explain(|inspection| (inspection.pushed, &inspection.pushed_details)),
-                    landed: explain(|inspection| (inspection.landed, &inspection.landed_details)),
-                    lifecycle,
-                    clone,
-                })
+            .map(|checkout_name| match selected_checkouts.get(checkout_name).map(|checkout| (&checkout.spec, checkout.home.as_str())) {
+                Some((flotilla_resources::CheckoutSpec::Worktree(spec), home)) => Ok(self
+                    .lifecycles
+                    .clones()?
+                    .get(&spec.clone_ref, Some(home))?
+                    .map(|clone| ExplainedClone { name: clone.name, reading: clone.reading })),
+                _ => Ok(None),
             })
             .collect::<Result<Vec<_>, String>>()?;
 
@@ -1453,6 +1430,33 @@ impl ReadProjections<'_> {
             .await
             .map_err(|error| error.to_string())?
             .items;
+        // Evidence is aged against a clock read after every read of it: a value confirmed as it
+        // is read must not appear to come from the future.
+        let now = self.clock.now();
+        let checkouts = expected
+            .iter()
+            .zip(checkout_clones)
+            .map(|(checkout_name, clone)| {
+                let selected = selected_checkouts.get(checkout_name);
+                let integration = selected.and_then(|checkout| checkout.integration.as_ref());
+                let explain = |value: fn(&flotilla_resources::checkout_records::Inspection) -> (Option<bool>, &Vec<String>)| {
+                    integration.map(|integration| {
+                        let (judged, details) = value(&integration.inspection);
+                        explain_judgement(judged, details, integration, now, LANDING_EVIDENCE_TTL)
+                    })
+                };
+                ExplainedCheckout {
+                    name: checkout_name.clone(),
+                    observed: selected.is_some(),
+                    provenance: selected.map(|checkout| checkout_provenance(checkout, self.node_id)),
+                    clean: explain(|inspection| (inspection.clean, &inspection.clean_details)),
+                    pushed: explain(|inspection| (inspection.pushed, &inspection.pushed_details)),
+                    landed: explain(|inspection| (inspection.landed, &inspection.landed_details)),
+                    lifecycle: selected.map(|checkout| checkout.reading.clone()),
+                    clone,
+                }
+            })
+            .collect::<Vec<_>>();
         let selected_change_requests =
             flotilla_resources::select_change_request_sources(change_request_sources.iter().map(|source| (&source.object, source)));
         let change_request_objects = selected_change_requests
