@@ -3227,6 +3227,7 @@ dependencies = [
  "flotilla-fake-forge",
  "flotilla-forge-forgejo",
  "flotilla-issue-tracker",
+ "flotilla-log-testkit",
  "flotilla-paths",
  "flotilla-protocol",
  "flotilla-provider-runtime",

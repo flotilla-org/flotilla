@@ -9,7 +9,7 @@ use flotilla_discovery_api::Factory;
 use flotilla_discovery_api::ProviderCategory;
 use flotilla_discovery_api::ProviderDescriptor;
 use flotilla_discovery_api::UnmetRequirement;
-use flotilla_forge_forgejo::discovery::bounded_forgejo_provider_config;
+use flotilla_forge_forgejo::discovery::{bounded_forgejo_provider_config, AuthReport};
 use flotilla_paths::path_context::ExecutionEnvironmentPath;
 use flotilla_provider_runtime::CommandRunner;
 use flotilla_provider_runtime::{HttpClient, ReqwestHttpClient};
@@ -19,11 +19,13 @@ use flotilla_change_request::ChangeRequestTracker;
 
 pub struct ForgejoChangeRequestFactory {
     http: Arc<dyn HttpClient>,
+    /// The authentication failure this factory last told.
+    auth: AuthReport,
 }
 
 impl ForgejoChangeRequestFactory {
     pub fn new(http: Arc<dyn HttpClient>) -> Self {
-        Self { http }
+        Self { http, auth: AuthReport::default() }
     }
 }
 
@@ -60,7 +62,7 @@ impl Factory for ForgejoChangeRequestFactory {
             return Err(vec![UnmetRequirement::MissingRemoteHost("Forgejo origin".into())]);
         }
         let settings = config.load_config_for_probe().await.map_err(|error| vec![UnmetRequirement::MissingConfig(error)])?;
-        let (provider_config, http) = bounded_forgejo_provider_config(env, config, &settings, Arc::clone(&self.http)).await?;
+        let (provider_config, http) = bounded_forgejo_provider_config(env, config, &settings, Arc::clone(&self.http), &self.auth).await?;
         let slug = env.repo_slug().ok_or_else(|| vec![UnmetRequirement::MissingRemoteHost("origin".into())])?;
         let mut provider = ForgejoChangeRequestProvider::new(http, runner, provider_config, slug);
         if let Some(login) = settings.change_request.operator_login {
