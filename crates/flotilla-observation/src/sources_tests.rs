@@ -68,6 +68,9 @@ impl ChangeRequestQueryPort for NoCooldownForgeReads {
     ) -> Result<Arc<dyn ChangeRequestTracker>, String> {
         panic!("cooldown must prevent forge discovery and reads")
     }
+    fn merge_check(&self, _: &RepositorySpec) -> Arc<dyn flotilla_change_request::MergeCheck> {
+        Arc::new(flotilla_change_request::NoMergeCheck)
+    }
 }
 
 // #2543: normal, fresh completion, and Landing/batch reads all respect the same
@@ -347,6 +350,7 @@ impl ChangeRequestTracker for BoundBatchTracker {
         &self,
         numbers: &[u64],
         _: &flotilla_change_request::CrewGithubLoginsByRequest,
+        _: Option<&dyn flotilla_change_request::MergeCheck>,
     ) -> Result<BoundObservations, ObservationError> {
         self.0.lock().await.push(numbers.to_vec());
         Ok(numbers
@@ -369,6 +373,9 @@ struct BoundBatchReads(Arc<Mutex<Vec<Vec<u64>>>>);
 impl ChangeRequestQueryPort for BoundBatchReads {
     async fn discover_repository_change_request(&self, _: &str, _: &RepositorySpec) -> Result<Arc<dyn ChangeRequestTracker>, String> {
         Ok(Arc::new(BoundBatchTracker(self.0.clone())))
+    }
+    fn merge_check(&self, _: &RepositorySpec) -> Arc<dyn flotilla_change_request::MergeCheck> {
+        Arc::new(flotilla_change_request::NoMergeCheck)
     }
 }
 // #3710: a selected merged record is absent from a sibling's bound batch and
@@ -421,4 +428,87 @@ async fn merged_record_excluded_from_bound_batch() {
     assert_eq!(*batches.lock().await, vec![vec![42, 43]]);
     assert_eq!(source.observe(&subjects[0]).await.expect("merged record").state.value, Some(ObservedChangeRequestState::Merged));
     assert_eq!(batches.lock().await.len(), 1);
+}
+
+/// A host whose repository tracker is the Forgejo provider on a fake forge, and whose clone
+/// judges every merge as `judgement`.
+struct ForgejoWithClone {
+    provider: Arc<dyn ChangeRequestTracker>,
+    judgement: Option<flotilla_resources::ObservedMergeability>,
+}
+struct Judged(Option<flotilla_resources::ObservedMergeability>);
+#[async_trait]
+impl MergeCheck for Judged {
+    async fn mergeability(&self, _: &flotilla_change_request::MergeCandidate) -> Option<flotilla_resources::ObservedMergeability> {
+        self.0
+    }
+}
+#[async_trait]
+impl ChangeRequestQueryPort for ForgejoWithClone {
+    async fn discover_repository_change_request(&self, _: &str, _: &RepositorySpec) -> Result<Arc<dyn ChangeRequestTracker>, String> {
+        Ok(Arc::clone(&self.provider))
+    }
+    fn merge_check(&self, _: &RepositorySpec) -> Arc<dyn MergeCheck> {
+        Arc::new(Judged(self.judgement))
+    }
+}
+
+// Behaviour (run 4 R4-4): an open Forgejo pull request that conflicts with its base reads
+// Conflicting through the host's observation, as a conflicting GitHub request does, so its
+// readiness is conflicting and `$cr.mergeable == conflicting` turn rules fire. With no clone
+// to judge in, Forgejo's false stays unknown and the request is not conflicting.
+#[tokio::test]
+async fn a_forgejo_request_git_finds_conflicting_reads_conflicting() {
+    use flotilla_fake_forge::{recorded::ManualClock, FakeForge, ForgeSettings, InProcessClient, MergeStatus, NewPull, RepoRef};
+    use flotilla_manifest::projection::{change_request_readiness, ChangeRequestReadiness};
+    use flotilla_resources::ObservedMergeability;
+    let clock = Arc::new(ManualClock::new("2026-11-18T12:00:00Z".parse().expect("time")));
+    let fake = Arc::new(FakeForge::new("https://forgejo.example", clock));
+    fake.add_forge("lab", ForgeSettings { token: "test-token".into(), login: "bot".into() }).expect("forge");
+    let repo = RepoRef::new("lab", "team", "repo");
+    fake.create_pull(
+        &repo,
+        NewPull { title: "Work".into(), head: "work".into(), base: "main".into(), body: String::new(), user: None, draft: false },
+    )
+    .expect("pull");
+    fake.set_merge_status(&repo, 1, MergeStatus::Conflict).expect("merge status");
+    let provider: Arc<dyn ChangeRequestTracker> = Arc::new(flotilla_forgejo_providers::change_request::ForgejoChangeRequestProvider::new(
+        Arc::new(InProcessClient::new(Arc::clone(&fake))),
+        Arc::new(flotilla_replay_testkit::testing::MockRunner::new(vec![])),
+        flotilla_forge_forgejo::ForgejoIssueProviderConfig::new(
+            fake.service_url("lab"),
+            None,
+            flotilla_forge_forgejo::ForgejoAuth { token: "test-token".into(), token_path: "unused".into() },
+        ),
+        "team/repo".into(),
+    ));
+    let backend = ResourceBackend::new(InMemoryBackend::default());
+    let forge = flotilla_resources::ForgeSpec {
+        forge_id: "lab".into(),
+        kind: flotilla_resources::ForgeKind::Forgejo,
+        hosts: ["forgejo.example".to_string()].into(),
+        https_url: "https://forgejo.example".into(),
+        git_ssh_host: "forgejo.example".into(),
+    };
+    let repository =
+        RepositorySpec::remote("https://forgejo.example/team/repo.git").and_then(|spec| spec.on_forge(&forge)).expect("repository");
+    backend
+        .using::<Repository>("ops")
+        .create(&flotilla_resources::InputMeta::builder().name(repository.key().to_string()).build(), &repository)
+        .await
+        .expect("repository");
+    let subject = ChangeRequestKey::new(
+        "ops",
+        flotilla_resources::address::stored_change_request_address("lab", "team/repo", 1, std::slice::from_ref(&forge)).expect("address"),
+    )
+    .expect("subject");
+
+    for (judgement, conflicting) in [(Some(ObservedMergeability::Conflicting), true), (None, false)] {
+        let port = Arc::new(ForgejoWithClone { provider: Arc::clone(&provider), judgement });
+        let source = ProviderChangeRequestObservationSource::new(backend.clone(), port);
+        let status = source.observe(&subject).await.expect("observed");
+        assert_eq!(status.state.value, Some(ObservedChangeRequestState::Open));
+        assert_eq!(status.mergeable.value, judgement);
+        assert_eq!(change_request_readiness(&status, false) == ChangeRequestReadiness::Conflicting, conflicting, "{judgement:?}");
+    }
 }

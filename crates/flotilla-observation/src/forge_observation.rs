@@ -7,7 +7,7 @@ use std::{
 
 use async_trait::async_trait;
 use chrono::{DateTime, Duration, Utc};
-use flotilla_change_request::{BoundObservations, ChangeRequestAdmission, ChangeRequestTracker, CrewGithubLoginsByRequest};
+use flotilla_change_request::{BoundObservations, ChangeRequestAdmission, ChangeRequestTracker, CrewGithubLoginsByRequest, MergeCheck};
 use flotilla_issue_tracker::IssueProvider;
 use flotilla_protocol::{
     issue_query::{IssueQuery, IssueResultPage},
@@ -406,11 +406,16 @@ pub struct ObservedChangeRequestTracker {
 }
 #[async_trait]
 impl ChangeRequestTracker for ObservedChangeRequestTracker {
-    async fn observe_bound(&self, numbers: &[u64], logins: &CrewGithubLoginsByRequest) -> Result<BoundObservations, ObservationError> {
+    async fn observe_bound(
+        &self,
+        numbers: &[u64],
+        logins: &CrewGithubLoginsByRequest,
+        merge_check: Option<&dyn MergeCheck>,
+    ) -> Result<BoundObservations, ObservationError> {
         if !owns_source(&self.reads.backend, &self.reads.namespace, &self.source).await? {
             return Err("bound PR observation belongs to another source owner".into());
         }
-        self.inner.observe_bound(numbers, logins).await
+        self.inner.observe_bound(numbers, logins, merge_check).await
     }
     async fn list_change_requests(&self, limit: usize) -> Result<Vec<(String, ChangeRequest)>, String> {
         self.reads.read(&self.source, ForgeReadRequest::ChangeRequests { limit }, || self.inner.list_change_requests(limit)).await

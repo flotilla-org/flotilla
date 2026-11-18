@@ -70,6 +70,27 @@ pub enum VcsCheck {
     Unknown(Vec<String>),
 }
 
+/// Two commits to merge, `head` into `base`, each with the ref `remote` serves it under, so a
+/// repository that lacks either commit can fetch it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct MergeTreeCheck<'a> {
+    pub remote: &'a str,
+    pub base: &'a str,
+    pub base_ref: &'a str,
+    pub head: &'a str,
+    pub head_ref: &'a str,
+}
+
+/// What Git's three-way merge of two commits does.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum MergeTreeOutcome {
+    Clean,
+    /// The paths whose contents or names conflict.
+    Conflicting {
+        paths: Vec<String>,
+    },
+}
+
 pub enum WorktreeAdd<'a> {
     ExistingLocal { target: &'a str, branch: &'a str },
     TrackingRemote { target: &'a str, branch: &'a str },
@@ -681,6 +702,12 @@ pub trait Vcs: Send + Sync {
     }
     async fn head_in_history_of(&self, _revision: &str) -> Result<bool, String> {
         Err("checkout revision ancestry inspection is unavailable".into())
+    }
+    /// Merge `check.head` into `check.base` in this repository's object store, fetching their
+    /// refs first when either commit is missing. Reads and writes no branch, index or working
+    /// tree. An error when a commit cannot be had, such as a ref that moved past it.
+    async fn merge_tree(&self, _check: MergeTreeCheck<'_>) -> Result<MergeTreeOutcome, String> {
+        Err("merge inspection is unavailable".into())
     }
     async fn current_branch(&self) -> Result<String, String> {
         Err("current branch inspection is unavailable".into())
@@ -1522,6 +1549,10 @@ impl Vcs for FlotillaVcs {
         }
     }
 
+    async fn merge_tree(&self, check: MergeTreeCheck<'_>) -> Result<MergeTreeOutcome, String> {
+        self.controller_cli().merge_tree(check).await
+    }
+
     async fn current_branch(&self) -> Result<String, String> {
         self.cli().current_branch().await
     }
@@ -2056,6 +2087,41 @@ impl<'a> GitCliBackend<'a> {
             ));
         }
         Ok(())
+    }
+
+    async fn merge_tree(&self, check: MergeTreeCheck<'_>) -> Result<MergeTreeOutcome, String> {
+        for commit in [check.base, check.head] {
+            if commit.len() < 7 || !commit.chars().all(|character| character.is_ascii_hexdigit()) {
+                return Err(format!("{commit:?} is not a commit id"));
+            }
+        }
+        for reference in [check.base_ref, check.head_ref] {
+            if !reference.starts_with("refs/") {
+                return Err(format!("{reference:?} is not a full ref name"));
+            }
+        }
+        if !(self.has_commit(check.base).await? && self.has_commit(check.head).await?) {
+            // Into no ref and no FETCH_HEAD: other fetches here may run at the same time.
+            self.run(&["fetch", "--quiet", "--no-tags", "--no-write-fetch-head", check.remote, check.base_ref, check.head_ref]).await?;
+            for (end, commit, reference) in [("base", check.base, check.base_ref), ("head", check.head, check.head_ref)] {
+                if !self.has_commit(commit).await? {
+                    return Err(format!("{end} commit {commit} is not at {reference} on {}: it moved", check.remote));
+                }
+            }
+        }
+        let output = self.output(&["merge-tree", "--write-tree", "--name-only", "--no-messages", check.base, check.head]).await?;
+        match output.exit_code {
+            Some(0) => Ok(MergeTreeOutcome::Clean),
+            // The first line is the merged tree; each later line names a conflicted path.
+            Some(1) => Ok(MergeTreeOutcome::Conflicting {
+                paths: output.stdout.lines().skip(1).filter(|line| !line.is_empty()).map(str::to_string).collect(),
+            }),
+            _ => Err(non_empty_output_or("Git could not merge the commits", &output.stderr)),
+        }
+    }
+
+    async fn has_commit(&self, commit: &str) -> Result<bool, String> {
+        Ok(self.output(&["cat-file", "-e", &format!("{commit}^{{commit}}")]).await?.success())
     }
 
     async fn verified_ancestor(&self, ancestor: &str, descendant: &str) -> Result<bool, String> {
@@ -3177,6 +3243,63 @@ mod tests {
         let files = vcs.files_at_revision(cache.path(), stale_repo, &tips[0], ".").await.expect("refetched tree");
         assert!(files.contains_key("charter.yaml"));
         assert!(vcs.retire_revision_caches(&cache.path().join("missing"), SystemTime::now()).await.expect("absent root").is_empty());
+    }
+
+    // Behaviour (run 4 R4-4): a clone that predates a pull request fetches its head and the
+    // moved base by ref, then merges them without its working tree: a conflict names its
+    // paths, a clean merge is clean, and a head that moved past the asked-for commit is an
+    // error, never clean. The clone's branch, working tree and FETCH_HEAD are untouched.
+    #[tokio::test]
+    async fn a_merge_check_fetches_what_it_lacks_and_reads_conflicts_from_commits() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let root = temp.path();
+        let commit = |repo: &str, file: &str, contents: &str, message: &str| {
+            std::fs::write(root.join(repo).join(file), contents).expect("write");
+            git(&root.join(repo), &["add", file]);
+            git(&root.join(repo), &["-c", "user.name=t", "-c", "user.email=t@t", "commit", "-q", "-m", message]);
+            let output =
+                std::process::Command::new("git").args(["rev-parse", "HEAD"]).current_dir(root.join(repo)).output().expect("rev-parse");
+            String::from_utf8(output.stdout).expect("utf8").trim().to_string()
+        };
+        git(root, &["init", "-q", "-b", "main", "work"]);
+        commit("work", "shared.txt", "one\n", "seed");
+        git(root, &["clone", "-q", "--bare", "work", "remote.git"]);
+        git(root, &["clone", "-q", "remote.git", "clone"]);
+        let clone_head = commit("clone", "local.txt", "local\n", "local work in the clone's tree");
+
+        // Two pull requests from the seed, then the base moves under them.
+        git(&root.join("work"), &["switch", "-q", "-c", "conflicts"]);
+        let conflicting = commit("work", "shared.txt", "theirs\n", "edit shared");
+        git(&root.join("work"), &["switch", "-q", "-c", "clean", "main"]);
+        let clean = commit("work", "other.txt", "other\n", "edit other");
+        git(&root.join("work"), &["switch", "-q", "main"]);
+        let base = commit("work", "shared.txt", "ours\n", "base moves");
+        git(&root.join("work"), &["push", "-q", "../remote.git", "main", "conflicts:refs/pull/1/head", "clean:refs/pull/2/head"]);
+
+        let clone = root.join("clone");
+        let vcs = test_fl(&clone, Arc::new(flotilla_provider_runtime::ProcessCommandRunner), true);
+        fn check<'a>(base: &'a str, head: &'a str, head_ref: &'a str) -> MergeTreeCheck<'a> {
+            MergeTreeCheck { remote: "origin", base, base_ref: "refs/heads/main", head, head_ref }
+        }
+        assert_eq!(
+            vcs.merge_tree(check(&base, &conflicting, "refs/pull/1/head")).await.expect("conflicting merge"),
+            MergeTreeOutcome::Conflicting { paths: vec!["shared.txt".into()] }
+        );
+        assert_eq!(vcs.merge_tree(check(&base, &clean, "refs/pull/2/head")).await.expect("clean merge"), MergeTreeOutcome::Clean);
+
+        // The head moved on the remote: the asked-for commit is not there to fetch.
+        let moved = "0123456789abcdef0123456789abcdef01234567";
+        let error = vcs.merge_tree(check(&base, moved, "refs/pull/2/head")).await.expect_err("an absent head is not judged");
+        assert!(error.contains("moved"), "{error}");
+        // No remote to fetch from: an error, not a guess.
+        git(&clone, &["remote", "set-url", "origin", root.join("gone.git").to_str().expect("path")]);
+        assert!(vcs.merge_tree(check(&base, moved, "refs/pull/2/head")).await.is_err());
+
+        let output = std::process::Command::new("git").args(["rev-parse", "HEAD"]).current_dir(&clone).output().expect("rev-parse");
+        assert_eq!(String::from_utf8(output.stdout).expect("utf8").trim(), clone_head);
+        let status = std::process::Command::new("git").args(["status", "--porcelain"]).current_dir(&clone).output().expect("status");
+        assert!(status.stdout.is_empty(), "{}", String::from_utf8_lossy(&status.stdout));
+        assert!(!clone.join(".git/FETCH_HEAD").exists());
     }
 
     fn git(cwd: &Path, args: &[&str]) {

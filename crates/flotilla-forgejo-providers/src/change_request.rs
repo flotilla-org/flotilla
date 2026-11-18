@@ -16,6 +16,7 @@ use flotilla_resources::{
 
 use flotilla_change_request::ChangeRequestAdmission;
 use flotilla_change_request::ChangeRequestTracker;
+use flotilla_change_request::{MergeCandidate, MergeCheck};
 
 pub struct ForgejoChangeRequestProvider {
     runner: Arc<dyn CommandRunner>,
@@ -108,6 +109,19 @@ fn actionable_at_head(reviews: &[serde_json::Value], author: Option<&str>, head:
     Some(commented_at_head || latest_by_reviewer.values().any(|(_, requests)| *requests))
 }
 
+/// Pull request `number`'s head and base as Forgejo reported them. Forgejo serves every pull
+/// request's head at `refs/pull/<number>/head`, also after its branch is deleted, and reports the
+/// base branch's current commit as the base's `sha`.
+fn merge_candidate(number: u64, value: &serde_json::Value) -> Option<MergeCandidate> {
+    let base_ref = value["base"]["ref"].as_str()?;
+    Some(MergeCandidate {
+        head: value["head"]["sha"].as_str()?.to_string(),
+        head_ref: format!("refs/pull/{number}/head"),
+        base: value["base"]["sha"].as_str()?.to_string(),
+        base_ref: if base_ref.starts_with("refs/") { base_ref.to_string() } else { format!("refs/heads/{base_ref}") },
+    })
+}
+
 impl ForgejoChangeRequestProvider {
     pub fn new(http: Arc<dyn HttpClient>, runner: Arc<dyn CommandRunner>, config: ForgejoIssueProviderConfig, repo_slug: String) -> Self {
         Self { forge: ForgejoClient::new(http, config), runner, repo_slug, operator_login: None }
@@ -133,8 +147,8 @@ impl ForgejoChangeRequestProvider {
         };
         // Forgejo's `mergeable` is `PullRequest.Mergeable()` (models/issues/pull.go, Forgejo 16):
         // false while the merge check is still running on a new head, on a conflict, on a failed
-        // check and on a draft. The API has no field that tells these apart, so false is unknown,
-        // never a conflict.
+        // check and on a draft. The API has no field that tells these apart, so false is unknown
+        // here, never a conflict; bound observation asks Git instead where it can.
         let mergeable = value["mergeable"].as_bool().filter(|mergeable| *mergeable).map(|_| ObservedMergeability::Mergeable);
         let requested = self.operator_login.as_deref().and_then(|operator| {
             value["requested_reviewers"].as_array().map(|reviewers| {
@@ -295,12 +309,23 @@ impl ChangeRequestTracker for ForgejoChangeRequestProvider {
         &self,
         numbers: &[u64],
         crew_logins: &flotilla_change_request::CrewGithubLoginsByRequest,
+        merge_check: Option<&dyn MergeCheck>,
     ) -> Result<flotilla_change_request::BoundObservations, ObservationError> {
         let mut statuses = std::collections::HashMap::new();
         for number in numbers {
             let result = match crate::observation::execute_pull(&self.forge, &self.repo_slug, *number).await {
                 Ok(value) => {
                     let mut status = self.observed_status(&value);
+                    // Forgejo's false says only "not mergeable now" (see `observed_status`), so Git
+                    // judges the observed head against the observed base. Each observation that
+                    // finds false judges again, so a moved head or base is judged afresh.
+                    if let (Some(merge_check), Some(ObservedChangeRequestState::Open), Some(false)) =
+                        (merge_check, status.state.value, value["mergeable"].as_bool())
+                    {
+                        if let Some(candidate) = merge_candidate(*number, &value) {
+                            status.mergeable = Observation { value: merge_check.mergeability(&candidate).await, observed_at: Utc::now() };
+                        }
+                    }
                     let observed_at = Utc::now();
                     match self.read_reviews(*number).await {
                         Ok(reviews) => {
@@ -501,7 +526,7 @@ mod tests {
             let before = Utc::now();
             let lookup = provider.find_change_request_by_branch("work").await.expect_err("throttled lookup");
             let admission = provider.get_change_request_for_admission("1").await.expect_err("throttled admission");
-            let mut observed = provider.observe_bound(&[1], &Default::default()).await.expect("per-request outcomes");
+            let mut observed = provider.observe_bound(&[1], &Default::default(), None).await.expect("per-request outcomes");
             let bound = observed.remove(&1).expect("bound outcome").expect_err("throttled observation");
             for error in [lookup, admission, bound] {
                 let ObservationError::RateLimited { retry_at, .. } = error else { panic!("lost typed rate-limit error: {error:?}") };
@@ -516,7 +541,7 @@ mod tests {
                 }
             }
             provider.forge.http = Arc::new(ThrottledForge { inner: InProcessClient::new(fake.clone()), header, value, reviews_only: true });
-            let mut observed = provider.observe_bound(&[1], &Default::default()).await.expect("per-request outcomes");
+            let mut observed = provider.observe_bound(&[1], &Default::default(), None).await.expect("per-request outcomes");
             assert!(matches!(observed.remove(&1), Some(Err(ObservationError::RateLimited { .. }))), "review throttling must remain typed");
             assert_no_refusals(&fake);
         }
@@ -606,7 +631,7 @@ mod tests {
                 urls: Mutex::new(Vec::new()),
             });
             let provider = provider(http.clone());
-            let outcomes = provider.observe_bound(&[70], &Default::default()).await.unwrap();
+            let outcomes = provider.observe_bound(&[70], &Default::default(), None).await.unwrap();
             assert_eq!(matches!(outcomes[&70], Err(ObservationError::NotFound(_))), repository_status == 200);
             assert_eq!(
                 *http.urls.lock().unwrap(),
@@ -825,7 +850,7 @@ mod tests {
             urls: Mutex::new(Vec::new()),
         });
         let provider = provider(http.clone()).with_operator_login("owner".into());
-        let observed = provider.observe_bound(&[7], &Default::default()).await.expect("observe bound request");
+        let observed = provider.observe_bound(&[7], &Default::default(), None).await.expect("observe bound request");
         let status = observed[&7].as_ref().expect("status");
         assert_eq!(status.title.value.as_deref(), Some("Keep metadata current"));
         assert_eq!(status.review_requested_from_owner.value, Some(true));
@@ -845,7 +870,7 @@ mod tests {
             urls: Mutex::new(Vec::new()),
         });
         let provider = provider(http.clone());
-        let observed = provider.observe_bound(&[7, 8], &Default::default()).await.expect("observe bound requests");
+        let observed = provider.observe_bound(&[7, 8], &Default::default(), None).await.expect("observe bound requests");
         assert_eq!(observed[&7].as_ref().expect("status").review_decision.value, Some(ObservedReviewDecision::Approved));
         let failed_review = observed[&8].as_ref().expect("status survives review failure");
         assert_eq!(failed_review.title.value.as_deref(), Some("Another PR"));
@@ -1197,7 +1222,7 @@ mod tests {
     }
 
     async fn observe(provider: &ForgejoChangeRequestProvider, number: u64) -> ObservedStatus {
-        let mut observed = provider.observe_bound(&[number], &Default::default()).await.expect("observe bound");
+        let mut observed = provider.observe_bound(&[number], &Default::default(), None).await.expect("observe bound");
         observed.remove(&number).expect("observed number").expect("observed status")
     }
 
@@ -1270,7 +1295,7 @@ mod tests {
             Some(ChangeRequestStatus::Draft)
         );
         fake.set_draft(&repo, 2, false).expect("ready");
-        let missing = provider.observe_bound(&[2, 99], &Default::default()).await.expect("observe bound");
+        let missing = provider.observe_bound(&[2, 99], &Default::default(), None).await.expect("observe bound");
         assert!(missing[&2].is_ok());
         assert!(matches!(missing[&99], Err(ObservationError::NotFound(_))));
 
@@ -1358,6 +1383,106 @@ mod tests {
         assert_no_refusals(&fake);
     }
 
+    /// Answers every merge with `answer` and records what it was asked.
+    struct ScriptedMergeCheck {
+        answer: Option<ObservedMergeability>,
+        asked: std::sync::Mutex<Vec<MergeCandidate>>,
+    }
+
+    impl ScriptedMergeCheck {
+        fn new(answer: Option<ObservedMergeability>) -> Self {
+            Self { answer, asked: Default::default() }
+        }
+        fn asked(&self) -> Vec<MergeCandidate> {
+            self.asked.lock().expect("asked").clone()
+        }
+    }
+
+    #[async_trait]
+    impl MergeCheck for ScriptedMergeCheck {
+        async fn mergeability(&self, candidate: &MergeCandidate) -> Option<ObservedMergeability> {
+            self.asked.lock().expect("asked").push(candidate.clone());
+            self.answer
+        }
+    }
+
+    async fn observe_checked(provider: &ForgejoChangeRequestProvider, number: u64, check: &dyn MergeCheck) -> ObservedStatus {
+        let mut observed = provider.observe_bound(&[number], &Default::default(), Some(check)).await.expect("observe bound");
+        observed.remove(&number).expect("observed number").expect("observed status")
+    }
+
+    // Behaviour (run 4 R4-4): where Forgejo says an open request is not mergeable, Git judges
+    // the observed head, served at its pull ref, against the observed base: its judgement is the
+    // request's mergeability. Each observation that finds Forgejo's false judges again, at the
+    // head and base it finds then.
+    #[tokio::test]
+    async fn an_open_request_forgejo_does_not_call_mergeable_takes_gits_judgement() {
+        use flotilla_fake_forge::MergeStatus;
+        let (fake, _clock, provider) = empty_fake();
+        let repo = team_repo();
+        fake.create_pull(
+            &repo,
+            NewPull { title: "Work".into(), head: "work".into(), base: "main".into(), body: String::new(), user: None, draft: false },
+        )
+        .expect("pull");
+        fake.set_merge_status(&repo, 1, MergeStatus::Conflict).expect("merge check");
+        let pull = provider.forge.execute(&provider.repo_slug, reqwest::Method::GET, "pulls/1", &[], None).await.expect("pull");
+        let base = pull["base"]["sha"].as_str().expect("base sha").to_string();
+
+        let conflicting = ScriptedMergeCheck::new(Some(ObservedMergeability::Conflicting));
+        let observed = observe_checked(&provider, 1, &conflicting).await;
+        assert_eq!(observed.mergeable.value, Some(ObservedMergeability::Conflicting));
+        let head = observed.head_sha.value.clone().expect("head");
+        let expected = |head: &str| MergeCandidate {
+            head: head.to_string(),
+            head_ref: "refs/pull/1/head".into(),
+            base: base.clone(),
+            base_ref: "refs/heads/main".into(),
+        };
+        assert_eq!(conflicting.asked(), vec![expected(&head)]);
+
+        // A new head still awaiting Forgejo's check: Git says it merges cleanly.
+        fake.push_head(&repo, 1).expect("push");
+        fake.set_merge_status(&repo, 1, MergeStatus::Checking).expect("merge check");
+        let clean = ScriptedMergeCheck::new(Some(ObservedMergeability::Mergeable));
+        let observed = observe_checked(&provider, 1, &clean).await;
+        assert_eq!(observed.mergeable.value, Some(ObservedMergeability::Mergeable));
+        let moved = observed.head_sha.value.clone().expect("head");
+        assert_ne!(moved, head);
+        assert_eq!(clean.asked(), vec![expected(&moved)]);
+        assert_no_refusals(&fake);
+    }
+
+    // Behaviour (run 4 R4-4): what Git cannot judge stays unknown, never mergeable; Forgejo's
+    // own true and a draft's false are not Git's to judge.
+    #[tokio::test]
+    async fn gits_judgement_is_asked_only_of_an_open_requests_ambiguous_false() {
+        use flotilla_fake_forge::MergeStatus;
+        let (fake, _clock, provider) = empty_fake();
+        let repo = team_repo();
+        for (head, draft) in [("work", false), ("draft", true)] {
+            fake.create_pull(
+                &repo,
+                NewPull { title: "Work".into(), head: head.into(), base: "main".into(), body: String::new(), user: None, draft },
+            )
+            .expect("pull");
+        }
+        fake.set_merge_status(&repo, 1, MergeStatus::Error).expect("merge check");
+
+        let unavailable = ScriptedMergeCheck::new(None);
+        assert_eq!(observe_checked(&provider, 1, &unavailable).await.mergeable.value, None);
+        assert_eq!(unavailable.asked().len(), 1);
+
+        let never = ScriptedMergeCheck::new(Some(ObservedMergeability::Conflicting));
+        let draft = observe_checked(&provider, 2, &never).await;
+        assert_eq!(draft.state.value, Some(ObservedChangeRequestState::Draft));
+        assert_eq!(draft.mergeable.value, None);
+        fake.set_merge_status(&repo, 1, MergeStatus::Mergeable).expect("merge check");
+        assert_eq!(observe_checked(&provider, 1, &never).await.mergeable.value, Some(ObservedMergeability::Mergeable));
+        assert!(never.asked().is_empty(), "{:?}", never.asked());
+        assert_no_refusals(&fake);
+    }
+
     // Behaviour (#3108 Q2 ruling (a)): a Forgejo change request has review feedback to act on at
     // its head when a reviewer other than its author and crew last decided to request changes, at
     // any commit, until a later decision or a dismissal, or commented with a body on the head
@@ -1374,7 +1499,7 @@ mod tests {
         .expect("pull");
         let crew = flotilla_change_request::CrewGithubLoginsByRequest::from([(1, vec!["Crew-Coder".to_owned()])]);
         let actionable = || async {
-            let mut observed = provider.observe_bound(&[1], &crew).await.expect("observe bound");
+            let mut observed = provider.observe_bound(&[1], &crew, None).await.expect("observe bound");
             observed.remove(&1).expect("observed").expect("status").review.actionable_at_head.value
         };
         let review = |user: &str, state, body: &str| {

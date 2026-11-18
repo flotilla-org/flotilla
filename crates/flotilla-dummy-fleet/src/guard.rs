@@ -10,7 +10,7 @@ use std::{
 };
 
 use async_trait::async_trait;
-use flotilla_change_request::{BoundObservations, ChangeRequestAdmission, ChangeRequestTracker, CrewGithubLoginsByRequest};
+use flotilla_change_request::{BoundObservations, ChangeRequestAdmission, ChangeRequestTracker, CrewGithubLoginsByRequest, MergeCheck};
 use flotilla_discovery::ProviderFactory;
 use flotilla_discovery_api::{provider_config::ProviderConfigView, EnvironmentBag, Factory, ProviderDescriptor, UnmetRequirement};
 use flotilla_paths::path_context::ExecutionEnvironmentPath;
@@ -20,7 +20,7 @@ use flotilla_provider_runtime::{
 };
 use flotilla_vcs::vcs::{
     CheckoutMaterialisation, CheckoutMaterialisationError, CheckoutRegistration, CheckoutRemoval, CommitFetchError, EnumeratedCheckout,
-    GitCredentialFile, LocalCloneRequest, RepositoryRead, TreeEntry, Vcs, VcsCheck, WorktreeMetadata,
+    GitCredentialFile, LocalCloneRequest, MergeTreeCheck, MergeTreeOutcome, RepositoryRead, TreeEntry, Vcs, VcsCheck, WorktreeMetadata,
 };
 
 pub(crate) const REFUSAL: &str = "the dummy fleet refuses writes to real forges";
@@ -71,8 +71,13 @@ impl ReadOnlyChangeRequests {
 
 #[async_trait]
 impl ChangeRequestTracker for ReadOnlyChangeRequests {
-    async fn observe_bound(&self, numbers: &[u64], crew_logins: &CrewGithubLoginsByRequest) -> Result<BoundObservations, ObservationError> {
-        self.0.observe_bound(numbers, crew_logins).await
+    async fn observe_bound(
+        &self,
+        numbers: &[u64],
+        crew_logins: &CrewGithubLoginsByRequest,
+        merge_check: Option<&dyn MergeCheck>,
+    ) -> Result<BoundObservations, ObservationError> {
+        self.0.observe_bound(numbers, crew_logins, merge_check).await
     }
 
     async fn list_change_requests(&self, limit: usize) -> Result<Vec<(String, ChangeRequest)>, String> {
@@ -234,6 +239,11 @@ impl Vcs for NoPushVcs {
 
     async fn head_in_history_of(&self, revision: &str) -> Result<bool, String> {
         self.0.head_in_history_of(revision).await
+    }
+
+    // Reads a real forge's refs into the local object store; pushes nothing.
+    async fn merge_tree(&self, check: MergeTreeCheck<'_>) -> Result<MergeTreeOutcome, String> {
+        self.0.merge_tree(check).await
     }
 
     async fn current_branch(&self) -> Result<String, String> {

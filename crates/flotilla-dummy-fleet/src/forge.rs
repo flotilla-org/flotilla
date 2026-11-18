@@ -11,7 +11,7 @@ use std::{
 
 use async_trait::async_trait;
 use chrono::Utc;
-use flotilla_change_request::{BoundObservations, ChangeRequestAdmission, ChangeRequestTracker, CrewGithubLoginsByRequest};
+use flotilla_change_request::{BoundObservations, ChangeRequestAdmission, ChangeRequestTracker, CrewGithubLoginsByRequest, MergeCheck};
 use flotilla_config::dummy_fleet::DummyFleetConfig;
 use flotilla_discovery_api::{
     provider_config::ProviderConfigView, EnvironmentBag, Factory, ProviderCategory, ProviderDescriptor, UnmetRequirement,
@@ -170,6 +170,8 @@ impl ChangeRequestTracker for DummyChangeRequestTracker {
         &self,
         numbers: &[u64],
         _crew_logins: &CrewGithubLoginsByRequest,
+        // The dummy forge reports its conflicts plainly.
+        _merge_check: Option<&dyn MergeCheck>,
     ) -> Result<BoundObservations, ObservationError> {
         let forge = &self.fleet.forge;
         let observed_at = Utc::now();
@@ -305,7 +307,7 @@ mod tests {
     }
 
     async fn state(tracker: &DummyChangeRequestTracker, number: u64) -> ObservedChangeRequestState {
-        let observed = tracker.observe_bound(&[number], &Default::default()).await.expect("observation");
+        let observed = tracker.observe_bound(&[number], &Default::default(), None).await.expect("observation");
         observed[&number].as_ref().expect("known request").state.value.expect("state")
     }
 
@@ -323,7 +325,7 @@ mod tests {
         let by_branch = tracker.find_change_request_by_branch("dummy/convoy-a").await.expect("lookup").expect("found");
         assert_eq!((by_branch.0.as_str(), by_branch.1.status), ("1", ProtocolStatus::Merged));
         assert_eq!(tracker.list_merged_branch_names(10).await.expect("merged"), vec!["dummy/convoy-a".to_string()]);
-        let missing = tracker.observe_bound(&[9], &Default::default()).await.expect("observation");
+        let missing = tracker.observe_bound(&[9], &Default::default(), None).await.expect("observation");
         assert!(missing[&9].is_err());
     }
 

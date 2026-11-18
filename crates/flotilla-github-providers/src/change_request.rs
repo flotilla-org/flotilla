@@ -430,6 +430,8 @@ impl flotilla_change_request::ChangeRequestTracker for GitHubChangeRequest {
         &self,
         numbers: &[u64],
         crew_logins: &flotilla_change_request::CrewGithubLoginsByRequest,
+        // GitHub reports a conflict plainly, as CONFLICTING.
+        _merge_check: Option<&dyn flotilla_change_request::MergeCheck>,
     ) -> Result<flotilla_change_request::BoundObservations, ObservationError> {
         let Some(poll) = &self.poll else {
             return self.observe_changed(numbers, crew_logins).await;
@@ -712,7 +714,7 @@ mod tests {
         let provider =
             GitHubChangeRequest::new("github".into(), "team/one".into(), Arc::new(GhApiClient::new(runner.clone())), runner.clone())
                 .with_operator_login("owner".into());
-        let statuses = provider.observe_bound(&[1], &Default::default()).await.expect("observe PR");
+        let statuses = provider.observe_bound(&[1], &Default::default(), None).await.expect("observe PR");
         assert_eq!(statuses[&1].as_ref().expect("status").review.actionable_at_head.value, Some(true));
         assert_eq!(statuses[&1].as_ref().expect("status").title.value.as_deref(), Some("Keep metadata current"));
         assert_eq!(statuses[&1].as_ref().expect("status").review_requested_from_owner.value, Some(true));
@@ -729,7 +731,7 @@ mod tests {
         let runner = Arc::new(MockRunner::new(vec![Ok(response)]));
         let provider = GitHubChangeRequest::new("github".into(), "team/one".into(), Arc::new(GhApiClient::new(runner.clone())), runner)
             .with_operator_login("owner".into());
-        let statuses = provider.observe_bound(&[1], &Default::default()).await.expect("observe PR");
+        let statuses = provider.observe_bound(&[1], &Default::default(), None).await.expect("observe PR");
         let status = statuses[&1].as_ref().expect("preserve PR status");
         assert_eq!(status.title.value.as_deref(), Some("Keep metadata current"));
         assert_eq!(status.state.value, Some(flotilla_resources::ObservedChangeRequestState::Open));
@@ -750,7 +752,8 @@ mod tests {
         let response = format!("HTTP/2 200 OK\r\n\r\n{}", serde_json::json!({"data": {"repository": {"pr1": request}}}));
         let runner = Arc::new(MockRunner::new(vec![Ok(response)]));
         let provider = GitHubChangeRequest::new("github".into(), "team/one".into(), Arc::new(GhApiClient::new(runner.clone())), runner);
-        let statuses = provider.observe_bound(&[1], &BTreeMap::from([(1, vec!["flotilla-crew".to_string()])])).await.expect("observe PR");
+        let statuses =
+            provider.observe_bound(&[1], &BTreeMap::from([(1, vec!["flotilla-crew".to_string()])]), None).await.expect("observe PR");
         assert_eq!(statuses[&1].as_ref().expect("status").review.actionable_at_head.value, Some(false));
     }
 
@@ -768,7 +771,7 @@ mod tests {
         let runner = Arc::new(MockRunner::new(vec![Ok(response)]));
         let provider = GitHubChangeRequest::new("github".into(), "team/one".into(), Arc::new(GhApiClient::new(runner.clone())), runner);
         let identities = BTreeMap::from([(1, vec!["crew-one".to_string()]), (2, vec!["crew-two".to_string()])]);
-        let statuses = provider.observe_bound(&[1, 2], &identities).await.expect("observe both PRs");
+        let statuses = provider.observe_bound(&[1, 2], &identities, None).await.expect("observe both PRs");
         assert_eq!(statuses[&1].as_ref().expect("first status").review.actionable_at_head.value, Some(false));
         assert_eq!(statuses[&2].as_ref().expect("second status").review.actionable_at_head.value, Some(true));
     }
@@ -787,7 +790,7 @@ mod tests {
         let response = format!("HTTP/2 200 OK\r\n\r\n{}", serde_json::json!({"data": {"repository": {"pr1": request}}}));
         let runner = Arc::new(MockRunner::new(vec![Ok(response)]));
         let provider = GitHubChangeRequest::new("github".into(), "team/one".into(), Arc::new(GhApiClient::new(runner.clone())), runner);
-        let statuses = provider.observe_bound(&[1], &Default::default()).await.expect("observe PR");
+        let statuses = provider.observe_bound(&[1], &Default::default(), None).await.expect("observe PR");
         assert_eq!(statuses[&1].as_ref().expect("status").review.actionable_at_head.value, Some(true));
     }
 
@@ -806,8 +809,8 @@ mod tests {
         let runner =
             Arc::new(MockRunner::new(vec![Ok(response("head-a", "2026-09-30T10:00:00Z")), Ok(response("head-b", "2026-09-30T12:00:00Z"))]));
         let provider = GitHubChangeRequest::new("github".into(), "team/one".into(), Arc::new(GhApiClient::new(runner.clone())), runner);
-        let first = provider.observe_bound(&[1], &Default::default()).await.expect("first head");
-        let second = provider.observe_bound(&[1], &Default::default()).await.expect("new head");
+        let first = provider.observe_bound(&[1], &Default::default(), None).await.expect("first head");
+        let second = provider.observe_bound(&[1], &Default::default(), None).await.expect("new head");
         assert_eq!(first[&1].as_ref().expect("first status").review.actionable_at_head.value, Some(true));
         assert_eq!(second[&1].as_ref().expect("second status").review.actionable_at_head.value, Some(false));
     }
@@ -829,7 +832,7 @@ mod tests {
         let response = format!("HTTP/2 200 OK\r\n\r\n{}", serde_json::json!({"data": {"repository": {"pr1": request}}}));
         let runner = Arc::new(MockRunner::new(vec![Ok(response)]));
         let provider = GitHubChangeRequest::new("github".into(), "team/one".into(), Arc::new(GhApiClient::new(runner.clone())), runner);
-        let statuses = provider.observe_bound(&[1], &Default::default()).await.expect("observe PR");
+        let statuses = provider.observe_bound(&[1], &Default::default(), None).await.expect("observe PR");
         assert_eq!(statuses[&1].as_ref().expect("status").review.actionable_at_head.value, Some(false));
     }
 
@@ -851,7 +854,7 @@ mod tests {
         let response = format!("HTTP/2 200 OK\r\n\r\n{}", serde_json::json!({"data": {"repository": {"pr1": request}}}));
         let runner = Arc::new(MockRunner::new(vec![Ok(response)]));
         let provider = GitHubChangeRequest::new("github".into(), "team/one".into(), Arc::new(GhApiClient::new(runner.clone())), runner);
-        let statuses = provider.observe_bound(&[1], &Default::default()).await.expect("observe PR");
+        let statuses = provider.observe_bound(&[1], &Default::default(), None).await.expect("observe PR");
         assert_eq!(statuses[&1].as_ref().expect("status").review.actionable_at_head.value, Some(false));
     }
 
@@ -870,7 +873,7 @@ mod tests {
         let response = format!("HTTP/2 200 OK\r\n\r\n{}", serde_json::json!({"data": {"repository": {"pr1": request}}}));
         let runner = Arc::new(MockRunner::new(vec![Ok(response)]));
         let provider = GitHubChangeRequest::new("github".into(), "team/one".into(), Arc::new(GhApiClient::new(runner.clone())), runner);
-        let statuses = provider.observe_bound(&[1], &Default::default()).await.expect("observe PR");
+        let statuses = provider.observe_bound(&[1], &Default::default(), None).await.expect("observe PR");
         assert_eq!(statuses[&1].as_ref().expect("status").review.actionable_at_head.value, Some(true));
     }
 
@@ -898,10 +901,12 @@ mod tests {
         };
         let runner = Arc::new(MockRunner::new(vec![Ok(response(false)), Ok(response(true))]));
         let provider = GitHubChangeRequest::new("github".into(), "team/one".into(), Arc::new(GhApiClient::new(runner.clone())), runner);
-        let first =
-            provider.observe_bound(&[1], &BTreeMap::from([(1, vec!["flotilla-crew".to_string()])])).await.expect("unaddressed review");
+        let first = provider
+            .observe_bound(&[1], &BTreeMap::from([(1, vec!["flotilla-crew".to_string()])]), None)
+            .await
+            .expect("unaddressed review");
         let second =
-            provider.observe_bound(&[1], &BTreeMap::from([(1, vec!["flotilla-crew".to_string()])])).await.expect("addressed review");
+            provider.observe_bound(&[1], &BTreeMap::from([(1, vec!["flotilla-crew".to_string()])]), None).await.expect("addressed review");
         assert_eq!(first[&1].as_ref().expect("first status").review.actionable_at_head.value, Some(true));
         assert_eq!(second[&1].as_ref().expect("second status").review.actionable_at_head.value, Some(false));
     }
@@ -931,11 +936,13 @@ mod tests {
         let runner = Arc::new(MockRunner::new(vec![Ok(response(false)), Ok(response(true))]));
         let provider = GitHubChangeRequest::new("github".into(), "team/one".into(), Arc::new(GhApiClient::new(runner.clone())), runner);
         let first = provider
-            .observe_bound(&[1], &BTreeMap::from([(1, vec!["flotilla-crew".to_string()])]))
+            .observe_bound(&[1], &BTreeMap::from([(1, vec!["flotilla-crew".to_string()])]), None)
             .await
             .expect("unaddressed formal review");
-        let second =
-            provider.observe_bound(&[1], &BTreeMap::from([(1, vec!["flotilla-crew".to_string()])])).await.expect("addressed formal review");
+        let second = provider
+            .observe_bound(&[1], &BTreeMap::from([(1, vec!["flotilla-crew".to_string()])]), None)
+            .await
+            .expect("addressed formal review");
         assert_eq!(first[&1].as_ref().expect("first status").review.actionable_at_head.value, Some(true));
         assert_eq!(second[&1].as_ref().expect("second status").review.actionable_at_head.value, Some(false));
     }
@@ -951,7 +958,7 @@ mod tests {
         let response = format!("HTTP/2 200 OK\r\n\r\n{}", serde_json::json!({"data": {"repository": {"pr1": request}}}));
         let runner = Arc::new(MockRunner::new(vec![Ok(response)]));
         let provider = GitHubChangeRequest::new("github".into(), "team/one".into(), Arc::new(GhApiClient::new(runner.clone())), runner);
-        let statuses = provider.observe_bound(&[1], &Default::default()).await.expect("observe PR");
+        let statuses = provider.observe_bound(&[1], &Default::default(), None).await.expect("observe PR");
         assert!(statuses[&1].as_ref().expect_err("truncated history").to_string().contains("truncated"));
     }
 
@@ -971,7 +978,7 @@ mod tests {
         let runner = Arc::new(MockRunner::new(vec![Ok(first), Ok(format!("HTTP/2 200 OK\r\n\r\n{older}"))]));
         let provider =
             GitHubChangeRequest::new("github".into(), "team/one".into(), Arc::new(GhApiClient::new(runner.clone())), runner.clone());
-        let statuses = provider.observe_bound(&[1], &Default::default()).await.expect("observe PR");
+        let statuses = provider.observe_bound(&[1], &Default::default(), None).await.expect("observe PR");
         assert_eq!(statuses[&1].as_ref().expect("complete history").review.actionable_at_head.value, Some(true));
         assert_eq!(runner.calls().len(), 2);
     }
@@ -1014,7 +1021,7 @@ mod tests {
             let runner = Arc::new(MockRunner::new(vec![Ok(first), Ok(format!("HTTP/2 200 OK\r\n\r\n{older}"))]));
             let provider =
                 GitHubChangeRequest::new("github".into(), "team/one".into(), Arc::new(GhApiClient::new(runner.clone())), runner.clone());
-            let statuses = provider.observe_bound(&[1], &Default::default()).await.expect("observe PR");
+            let statuses = provider.observe_bound(&[1], &Default::default(), None).await.expect("observe PR");
             assert_eq!(statuses[&1].as_ref().expect(case).review.actionable_at_head.value, Some(true), "{case}");
             assert_eq!(runner.calls().len(), 2, "{case}");
         }
@@ -1053,7 +1060,7 @@ mod tests {
             GitHubChangeRequest::new("github".into(), "team/one".into(), Arc::new(GhApiClient::new(runner.clone())), runner.clone());
         let runtime = tokio::runtime::Builder::new_current_thread().enable_all().build().expect("runtime");
         let numbers = (1..=count as u64).collect::<Vec<_>>();
-        let statuses = runtime.block_on(provider.observe_bound(&numbers, &Default::default())).expect("batch results");
+        let statuses = runtime.block_on(provider.observe_bound(&numbers, &Default::default(), None)).expect("batch results");
         assert_eq!(statuses.len(), count);
         assert!(statuses.values().all(|status| status.as_ref().is_err_and(|error| error.to_string().contains("kind=secondary"))));
         assert_eq!(runner.calls().len(), if count == 0 { 0 } else { 2 }, "no further history calls during a cooldown");
@@ -1079,7 +1086,7 @@ mod tests {
         let runner = Arc::new(MockRunner::new(responses));
         let provider =
             GitHubChangeRequest::new("github".into(), "team/one".into(), Arc::new(GhApiClient::new(runner.clone())), runner.clone());
-        let statuses = provider.observe_bound(&[1, 2], &Default::default()).await.expect("observe both PRs");
+        let statuses = provider.observe_bound(&[1, 2], &Default::default(), None).await.expect("observe both PRs");
         assert!(statuses[&1].as_ref().expect_err("budget exhausted").to_string().contains("pagination budget"));
         assert_eq!(statuses[&2].as_ref().expect("healthy PR").title.value.as_deref(), Some("Healthy"));
         assert_eq!(runner.calls().len(), MAX_HISTORY_PAGE_QUERIES + 1);
@@ -1101,7 +1108,7 @@ mod tests {
         let provider =
             GitHubChangeRequest::new("github".into(), "team/one".into(), Arc::new(GhApiClient::new(runner.clone())), runner.clone());
         for priority in [[1, 2], [2, 1]] {
-            let statuses = provider.observe_bound(&priority, &Default::default()).await.expect("observe cycle");
+            let statuses = provider.observe_bound(&priority, &Default::default(), None).await.expect("observe cycle");
             assert!(statuses.values().all(Result::is_err), "incomplete histories remain errors");
         }
         let calls = runner.calls();
@@ -1134,7 +1141,7 @@ mod tests {
         let runner = Arc::new(MockRunner::new(responses));
         let provider =
             GitHubChangeRequest::new("github".into(), "team/one".into(), Arc::new(GhApiClient::new(runner.clone())), runner.clone());
-        let statuses = provider.observe_bound(&[1], &Default::default()).await.expect("observe PR");
+        let statuses = provider.observe_bound(&[1], &Default::default(), None).await.expect("observe PR");
         assert!(statuses[&1].as_ref().expect_err("node budget exhausted").to_string().contains("pagination budget"));
         assert_eq!(runner.calls().len(), 4, "three 220-node pages leave too little budget for a fourth");
     }
@@ -1148,7 +1155,7 @@ mod tests {
         let failed = "HTTP/2 200 OK\r\n\r\n{\"errors\":[{\"message\":\"cursor expired\"}]}".to_string();
         let runner = Arc::new(MockRunner::new(vec![Ok(first), Ok(failed)]));
         let provider = GitHubChangeRequest::new("github".into(), "team/one".into(), Arc::new(GhApiClient::new(runner.clone())), runner);
-        let statuses = provider.observe_bound(&[1, 2], &Default::default()).await.expect("observe both PRs");
+        let statuses = provider.observe_bound(&[1, 2], &Default::default(), None).await.expect("observe both PRs");
         assert!(statuses[&1].as_ref().expect_err("failed page").to_string().contains("cursor expired"));
         assert_eq!(statuses[&2].as_ref().expect("healthy PR").title.value.as_deref(), Some("Healthy"));
     }
@@ -1160,7 +1167,7 @@ mod tests {
         let runner = replay::test_runner(&session);
         let provider =
             GitHubChangeRequest::new("github".into(), "flotilla-org/flotilla".into(), Arc::new(GhApiClient::new(runner.clone())), runner);
-        let statuses = provider.observe_bound(&[2320], &Default::default()).await.expect("observe real PR");
+        let statuses = provider.observe_bound(&[2320], &Default::default(), None).await.expect("observe real PR");
         let status = statuses[&2320].as_ref().expect("complete real PR observation");
         assert_eq!(status.title.value.as_deref(), Some("fix: wake crews for unaddressed PR review feedback"));
         assert_eq!(status.head_sha.value.as_deref(), Some("1256f96194276ce7b7c7d4fa614d6782dbf1fabf"));
@@ -1191,8 +1198,8 @@ mod tests {
         let first = GitHubChangeRequest::new("github".into(), "team/one".into(), api.clone(), runner.clone());
         let second = GitHubChangeRequest::new("github".into(), "team/two".into(), api, runner.clone());
 
-        assert_eq!(first.observe_bound(&[1, 2, 3, 4], &Default::default()).await.expect("first repository").len(), 4);
-        assert_eq!(second.observe_bound(&[5, 6, 7], &Default::default()).await.expect("second repository").len(), 3);
+        assert_eq!(first.observe_bound(&[1, 2, 3, 4], &Default::default(), None).await.expect("first repository").len(), 4);
+        assert_eq!(second.observe_bound(&[5, 6, 7], &Default::default(), None).await.expect("second repository").len(), 3);
         let calls = runner.calls();
         assert_eq!(calls.len(), 2, "one request per repository, independent of bound CR count");
         assert!(calls[0].1.iter().any(|argument| argument.contains("pr1:") && argument.contains("pr4:")));
@@ -1206,7 +1213,7 @@ mod tests {
         )]));
         let api = Arc::new(GhApiClient::new(runner.clone()));
         let provider = GitHubChangeRequest::new("github".into(), "team/one".into(), api, runner);
-        let error = provider.observe_bound(&[1], &Default::default()).await.expect_err("rate limited");
+        let error = provider.observe_bound(&[1], &Default::default(), None).await.expect_err("rate limited");
         assert!(
             error.to_string().contains(
                 "rate limited (budget=GraphQL, identity=host gh login, kind=primary, retry_source=x-ratelimit-reset, retry_at=2026-"
@@ -1225,7 +1232,7 @@ mod tests {
             "HTTP/2 403 Forbidden\r\nX-RateLimit-Remaining: 0\r\n\r\n{\"message\":\"API rate limit exceeded\"}".into(),
         )]));
         let provider = GitHubChangeRequest::new("github".into(), "team/one".into(), Arc::new(GhApiClient::new(runner.clone())), runner);
-        let error = provider.observe_bound(&[1], &Default::default()).await.expect_err("classified limit");
+        let error = provider.observe_bound(&[1], &Default::default(), None).await.expect_err("classified limit");
         assert!(matches!(GithubRateLimit::from_observation_error(&error), Some(limit)
             if limit.kind == GithubRateLimitKind::Primary && limit.retry_source == GithubRetrySource::Unavailable));
         assert_eq!(error.retry_at(), None, "no fabricated deadline for a cache, completion or Landing wait");
@@ -1248,7 +1255,7 @@ mod tests {
         })]));
         let api = Arc::new(GhApiClient::new(runner.clone()));
         let provider = GitHubChangeRequest::new("github".into(), "team/one".into(), api, runner);
-        let statuses = provider.observe_bound(&[1, 2], &Default::default()).await.expect("partial GraphQL result");
+        let statuses = provider.observe_bound(&[1, 2], &Default::default(), None).await.expect("partial GraphQL result");
         assert!(matches!(statuses[&1], Err(ObservationError::NotFound(_))));
         assert!(statuses.contains_key(&2));
     }
@@ -1326,7 +1333,7 @@ mod tests {
                     runner.clone(),
                 )
                 .with_poll_directory(directory.path().into());
-                let result = provider.observe_bound(&[1, 2], &Default::default()).await;
+                let result = provider.observe_bound(&[1, 2], &Default::default(), None).await;
                 if expect_local {
                     let statuses = result.expect("independent outcomes");
                     assert!(statuses[&1].is_err());
@@ -1398,14 +1405,14 @@ mod tests {
             .with_poll_directory(directory.path().join("bound"))
         };
         let provider = make();
-        let first = provider.observe_bound(&[1], &Default::default()).await.expect("first");
+        let first = provider.observe_bound(&[1], &Default::default(), None).await.expect("first");
         assert_eq!(first[&1].as_ref().expect("observed").title.value.as_deref(), Some("Initial"));
-        provider.observe_bound(&[1], &Default::default()).await.expect("quiet");
+        provider.observe_bound(&[1], &Default::default(), None).await.expect("quiet");
         drop(provider);
         let provider = make();
-        let restarted = provider.observe_bound(&[1], &Default::default()).await.expect("restart");
+        let restarted = provider.observe_bound(&[1], &Default::default(), None).await.expect("restart");
         assert_eq!(restarted[&1].as_ref().expect("cached").title.value.as_deref(), Some("Initial"));
-        let changed = provider.observe_bound(&[1], &Default::default()).await.expect("checks updated");
+        let changed = provider.observe_bound(&[1], &Default::default(), None).await.expect("checks updated");
         assert_eq!(changed[&1].as_ref().expect("refreshed").title.value.as_deref(), Some("Refreshed"));
         let calls = runner.calls();
         assert_eq!(calls.iter().filter(|(_, args)| args.contains(&"graphql".into())).count(), 2);

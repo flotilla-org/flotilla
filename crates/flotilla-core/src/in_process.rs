@@ -75,6 +75,7 @@ use flotilla_admission::convoy_admission::PlacementResolution;
 use flotilla_admission::convoy_admission::PreparedConvoyAdmission;
 use flotilla_admission::convoy_admission::{ConvoyAdmission, ConvoyStartTask, StaticFulfilmentDecider};
 use flotilla_resources::convoy_address::RoleAddress;
+mod merge_check;
 mod repository_discovery;
 use flotilla_change_request::ChangeRequestTracker;
 use flotilla_projections::ports::ResolvedAttach;
@@ -172,6 +173,9 @@ struct ProviderChangeRequestQueryPort {
     discovery: Arc<DiscoveryRuntime>,
     environment_manager: Arc<EnvironmentManager>,
     local_environment_id: EnvironmentId,
+    /// The engine's clones, where merges are judged, and the VCS for each.
+    lifecycle_reads: Arc<dyn flotilla_resources::lifecycle_reads::LifecycleReads>,
+    checkout_vcs: Arc<dyn flotilla_vcs::vcs::CheckoutVcsResolver>,
 }
 
 #[derive(bon::Builder)]
@@ -339,6 +343,14 @@ impl ChangeRequestQueryPort for ProviderChangeRequestQueryPort {
             repository,
         )
         .await
+    }
+
+    fn merge_check(&self, repository: &RepositorySpec) -> Arc<dyn flotilla_change_request::MergeCheck> {
+        Arc::new(merge_check::ManagedCloneMergeCheck {
+            lifecycle_reads: Arc::clone(&self.lifecycle_reads),
+            vcs: Arc::clone(&self.checkout_vcs),
+            repository: repository.key(),
+        })
     }
 }
 
@@ -1326,12 +1338,28 @@ impl InProcessDaemon {
         let forge_reads =
             flotilla_observation::forge_observation::ForgeReads::new(resource_backend.clone(), DEFAULT_PROVISIONING_NAMESPACE.into())
                 .with_clock(Arc::clone(&clock));
+        let lifecycle_reads = Arc::new(flotilla_resources::lifecycle_reads::LateLifecycleReads::default());
+        let checkout_providers = Arc::new(
+            CheckoutProviders::builder()
+                .lifecycle_reads(lifecycle_reads.clone() as Arc<dyn flotilla_resources::lifecycle_reads::LifecycleReads>)
+                .resource_backend(resource_backend.clone())
+                .discovered_checkouts(discovered_checkouts.clone())
+                .config(Arc::clone(&config))
+                .discovery(Arc::clone(&discovery))
+                .environment_manager(Arc::clone(&environment_manager))
+                .local_environment_id(local_environment_id.clone())
+                .provisioning_namespace(Arc::clone(&provisioning_namespace))
+                .forge_credentials(forge_credentials)
+                .build(),
+        );
         let query_port: Arc<dyn ChangeRequestQueryPort> = Arc::new(ProviderChangeRequestQueryPort {
             forge_reads: forge_reads.clone(),
             config: Arc::clone(&config),
             discovery: Arc::clone(&discovery),
             environment_manager: Arc::clone(&environment_manager),
             local_environment_id: local_environment_id.clone(),
+            lifecycle_reads: lifecycle_reads.clone() as Arc<dyn flotilla_resources::lifecycle_reads::LifecycleReads>,
+            checkout_vcs: checkout_providers.clone() as Arc<dyn flotilla_vcs::vcs::CheckoutVcsResolver>,
         });
         let observation_source = Arc::new(ProviderChangeRequestObservationSource::new(resource_backend.clone(), Arc::clone(&query_port)));
         let change_request_refresher = flotilla_observation::change_request_observer::ChangeRequestRefresher::new(
@@ -1364,7 +1392,6 @@ impl InProcessDaemon {
         let message_path = flotilla_engine_messages::MessagePath::default();
         let crew_message_path = flotilla_crew::ports::MessagePath::default();
         let convoy_engine_path = flotilla_resources::convoy::engine::EngineConvoyPath::default();
-        let lifecycle_reads = Arc::new(flotilla_resources::lifecycle_reads::LateLifecycleReads::default());
         let change_request_observer = change_request_refresher.clone();
         let issue_observer = issue_refresher.clone();
         let leaf_subscriptions = LeafSubscriptionTable::with_issues(
@@ -1390,19 +1417,6 @@ impl InProcessDaemon {
         let accounts = Arc::clone(&engine.accounts);
         let manifest_roots = Arc::clone(&engine.manifest_roots);
         let standing_roles = Arc::clone(&engine.standing_roles);
-        let checkout_providers = Arc::new(
-            CheckoutProviders::builder()
-                .lifecycle_reads(lifecycle_reads.clone() as Arc<dyn flotilla_resources::lifecycle_reads::LifecycleReads>)
-                .resource_backend(resource_backend.clone())
-                .discovered_checkouts(discovered_checkouts.clone())
-                .config(Arc::clone(&config))
-                .discovery(Arc::clone(&discovery))
-                .environment_manager(Arc::clone(&environment_manager))
-                .local_environment_id(local_environment_id.clone())
-                .provisioning_namespace(Arc::clone(&provisioning_namespace))
-                .forge_credentials(forge_credentials)
-                .build(),
-        );
         let crew = Arc::new(
             CrewService::builder()
                 .lifecycle_reads(lifecycle_reads.clone() as Arc<dyn flotilla_resources::lifecycle_reads::LifecycleReads>)

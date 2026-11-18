@@ -5582,6 +5582,9 @@ mod tests {
             self.discoveries.fetch_add(1, Ordering::SeqCst);
             Ok(Arc::clone(&self.tracker))
         }
+        fn merge_check(&self, _repository: &RepositorySpec) -> Arc<dyn flotilla_change_request::MergeCheck> {
+            Arc::new(flotilla_change_request::NoMergeCheck)
+        }
     }
 
     #[tokio::test]
@@ -6431,6 +6434,9 @@ struct FixtureQueries;
 impl ChangeRequestQueryPort for FixtureQueries {
     async fn discover_repository_change_request(&self, _: &str, _: &RepositorySpec) -> Result<Arc<dyn ChangeRequestTracker>, String> {
         Ok(Arc::new(flotilla_discovery_testkit::FakeChangeRequest::default()))
+    }
+    fn merge_check(&self, _: &RepositorySpec) -> Arc<dyn flotilla_change_request::MergeCheck> {
+        Arc::new(flotilla_change_request::NoMergeCheck)
     }
 }
 #[cfg(test)]
