@@ -394,8 +394,8 @@ pub(super) fn convoy_links(row: &flotilla_protocol::result_set::ConvoyRow) -> Ve
     if let Some(role) = &row.ensured_from {
         links.push(Dependency::Role(row.resource.namespace.clone(), role.clone()));
     }
-    if let (Some(project), Some(role)) = (&row.project_ref, &row.address_role) {
-        links.push(Dependency::Address(row.resource.namespace.clone(), project.clone(), role.clone()));
+    if let Some(role) = &row.address_role {
+        links.push(Dependency::Address(row.resource.namespace.clone(), row.project_ref.clone(), role.clone()));
     }
     links.extend(row.subjects.iter().map(|entry| Dependency::Subject(entry.subject.clone())));
     links

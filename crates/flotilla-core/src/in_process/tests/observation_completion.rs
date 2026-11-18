@@ -194,6 +194,7 @@ async fn live_bound_observation_batches_two_repositories_and_caches_rate_limit()
         backend.using::<Repository>("flotilla").create(&test_meta(&repository_key.to_string()), &repository).await.expect("repository");
         for id in ids {
             let mut spec = ConvoySpec::builder()
+                .project_ref("flotilla".into())
                 .workflow_ref("test".to_string())
                 .repositories(vec![ConvoyRepositorySpec {
                     url: format!("{scheme}://github.com/{scope}"),
@@ -234,6 +235,7 @@ async fn live_bound_observation_batches_two_repositories_and_caches_rate_limit()
         .spec
         .key();
     let mut spec = ConvoySpec::builder()
+        .project_ref("flotilla".into())
         .workflow_ref("test".to_string())
         .repositories(vec![ConvoyRepositorySpec {
             url: "http://github.com/team/one".into(),
@@ -412,6 +414,7 @@ async fn pr_submission_observation_case(rate_limited: bool, missing_artifact: bo
         &daemon,
         "refused-claim",
         ConvoySpec::builder()
+            .project_ref("flotilla".into())
             .workflow_ref("implement-review".to_string())
             .repositories(vec![flotilla_resources::ConvoyRepositorySpec::builder()
                 .url("https://github.com/flotilla-org/flotilla".to_string())

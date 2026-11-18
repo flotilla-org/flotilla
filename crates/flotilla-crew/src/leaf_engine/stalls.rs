@@ -199,8 +199,8 @@ fn convoy_stall_subject(project: &str, convoy: &str) -> String {
 }
 
 /// A convoy stall has a subject even when no crew caused it.
-pub(super) fn stall_subject(namespace: &str, convoy: &ResourceObject<Convoy>, condition: &StalledCondition) -> String {
-    let project = convoy.spec.project_ref.as_deref().unwrap_or(namespace);
+pub(super) fn stall_subject(convoy: &ResourceObject<Convoy>, condition: &StalledCondition) -> String {
+    let project = convoy.spec.project_ref.as_str();
     stalled_source_actor(condition)
         .map(|(vessel, role)| crew_role_address(project, &convoy.metadata.name, vessel, role))
         .unwrap_or_else(|| convoy_stall_subject(project, &convoy.metadata.name))
@@ -208,9 +208,9 @@ pub(super) fn stall_subject(namespace: &str, convoy: &ResourceObject<Convoy>, co
 
 /// What a supervision send records of the stall it escalates: its subject, and the evidence its
 /// stall record carries to every home.
-pub(super) fn stall_of(namespace: &str, convoy: &ResourceObject<Convoy>, condition: &StalledCondition) -> flotilla_messaging::StallOf {
+pub(super) fn stall_of(convoy: &ResourceObject<Convoy>, condition: &StalledCondition) -> flotilla_messaging::StallOf {
     flotilla_messaging::StallOf {
-        about: stall_subject(namespace, convoy, condition),
+        about: stall_subject(convoy, condition),
         report: convoy.status.as_ref().and_then(|status| condition.report(status)).map(str::to_owned),
         reason: condition.reason,
         proposed_disposition: condition.proposed_disposition,
@@ -708,12 +708,12 @@ impl ReconcilerWake {
                 return;
             }
         };
-        let project = convoy.spec.project_ref.as_deref().unwrap_or(namespace);
+        let project = convoy.spec.project_ref.as_str();
         let address = |vessel: &str, role: &str| crew_role_address(project, &convoy.metadata.name, vessel, role);
         let stalled = stalls
             .iter()
             .filter(|condition| condition.rung != StallRung::Operator)
-            .map(|condition| stall_subject(namespace, convoy, condition))
+            .map(|condition| stall_subject(convoy, condition))
             .collect::<Vec<_>>();
         let seats = status
             .crew_work
@@ -865,8 +865,8 @@ impl ReconcilerWake {
         for convoy in pass.judged.iter().filter_map(|name| convoys.get(name)).map(ConvoyRead::convoy) {
             // Each seat, whether it is a crew member's, and the turns named to it.
             let mut seats: BTreeMap<String, (bool, Vec<String>)> =
-                flotilla_resources::convoy_crew_seats(namespace, convoy).into_iter().map(|seat| (seat, (true, Vec::new()))).collect();
-            for (seat, record) in flotilla_resources::convoy_seat_turns(namespace, convoy) {
+                flotilla_resources::convoy_crew_seats(convoy).into_iter().map(|seat| (seat, (true, Vec::new()))).collect();
+            for (seat, record) in flotilla_resources::convoy_seat_turns(convoy) {
                 seats.entry(seat).or_default().1.push(record);
             }
             for (_, turns) in seats.values_mut() {
@@ -1281,7 +1281,7 @@ impl ReconcilerWake {
         vessel: &str,
         role: &str,
     ) -> Result<RowJudgement, String> {
-        let StallTick { namespace, now, progress_observations, .. } = tick;
+        let StallTick { now, progress_observations, .. } = tick;
         let messages = &tick.inputs.messages;
         let judgement: Result<(), (String, StallEvidenceSource)> = {
             let session = selected_sessions.values().find(|session| {
@@ -1356,8 +1356,7 @@ impl ReconcilerWake {
                 *progress_changed = true;
             }
             obligation.progress.extend(progress);
-            let receiver_address =
-                crew_role_address(convoy.spec.project_ref.as_deref().unwrap_or(namespace), &convoy.metadata.name, vessel, role);
+            let receiver_address = crew_role_address(&convoy.spec.project_ref, &convoy.metadata.name, vessel, role);
             let current_message = messages
                 .iter()
                 .filter(|message| {
@@ -1920,8 +1919,7 @@ impl ReconcilerWake {
         let brief =
             format!("For {role}@{vessel} in {} (resource ref: {}):\n{obligation}", convoy_message_address(convoy), convoy.metadata.name);
         // A condition or reference that names nothing fails this delivery like any other.
-        let project = convoy.spec.project_ref.as_deref().unwrap_or(namespace);
-        let parts = flotilla_resources::address::leaf_condition(leaf, Some(project), &[])
+        let parts = flotilla_resources::address::leaf_condition(leaf, Some(&convoy.spec.project_ref), &[])
             .and_then(|condition| Ok((condition, convoy_reference(convoy)?)));
         let (condition, reference) = match parts {
             Ok(parts) => parts,
@@ -2007,7 +2005,7 @@ impl ReconcilerWake {
                         .sender(
                             stalled_source_actor(&*condition)
                                 .map(|(_, role)| Party::Seat {
-                                    project: convoy.spec.project_ref.clone().unwrap_or_else(|| namespace.to_owned()),
+                                    project: convoy.spec.project_ref.clone(),
                                     convoy: convoy.metadata.name.clone(),
                                     role: role.to_owned(),
                                 })
@@ -2016,7 +2014,7 @@ impl ReconcilerWake {
                         .relation(flotilla_resources::MessageRelation::Supervisor)
                         .expectation(supervision_expectation(rung))
                         .references(vec![convoy_reference])
-                        .maybe_stall_of((rung != StallRung::Operator).then(|| stall_of(namespace, convoy, &*condition)))
+                        .maybe_stall_of((rung != StallRung::Operator).then(|| stall_of(convoy, &*condition)))
                         .build()
                 });
                 let actuator = self.subscriptions.inner.turn_delivery.lock().await.clone();

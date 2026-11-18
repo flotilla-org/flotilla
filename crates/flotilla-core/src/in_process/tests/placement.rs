@@ -47,7 +47,7 @@ async fn placement_daemon(machine: &str) -> (Arc<InProcessDaemon>, tempfile::Tem
 /// Resolves an unpinned convoy's placement at `daemon` through admission's
 /// capability path.
 async fn created_convoy_placement(daemon: &InProcessDaemon, workflow: &WorkflowTemplateSpec) -> Result<PlacementResolution, String> {
-    daemon.admission.resolve_created_convoy_placement("flotilla", None, &[], workflow, None).await
+    daemon.admission.resolve_created_convoy_placement("flotilla", "flotilla", &[], workflow, None).await
 }
 
 /// Writes FulfilmentKind `name` at `home`, another daemon, and replicates it to `daemon`.
@@ -536,7 +536,7 @@ async fn fleet_list_scopes_rows_to_the_live_convoy_project() {
     let mut crew_one = String::new();
     let mut launches = BTreeMap::new();
     for (record, project) in [("convoy-one", "island-one"), ("convoy-two", "island-two")] {
-        let convoy = create_identity_convoy(&daemon, record, record, Some(project)).await;
+        let convoy = create_identity_convoy(&daemon, record, record, project).await;
         launches.insert(record, convoy.clone());
         if record == "convoy-one" {
             let vessel = ensure_vessel(&engine, &convoy, "work");

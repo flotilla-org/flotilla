@@ -54,7 +54,7 @@ fn convoy_spec(workflow_ref: &str, role: &str) -> ConvoySpec {
         placement_policy: None,
         repositories: Vec::new(),
         r#ref: None,
-        project_ref: Some("flotilla".to_string()),
+        project_ref: "flotilla".to_string(),
         adopted_checkout_refs: BTreeMap::new(),
         issues: Vec::new(),
         change_request: None,

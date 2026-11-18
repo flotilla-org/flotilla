@@ -12,7 +12,7 @@ async fn launch_standing(
     status: flotilla_resources::ConvoyStatus,
 ) -> flotilla_resources::ResourceObject<Convoy> {
     engine(daemon);
-    let spec = ConvoySpec::builder().workflow_ref("standing".to_string()).build();
+    let spec = ConvoySpec::builder().project_ref(NAMESPACE.into()).workflow_ref("standing".to_string()).build();
     let launch = admit_convoy(daemon, flotilla_engine_convoys_testkit::convoy(NAMESPACE, name, spec, status)).await;
     daemon.resource_backend().using::<Convoy>(NAMESPACE).get(&launch).await.expect("launched convoy")
 }

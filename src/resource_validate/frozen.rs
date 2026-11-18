@@ -537,7 +537,7 @@ mod tests {
         let created = convoys
             .create(
                 &InputMeta::builder().name("governor".into()).build(),
-                &ConvoySpec::builder().workflow_ref("single-agent".into()).build(),
+                &ConvoySpec::builder().project_ref("fleet".into()).workflow_ref("single-agent".into()).build(),
             )
             .await
             .expect("convoy");

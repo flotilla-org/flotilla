@@ -67,7 +67,7 @@ async fn convoy_work_state_reconciles_credentials_after_resume_and_review_delive
         convoy(
             NAMESPACE,
             "credential-work",
-            ConvoySpec::builder().workflow_ref("test".to_string()).build(),
+            ConvoySpec::builder().project_ref(NAMESPACE.into()).workflow_ref("test".to_string()).build(),
             credential_work(
                 VesselRequirement::builder()
                     .name("work".to_string())
@@ -122,7 +122,11 @@ async fn convoy_work_state_reconciles_credentials_after_resume_and_review_delive
         convoy(
             NAMESPACE,
             "unavailable-credential-work",
-            ConvoySpec::builder().workflow_ref("test".to_string()).placement_policy("missing-policy".to_string()).build(),
+            ConvoySpec::builder()
+                .project_ref(NAMESPACE.into())
+                .workflow_ref("test".to_string())
+                .placement_policy("missing-policy".to_string())
+                .build(),
             credential_work(
                 VesselRequirement::builder()
                     .name("unavailable".to_string())
@@ -169,7 +173,11 @@ async fn convoy_work_state_reconciles_credentials_after_resume_and_review_delive
         convoy(
             NAMESPACE,
             "conflicting-credential-work",
-            ConvoySpec::builder().workflow_ref("test".to_string()).placement_policy("test".to_string()).build(),
+            ConvoySpec::builder()
+                .project_ref(NAMESPACE.into())
+                .workflow_ref("test".to_string())
+                .placement_policy("test".to_string())
+                .build(),
             credential_work(
                 VesselRequirement::builder()
                     .name("other-work".to_string())
@@ -301,7 +309,7 @@ async fn a_missing_credential_declaration_is_delivered_once_it_arrives() {
         convoy(
             NAMESPACE,
             "late-work",
-            ConvoySpec::builder().workflow_ref("test".to_string()).build(),
+            ConvoySpec::builder().project_ref(NAMESPACE.into()).workflow_ref("test".to_string()).build(),
             credential_work(
                 VesselRequirement::builder()
                     .name("work".to_string())

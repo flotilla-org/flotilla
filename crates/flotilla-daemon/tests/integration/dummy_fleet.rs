@@ -105,7 +105,7 @@ async fn a_named_convoy_records_its_naming_and_has_its_project() {
     assert_eq!(explained.naming, Some(ConvoyNaming::Explicit));
     assert_eq!(explained.dispatch_score_error, None);
     let found = fleet.get::<Convoy>(&dispatched).await.expect("the dispatched convoy");
-    assert_eq!(found.spec.project_ref.as_deref(), Some(catalog::FLEET_PROJECT));
+    assert_eq!(found.spec.project_ref, catalog::FLEET_PROJECT);
     let CommandValue::ConvoyExplanation(explained) = fleet.execute(explain(&created)).await else { panic!("an explanation") };
     assert_eq!(explained.naming, Some(ConvoyNaming::Explicit));
 }

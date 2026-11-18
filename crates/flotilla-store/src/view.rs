@@ -840,7 +840,7 @@ mod tests {
                 "metadata": {"name": format!("object-{name}"), "namespace": "test", "resourceVersion": "1",
                     "creationTimestamp": "2026-01-01T00:00:00Z", "labels": {"team": format!("team-{team}")},
                     "ownerReferences": [{"apiVersion":"flotilla.work/v1", "kind":"Project", "name":format!("owner-{owner}"), "controller":false}]},
-                "spec": ConvoySpec::builder().workflow_ref("test".into()).build(),
+                "spec": ConvoySpec::builder().workflow_ref("test".into()).project_ref("test".into()).build(),
                 "status": {"phase": if phase == 0 { "Active" } else { "Pending" }},
             });
             if team == 2 {

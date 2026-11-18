@@ -23,7 +23,13 @@ use flotilla_daemon::{
 
 pub async fn apply_convoy_replica_feed(daemon: &InProcessDaemon, namespace: &str, name: &str, home: HostName) {
     let resource = ResourceRef::new(api_version(Convoy::API_PATHS), Convoy::API_PATHS.kind, namespace, name).on_host(home.clone());
-    let row = ConvoyRow::builder().resource(resource).name(name).workflow_ref("scratch").phase(ConvoyPhase::Pending).build();
+    let row = ConvoyRow::builder()
+        .resource(resource)
+        .name(name)
+        .workflow_ref("scratch")
+        .project_ref(namespace)
+        .phase(ConvoyPhase::Pending)
+        .build();
     let state = daemon.aggregator_projection_state().await;
     state.write().await.replace_replica_rows(HashMap::from([(home, HashMap::from([(row.resource.clone(), row)]))]));
 }

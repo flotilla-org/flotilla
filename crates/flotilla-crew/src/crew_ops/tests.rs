@@ -181,8 +181,7 @@ struct Crewed<'a> {
 async fn admit_crewed(engine: &EngineHome, crewed: &Crewed<'_>) -> (String, String) {
     let mut status = flotilla_engine_convoys_testkit::single_agent(crewed.member);
     status.workflow_snapshot.as_mut().expect("workflow").vessels[0].name = crewed.work.into();
-    let launch =
-        engine.admit(crewed.name, ConvoySpec::builder().workflow_ref("workflow".into()).role(crewed.role.into()).build(), status).await;
+    let launch = engine.admit(crewed.name, crew_spec_for(crewed.role), status).await;
     let vessel = engine.vessel(&launch, crewed.work, "resume-env");
     let session = engine.session(&vessel, crewed.member, crewed.session, "resume-env");
     (launch, session)
@@ -213,9 +212,14 @@ async fn project_fixture(phase: CrewWorkPhase) -> (Arc<CrewService>, ResourceBac
     build_fixture(phase, Default::default(), Some("work"), spec, &[], |_, _| {}).await
 }
 
-/// The fixture convoy's spec: workflow `workflow`, for role `crew`.
+/// The fixture convoy's spec: workflow `workflow`, for role `crew` in project `flotilla`.
 fn crew_spec() -> ConvoySpec {
-    ConvoySpec::builder().workflow_ref("workflow".into()).role("crew".into()).build()
+    crew_spec_for("crew")
+}
+
+/// A convoy spec of workflow `workflow` for `role` in project `flotilla`.
+fn crew_spec_for(role: &str) -> ConvoySpec {
+    ConvoySpec::builder().workflow_ref("workflow".into()).project_ref("flotilla".into()).role(role.into()).build()
 }
 
 /// A turn's subject: the fixture's convoy `launch`, admitted in project `flotilla`, at `revision`.

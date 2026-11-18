@@ -166,7 +166,7 @@ impl VesselPlanning {
                             };
                             let mut render_options = self.brief_templates.render_options_with_fork_stance(
                                 brief_template.as_deref(),
-                                convoy.spec.project_ref.as_deref(),
+                                Some(&convoy.spec.project_ref),
                                 seating.checkout_paths.iter().map(PathBuf::from),
                                 seating.fork_stance,
                             );
@@ -215,17 +215,15 @@ impl VesselPlanning {
                                     &requirement.credential_scopes,
                                     Some(&seating.terminal_cwd),
                                 );
-                                if let Some(project) = convoy.spec.project_ref.as_deref() {
-                                    let address = flotilla_resources::crew_role_address(
-                                        project,
-                                        &convoy.metadata.name,
-                                        &obj.spec.vessel_name,
-                                        &process.role,
-                                    );
-                                    let book = flotilla_messaging::crew_address_book(&self.backend, &self.namespace, &address).await?;
-                                    brief.content.push('\n');
-                                    brief.content.push_str(&book.render());
-                                }
+                                let address = flotilla_resources::crew_role_address(
+                                    &convoy.spec.project_ref,
+                                    &convoy.metadata.name,
+                                    &obj.spec.vessel_name,
+                                    &process.role,
+                                );
+                                let book = flotilla_messaging::crew_address_book(&self.backend, &self.namespace, &address).await?;
+                                brief.content.push('\n');
+                                brief.content.push_str(&book.render());
                                 brief
                             };
                             brief.copies = seating.brief_copies.clone();

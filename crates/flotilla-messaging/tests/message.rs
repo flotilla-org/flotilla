@@ -379,7 +379,10 @@ fn receiver_snapshot_is_pure_and_refreshes(tc: hegel::TestCase) {
         let backend = ResourceBackend::new(memory.clone());
         backend
             .using::<Convoy>("flotilla")
-            .create(&InputMeta::builder().name("convoy".into()).build(), &ConvoySpec::builder().workflow_ref("workflow".into()).build())
+            .create(
+                &InputMeta::builder().name("convoy".into()).build(),
+                &ConvoySpec::builder().workflow_ref("workflow".into()).project_ref("flotilla".into()).build(),
+            )
             .await
             .expect("convoy");
         let old = MessageReceiverSnapshot::load(&backend, "flotilla").await.expect("snapshot");

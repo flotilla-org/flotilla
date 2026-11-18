@@ -67,7 +67,7 @@ struct Pending {
     id: String,
     attention: Attention,
     principal: String,
-    project: Option<String>,
+    project: String,
 }
 
 /// What one demand becomes before it is admitted: an attention to send, or not.
@@ -374,7 +374,7 @@ fn credential(
 }
 
 fn message(old: &OldDemand<'_>, pending: &Pending, version: u64, conversion: &Conversion<'_>) -> Result<ImportedMessage, String> {
-    let inbox = conversion.person(&pending.principal, pending.project.as_deref())?;
+    let inbox = conversion.person(&pending.principal, Some(&pending.project))?;
     let mut spec = pending.attention.spec(conversion.roles, inbox.clone())?;
     spec.admitted_seq = version;
     let name = imported_name(&inbox, &pending.id)?;

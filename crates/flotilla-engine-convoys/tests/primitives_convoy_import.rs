@@ -208,6 +208,29 @@ fn a_convoy_with_no_role_imports_known_by_its_name() {
     }
 }
 
+// Behaviour: every convoy names its project. A stored convoy naming none does not decode, and one
+// naming an empty project is refused by name, finite or standing, rather than imported under its
+// namespace.
+#[test]
+fn a_convoy_naming_no_project_is_refused() {
+    let mut stored = serde_json::to_value(convoy("c", ConvoyPhase::Active, vec![agent("coder", true)])).expect("encoded");
+    stored["spec"].as_object_mut().expect("spec").remove("project_ref");
+    assert!(serde_json::from_value::<ResourceObject<Convoy>>(stored).is_err(), "a projectless convoy decodes");
+    for standing in [false, true] {
+        let mut old = convoy("c", ConvoyPhase::Active, vec![agent("coder", true)]);
+        old.spec.project_ref = String::new();
+        if standing {
+            old.spec.role = "governor".into();
+            old.metadata.annotations.insert(ENSURED_FROM_ANNOTATION.into(), "ensure-governor".into());
+        }
+        let world = World { standing_ruled: true };
+        assert!(
+            matches!(import_convoy(&old, HOME, &[], &world), Err(ConvoyImportRefusal::Unmappable { ref convoy, .. }) if convoy == "c"),
+            "standing {standing}"
+        );
+    }
+}
+
 // Behaviour: a finite, unfinished convoy with no promise is the named refusal NoObligations (its
 // only agent is done, so admission owes it no default ledger); an ended convoy whose status lacks
 // what its end carries is refused by name; an unbootstrapped convoy stays on the old path.

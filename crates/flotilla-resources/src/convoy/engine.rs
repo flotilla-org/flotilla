@@ -314,9 +314,8 @@ pub fn convoy_records(address: &flotilla_address::Address) -> Vec<String> {
     standing.into_iter().chain([segment.to_owned()]).collect()
 }
 
-/// The address a message refers to convoy record `name` by, under `project` (the project it
-/// declares, else its namespace's): a launch has one address, its [`launch_address`], which its
-/// seats are under (#3108 R4).
+/// The address a message refers to convoy record `name` by, under the project it belongs to: a
+/// launch has one address, its [`launch_address`], which its seats are under (#3108 R4).
 pub fn convoy_reference_address(name: &str, project: &str) -> Result<flotilla_address::Address, String> {
     flotilla_address::Address::project(project)
         .map_err(|error| error.to_string())
@@ -324,10 +323,10 @@ pub fn convoy_reference_address(name: &str, project: &str) -> Result<flotilla_ad
         .map_err(|error| format!("convoy `{name}`: {error}"))
 }
 
-/// The address a message refers to `convoy` by: [`convoy_reference_address`] under the project it
-/// declares, else its namespace's, as its seats are.
+/// The address a message refers to `convoy` by: [`convoy_reference_address`] under its project,
+/// as its seats are.
 pub fn convoy_address(convoy: &ResourceObject<Convoy>) -> Result<flotilla_address::Address, String> {
-    convoy_reference_address(&convoy.metadata.name, convoy.spec.project_ref.as_deref().unwrap_or(&convoy.metadata.namespace))
+    convoy_reference_address(&convoy.metadata.name, &convoy.spec.project_ref)
 }
 
 /// What `convoy` is a launch of. A launch read from the engine is named by its launch. An old
@@ -348,12 +347,11 @@ pub fn engine_name(convoy: &ResourceObject<Convoy>) -> Result<String, String> {
         .filter(|role| !role.is_empty())
         .or_else(|| (!convoy.spec.role.is_empty()).then_some(convoy.spec.role.as_str()))
         .ok_or_else(|| format!("standing convoy `{}` has no recorded ensure role", convoy.metadata.name))?;
-    standing_name(convoy.spec.project_ref.as_deref().unwrap_or(&convoy.metadata.namespace), role)
+    standing_name(&convoy.spec.project_ref, role)
 }
 
 /// The launch an old convoy record imports as (#3108): launch `n` of its [`engine_name`], at the
-/// home the record is homed at, in the project it is addressed under (its `project_ref`, else its
-/// namespace).
+/// home the record is homed at, in its project.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ImportedLaunch {
     pub home: String,
@@ -446,12 +444,7 @@ impl ImportedLaunches {
             let n = if super::reconcile::is_ensured(convoy) { convoy.spec.generation } else { 1 };
             let highest = this.highest.entry(home.to_owned()).or_default();
             *highest = (*highest).max(n);
-            let launch = ImportedLaunch {
-                home: home.to_owned(),
-                project: convoy.spec.project_ref.clone().unwrap_or_else(|| convoy.metadata.namespace.clone()),
-                of,
-                n,
-            };
+            let launch = ImportedLaunch { home: home.to_owned(), project: convoy.spec.project_ref.clone(), of, n };
             named.entry((home.to_owned(), launch.name())).or_default().insert(convoy.metadata.name.clone());
             if convoy.status.as_ref().is_some_and(|status| status.workflow_snapshot.is_some()) {
                 this.launches.insert(key, launch);
@@ -708,7 +701,7 @@ mod tests {
                 creation_timestamp: Utc::now(),
                 merge: None,
             },
-            spec: ConvoySpec::builder().workflow_ref("w".to_string()).build(),
+            spec: ConvoySpec::builder().workflow_ref("w".to_string()).project_ref("flotilla".to_string()).build(),
             status: Some(ConvoyStatus::default()),
         }
     }

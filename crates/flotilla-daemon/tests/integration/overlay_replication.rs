@@ -137,7 +137,11 @@ async fn fleet_list_and_health_include_replicated_remote_crew_without_snapshot_f
         flotilla_engine_convoys_testkit::convoy(
             "flotilla",
             "feta-convoy",
-            ConvoySpec::builder().workflow_ref("workflow".to_string()).role("feta-convoy".to_string()).build(),
+            ConvoySpec::builder()
+                .workflow_ref("workflow".to_string())
+                .project_ref("flotilla".to_string())
+                .role("feta-convoy".to_string())
+                .build(),
             flotilla_engine_convoys_testkit::single_agent("coder"),
         ),
     )
@@ -220,6 +224,7 @@ async fn pr_observed_after_admission_becomes_home_subject_and_replica_fact() {
             "crew-convoy",
             ConvoySpec::builder()
                 .workflow_ref("workflow".to_string())
+                .project_ref("flotilla".to_string())
                 .r#ref("fix/crew-branch".to_string())
                 .repositories(vec![ConvoyRepositorySpec {
                     url: repository_url.into(),
@@ -637,8 +642,8 @@ async fn attach_routes_by_session_host_when_convoy_is_homed_elsewhere() {
         },
         None,
     );
-    let mut spec = ConvoySpec::builder().workflow_ref("workflow".to_string()).role("coder".to_string()).build();
-    spec.project_ref = Some("flotilla".to_string());
+    let spec =
+        ConvoySpec::builder().workflow_ref("workflow".to_string()).project_ref("flotilla".to_string()).role("coder".to_string()).build();
     let convoy = crate::admit_convoy(
         &kiwi,
         flotilla_engine_convoys_testkit::convoy(

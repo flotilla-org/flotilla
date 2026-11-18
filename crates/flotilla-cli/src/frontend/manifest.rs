@@ -272,7 +272,7 @@ mod tests {
                             .name(name)
                             .annotations(std::collections::BTreeMap::from([(ENSURED_FROM_ANNOTATION.to_string(), ensure)]))
                             .build(),
-                        &ConvoySpec::builder().workflow_ref("standing".into()).generation(generation).build(),
+                        &ConvoySpec::builder().workflow_ref("standing".into()).project_ref("demo".into()).generation(generation).build(),
                     )
                     .await
                     .expect("create convoy");

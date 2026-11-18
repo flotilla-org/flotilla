@@ -155,7 +155,10 @@ mod tests {
             workspace_slug: "project-map".into(),
             subpaths: Vec::new(),
         };
-        let mut convoy = resource("convoy", ConvoySpec::builder().workflow_ref("work".into()).repositories(vec![repository]).build());
+        let mut convoy = resource(
+            "convoy",
+            ConvoySpec::builder().workflow_ref("work".into()).project_ref("project".into()).repositories(vec![repository]).build(),
+        );
         let mut status = ConvoyStatus::default();
         status.discover_subject(
             flotilla_protocol::Subject {

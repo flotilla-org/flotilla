@@ -84,9 +84,15 @@ async fn change_request_homes(daemon: &InProcessDaemon, name: &str) -> Vec<Strin
 /// Admits convoy `name` at `requester`'s engine, its coder having submitted change request 330
 /// of org/shared as the PR it promises. Returns the launch.
 async fn produce(requester: &InProcessDaemon, name: &str) -> String {
-    let launch =
-        admit_convoy(requester, engine_convoy(name, ConvoySpec::builder().workflow_ref("scratch".into()).build(), ConvoyStatus::default()))
-            .await;
+    let launch = admit_convoy(
+        requester,
+        engine_convoy(
+            name,
+            ConvoySpec::builder().project_ref("flotilla".into()).workflow_ref("scratch".into()).build(),
+            ConvoyStatus::default(),
+        ),
+    )
+    .await;
     let convoy = requester.resource_backend().using::<Convoy>("flotilla").get(&launch).await.expect("admitted convoy");
     let submit = PromiseOperation::Submit {
         id: "produced-pr".into(),

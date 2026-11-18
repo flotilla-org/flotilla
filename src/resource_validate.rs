@@ -1080,7 +1080,7 @@ mod tests {
         let document = serde_json::json!({
             "apiVersion": "flotilla.work/v1", "kind": "Convoy",
             "metadata": {"name": "sample"},
-            "spec": serde_json::to_value(ConvoySpec::builder().workflow_ref("default".to_string()).build()).expect("encode convoy spec"),
+            "spec": serde_json::to_value(ConvoySpec::builder().project_ref("flotilla".into()).workflow_ref("default".to_string()).build()).expect("encode convoy spec"),
             "status": status
         });
         let error = validate_resource_document(&document).expect_err("unknown nested status field must fail");
@@ -1415,7 +1415,7 @@ mod tests {
             flotilla_engine_convoys_testkit::convoy(
                 "flotilla",
                 "sample-convoy",
-                ConvoySpec::builder().workflow_ref("default".to_string()).build(),
+                ConvoySpec::builder().project_ref("flotilla".into()).workflow_ref("default".to_string()).build(),
                 flotilla_engine_convoys_testkit::single_agent("coder"),
             ),
         )
@@ -1974,7 +1974,7 @@ mod frozen_reference_regression {
         }]}]});
         let document = serde_json::json!({"apiVersion":"flotilla.work/v1", "kind":"Convoy",
             "metadata":{"name":"governor","namespace":"fleet","resourceVersion":"1","creationTimestamp":"2026-10-07T00:00:00Z"},
-            "spec":ConvoySpec::builder().workflow_ref("single-agent".into()).build(), "status":status});
+            "spec":ConvoySpec::builder().project_ref("flotilla".into()).workflow_ref("single-agent".into()).build(), "status":status});
         super::validate_resource_document(&document).expect("previous decode-only gate accepts this pin");
         let directory = TestSocketDir::new();
         let socket = directory.socket_path("frozen.sock");

@@ -308,8 +308,12 @@ async fn frozen_crew(state: &ControllerRuntimeState, launch: &AccountLaunch<'_>,
         .and_then(|requirement| requirement.crew.iter().find(|crew| crew.role == launch.role))
         .ok_or_else(|| format!("crew `{}` is missing from convoy `{}`'s frozen vessel `{}`", launch.role, launch.convoy, vessel_ref))?;
     // The crew's Role Address, its access key until the #3108 cut-over.
-    let project = convoy.object.spec.project_ref.as_deref().unwrap_or(launch.namespace);
-    let access = flotilla_resources::access_delivery::access_key(project, launch.convoy, &vessel.object.spec.vessel_name, launch.role);
+    let access = flotilla_resources::access_delivery::access_key(
+        &convoy.object.spec.project_ref,
+        launch.convoy,
+        &vessel.object.spec.vessel_name,
+        launch.role,
+    );
     Ok(FrozenCrew { access, skills: crew.skills.selected.clone() })
 }
 

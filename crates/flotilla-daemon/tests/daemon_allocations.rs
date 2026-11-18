@@ -99,7 +99,7 @@ async fn memory_scenario(n: usize) -> Vec<(usize, usize, usize, usize)> {
         let mut convoy = flotilla_engine_convoys_testkit::convoy(
             "flotilla",
             &format!("convoy-{i:04}"),
-            ConvoySpec::builder().workflow_ref("single-agent".into()).build(),
+            ConvoySpec::builder().project_ref("flotilla".into()).workflow_ref("single-agent".into()).build(),
             status,
         );
         convoy.metadata.name = flotilla_engine_convoys_testkit::launch(&path, convoy.clone()).await;

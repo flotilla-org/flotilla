@@ -334,7 +334,7 @@ fn crew_change_request_query(
 
 /// The convoy's `role@project` address, as a message names it.
 pub fn convoy_message_address(convoy: &ResourceObject<ResourceConvoy>) -> String {
-    convoy_address(&convoy.spec.role, convoy.spec.project_ref.as_deref())
+    convoy_address(&convoy.spec.role, &convoy.spec.project_ref)
 }
 
 fn ensure_crew_work_is_defined(
@@ -397,8 +397,8 @@ impl ResumeSelection {
         self.convoy.status.as_ref().expect("a selected convoy has a status")
     }
 
-    fn project<'a>(&'a self, namespace: &'a str) -> &'a str {
-        self.convoy.spec.project_ref.as_deref().unwrap_or(namespace)
+    fn project(&self) -> &str {
+        &self.convoy.spec.project_ref
     }
 }
 
@@ -765,8 +765,7 @@ impl CrewService {
             .get(&context.convoy)
             .await
             .map_err(|error| error.to_string())?;
-        let project = convoy.spec.project_ref.as_deref().unwrap_or(&context.namespace);
-        let address = crew_role_address(project, &context.convoy, &context.vessel, &context.caller_role);
+        let address = crew_role_address(&convoy.spec.project_ref, &context.convoy, &context.vessel, &context.caller_role);
         flotilla_messaging::crew_address_book(&self.resource_backend, &context.namespace, &address).await.map_err(|error| error.to_string())
     }
 
@@ -775,13 +774,11 @@ impl CrewService {
         let convoys = self.resource_backend.clone().using::<ResourceConvoy>(&context.namespace);
         let convoy = convoys.get(&context.convoy).await.map_err(|err| err.to_string())?;
         let mut response = self.crew_state(&context, &convoy).await?;
-        if let Some(project_ref) = &convoy.spec.project_ref {
-            // Orientation reports an unavailable charter without hiding crew state
-            // or substituting admission-time membership.
-            match self.live_project_charter(&context, project_ref).await {
-                Ok(project) => response.project = Some(project),
-                Err(error) => response.project_error = Some(error),
-            }
+        // Orientation reports an unavailable charter without hiding crew state
+        // or substituting admission-time membership.
+        match self.live_project_charter(&context, &convoy.spec.project_ref).await {
+            Ok(project) => response.project = Some(project),
+            Err(error) => response.project_error = Some(error),
         }
         Ok(response)
     }
@@ -1245,7 +1242,7 @@ impl CrewService {
                 reason: "stall is already at the operator rung".into(),
             });
         }
-        let project = convoy.spec.project_ref.as_deref().unwrap_or(namespace);
+        let project = convoy.spec.project_ref.as_str();
         let (sender, party) = off_frame(|| self.supervision_sender(namespace, stalled, actor_crew_id, principal)).await?;
         let seat = Party::Seat { project: project.to_owned(), convoy: convoy_name.to_owned(), role: role.to_owned() };
         let parties =
@@ -1355,7 +1352,7 @@ impl CrewService {
                 .get(&supervisor.convoy)
                 .await
                 .map_err(|error| error.to_string())?;
-            let project = supervisor_convoy.object.spec.project_ref.as_deref().unwrap_or(namespace);
+            let project = supervisor_convoy.object.spec.project_ref.as_str();
             let sender = crew_role_address(project, &supervisor.convoy, &supervisor.vessel, &supervisor.role);
             let party = Party::Seat { project: project.to_owned(), convoy: supervisor.convoy.clone(), role: supervisor.role.clone() };
             return Ok((sender, party));
@@ -1842,7 +1839,7 @@ impl CrewService {
                 }
             }
         }
-        let project = convoy.spec.project_ref.as_deref().unwrap_or(&context.namespace);
+        let project = convoy.spec.project_ref.as_str();
         let receiver = flotilla_resources::qualify_message_address(
             target,
             &flotilla_resources::MessageAddressContext {
@@ -1951,7 +1948,7 @@ impl CrewService {
             return Err(self.refuse_undeliverable(&refused, reason).await);
         }
 
-        let project = convoy.spec.project_ref.as_deref().unwrap_or(&context.namespace);
+        let project = convoy.spec.project_ref.as_str();
         let seat = |role: &str| Party::Seat { project: project.to_owned(), convoy: context.convoy.clone(), role: role.to_owned() };
         let mut intent = Intent::new(
             self.party_inbox(&context.namespace, &seat(&context.caller_role), project).await?,
@@ -2095,7 +2092,7 @@ impl CrewService {
                         let mut render_options = CrewBriefTemplateResolver::with_config_dir(self.config.base_path().as_path())
                             .render_options_with_fork_stance(
                                 brief_template.as_deref(),
-                                convoy.spec.project_ref.as_deref(),
+                                Some(&convoy.spec.project_ref),
                                 repo_roots,
                                 fork_stance,
                             );
@@ -2118,14 +2115,12 @@ impl CrewService {
                             &render_options,
                             Some(&anchor.spec.cwd),
                         )?;
-                        if let Some(project) = convoy.spec.project_ref.as_deref() {
-                            let address = crew_role_address(project, &context.convoy, &context.vessel, target);
-                            let book = flotilla_messaging::crew_address_book(&self.resource_backend, &context.namespace, &address)
-                                .await
-                                .map_err(|error| error.to_string())?;
-                            brief.content.push('\n');
-                            brief.content.push_str(&book.render());
-                        }
+                        let address = crew_role_address(&convoy.spec.project_ref, &context.convoy, &context.vessel, target);
+                        let book = flotilla_messaging::crew_address_book(&self.resource_backend, &context.namespace, &address)
+                            .await
+                            .map_err(|error| error.to_string())?;
+                        brief.content.push('\n');
+                        brief.content.push_str(&book.render());
                         if let Some(writer) = self.brief_artifact_writer.read().await.clone() {
                             let subject = format!("{}/handoff/{}", context.convoy, uuid::Uuid::new_v4().simple());
                             brief.artifact_digest = Some(
@@ -2323,7 +2318,7 @@ impl CrewService {
         body: &str,
     ) -> Result<Intent, String> {
         let MessageAttribution { party, in_reply_to, .. } = attribution;
-        let project = selected.project(namespace);
+        let project = selected.project();
         let seat = Party::Seat { project: project.to_owned(), convoy: name.to_owned(), role: selected.role.clone() };
         let (from, to) = (self.party_inbox(namespace, &party, project).await?, self.party_inbox(namespace, &seat, project).await?);
         let mut intent = Intent::new(from, to, flotilla_resources::MessageRelation::Supervisor, body);
@@ -2456,7 +2451,7 @@ impl CrewService {
             selected.status().crew_work.get(vessel).and_then(|crew| crew.get(role)).and_then(|state| state.pending_follow_up.as_ref());
         let pending_message = if let Some(reference) = pending_ref {
             // A follow-up is queued to the crew member it follows up.
-            let receiver = crew_role_address(selected.project(namespace), name, vessel, role);
+            let receiver = crew_role_address(selected.project(), name, vessel, role);
             Some(
                 self.message_to(namespace, &receiver, &reference.name)
                     .await
@@ -2547,8 +2542,8 @@ impl CrewService {
         if status.phase.is_terminal() {
             return Err(format!("convoy `{name}` is in terminal phase `{:?}` and cannot accept message changes", status.phase));
         }
-        let project = convoy.spec.project_ref.as_deref().unwrap_or(namespace);
-        let seats = flotilla_resources::convoy_crew_seats(namespace, &convoy);
+        let project = convoy.spec.project_ref.as_str();
+        let seats = flotilla_resources::convoy_crew_seats(&convoy);
         let messages = self.queued_briefs(namespace, &seats).await.map_err(|error| error.to_string())?;
         let withdrawn = messages.last().map(|message| message.body.clone());
         let mut closed = BTreeSet::new();
@@ -2626,7 +2621,7 @@ impl CrewService {
                     .get(&request.convoy)
                     .await
                     .map_err(|error| error.to_string())?;
-                convoy.object.spec.project_ref.unwrap_or_else(|| request.namespace.clone())
+                convoy.object.spec.project_ref
             }
             _ => String::new(),
         };
@@ -2766,7 +2761,7 @@ impl CrewService {
         if convoy.object.status.as_ref().is_some_and(|status| status.phase.is_terminal()) {
             return Ok(());
         }
-        let project = convoy.object.spec.project_ref.unwrap_or_else(|| request.namespace.clone());
+        let project = convoy.object.spec.project_ref;
         let operator = self.party_inbox(&request.namespace, &Party::Person("operator".into()), &project).await?;
         let sender = self.party_inbox(&request.namespace, &request.sender, &project).await?;
         let turn =
@@ -2897,7 +2892,7 @@ impl CrewService {
             return Ok(PreparedTurn::Undeliverable(terminal_convoy_refusal(&request.convoy, "is terminal")));
         }
         self.ensure_vessel_backing_available(&request.namespace, &request.convoy, &request.vessel).await?;
-        let project = convoy.spec.project_ref.as_deref().unwrap_or(&request.namespace);
+        let project = convoy.spec.project_ref.as_str();
         let receiver = crew_role_address(project, &request.convoy, &request.vessel, &request.role);
         let seat = Party::Seat { project: project.to_owned(), convoy: request.convoy.clone(), role: request.role.clone() };
         let inbox = self.party_inbox(&request.namespace, &seat, project).await?;
@@ -3090,7 +3085,7 @@ impl CrewService {
         let mut references = BTreeMap::<String, Vec<(String, String)>>::new();
         for source in &candidates {
             let convoy = &source.object;
-            let project = convoy.spec.project_ref.as_deref().unwrap_or(namespace);
+            let project = convoy.spec.project_ref.as_str();
             for (vessel, crew) in convoy.status.iter().flat_map(|status| &status.crew_work) {
                 for (role, state) in crew {
                     let Some(reference) = &state.pending_follow_up else { continue };
@@ -3243,7 +3238,7 @@ impl CrewService {
             }
             return Err("turn-delivery hold was cleared before supervisor publication".into());
         };
-        let project = convoy.spec.project_ref.as_deref().unwrap_or(&request.namespace);
+        let project = convoy.spec.project_ref.as_str();
         let project_policy =
             match self.resource_backend.including_replicas::<flotilla_resources::Project>(&request.namespace).get(project).await {
                 Ok(source) => source.object.spec.supervision,
@@ -3292,10 +3287,7 @@ impl CrewService {
         let hold_key =
             format!("{}:{}:{}:{}:{}", request.convoy, request.vessel, request.role, request.source, attention.raised_at.timestamp_micros());
         let mut references = request.references.clone();
-        let about = flotilla_resources::convoy::engine::convoy_reference_address(
-            &request.convoy,
-            convoy.spec.project_ref.as_deref().unwrap_or(&request.namespace),
-        )?;
+        let about = flotilla_resources::convoy::engine::convoy_reference_address(&request.convoy, &convoy.spec.project_ref)?;
         let revision = flotilla_address::Revision::new(convoy.metadata.resource_version.clone()).map_err(|error| error.to_string())?;
         references.push(flotilla_messaging::IntentReference::new(about.clone(), revision));
         let hold = |inbox: flotilla_address::Address, body: String| {

@@ -328,7 +328,7 @@ pub async fn admission_rejects_agent_roles_reused_across_vessels_before_writing_
             VesselRequirement::builder().name("verify".to_string()).crew(vec![agent()]).build(),
         ])
         .build();
-    let spec = ConvoySpec::builder().workflow_ref("workflow".to_string()).build();
+    let spec = ConvoySpec::builder().workflow_ref("workflow".to_string()).project_ref("flotilla".to_string()).build();
     let error = daemon.write_admission_briefs("flotilla", "convoy-ambiguous", &spec, &workflow).await.expect_err("duplicate role");
     assert!(error.contains("agent role `coder` occurs in vessels `implement` and `verify`"), "{error}");
     assert!(writer.writes.lock().await.is_empty(), "admission must not publish a partial set of briefs");
@@ -340,7 +340,7 @@ pub async fn generation_allocation_sees_live_and_terminal_replicated_convoys(fac
     let backend = ResourceBackend::new(InMemoryBackend::default());
     let writer = backend.replica_writer::<ResourceConvoy>(NodeId::new("other-root"), "flotilla");
     writer.replace(&source.using::<ResourceConvoy>("flotilla").list().await.expect("source convoys"), Utc::now()).await.expect("replicate");
-    let error = refuse_live_convoy_in(&backend, "flotilla", Some("standing-project"), "quartermaster")
+    let error = refuse_live_convoy_in(&backend, "flotilla", "standing-project", "quartermaster")
         .await
         .expect_err("remote live generation blocks admission");
     assert!(error.contains("already exists"), "{error}");
@@ -353,7 +353,7 @@ pub async fn generation_allocation_sees_live_and_terminal_replicated_convoys(fac
         .await
         .expect("replicate terminal history");
     // The next generation's number is its launch's, reserved at admission.
-    refuse_live_convoy_in(&backend, "flotilla", Some("standing-project"), "quartermaster").await.expect("next generation");
+    refuse_live_convoy_in(&backend, "flotilla", "standing-project", "quartermaster").await.expect("next generation");
 }
 
 pub async fn ensure_dependency_fingerprint_tracks_replicated_placement_changes(factory: &dyn EnsureScenarioController) {
@@ -614,7 +614,7 @@ pub async fn standing_ensure_admission_uses_default_branch_observed_only_on_non_
         .into_iter()
         .next()
         .expect("admitted convoy on root B");
-    assert_eq!(convoy.spec.project_ref.as_deref(), Some("cross-root-project"));
+    assert_eq!(convoy.spec.project_ref, "cross-root-project");
 
     let root_c = other_home(&daemon, "root-c");
     root_c.repository(&repository_key.to_string(), &repository_spec).await;
@@ -841,7 +841,7 @@ pub async fn admission_refuses_same_role_briefs_before_writing_any_artifact(fact
     let mut second = workflow.vessels[0].clone();
     second.name = "second".into();
     workflow.vessels.push(second);
-    let spec = ConvoySpec::builder().workflow_ref("same-role".into()).build();
+    let spec = ConvoySpec::builder().workflow_ref("same-role".into()).project_ref("flotilla".into()).build();
     let error = daemon.write_admission_briefs("flotilla", "same-role", &spec, &workflow).await.expect_err("collision refused");
     assert!(error.contains("convoy-wide unique roles"));
     assert!(writer.writes.lock().await.is_empty(), "refusal is before all artifact writes");

@@ -214,25 +214,21 @@ pub fn old_ids(convoy: &Resource<Convoy>) -> BTreeMap<PromiseId, String> {
     ids
 }
 
-/// The convoy's project address, or the namespace's when it names none.
+/// The convoy's project address; a convoy naming no project is refused.
 pub fn project(convoy: &ResourceObject<OldConvoy>) -> Result<Address, String> {
-    let project = convoy.spec.project_ref.as_deref().unwrap_or(&convoy.metadata.namespace);
+    let project = &convoy.spec.project_ref;
     Address::project(project).map_err(|error| format!("convoy `{}` project `{project}`: {error}", convoy.metadata.name))
 }
 
 pub use flotilla_resources::convoy::engine::engine_name;
 
-/// The convoy's address: under its project when it names one.
+/// The convoy's address, under its project.
 pub fn address(convoy: &ResourceObject<OldConvoy>) -> Result<Address, String> {
     if is_ensured(convoy) {
         return engine_name(convoy)?.parse().map_err(|error: flotilla_address::Error| error.to_string());
     }
     let name = &convoy.metadata.name;
-    let address = match convoy.spec.project_ref.as_deref() {
-        Some(project) => Address::project(project).and_then(|project| project.child(AddressKind::Convoy, name)),
-        None => Address::convoy(name),
-    };
-    address.map_err(|error| format!("convoy `{name}`: {error}"))
+    project(convoy)?.child(AddressKind::Convoy, name).map_err(|error| format!("convoy `{name}`: {error}"))
 }
 
 /// Who supervises the convoy's seats: the workflow's first supervision

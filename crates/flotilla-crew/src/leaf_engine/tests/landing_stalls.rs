@@ -369,7 +369,9 @@ fn merged_submission_entering_landing_owes_settlement_or_names_no_exit(tc: hegel
             }),
             ..Default::default()
         };
-        let launch = home.admit("merged", ConvoySpec::builder().workflow_ref("single-agent".into()).build(), status).await;
+        let launch = home
+            .admit("merged", ConvoySpec::builder().project_ref("flotilla".into()).workflow_ref("single-agent".into()).build(), status)
+            .await;
         let vessel = home.vessel(&launch, "work", "env");
         home.seat(&backend, &launch, (&vessel, "work"), ("coder", "merged-coder"), CrewWorkPhase::Working).await;
         if scanned {

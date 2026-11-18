@@ -231,7 +231,7 @@ mod tests {
         let mut value = serde_json::json!({
             "apiVersion": api_version(Convoy::API_PATHS), "kind": Convoy::API_PATHS.kind,
             "metadata": {"name": "payload", "namespace": "test", "resourceVersion": "1", "creationTimestamp": "2026-01-01T00:00:00Z"},
-            "spec": ConvoySpec::builder().workflow_ref("x".repeat(size)).build(),
+            "spec": ConvoySpec::builder().workflow_ref("x".repeat(size)).project_ref("test".into()).build(),
         });
         let map: std::collections::BTreeMap<_, _> = (0..labels).map(|i| (format!("key-{i}"), "value".to_owned())).collect();
         value["metadata"]["labels"] = serde_json::to_value(map).expect("labels");

@@ -120,7 +120,7 @@ fn k8s_object_projection_deserializes_kubernetes_casing() {
             "creationTimestamp": "2026-04-13T12:00:00Z"
         },
         "spec": {
-            "workflow_ref": "review",
+            "workflow_ref": "review", "project_ref": "flotilla",
             "inputs": {},
             "placement_policy": "laptop-docker"
         },

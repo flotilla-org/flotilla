@@ -46,26 +46,20 @@ async fn actuator_refuses_delivery_and_hold_after_service_stops() {
 // the crew, convoy, and admission snapshot remain intact.
 
 // #2592: attribution uses role/project addresses.
-// Formatting glue: these rows exhaust absent/present project.
 #[tokio::test]
 async fn convoy_message_addresses_are_role_and_project() {
     let backend = ResourceBackend::new(InMemoryBackend::default());
-    let convoys = backend.using::<ResourceConvoy>("flotilla");
-    for (name, role, project, expected) in [
-        ("named", "graphql-budget", None, "graphql-budget"),
-        ("named-project", "graphql-budget", Some("project"), "graphql-budget@project"),
-    ] {
-        let convoy = convoys
-            .create(
-                &InputMeta::builder().name(name.into()).build(),
-                &ConvoySpec::builder()
-                    .workflow_ref("workflow".to_string())
-                    .role(role.to_string())
-                    .maybe_project_ref(project.map(str::to_string))
-                    .build(),
-            )
-            .await
-            .expect("convoy");
-        assert_eq!(convoy_message_address(&convoy), expected);
-    }
+    let convoy = backend
+        .using::<ResourceConvoy>("flotilla")
+        .create(
+            &InputMeta::builder().name("named-project".into()).build(),
+            &ConvoySpec::builder()
+                .workflow_ref("workflow".to_string())
+                .role("graphql-budget".to_string())
+                .project_ref("project".to_string())
+                .build(),
+        )
+        .await
+        .expect("convoy");
+    assert_eq!(convoy_message_address(&convoy), "graphql-budget@project");
 }

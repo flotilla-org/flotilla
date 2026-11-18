@@ -153,7 +153,11 @@ pub(super) async fn resume_staging_fixture_shaped(
         turn_delivery: Default::default(),
         vessels: vec![VesselRequirement::builder().name("work".to_string()).crew(vec![coder]).build()],
     };
-    let mut spec = ConvoySpec::builder().workflow_ref("implement-review".to_string()).role("resume-staging".to_string()).build();
+    let mut spec = ConvoySpec::builder()
+        .workflow_ref("implement-review".to_string())
+        .project_ref("flotilla".to_string())
+        .role("resume-staging".to_string())
+        .build();
     shape(&mut spec, &mut snapshot);
     let launch = admit(&daemon, "resume-staging", spec, ConvoyStatus { workflow_snapshot: Some(snapshot), ..Default::default() }).await;
     if complete {
@@ -363,14 +367,13 @@ impl CommandRunner for BatchedObservationRunner {
 
 /// Admits a launch of `record`, generation 1 of standing `role` in `project`, on `daemon`'s
 /// engine, its work crewed by an agent for `role`. Returns the launch's name.
-pub(in crate::in_process) async fn create_identity_convoy(
-    daemon: &InProcessDaemon,
-    record: &str,
-    role: &str,
-    project: Option<&str>,
-) -> String {
-    let mut spec = ConvoySpec::builder().workflow_ref("review".to_string()).role(role.to_string()).generation(1).build();
-    spec.project_ref = project.map(str::to_string);
+pub(in crate::in_process) async fn create_identity_convoy(daemon: &InProcessDaemon, record: &str, role: &str, project: &str) -> String {
+    let spec = ConvoySpec::builder()
+        .workflow_ref("review".to_string())
+        .project_ref(project.to_string())
+        .role(role.to_string())
+        .generation(1)
+        .build();
     identity_launch(daemon, record, spec).await
 }
 
@@ -378,7 +381,7 @@ pub(in crate::in_process) async fn create_identity_convoy(
 /// labels a standing role's generation; see [`create_identity_convoy`].
 pub(in crate::in_process) async fn identity_launch(daemon: &InProcessDaemon, record: &str, spec: ConvoySpec) -> String {
     let labels = BTreeMap::from([
-        (PROJECT_LABEL.to_string(), spec.project_ref.clone().unwrap_or_default()),
+        (PROJECT_LABEL.to_string(), spec.project_ref.clone()),
         (ROLE_LABEL.to_string(), spec.role.clone()),
         (GENERATION_LABEL.to_string(), spec.generation.to_string()),
     ]);
@@ -597,8 +600,7 @@ pub(in crate::in_process) async fn admit_standing(
     role: &str,
     snapshot: flotilla_resources::WorkflowSnapshot,
 ) -> String {
-    let mut spec = ConvoySpec::builder().workflow_ref("standing".to_string()).role(role.to_string()).build();
-    spec.project_ref = Some(project.to_string());
+    let spec = ConvoySpec::builder().workflow_ref("standing".to_string()).project_ref(project.to_string()).role(role.to_string()).build();
     let ensure = flotilla_resources::ConvoyEnsureSpec::builder()
         .project_ref(project.to_string())
         .role(role.to_string())

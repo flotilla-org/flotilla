@@ -96,7 +96,7 @@ pub async fn create_convoy_with_single_task(
                     subpaths: Vec::new(),
                 }],
                 r#ref: Some(git_ref.to_string()),
-                project_ref: None,
+                project_ref: namespace.to_string(),
                 adopted_checkout_refs: BTreeMap::new(),
                 issues: Vec::new(),
                 change_request: None,

@@ -1154,8 +1154,7 @@ pub struct ConvoyRow {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub observed_workflow_ref: Option<String>,
     /// The Project this convoy belongs to, from `ConvoySpec.project_ref`.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub project_ref: Option<String>,
+    pub project_ref: String,
     /// Name of the `ConvoyEnsure` that admitted this attempt. `None` for task
     /// convoys, even when they carry a role address.
     #[serde(default, skip_serializing_if = "Option::is_none")]

@@ -617,10 +617,7 @@ fn project_at(address: &ViewAddress, data: &TableRows<'_>, now: Timestamp) -> Re
                 .filter(|convoy| &convoy.namespace == namespace)
                 .filter(|convoy| {
                     scope.as_ref().is_none_or(|scope| {
-                        convoy
-                            .project_ref
-                            .as_deref()
-                            .is_some_and(|project| project == scope.name || project == format!("{}/{}", scope.namespace, scope.name))
+                        convoy.project_ref == scope.name || convoy.project_ref == format!("{}/{}", scope.namespace, scope.name)
                     })
                 })
                 .cloned()
@@ -1288,7 +1285,7 @@ fn convoy_subjects_label(subjects: &[flotilla_protocol::result_set::ConvoySubjec
 }
 
 fn convoy_scope(row: &ConvoySummary) -> CellValue {
-    CellValue::plain(row.project_ref.as_deref().or_else(|| row.repo_hint.as_ref().map(|repo| repo.0.as_str())).unwrap_or_default())
+    CellValue::plain(row.project_ref.as_str())
 }
 
 fn convoy_description(row: &ConvoySummary) -> Vec<DetailField> {
@@ -1628,7 +1625,7 @@ mod tests {
             message: None,
             disposition: None,
             repo_hint: None,
-            project_ref: Some("flotilla".into()),
+            project_ref: "flotilla".into(),
             issues: Vec::new(),
             subjects: Vec::new(),
             vessels,
@@ -1804,6 +1801,7 @@ mod tests {
             .resource(ResourceRef::new("flotilla.work/v1", "Convoy", "dev", "capacity"))
             .name("governor")
             .workflow_ref("governor")
+            .project_ref("dev")
             .phase(WirePhase::Active)
             .initializing(true)
             .admission_blockers(vec![ReadinessBlocker {
@@ -1867,12 +1865,12 @@ mod tests {
         let mut first = convoy(vec![vessel("first-vessel", &[], WorkPhase::Running)]);
         first.resource_name = "convoy-first".into();
         first.name = "coder".into();
-        first.project_ref = Some("first-project".into());
+        first.project_ref = "first-project".into();
 
         let mut second = convoy(vec![vessel("second-vessel", &[], WorkPhase::Running)]);
         second.resource_name = "convoy-second".into();
         second.name = "coder".into();
-        second.project_ref = Some("second-project".into());
+        second.project_ref = "second-project".into();
 
         let first_address = ViewAddress::Convoys { namespace: "dev".into(), scope: Some(QueryScope::new("dev", "first-project")) };
         let first_table =
@@ -1970,6 +1968,7 @@ mod tests {
             .resource(ResourceRef::new("flotilla.work/v1", "Convoy", "dev", "broken"))
             .name("broken")
             .workflow_ref("implement")
+            .project_ref("dev")
             .unreadable("admission document does not decode")
             .initializing(true)
             .build();
@@ -2110,7 +2109,7 @@ mod tests {
         let mut elsewhere = convoy(vec![]);
         elsewhere.id = ConvoyId::new("dev", "elsewhere");
         elsewhere.name = "elsewhere".into();
-        elsewhere.project_ref = Some("other".into());
+        elsewhere.project_ref = "other".into();
 
         let vessel = project_convoys("vessel/dev/tables/review", &[&in_project, &elsewhere]).expect("vessel table");
         assert_eq!(vessel.rows.len(), 1);
@@ -2170,7 +2169,7 @@ mod tests {
         let mut convoy = convoy(vec![vessel("implement", &[], WorkPhase::Running)]);
         convoy.id = ConvoyId::new("flotilla", "tables");
         convoy.namespace = "flotilla".into();
-        convoy.project_ref = Some("roadmap".into());
+        convoy.project_ref = "roadmap".into();
         let checkout = CheckoutRow::builder()
             .resource(ResourceRef::new("flotilla.work/v1", "Checkout", "flotilla", "roadmap"))
             .repo(RepositoryKey("repo_flotilla".into()))
@@ -2284,7 +2283,7 @@ mod tests {
         let mut convoy = convoy(vec![vessel("implement", &[], WorkPhase::Running)]);
         convoy.id = ConvoyId::new("flotilla", "tables");
         convoy.namespace = "flotilla".into();
-        convoy.project_ref = Some("roadmap".into());
+        convoy.project_ref = "roadmap".into();
         let address = ViewAddress::Project { namespace: "flotilla".into(), name: "roadmap".into() };
 
         let panels = project_panels(&address, &TableRows { convoys: vec![&convoy], ..TableRows::default() }).expect("project panels");

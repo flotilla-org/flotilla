@@ -143,7 +143,7 @@ pub async fn seed_convoy_history(
         let convoy = convoys
             .create(
                 &InputMeta::builder().name(format!("history-{index}")).build(),
-                &RealConvoySpec::builder().workflow_ref("workflow".into()).build(),
+                &RealConvoySpec::builder().workflow_ref("workflow".into()).project_ref(namespace.into()).build(),
             )
             .await?;
         convoys
@@ -298,7 +298,7 @@ pub fn valid_convoy_spec() -> RealConvoySpec {
         placement_policy: Some("laptop-docker".to_string()),
         repositories: Vec::new(),
         r#ref: None,
-        project_ref: None,
+        project_ref: "flotilla".to_string(),
         adopted_checkout_refs: BTreeMap::new(),
         issues: Vec::new(),
         change_request: None,

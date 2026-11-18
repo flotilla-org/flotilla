@@ -229,7 +229,11 @@ pub async fn populated(dir: &Path) -> SqliteBackend {
         ),
     )
     .await;
-    own::<Convoy>(&backend, document("Convoy", "governor-1", json!({"workflow_ref": "w", "inputs": {}}), Value::Null)).await;
+    own::<Convoy>(
+        &backend,
+        document("Convoy", "governor-1", json!({"workflow_ref": "w", "inputs": {}, "project_ref": "flotilla"}), Value::Null),
+    )
+    .await;
     own_retired(
         dir,
         demand("reclaim-refusal-demo", ("Convoy", "demo"), &[(retired::RECLAIM_REFUSAL_REASON_ANNOTATION, "checkout is dirty")], "raised"),

@@ -204,7 +204,10 @@ async fn the_sweep_settles_held_outcomes_and_withdraws_on_a_false_delivery_condi
     let backend = ResourceBackend::new(InMemoryBackend::default());
     let convoys = backend.using::<Convoy>(NAMESPACE);
     let convoy = convoys
-        .create(&InputMeta::builder().name("demo".to_string()).build(), &ConvoySpec::builder().workflow_ref("w".into()).build())
+        .create(
+            &InputMeta::builder().name("demo".to_string()).build(),
+            &ConvoySpec::builder().project_ref(NAMESPACE.into()).workflow_ref("w".into()).build(),
+        )
         .await
         .expect("convoy");
     convoys

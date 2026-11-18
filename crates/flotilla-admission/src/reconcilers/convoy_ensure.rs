@@ -1213,7 +1213,7 @@ mod tests {
                 PreparedConvoyAdmission::builder()
                     .evidence(self.backend.clone())
                     .name("unused".into())
-                    .spec(ConvoySpec::builder().workflow_ref("standing".into()).build())
+                    .spec(ConvoySpec::builder().workflow_ref("standing".into()).project_ref(ensure.spec.project_ref.clone()).build())
                     .workflow(WorkflowTemplateSpec::builder().build())
                     .build(),
             ))
@@ -1299,7 +1299,7 @@ mod tests {
                 let mut convoy = flotilla_engine_convoys_testkit::convoy(
                     "test",
                     ensure,
-                    ConvoySpec::builder().workflow_ref("workflow".into()).role(ensure.into()).build(),
+                    ConvoySpec::builder().workflow_ref("workflow".into()).project_ref("test".into()).role(ensure.into()).build(),
                     flotilla_engine_convoys_testkit::single_agent(ensure),
                 );
                 convoy.metadata.annotations = BTreeMap::from([(ENSURED_FROM_ANNOTATION.into(), ensure.into())]);

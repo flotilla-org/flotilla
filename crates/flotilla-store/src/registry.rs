@@ -1553,7 +1553,7 @@ mod tests {
             local
                 .create(
                     &InputMeta::builder().name("copied".to_string()).annotations(annotations.clone()).build(),
-                    &ConvoySpec::builder().workflow_ref("workflow".to_string()).build(),
+                    &ConvoySpec::builder().workflow_ref("workflow".to_string()).project_ref("flotilla".to_string()).build(),
                 )
                 .await
                 .expect("author copied manifest");
@@ -1599,7 +1599,10 @@ mod tests {
         let backend = ResourceBackend::new(crate::test_store::memory_backend());
         backend
             .using::<Convoy>("flotilla")
-            .create(&InputMeta::builder().name("demo".to_string()).build(), &ConvoySpec::builder().workflow_ref("wf".to_string()).build())
+            .create(
+                &InputMeta::builder().name("demo".to_string()).build(),
+                &ConvoySpec::builder().workflow_ref("wf".to_string()).project_ref("flotilla".to_string()).build(),
+            )
             .await
             .expect("create convoy");
 
@@ -1617,7 +1620,10 @@ mod tests {
         let peer = ResourceBackend::new(crate::test_store::memory_backend());
         let convoys = source.using::<Convoy>("flotilla");
         convoys
-            .create(&InputMeta::builder().name("ghost".to_string()).build(), &ConvoySpec::builder().workflow_ref("wf".to_string()).build())
+            .create(
+                &InputMeta::builder().name("ghost".to_string()).build(),
+                &ConvoySpec::builder().workflow_ref("wf".to_string()).project_ref("flotilla".to_string()).build(),
+            )
             .await
             .expect("create source convoy");
         let listed = convoys.list().await.expect("list source convoys");
@@ -1717,7 +1723,7 @@ mod tests {
             "apiVersion": "flotilla.work/v1",
             "kind": "Convoy",
             "metadata": { "name": "demo" },
-            "spec": { "workflow_ref": workflow }
+            "spec": { "workflow_ref": workflow, "project_ref": "flotilla" }
         })
     }
 
@@ -1749,7 +1755,7 @@ mod tests {
                     .owner_references(vec![owner_reference.clone()])
                     .finalizers(vec!["standing.flotilla.work/finalizer".to_string()])
                     .build(),
-                &ConvoySpec::builder().workflow_ref("implement".to_string()).build(),
+                &ConvoySpec::builder().workflow_ref("implement".to_string()).project_ref("flotilla".to_string()).build(),
             )
             .await
             .expect("create convoy with metadata");

@@ -646,7 +646,7 @@ fn lifecycle_records_import_by_state_and_name_what_they_cannot_map() {
                 json!({"project_ref": "flotilla", "role": "reviewer", "repositories": []}),
                 json!({"convoy_ref": "governor-1"}),
             ),
-            document("Convoy", "governor-1", json!({"workflow_ref": "w", "inputs": {}}), Value::Null),
+            document("Convoy", "governor-1", json!({"workflow_ref": "w", "inputs": {}, "project_ref": "flotilla"}), Value::Null),
         ]),
         HERE,
     );
@@ -1128,8 +1128,7 @@ fn attention_records() -> Vec<Value> {
     standing["spec"]["role"] = json!("gui");
     standing["spec"]["generation"] = json!(1);
     standing["metadata"]["annotations"] = json!({"flotilla.work/ensured-from": "standing-gui"});
-    let mut finished = ended_convoy("finished", "Landed", "2026-10-19T01:00:00Z", json!({"disposition": "merged"}));
-    finished["spec"].as_object_mut().expect("spec").remove("project_ref");
+    let finished = ended_convoy("finished", "Landed", "2026-10-19T01:00:00Z", json!({"disposition": "merged"}));
     let mut terminal = document(
         "TerminalSession",
         "coder-session",
@@ -1213,13 +1212,12 @@ fn open_demands_import_as_the_attentions_their_writers_send() {
     };
     // Each convoy is the launch it imports as, numbered by the convoy (#1, or a standing
     // generation's generation): a hold is on the role's generation by its launch, as the ensure
-    // pass raises and clears it, and a convoy with no project of its own is under its namespace's.
-    // A standing launch is at its one address, the role's segment numbered (#3108 R4).
+    // pass raises and clears it. A standing launch is at its one address, the role's segment numbered (#3108 R4).
     let generation = "project:flotilla/convoy:gui%231".to_owned();
     let cases = [
         ("project:flotilla/role:operator/message:ensure-attention-standing-gui", "standing", generation.as_str()),
         ("project:flotilla/role:operator/message:ensure-config-drift-standing-gui", "standing", "project:flotilla/role:gui"),
-        ("fleet:lab/role:operator/message:reclaim-refusal-finished", "teardown", "project:flotilla/convoy:finished%231"),
+        ("project:flotilla/role:operator/message:reclaim-refusal-finished", "teardown", "project:flotilla/convoy:finished%231"),
         (
             "project:flotilla/role:operator/message:credential-refresh-demo-work",
             "capabilities",

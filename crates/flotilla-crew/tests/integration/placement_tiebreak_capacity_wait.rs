@@ -32,7 +32,7 @@ async fn convoy_waits_for_selected_minimal_kind_with_legacy_host_alias_and_resum
     let convoy = convoys
         .create(
             &InputMeta::builder().name("waiting".to_string()).build(),
-            &ConvoySpec::builder().workflow_ref("missing".to_string()).build(),
+            &ConvoySpec::builder().project_ref("flotilla".into()).workflow_ref("missing".to_string()).build(),
         )
         .await
         .expect("convoy");

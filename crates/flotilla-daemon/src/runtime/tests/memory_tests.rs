@@ -75,7 +75,7 @@ async fn memory_incident_survives_backing_loss_and_is_visible_in_explain() {
         }),
         ..Default::default()
     };
-    let spec = ConvoySpec::builder().workflow_ref("scratch".into()).build();
+    let spec = ConvoySpec::builder().project_ref(NAMESPACE.into()).workflow_ref("scratch".into()).build();
     let convoy = admit_convoy(&daemon, flotilla_engine_convoys_testkit::convoy(NAMESPACE, "memory-incident", spec, status)).await;
     // The work's adopted checkout, ready on the engine and held for its convoy.
     let checkouts = runtime_checkouts(&daemon);

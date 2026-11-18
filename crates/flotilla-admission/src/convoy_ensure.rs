@@ -166,7 +166,7 @@ mod tests {
             let convoy = flotilla_engine_convoys_testkit::convoy(
                 "flotilla",
                 "convoy",
-                ConvoySpec::builder().workflow_ref("workflow".into()).build(),
+                ConvoySpec::builder().workflow_ref("workflow".into()).project_ref("flotilla".into()).build(),
                 status,
             );
             let engine = &home.engine;

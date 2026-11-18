@@ -2879,7 +2879,7 @@ mod tests {
                 .using::<Convoy>("flotilla")
                 .create(
                     &InputMeta::builder().name("crew".into()).build(),
-                    &ConvoySpec::builder().workflow_ref("workflow".into()).role("crew".into()).build(),
+                    &ConvoySpec::builder().workflow_ref("workflow".into()).project_ref("flotilla".into()).role("crew".into()).build(),
                 )
                 .await
                 .expect("convoy");

@@ -222,9 +222,7 @@ impl DispatchReconciler {
         let convoy_error = self.refresh_convoys(&mut mission).await.err();
         let mut project_convoys = ProjectConvoys::new();
         for convoy in mission.convoys.values() {
-            if let Some(project) = &convoy.spec.project_ref {
-                project_convoys.entry(project.clone()).or_default().push(convoy.clone());
-            }
+            project_convoys.entry(convoy.spec.project_ref.clone()).or_default().push(convoy.clone());
         }
         let local = self.backend.local_root().map_err(|e| e.to_string())?;
         let mut homes = BTreeMap::new();
@@ -501,14 +499,10 @@ impl DispatchReconciler {
                         continue;
                     }
                     if let Some(previous) = state.convoys.remove(&name) {
-                        if let Some(project) = &previous.spec.project_ref {
-                            state.occupancy.remove(project);
-                        }
+                        state.occupancy.remove(&previous.spec.project_ref);
                     }
                     if let Some(object) = object {
-                        if let Some(project) = &object.spec.project_ref {
-                            state.occupancy.remove(project);
-                        }
+                        state.occupancy.remove(&object.spec.project_ref);
                         state.convoys.insert(name, Arc::new(object));
                     }
                 }
@@ -1120,7 +1114,7 @@ mod tests {
                     placement_policy: Some("docker-local".to_string()),
                     repositories: Vec::new(),
                     r#ref: Some("fix-2".to_string()),
-                    project_ref: Some("widgets".to_string()),
+                    project_ref: "widgets".to_string(),
                     adopted_checkout_refs: Default::default(),
                     issues: vec![ConvoyIssue {
                         reference: ready.reference.clone(),
@@ -1195,7 +1189,7 @@ mod tests {
                     placement_policy: None,
                     repositories: Vec::new(),
                     r#ref: Some("fix-2".to_string()),
-                    project_ref: Some("widgets".to_string()),
+                    project_ref: "widgets".to_string(),
                     adopted_checkout_refs: Default::default(),
                     issues: vec![ConvoyIssue {
                         reference: dispatched.reference,

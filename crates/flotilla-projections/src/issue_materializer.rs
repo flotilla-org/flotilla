@@ -1806,6 +1806,7 @@ mod tests {
                     .resource(resource.clone())
                     .name("batch")
                     .workflow_ref("workflow")
+                    .project_ref("flotilla")
                     .phase(ConvoyPhase::Active)
                     .issues(vec![ConvoyIssueRow {
                         reference: represented.clone(),

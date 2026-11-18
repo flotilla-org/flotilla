@@ -1301,6 +1301,7 @@ mod tests {
             };
             let spec = ConvoySpec::builder()
                 .workflow_ref("dev".into())
+                .project_ref("flotilla".into())
                 .role("coder".into())
                 .r#ref("feature/work".into())
                 .repositories(vec![repository])
@@ -1679,7 +1680,7 @@ mod tests {
                 let convoy = convoys
                     .create(
                         &InputMeta::builder().name(name.clone()).build(),
-                        &ConvoySpec::builder().workflow_ref("dev".into()).role("coder".into()).build(),
+                        &ConvoySpec::builder().workflow_ref("dev".into()).project_ref("flotilla".into()).role("coder".into()).build(),
                     )
                     .await
                     .expect("convoy");
@@ -1874,7 +1875,7 @@ mod tests {
         let broken = convoys
             .create(
                 &InputMeta::builder().name("00-broken".into()).build(),
-                &ConvoySpec::builder().workflow_ref("dev".into()).role("coder".into()).build(),
+                &ConvoySpec::builder().workflow_ref("dev".into()).project_ref("flotilla".into()).role("coder".into()).build(),
             )
             .await
             .unwrap();
@@ -1887,7 +1888,7 @@ mod tests {
             let convoy = convoys
                 .create(
                     &InputMeta::builder().name(name.into()).build(),
-                    &ConvoySpec::builder().workflow_ref("dev".into()).role("coder".into()).build(),
+                    &ConvoySpec::builder().workflow_ref("dev".into()).project_ref("flotilla".into()).role("coder".into()).build(),
                 )
                 .await
                 .unwrap();
@@ -2350,7 +2351,12 @@ mod tests {
             issue: None,
             change_request: None,
         };
-        let convoy = ConvoySpec::builder().workflow_ref("dev".into()).role("coder".into()).subjects(vec![produces]).build();
+        let convoy = ConvoySpec::builder()
+            .workflow_ref("dev".into())
+            .project_ref("flotilla".into())
+            .role("coder".into())
+            .subjects(vec![produces])
+            .build();
         backend.using::<Convoy>("ops").create(&InputMeta::builder().name("producer".into()).build(), &convoy).await.expect("convoy");
         let refresher = ChangeRequestRefresher::new(
             backend.clone(),

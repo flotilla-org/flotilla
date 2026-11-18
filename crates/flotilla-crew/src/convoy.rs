@@ -213,8 +213,7 @@ impl ConvoyReconciler {
             return Ok(None);
         }
         let namespace = &obj.metadata.namespace;
-        let receiver =
-            crate::leaf_engine::crew_role_address(obj.spec.project_ref.as_deref().unwrap_or(namespace), &obj.metadata.name, vessel, role);
+        let receiver = crate::leaf_engine::crew_role_address(&obj.spec.project_ref, &obj.metadata.name, vessel, role);
         messages.delivery_held_until(namespace, &receiver).await.map_err(ResourceError::other)
     }
 

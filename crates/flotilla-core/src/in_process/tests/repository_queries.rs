@@ -232,6 +232,7 @@ async fn cli_checkout_rows_follow_engine_checkouts() {
             &daemon,
             &format!("crew-{name}"),
             flotilla_resources::ConvoySpec::builder()
+                .project_ref("flotilla".into())
                 .workflow_ref("workflow".into())
                 .adopted_checkout_refs(std::collections::BTreeMap::from([(key.clone(), name.clone())]))
                 .build(),

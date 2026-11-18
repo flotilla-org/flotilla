@@ -106,7 +106,7 @@ async fn standing_ensure_dependency_changes_emit_wakes() {
                 let launch = home
                     .admit(
                         "standing",
-                        ConvoySpec::builder().workflow_ref("workflow".to_string()).build(),
+                        ConvoySpec::builder().workflow_ref("workflow".to_string()).project_ref(NAMESPACE.into()).build(),
                         flotilla_engine_convoys_testkit::single_agent("coder"),
                     )
                     .await;
@@ -173,7 +173,7 @@ async fn convoy_reclaims_vessels_after_checkout_authority_collected_the_checkout
         flotilla_engine_convoys_testkit::convoy(
             NAMESPACE,
             "raced",
-            ConvoySpec::builder().workflow_ref("wf-a".to_string()).build(),
+            ConvoySpec::builder().workflow_ref("wf-a".to_string()).project_ref(NAMESPACE.into()).build(),
             flotilla_engine_convoys_testkit::single_agent("coder"),
         ),
     )
@@ -534,6 +534,7 @@ async fn checkout_authority_observes_replicated_landing_and_convoy_authority_set
     };
     let spec = ConvoySpec::builder()
         .workflow_ref("review-and-fix".to_string())
+        .project_ref(NAMESPACE.into())
         .repositories(vec![ConvoyRepositorySpec::builder()
             .url("https://github.com/flotilla-org/flotilla".to_string())
             .repo_ref(repository_key.clone())

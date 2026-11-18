@@ -11,6 +11,7 @@ pub async fn refused_convoy_reclaim_leaves_runtime_children_untouched(factory: &
         &daemon,
         "failed-before-checkout",
         ConvoySpec::builder()
+            .project_ref("flotilla".into())
             .workflow_ref("quartermaster".to_string())
             .adopted_checkout_refs(BTreeMap::from([(repository, "checkout-never-provisioned".to_string())]))
             .build(),
@@ -45,9 +46,13 @@ pub async fn refused_convoy_reclaim_leaves_runtime_children_untouched(factory: &
 pub async fn concurrent_convoy_phase_change_prevents_operator_abandonment(factory: &dyn EnsureScenarioController) {
     let (daemon, backend, _clock, _temp) = standing_ensure_fixture(factory).await;
     let convoys = backend.using::<ResourceConvoy>("flotilla");
-    let name =
-        launch_convoy(&daemon, "abandon-race", ConvoySpec::builder().workflow_ref("workflow".to_string()).build(), ConvoyPhase::Active)
-            .await;
+    let name = launch_convoy(
+        &daemon,
+        "abandon-race",
+        ConvoySpec::builder().project_ref("flotilla".into()).workflow_ref("workflow".to_string()).build(),
+        ConvoyPhase::Active,
+    )
+    .await;
     // A running convoy's work has its vessel, which holds it once it ends.
     engine(&daemon).vessels.request(&name, "work", "local");
 
@@ -76,6 +81,7 @@ pub async fn gone_worktree_satisfies_teardown_gate_without_integration_observati
         &daemon,
         "gone-worktree",
         ConvoySpec::builder()
+            .project_ref("flotilla".into())
             .workflow_ref("quartermaster".to_string())
             .adopted_checkout_refs(BTreeMap::from([(RepositoryKey("repo".to_string()), "checkout-gone".to_string())]))
             .build(),

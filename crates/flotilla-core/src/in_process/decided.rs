@@ -146,7 +146,7 @@ mod tests {
             let clock = Arc::new(flotilla_resources::SystemClock);
             let home = flotilla_engine_convoys_testkit::EngineConvoysHome::over(&composed.service, "flotilla", &backend, clock, reads);
             let status = ConvoyStatus { phase: ConvoyPhase::Failed, ..flotilla_engine_convoys_testkit::single_agent("coder") };
-            let spec = ConvoySpec::builder().workflow_ref("review".into()).build();
+            let spec = ConvoySpec::builder().project_ref("flotilla".into()).workflow_ref("review".into()).build();
             let launch = home.launch(flotilla_engine_convoys_testkit::convoy("flotilla", "fix-it", spec, status)).await;
             assert_eq!(home.convoys().retire(&launch, flotilla_schema::Timestamp(9_000_000)), Ok(Retirement::Retired));
             launch

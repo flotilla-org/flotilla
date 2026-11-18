@@ -52,7 +52,7 @@ async fn agent_launch_reads_grants_from_its_own_vessel_pin() {
     let mut convoy = flotilla_engine_convoys_testkit::convoy(
         NAMESPACE,
         "demo",
-        ConvoySpec::builder().workflow_ref("workflow".to_string()).build(),
+        ConvoySpec::builder().project_ref(NAMESPACE.into()).workflow_ref("workflow".to_string()).build(),
         ConvoyStatus { placement_decision: Some(decision("broad")), ..single_agent("coder") },
     );
     convoy

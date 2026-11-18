@@ -11,8 +11,8 @@ pub fn convoy_ensure_name(project: &str, role: &str) -> String {
     format!("ensure-{digest:x}")
 }
 
-pub fn convoy_address(role: &str, project: Option<&str>) -> String {
-    project.map_or_else(|| role.to_string(), |project| format!("{role}@{project}"))
+pub fn convoy_address(role: &str, project: &str) -> String {
+    format!("{role}@{project}")
 }
 
 /// The stable human-facing address of a convoy role, independent of any one
@@ -56,12 +56,5 @@ mod naming_tests {
         for value in ["governor", "@andamento", "governor@", "governor@andamento@extra"] {
             assert!(RoleAddress::from_str(value).is_err(), "{value} must not produce a qualified address");
         }
-    }
-
-    // Naming retains the projectless spelling independently of disambiguation spelling.
-    #[test]
-    fn role_names_preserve_projectless_and_scoped_spelling() {
-        assert_eq!(convoy_address("coder", None), "coder");
-        assert_eq!(convoy_address("coder", Some("fleet")), "coder@fleet");
     }
 }

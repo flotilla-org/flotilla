@@ -50,7 +50,7 @@ async fn convoy(backend: &ResourceBackend, name: &str) {
         .using::<Convoy>(NAMESPACE)
         .create(
             &InputMeta::builder().name(name.into()).build(),
-            &ConvoySpec::builder().workflow_ref("workflow".into()).role("crew".into()).build(),
+            &ConvoySpec::builder().workflow_ref("workflow".into()).project_ref(NAMESPACE.into()).role("crew".into()).build(),
         )
         .await
         .expect("convoy");
@@ -65,7 +65,7 @@ async fn terminal(backend: &ResourceBackend, convoy: &str, vessel: &str, role: &
 async fn open_read(unrelated: usize) -> ReadSnapshot {
     let backend = InMemoryBackend::default().with_read_counts();
     designate_fleet(&backend, NAMESPACE).await;
-    let spec = ConvoySpec::builder().workflow_ref("workflow".into()).role("crew".into()).build();
+    let spec = ConvoySpec::builder().workflow_ref("workflow".into()).project_ref(NAMESPACE.into()).role("crew".into()).build();
     crewed_convoy(&backend, NAMESPACE, "crew", &spec, &["coder"]).await;
     terminal(&backend, "crew", "work", "coder").await;
     for n in 0..unrelated {

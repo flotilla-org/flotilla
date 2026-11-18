@@ -607,8 +607,8 @@ fn project_standing_role(catalog: &mut Catalog, role: &StandingRoleRow, convoys:
 fn mark_superseded_convoys(catalog: &mut Catalog, convoys: &[ConvoyRow]) {
     let mut latest = BTreeMap::new();
     for row in convoys {
-        if let (Some(project), Some(role)) = (&row.project_ref, &row.address_role) {
-            let key = (&row.resource.namespace, project, role);
+        if let Some(role) = &row.address_role {
+            let key = (&row.resource.namespace, &row.project_ref, role);
             latest.entry(key).and_modify(|generation: &mut u64| *generation = (*generation).max(row.generation)).or_insert(row.generation);
         }
     }
@@ -616,12 +616,9 @@ fn mark_superseded_convoys(catalog: &mut Catalog, convoys: &[ConvoyRow]) {
         .iter()
         .filter(|row| {
             row.is_ended()
-                && match (&row.project_ref, &row.address_role) {
-                    (Some(project), Some(role)) => {
-                        latest.get(&(&row.resource.namespace, project, role)).is_some_and(|generation| *generation > row.generation)
-                    }
-                    _ => false,
-                }
+                && row.address_role.as_ref().is_some_and(|role| {
+                    latest.get(&(&row.resource.namespace, &row.project_ref, role)).is_some_and(|generation| *generation > row.generation)
+                })
         })
         .map(|row| entity::convoy(&row.resource.namespace, &row.resource.name, &entity::resource_origin(&row.resource)).id)
         .collect::<BTreeSet<_>>();
@@ -1003,7 +1000,7 @@ fn readiness_badge(badge: Badge, readiness: &Readiness) -> Badge {
 fn project_convoy(catalog: &mut Catalog, convoy: &ConvoyRow, mint: &dyn RecipeMint) {
     let namespace = &convoy.resource.namespace;
     let origin = entity::resource_origin(&convoy.resource);
-    let project = project_fact(convoy.project_ref.as_deref(), &origin);
+    let project = project_fact(Some(&convoy.project_ref), &origin);
     let repo = convoy.repo.as_ref().map(|repo| repo.0.clone());
     if let Some((entity, facts)) = &project {
         catalog.assert_entity(entity.clone(), facts.clone(), None);

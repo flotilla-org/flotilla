@@ -151,6 +151,7 @@ async fn convoy_change_request_resolution_uses_forge_aware_factory_and_credentia
     probe(second_url).await;
     let convoy_spec = ConvoySpec::builder()
         .workflow_ref("workflow".to_string())
+        .project_ref("flotilla".to_string())
         .repositories(vec![
             ConvoyRepositorySpec {
                 url: "https://forgejo.lab.flotilla.work/robert/ghostty-ops".into(),
@@ -414,7 +415,13 @@ async fn prepared_placement_snapshot_rejects_a_different_replica_spec() {
 /// Admits a launch of convoy `name` on `daemon`'s engine, which its checkouts are held for.
 /// Returns the holder of its checkouts and the launch's name.
 async fn archive_convoy(daemon: &InProcessDaemon, name: &str) -> (CheckoutHolder, String) {
-    let launch = admit(daemon, name, ConvoySpec::builder().workflow_ref("work".into()).build(), single_agent("coder")).await;
+    let launch = admit(
+        daemon,
+        name,
+        ConvoySpec::builder().workflow_ref("work".into()).project_ref("flotilla".into()).build(),
+        single_agent("coder"),
+    )
+    .await;
     (CheckoutHolder::Convoy(launch.clone()), launch)
 }
 
@@ -692,8 +699,13 @@ async fn host_direct_checkout_on_the_daemon_host_is_archived_and_passes_delete_i
     assert_ne!(env_ref, daemon.local_environment_id.as_str());
     let repository = RepositorySpec::remote("https://github.com/acme/archive").unwrap();
     backend.using::<Repository>("flotilla").create(&test_meta(&repository.key().to_string()), &repository).await.unwrap();
-    let governor =
-        admit(&daemon, "governor", ConvoySpec::builder().workflow_ref("governor".into()).build(), single_agent("governor")).await;
+    let governor = admit(
+        &daemon,
+        "governor",
+        ConvoySpec::builder().workflow_ref("governor".into()).project_ref("flotilla".into()).build(),
+        single_agent("governor"),
+    )
+    .await;
     engine.put_ready(
         "governor-checkout",
         &ResourceCheckoutSpec::Worktree(

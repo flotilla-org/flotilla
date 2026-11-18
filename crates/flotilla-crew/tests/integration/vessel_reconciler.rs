@@ -249,7 +249,7 @@ async fn repositoryless_vessel_runs_tools_without_provisioning_a_checkout() {
                 placement_policy: None,
                 repositories: Vec::new(),
                 r#ref: None,
-                project_ref: None,
+                project_ref: NAMESPACE.to_string(),
                 adopted_checkout_refs: BTreeMap::new(),
                 issues: Vec::new(),
                 change_request: None,
@@ -509,7 +509,7 @@ async fn multi_repository_vessel_provisions_every_checkout_and_runs_crew_at_work
                     },
                 ],
                 r#ref: Some("feature/multi".to_string()),
-                project_ref: Some("flotilla-suite".to_string()),
+                project_ref: "flotilla-suite".to_string(),
                 adopted_checkout_refs: BTreeMap::new(),
                 issues: vec![
                     ConvoyIssue {
@@ -698,7 +698,7 @@ async fn multi_repository_docker_mounts_the_workspace_and_each_git_common_dir() 
                     },
                 ],
                 r#ref: Some("feature/multi".to_string()),
-                project_ref: Some("flotilla-suite".to_string()),
+                project_ref: "flotilla-suite".to_string(),
                 adopted_checkout_refs: BTreeMap::new(),
                 issues: Vec::new(),
                 change_request: None,
@@ -937,7 +937,7 @@ async fn vessel_repository_scope_narrows_a_multi_repository_convoy() {
                     },
                 ],
                 r#ref: Some("feature/scoped".to_string()),
-                project_ref: Some("flotilla-suite".to_string()),
+                project_ref: "flotilla-suite".to_string(),
                 adopted_checkout_refs: BTreeMap::new(),
                 issues: Vec::new(),
                 change_request: None,
@@ -2045,7 +2045,7 @@ async fn issue_carrying_convoy_without_prompt_assigns_the_issue_in_the_brief() {
                     subpaths: Vec::new(),
                 }],
                 r#ref: Some("feat/issue-brief".to_string()),
-                project_ref: None,
+                project_ref: NAMESPACE.to_string(),
                 adopted_checkout_refs: BTreeMap::new(),
                 issues: vec![ConvoyIssue {
                     reference: IssueRef {
@@ -2280,7 +2280,7 @@ async fn create_convoy_with_labeled_processes(
                     subpaths: Vec::new(),
                 }],
                 r#ref: Some(git_ref.to_string()),
-                project_ref: None,
+                project_ref: NAMESPACE.to_string(),
                 adopted_checkout_refs: BTreeMap::new(),
                 issues: Vec::new(),
                 change_request: None,

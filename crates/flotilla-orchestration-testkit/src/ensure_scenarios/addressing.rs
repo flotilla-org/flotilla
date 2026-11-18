@@ -4,13 +4,13 @@ use super::*;
 
 pub async fn convoy_routing_falls_back_to_a_unique_terminal_generation_and_refuses_multiple(factory: &dyn EnsureScenarioController) {
     let (daemon, _backend, _clock, _temp) = standing_ensure_fixture(factory).await;
-    seed_convoy_routing_row(&daemon, "convoy-one", Some("reviewer"), Some("flotilla"), flotilla_protocol::ConvoyPhase::Landed).await;
+    seed_convoy_routing_row(&daemon, "convoy-one", Some("reviewer"), "flotilla", flotilla_protocol::ConvoyPhase::Landed).await;
     let action = flotilla_protocol::CommandAction::ConvoyDelete { namespace: None, name: "reviewer@flotilla".to_string(), force: false };
 
     let target = daemon.resolve_existing_convoy_target(&action).await.expect("route sole terminal generation").expect("routing target");
     assert_eq!(target.home, daemon.host_name().clone());
 
-    seed_convoy_routing_row(&daemon, "convoy-two", Some("reviewer"), Some("flotilla"), flotilla_protocol::ConvoyPhase::Failed).await;
+    seed_convoy_routing_row(&daemon, "convoy-two", Some("reviewer"), "flotilla", flotilla_protocol::ConvoyPhase::Failed).await;
     assert_eq!(
         daemon.resolve_existing_convoy_target(&action).await,
         Err("convoy `reviewer@flotilla` is held by several records; name one by its record: convoy-one, convoy-two".to_string())
@@ -19,7 +19,7 @@ pub async fn convoy_routing_falls_back_to_a_unique_terminal_generation_and_refus
 
 pub async fn convoy_routing_prefers_an_exact_terminal_pre_identity_record(factory: &dyn EnsureScenarioController) {
     let (daemon, _backend, _clock, _temp) = standing_ensure_fixture(factory).await;
-    seed_convoy_routing_row(&daemon, "pre-identity-record", None, None, flotilla_protocol::ConvoyPhase::Landed).await;
+    seed_convoy_routing_row(&daemon, "pre-identity-record", None, "flotilla", flotilla_protocol::ConvoyPhase::Landed).await;
     let action = flotilla_protocol::CommandAction::ConvoyDelete { namespace: None, name: "pre-identity-record".to_string(), force: false };
 
     let target = daemon.resolve_existing_convoy_target(&action).await.expect("route exact terminal record").expect("routing target");
@@ -28,8 +28,8 @@ pub async fn convoy_routing_prefers_an_exact_terminal_pre_identity_record(factor
 
 pub async fn convoy_routing_does_not_treat_a_legacy_display_name_as_role_identity(factory: &dyn EnsureScenarioController) {
     let (daemon, _backend, _clock, _temp) = standing_ensure_fixture(factory).await;
-    seed_convoy_routing_row(&daemon, "reviewer", None, Some("flotilla"), flotilla_protocol::ConvoyPhase::Landed).await;
-    seed_convoy_routing_row(&daemon, "convoy-one", Some("reviewer"), Some("flotilla"), flotilla_protocol::ConvoyPhase::Landed).await;
+    seed_convoy_routing_row(&daemon, "reviewer", None, "flotilla", flotilla_protocol::ConvoyPhase::Landed).await;
+    seed_convoy_routing_row(&daemon, "convoy-one", Some("reviewer"), "flotilla", flotilla_protocol::ConvoyPhase::Landed).await;
     let action = flotilla_protocol::CommandAction::ConvoyDelete { namespace: None, name: "reviewer@flotilla".to_string(), force: false };
 
     let target = daemon.resolve_existing_convoy_target(&action).await.expect("route explicit role identity").expect("routing target");
@@ -41,7 +41,7 @@ pub async fn convoy_explain_addresses_an_exact_terminal_pre_identity_record(fact
     let record = launch_convoy(
         &daemon,
         "pre-identity-record",
-        ConvoySpec::builder().workflow_ref("review".to_string()).build(),
+        ConvoySpec::builder().project_ref("flotilla".into()).workflow_ref("review".to_string()).build(),
         ConvoyPhase::Failed,
     )
     .await;
@@ -82,7 +82,12 @@ pub async fn convoy_explain_surfaces_queued_turn_age_and_blocker(factory: &dyn E
     };
     let queued = flotilla_engine_convoys_testkit::launch(
         &daemon.convoy_engine_path(),
-        flotilla_engine_convoys_testkit::convoy("flotilla", "queued", ConvoySpec::builder().workflow_ref("review".into()).build(), status),
+        flotilla_engine_convoys_testkit::convoy(
+            "flotilla",
+            "queued",
+            ConvoySpec::builder().project_ref("flotilla".into()).workflow_ref("review".into()).build(),
+            status,
+        ),
     )
     .await;
     let explanation = daemon.explain_convoy_internal(Some("flotilla"), &queued).await.unwrap();
@@ -99,8 +104,8 @@ pub async fn convoy_explain_surfaces_queued_turn_age_and_blocker(factory: &dyn E
 
 pub async fn convoy_explain_refuses_multiple_terminal_generations(factory: &dyn EnsureScenarioController) {
     let (daemon, _backend, _clock, _temp) = standing_ensure_fixture(factory).await;
-    let one = create_identity_convoy(&daemon, "convoy-one", "reviewer", Some("flotilla")).await;
-    let two = create_identity_convoy(&daemon, "convoy-two", "reviewer", Some("flotilla")).await;
+    let one = create_identity_convoy(&daemon, "convoy-one", "reviewer", "flotilla").await;
+    let two = create_identity_convoy(&daemon, "convoy-two", "reviewer", "flotilla").await;
     // Each generation ends held, as an unread message to its seat holds it: neither retires.
     for name in [&one, &two] {
         hold_with_message(&daemon, name, "reviewer").await;
@@ -119,8 +124,8 @@ pub async fn convoy_explain_refuses_multiple_terminal_generations(factory: &dyn 
 pub async fn convoy_explain_names_retired_generations_by_record_only(factory: &dyn EnsureScenarioController) {
     let (daemon, backend, _clock, _temp) = standing_ensure_fixture(factory).await;
     let mut watch = backend.including_replicas::<ResourceConvoy>("flotilla").watch().await.expect("watch");
-    let one = create_identity_convoy(&daemon, "convoy-one", "reviewer", Some("flotilla")).await;
-    let two = create_identity_convoy(&daemon, "convoy-two", "reviewer", Some("flotilla")).await;
+    let one = create_identity_convoy(&daemon, "convoy-one", "reviewer", "flotilla").await;
+    let two = create_identity_convoy(&daemon, "convoy-two", "reviewer", "flotilla").await;
     for name in [&one, &two] {
         land_convoy(&daemon, name).await;
     }
@@ -147,13 +152,12 @@ pub async fn convoy_explain_names_retired_generations_by_record_only(factory: &d
     }
 }
 
-// #4272: the lookup is exact. A bare role names the convoy of no project holding it, not one in
-// any project; the client completes a role from its context before sending it. The engine holds a
-// convoy admitted without a project under its namespace's project, so a bare role names none.
-pub async fn convoy_explain_names_a_bare_role_only_without_a_project(factory: &dyn EnsureScenarioController) {
+// #4272: the lookup is exact. Every convoy names its project, so a bare role names none; the
+// client completes a role from its context before sending it.
+pub async fn convoy_explain_names_no_convoy_by_a_bare_role(factory: &dyn EnsureScenarioController) {
     let (daemon, _backend, _clock, _temp) = standing_ensure_fixture(factory).await;
-    let one = create_identity_convoy(&daemon, "convoy-one", "reviewer", None).await;
-    let two = create_identity_convoy(&daemon, "convoy-two", "reviewer", Some("beta")).await;
+    let one = create_identity_convoy(&daemon, "convoy-one", "reviewer", "flotilla").await;
+    let two = create_identity_convoy(&daemon, "convoy-two", "reviewer", "beta").await;
 
     for (address, record) in [("reviewer@flotilla", &one), ("reviewer@beta", &two)] {
         daemon.explain_convoy_internal(None, address).await.expect("explained");

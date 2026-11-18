@@ -2371,7 +2371,7 @@ async fn convoy_create_carries_project_ref() {
         flotilla_resources::convoy::engine::launch_address(&"project:my-project".parse().expect("project"), &convoy.metadata.name)
             .expect("launch address");
     assert_eq!(created, CommandValue::ConvoyCreated { name: address.to_string() });
-    assert_eq!(convoy.spec.project_ref.as_deref(), Some("my-project"));
+    assert_eq!(convoy.spec.project_ref, "my-project");
     assert_eq!(convoy.spec.repositories.len(), 1);
     assert_eq!(convoy.spec.repositories[0].source_ref, "main");
     assert_eq!(convoy.spec.repositories[0].target_ref, "main");

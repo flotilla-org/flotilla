@@ -4290,6 +4290,7 @@ mod tests {
                 &meta,
                 &crate::ConvoySpec::builder()
                     .workflow_ref("workflow".into())
+                    .project_ref("flotilla".into())
                     .repositories(vec![crate::ConvoyRepositorySpec::builder()
                         .url("https://example.com/repo".into())
                         .repo_ref(crate::RepositoryKey("repository".into()))

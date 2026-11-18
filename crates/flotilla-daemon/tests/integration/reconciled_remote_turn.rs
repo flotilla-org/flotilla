@@ -99,7 +99,11 @@ async fn remote_turn_scenario(closed_watch: Option<ClosedWatch>) {
         flotilla_engine_convoys_testkit::convoy(
             "flotilla",
             "nudge-convoy",
-            ConvoySpec::builder().workflow_ref("wf".to_string()).placement_policy("placement-policy".to_string()).build(),
+            ConvoySpec::builder()
+                .project_ref("flotilla".into())
+                .workflow_ref("wf".to_string())
+                .placement_policy("placement-policy".to_string())
+                .build(),
             ConvoyStatus {
                 phase: ConvoyPhase::Active,
                 workflow_snapshot: Some(WorkflowSnapshot {

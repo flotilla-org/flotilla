@@ -84,12 +84,12 @@ impl Home {
             _third: third,
             _placed: placed,
         };
-        let spec = ConvoySpec::builder().workflow_ref("workflow".into()).build();
+        let spec = ConvoySpec::builder().workflow_ref("workflow".into()).project_ref(NAMESPACE.into()).build();
         let crew = home.convoys.launch(convoy(NAMESPACE, "crew", spec, single_agent("coder"))).await;
         home.session = home.crew_here(&crew);
         home.crew = crew;
         for n in 0..others {
-            let spec = ConvoySpec::builder().workflow_ref("workflow".into()).build();
+            let spec = ConvoySpec::builder().workflow_ref("workflow".into()).project_ref(NAMESPACE.into()).build();
             let launch = home.convoys.launch(convoy(NAMESPACE, &format!("other-{n}"), spec, single_agent("coder"))).await;
             home.crew_at_third(&launch);
             unrelated(&home.backend, n).await;

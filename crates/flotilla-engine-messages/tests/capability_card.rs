@@ -20,7 +20,7 @@ const NAMESPACE: &str = "flotilla";
 async fn a_capability_card_is_admitted_about_its_sessions_seat() {
     let backend = ResourceBackend::new(InMemoryBackend::default());
     designate_fleet(&backend, NAMESPACE).await;
-    let spec = ConvoySpec::builder().workflow_ref("workflow".into()).role("crew".into()).build();
+    let spec = ConvoySpec::builder().workflow_ref("workflow".into()).project_ref(NAMESPACE.into()).role("crew".into()).build();
     crewed_convoy(&backend, NAMESPACE, "crew", &spec, &["coder"]).await;
     // The crew's vessel and its coder's session are launched here; the seat reaches the session
     // through them.

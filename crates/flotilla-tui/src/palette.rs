@@ -740,7 +740,7 @@ mod tests {
             message: None,
             disposition: None,
             repo_hint: None,
-            project_ref: None,
+            project_ref: "flotilla".into(),
             issues: Vec::new(),
             subjects: Vec::new(),
             vessels: vessels

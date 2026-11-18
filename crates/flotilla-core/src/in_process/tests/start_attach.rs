@@ -35,7 +35,7 @@ async fn slow_start_attach_does_not_fail() {
     use super::support::test_engine;
     use flotilla_resources::vessel_records::VesselStep;
     let (daemon, backend, _temp) = fixture().await;
-    let slow = create_identity_convoy(&daemon, "convoy-slow", "coder", Some("flotilla")).await;
+    let slow = create_identity_convoy(&daemon, "convoy-slow", "coder", "flotilla").await;
     let start = tokio::time::Instant::now();
     let result = daemon.wait_for_convoy_attach("flotilla", &slow, "coder@flotilla").await;
     assert!(result.is_ok(), "healthy slow provisioning failed: {result:?}");
@@ -53,7 +53,7 @@ async fn slow_start_attach_does_not_fail() {
     assert!(error.contains("placement refused"), "{error}");
     // A failed work item is an error with its own message: the next launch's vessel fails, which
     // fails its work, and so its convoy.
-    let next = create_identity_convoy(&daemon, "convoy-slow", "coder", Some("flotilla")).await;
+    let next = create_identity_convoy(&daemon, "convoy-slow", "coder", "flotilla").await;
     let engine = test_engine(&daemon);
     let vessel = engine.vessels.request(&next, "work", "local");
     engine.vessels.step(&vessel, VesselStep::Failed { cause: "checkout failed".into(), retryable: false });
@@ -76,7 +76,7 @@ fn start_attach_lifecycle(tc: hegel::TestCase) {
     let runtime = tokio::runtime::Builder::new_current_thread().enable_all().start_paused(true).build().unwrap();
     runtime.block_on(async {
         let (daemon, backend, _temp) = fixture().await;
-        let slow = create_identity_convoy(&daemon, "convoy-slow", "coder", Some("flotilla")).await;
+        let slow = create_identity_convoy(&daemon, "convoy-slow", "coder", "flotilla").await;
         let host = daemon.local_host_id().unwrap().to_string();
         backend.using::<Host>("flotilla").create(&test_meta(&host), &HostSpec::default()).await.unwrap();
         let engine = test_engine(&daemon);
@@ -125,7 +125,7 @@ async fn start_attach_stage_uses_vessel_status() {
     use flotilla_resources::vessel_records::VesselStep;
     let (daemon, backend, _temp) = fixture().await;
     let engine = test_engine(&daemon);
-    let slow = create_identity_convoy(&daemon, "convoy-slow", "coder", Some("flotilla")).await;
+    let slow = create_identity_convoy(&daemon, "convoy-slow", "coder", "flotilla").await;
     let convoy = backend.using::<Convoy>("flotilla").get(&slow).await.unwrap();
     // Unrelated vessel failures must not contaminate this convoy's start.
     let unrelated = engine.vessels.request("other", "work", "local");

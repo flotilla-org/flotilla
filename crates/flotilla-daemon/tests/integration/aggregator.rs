@@ -68,7 +68,7 @@ fn convoy_spec(workflow_ref: &str) -> ConvoySpec {
         placement_policy: None,
         repositories: Vec::new(),
         r#ref: None,
-        project_ref: None,
+        project_ref: "flotilla".to_string(),
         adopted_checkout_refs: BTreeMap::new(),
         issues: Vec::new(),
         change_request: None,
@@ -545,7 +545,7 @@ async fn aggregator_emits_result_set_events() {
     // Admit a convoy on the engine — the Aggregator should pick it up via the watch
     // stream and emit a delta for the convoys query.
     let mut spec = convoy_spec("my-workflow");
-    spec.project_ref = Some("my-project".to_string());
+    spec.project_ref = "my-project".to_string();
     let launch = admit_convoy(&daemon, engine_convoy("test-convoy-1", spec)).await;
     let DaemonEvent::ResultDelta(_) = next_convoys_event(&mut rx, "the convoy's delta").await else { panic!("a delta follows") };
 
@@ -553,7 +553,7 @@ async fn aggregator_emits_result_set_events() {
     let rows = convoy_rows(&found);
     assert_eq!(rows.len(), 1, "expected exactly one convoy in the result set");
     assert_eq!(rows[0].name, launch);
-    assert_eq!(rows[0].project_ref.as_deref(), Some("my-project"));
+    assert_eq!(rows[0].project_ref, "my-project");
 }
 
 // Behaviour (#3108): a launch whose admission document does not decode, held when the daemon
@@ -683,8 +683,7 @@ async fn an_attention_raised_on_the_engine_marks_its_convoys_row() {
         )
         .await
         .expect("designation");
-    let mut spec = convoy_spec("w");
-    spec.project_ref = Some("flotilla".to_string());
+    let spec = convoy_spec("w");
     let demo = admit_convoy(&daemon, engine_convoy("demo", spec)).await;
     let _ = next_convoys_event(&mut rx, "the convoy's row").await;
 

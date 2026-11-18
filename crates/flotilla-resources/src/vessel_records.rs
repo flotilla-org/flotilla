@@ -600,7 +600,7 @@ mod tests {
                 creation_timestamp: at(0),
                 merge: None,
             },
-            spec: ConvoySpec::builder().workflow_ref("wf".into()).build(),
+            spec: ConvoySpec::builder().workflow_ref("wf".into()).project_ref("flotilla".into()).build(),
             status: Some(ConvoyStatus {
                 phase: ConvoyPhase::Active,
                 workflow_snapshot: Some(WorkflowSnapshot {

@@ -42,6 +42,7 @@ async fn convoy_branch_refresh_case(outcomes: [RestAdmissionReply; 2], empty: bo
         })
         .collect::<Vec<_>>();
     let spec = ConvoySpec::builder()
+        .project_ref("flotilla".into())
         .workflow_ref("workflow".into())
         .repositories(if empty { Vec::new() } else { snapshots })
         .r#ref("feature/wanted".into())
@@ -96,6 +97,7 @@ async fn prless_decision_ledger_promise_settles_without_a_claim() {
         &daemon,
         "ledger-claim",
         ConvoySpec::builder()
+            .project_ref("flotilla".into())
             .workflow_ref("test".into())
             .subjects(vec![flotilla_resources::DeclaredSubject {
                 subject: flotilla_protocol::Subject {

@@ -425,12 +425,13 @@ pub fn append_convoy_work_context(
     if let Some(branch) = &convoy.spec.r#ref {
         content.push_str(&format!("- Branch: `{branch}`\n"));
     }
-    if let Some(project_ref) = &convoy.spec.project_ref {
-        content.push_str(&format!("- Island Project: `{project_ref}` — resolve current repositories and roles with `flotilla crew list` on each orientation sweep.\n"));
-    }
-    // Project-scoped governors orient against live membership. Delivery crews
+    content.push_str(&format!(
+        "- Island Project: `{}` — resolve current repositories and roles with `flotilla crew list` on each orientation sweep.\n",
+        convoy.spec.project_ref
+    ));
+    // Governors orient against live project membership. Delivery crews
     // retain admitted repository URLs and target refs as their delivery contract.
-    if convoy.spec.role != "governor" || convoy.spec.project_ref.is_none() {
+    if convoy.spec.role != "governor" {
         content.push_str("- Repositories:\n");
         let checkouts = work_dir.map(|dir| multi_repository_checkouts(&convoy.spec, repository_refs, dir)).unwrap_or_default();
         for repository in convoy.spec.repositories.iter().filter(|repository| repository_refs.contains(&repository.repo_ref)) {
@@ -1732,7 +1733,7 @@ mod tests {
     fn governor_work_context_references_live_island() {
         let (mut convoy, repository_key) = convoy_brief_fixture();
         convoy.spec.role = "governor".into();
-        convoy.spec.project_ref = Some("porthole".into());
+        convoy.spec.project_ref = "porthole".into();
         let mut content = String::new();
         append_convoy_work_context(&mut content, &convoy, &[repository_key], &BTreeMap::new(), None);
         assert!(content.contains("Island Project: `porthole`"));
@@ -2166,7 +2167,7 @@ mod tests {
                     subpaths: Vec::new(),
                 }],
                 r#ref: Some("fix/batch".to_string()),
-                project_ref: None,
+                project_ref: "flotilla".to_string(),
                 adopted_checkout_refs: BTreeMap::new(),
                 subjects: Vec::new(),
                 issues: vec![issue("809", "First issue", "First issue body."), issue("810", "Second issue", "Second issue body.")],

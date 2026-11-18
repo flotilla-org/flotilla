@@ -76,7 +76,7 @@ async fn contained_codex_to_claude_handoff_stages_credentials_for_the_latent_rev
     let two_crew = admit(
         &daemon,
         "convoy-two-crew",
-        ConvoySpec::builder().workflow_ref("implement-review".to_string()).build(),
+        ConvoySpec::builder().project_ref("flotilla".into()).workflow_ref("implement-review".to_string()).build(),
         ConvoyStatus { workflow_snapshot: Some(snapshot(requirement.clone())), ..Default::default() },
     )
     .await;
@@ -234,7 +234,7 @@ async fn a_handoff_delivers_to_a_target_session_created_concurrently() {
         let concurrent = admit(
             &daemon,
             "convoy-concurrent",
-            ConvoySpec::builder().workflow_ref("govern".to_string()).build(),
+            ConvoySpec::builder().project_ref("flotilla".into()).workflow_ref("govern".to_string()).build(),
             ConvoyStatus { workflow_snapshot: Some(snapshot(requirement.clone())), ..Default::default() },
         )
         .await;

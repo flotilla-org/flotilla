@@ -500,6 +500,7 @@ async fn issue_turn_delivery_fires_once_for_changed_issue() {
         id: "2052".into(),
     };
     let spec = ConvoySpec::builder()
+        .project_ref("flotilla".into())
         .workflow_ref("workflow".into())
         .repositories(vec![ConvoyRepositorySpec::builder()
             .url("https://github.com/flotilla-org/flotilla".into())
@@ -633,7 +634,13 @@ fn rejected_promise_arms_owner_turn(tc: hegel::TestCase) {
         table.set_turn_delivery_actuator(actuator.clone()).await;
         let convoys = backend.using::<Convoy>("flotilla");
         let status = ConvoyStatus { workflow_snapshot: Some(stock_snapshot("single-agent")), ..Default::default() };
-        let launch = home.admit("rejected-promise", ConvoySpec::builder().workflow_ref("single-agent".into()).build(), status).await;
+        let launch = home
+            .admit(
+                "rejected-promise",
+                ConvoySpec::builder().project_ref("flotilla".into()).workflow_ref("single-agent".into()).build(),
+                status,
+            )
+            .await;
         let launch = launch.as_str();
         let vessel = home.vessel(launch, "work", "env");
         home.seat(&backend, launch, (&vessel, "work"), ("coder", "rejected-promise-coder"), phase).await;
@@ -1097,7 +1104,9 @@ async fn review_rounds_fixture(phase: CrewWorkPhase, custom: Option<&str>) -> Ro
         snapshot.turn_delivery.insert("custom-pending".into(), rule);
     }
     let status = ConvoyStatus { workflow_snapshot: Some(snapshot), ..Default::default() };
-    let launch = home.admit("rounds", ConvoySpec::builder().workflow_ref("single-agent".into()).build(), status).await;
+    let launch = home
+        .admit("rounds", ConvoySpec::builder().project_ref("flotilla".into()).workflow_ref("single-agent".into()).build(), status)
+        .await;
     let vessel = home.vessel(&launch, "work", "env");
     let pr = flotilla_protocol::Subject {
         kind: flotilla_protocol::SubjectKind::ChangeRequest,
@@ -1259,6 +1268,7 @@ async fn artifact_rounds_at_one_head_hold_until_the_head_moves() {
         .build();
     let repo_ref = RepositoryKey("repo".into());
     let spec = ConvoySpec::builder()
+        .project_ref("flotilla".into())
         .workflow_ref("workflow".into())
         .repositories(vec![ConvoyRepositorySpec::builder()
             .url("https://github.com/flotilla-org/flotilla".into())

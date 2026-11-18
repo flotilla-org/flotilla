@@ -634,7 +634,7 @@ mod tests {
         );
         let convoy = ResourceObject::<Convoy> {
             metadata: serde_json::from_value(serde_json::json!({"name":"convoy", "namespace":"ops", "resource_version":"1", "labels":{}, "annotations":{}, "creation_timestamp":"2026-10-01T00:00:00Z"})).expect("metadata"),
-            spec: flotilla_resources::ConvoySpec::builder().workflow_ref("review".into()).build(), status: None,
+            spec: flotilla_resources::ConvoySpec::builder().workflow_ref("review".into()).project_ref("ops".into()).build(), status: None,
         };
         let mut status = merged_change_request("merged-head");
         status.state.value = Some(ObservedChangeRequestState::Open);

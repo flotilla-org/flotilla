@@ -798,7 +798,7 @@ async fn capped_docker_kind_publishes_free_slots_from_the_hosts_vessels() {
         flotilla_engine_convoys_testkit::convoy(
             NAMESPACE,
             "host-direct-work",
-            flotilla_resources::ConvoySpec::builder().workflow_ref("missing".to_string()).build(),
+            flotilla_resources::ConvoySpec::builder().project_ref(NAMESPACE.into()).workflow_ref("missing".to_string()).build(),
             flotilla_resources::ConvoyStatus {
                 placement_decision: Some(decision),
                 ..flotilla_engine_convoys_testkit::single_agent("coder")

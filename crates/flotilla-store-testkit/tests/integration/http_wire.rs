@@ -81,7 +81,7 @@ async fn list_decodes_collection_resource_version() {
                 "creationTimestamp": "2026-04-13T12:00:00Z"
             },
             "spec": {
-                "workflow_ref": "review",
+                "workflow_ref": "review", "project_ref": "flotilla",
                 "inputs": {},
                 "placement_policy": "laptop-docker"
             },
@@ -119,7 +119,7 @@ async fn replica_point_get_requests_read_view_and_decodes_provenance() {
             "creationTimestamp": "2026-04-13T12:00:00Z"
         },
         "spec": {
-            "workflow_ref": "review",
+            "workflow_ref": "review", "project_ref": "flotilla",
             "inputs": {},
             "placement_policy": "laptop-docker"
         },
@@ -161,7 +161,7 @@ async fn provenance_point_get_requests_only_one_name() {
                 "creationTimestamp": "2026-04-13T12:00:00Z"
             },
             "spec": {
-                "workflow_ref": "review",
+                "workflow_ref": "review", "project_ref": "flotilla",
                 "inputs": {},
                 "placement_policy": "laptop-docker"
             },
@@ -193,7 +193,7 @@ async fn update_status_uses_status_subresource_path_and_body() {
             "creationTimestamp": "2026-04-13T12:00:00Z"
         },
         "spec": {
-            "workflow_ref": "review",
+            "workflow_ref": "review", "project_ref": "flotilla",
             "inputs": {},
             "placement_policy": "laptop-docker"
         },
@@ -217,8 +217,8 @@ async fn update_status_uses_status_subresource_path_and_body() {
 #[cfg_attr(feature = "skip-no-sandbox-tests", ignore = "excluded by `skip-no-sandbox-tests`; run without that feature to include")]
 async fn watch_decodes_kubernetes_watch_events() {
     let body = concat!(
-        "{\"type\":\"ADDED\",\"object\":{\"apiVersion\":\"flotilla.work/v1\",\"kind\":\"Convoy\",\"metadata\":{\"name\":\"alpha\",\"namespace\":\"flotilla\",\"resourceVersion\":\"7\",\"labels\":{},\"annotations\":{},\"creationTimestamp\":\"2026-04-13T12:00:00Z\"},\"spec\":{\"workflow_ref\":\"review\",\"inputs\":{},\"placement_policy\":\"laptop-docker\"},\"status\":{\"phase\":\"Pending\"}}}\n",
-        "{\"type\":\"DELETED\",\"object\":{\"apiVersion\":\"flotilla.work/v1\",\"kind\":\"Convoy\",\"metadata\":{\"name\":\"alpha\",\"namespace\":\"flotilla\",\"resourceVersion\":\"8\",\"labels\":{},\"annotations\":{},\"creationTimestamp\":\"2026-04-13T12:00:00Z\"},\"spec\":{\"workflow_ref\":\"review\",\"inputs\":{},\"placement_policy\":\"laptop-docker\"},\"status\":{\"phase\":\"Pending\"}}}\n"
+        "{\"type\":\"ADDED\",\"object\":{\"apiVersion\":\"flotilla.work/v1\",\"kind\":\"Convoy\",\"metadata\":{\"name\":\"alpha\",\"namespace\":\"flotilla\",\"resourceVersion\":\"7\",\"labels\":{},\"annotations\":{},\"creationTimestamp\":\"2026-04-13T12:00:00Z\"},\"spec\":{\"workflow_ref\":\"review\",\"project_ref\":\"flotilla\",\"inputs\":{},\"placement_policy\":\"laptop-docker\"},\"status\":{\"phase\":\"Pending\"}}}\n",
+        "{\"type\":\"DELETED\",\"object\":{\"apiVersion\":\"flotilla.work/v1\",\"kind\":\"Convoy\",\"metadata\":{\"name\":\"alpha\",\"namespace\":\"flotilla\",\"resourceVersion\":\"8\",\"labels\":{},\"annotations\":{},\"creationTimestamp\":\"2026-04-13T12:00:00Z\"},\"spec\":{\"workflow_ref\":\"review\",\"project_ref\":\"flotilla\",\"inputs\":{},\"placement_policy\":\"laptop-docker\"},\"status\":{\"phase\":\"Pending\"}}}\n"
     );
     let (base_url, request_rx) = spawn_one_shot_server(response("200 OK", body)).await;
     let backend = ResourceBackend::new(HttpBackend::new(rigging_tls::client(), base_url));
@@ -302,7 +302,7 @@ async fn stale_watch_maps_http_gone_before_reading_a_truncated_body() {
 #[cfg_attr(feature = "skip-no-sandbox-tests", ignore = "excluded by `skip-no-sandbox-tests`; run without that feature to include")]
 async fn watch_decodes_crlf_terminated_events() {
     let body =
-        "{\"type\":\"ADDED\",\"object\":{\"apiVersion\":\"flotilla.work/v1\",\"kind\":\"Convoy\",\"metadata\":{\"name\":\"alpha\",\"namespace\":\"flotilla\",\"resourceVersion\":\"7\",\"labels\":{},\"annotations\":{},\"creationTimestamp\":\"2026-04-13T12:00:00Z\"},\"spec\":{\"workflow_ref\":\"review\",\"inputs\":{},\"placement_policy\":\"laptop-docker\"},\"status\":{\"phase\":\"Pending\"}}}\r\n";
+        "{\"type\":\"ADDED\",\"object\":{\"apiVersion\":\"flotilla.work/v1\",\"kind\":\"Convoy\",\"metadata\":{\"name\":\"alpha\",\"namespace\":\"flotilla\",\"resourceVersion\":\"7\",\"labels\":{},\"annotations\":{},\"creationTimestamp\":\"2026-04-13T12:00:00Z\"},\"spec\":{\"workflow_ref\":\"review\",\"project_ref\":\"flotilla\",\"inputs\":{},\"placement_policy\":\"laptop-docker\"},\"status\":{\"phase\":\"Pending\"}}}\r\n";
     let (base_url, _request_rx) = spawn_one_shot_server(response("200 OK", body)).await;
     let backend = ResourceBackend::new(HttpBackend::new(rigging_tls::client(), base_url));
     let resolver = backend.using::<Convoy>("flotilla");

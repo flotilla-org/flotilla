@@ -43,7 +43,7 @@ fn convoy_spec(workflow_ref: &str) -> ConvoySpec {
         placement_policy: Some("laptop-docker".to_string()),
         repositories: Vec::new(),
         r#ref: None,
-        project_ref: None,
+        project_ref: "flotilla".to_string(),
         adopted_checkout_refs: Default::default(),
         issues: Vec::new(),
         change_request: None,

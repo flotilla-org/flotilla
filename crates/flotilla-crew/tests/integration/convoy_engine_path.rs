@@ -155,7 +155,10 @@ async fn ledger_convoy(backend: &ResourceBackend) -> ResourceObject<Convoy> {
     promises::apply(&mut status, "work", "coder", &declare);
     let convoys = backend.clone().using::<Convoy>(NAMESPACE);
     let created = convoys
-        .create(&InputMeta::builder().name("c".to_string()).build(), &ConvoySpec::builder().workflow_ref("w".to_string()).build())
+        .create(
+            &InputMeta::builder().name("c".to_string()).build(),
+            &ConvoySpec::builder().project_ref(NAMESPACE.into()).workflow_ref("w".to_string()).build(),
+        )
         .await
         .expect("convoy");
     publish_ledger(backend, "c").await;

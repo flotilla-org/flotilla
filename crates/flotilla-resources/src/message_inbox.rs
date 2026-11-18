@@ -50,8 +50,8 @@ pub fn crew_convoy_prefix(project: &str, convoy: &str) -> String {
 
 /// The crew members' addresses a convoy's frozen workflow declares: the receivers its crew
 /// Messages are sent to.
-pub fn convoy_crew_seats(namespace: &str, convoy: &ResourceObject<Convoy>) -> Vec<String> {
-    let project = convoy.spec.project_ref.as_deref().unwrap_or(namespace);
+pub fn convoy_crew_seats(convoy: &ResourceObject<Convoy>) -> Vec<String> {
+    let project = &convoy.spec.project_ref;
     convoy
         .status
         .iter()
@@ -63,8 +63,8 @@ pub fn convoy_crew_seats(namespace: &str, convoy: &ResourceObject<Convoy>) -> Ve
 
 /// The turns a convoy's status names by Message, each with the crew member it was sent to: its
 /// queued turn deliveries and its crew's resume briefs.
-pub fn convoy_seat_turns(namespace: &str, convoy: &ResourceObject<Convoy>) -> Vec<(String, String)> {
-    let project = convoy.spec.project_ref.as_deref().unwrap_or(namespace);
+pub fn convoy_seat_turns(convoy: &ResourceObject<Convoy>) -> Vec<(String, String)> {
+    let project = &convoy.spec.project_ref;
     let seat = |vessel: &str, role: &str| crew_role_address(project, &convoy.metadata.name, vessel, role);
     let Some(status) = &convoy.status else { return Vec::new() };
     let queued = status.turn_deliveries.values().flat_map(|delivery| &delivery.episodes).filter_map(|episode| match &episode.outcome {

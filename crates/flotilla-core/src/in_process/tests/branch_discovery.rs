@@ -42,6 +42,7 @@ async fn branch_discovery_ignores_preexisting_terminal_request() {
             &fixture.daemon,
             "new-work",
             ConvoySpec::builder()
+                .project_ref("flotilla".into())
                 .workflow_ref("dev".into())
                 .r#ref("reused".into())
                 .repositories(vec![ConvoyRepositorySpec {
@@ -80,6 +81,7 @@ async fn inspected_change_request_is_discovered_and_unlink_wins() {
         &fixture.daemon,
         "switch-work",
         ConvoySpec::builder()
+            .project_ref("flotilla".into())
             .workflow_ref("dev".into())
             .r#ref("requested".into())
             .adopted_checkout_refs(BTreeMap::from([(fixture.keys[0].clone(), "switch-checkout".into())]))

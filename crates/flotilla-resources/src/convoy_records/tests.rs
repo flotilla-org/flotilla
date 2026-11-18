@@ -125,7 +125,7 @@ fn a_launch_reads_its_phases_from_its_records_and_joins() {
     assert_eq!(convoy.metadata.creation_timestamp, at(100));
     assert_eq!(convoy.metadata.labels.get(PROJECT_LABEL).map(String::as_str), Some("flotilla"));
     assert_eq!(convoy.metadata.labels.get(ROLE_LABEL).map(String::as_str), Some("fixer"));
-    assert_eq!((convoy.spec.generation, convoy.spec.project_ref.as_deref()), (7, Some("flotilla")));
+    assert_eq!((convoy.spec.generation, convoy.spec.project_ref.as_str()), (7, "flotilla"));
     let status = convoy.status.expect("status");
     assert_eq!(status.phase, ConvoyPhase::Active);
     assert_eq!(status.work["work"].phase, WorkPhase::Running);

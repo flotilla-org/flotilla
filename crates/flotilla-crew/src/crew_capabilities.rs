@@ -119,7 +119,7 @@ async fn render_card(
         "{}\n\nYou act as `{}` in project `{}`.\n\n### Repositories in scope\n",
         CAPABILITIES_HEADING.trim_start(),
         spec.role,
-        convoy.spec.project_ref.as_deref().unwrap_or(namespace)
+        convoy.spec.project_ref
     );
     for repository in &convoy.spec.repositories {
         text.push_str(&format!("- {} ({})\n", repository.url, repository.repo_ref));
@@ -558,12 +558,7 @@ async fn card_receiver(backend: &ResourceBackend, namespace: &str, session: &Res
     };
     let convoy = backend.including_replicas::<Convoy>(namespace).get(&context.convoy).await.map_err(|error| error.to_string())?.object;
     let vessel = backend.including_replicas::<Vessel>(namespace).get(&context.vessel_ref).await.map_err(|error| error.to_string())?.object;
-    Ok(flotilla_resources::crew_role_address(
-        convoy.spec.project_ref.as_deref().unwrap_or(namespace),
-        &context.convoy,
-        &vessel.spec.vessel_name,
-        &session.spec.role,
-    ))
+    Ok(flotilla_resources::crew_role_address(&convoy.spec.project_ref, &context.convoy, &vessel.spec.vessel_name, &session.spec.role))
 }
 
 /// Advisory launch observation: callers can warn and still launch with the card.
@@ -755,12 +750,7 @@ async fn refresh_record_card(
         let endpoints = source.endpoints(&session.spec.env_ref, &session.metadata.name).await?;
         let read = CardRead { backend, namespace, convoy: &convoy, work: Some(work) };
         let card = render_card(&read, &session.spec, &credentials, &endpoints, reads, accounts).await?;
-        let receiver = flotilla_resources::crew_role_address(
-            convoy.spec.project_ref.as_deref().unwrap_or(namespace),
-            &vessel.convoy,
-            work,
-            &session.spec.role,
-        );
+        let receiver = flotilla_resources::crew_role_address(&convoy.spec.project_ref, &vessel.convoy, work, &session.spec.role);
         observe(backend, namespace, &session, &card, tracker, Some(&receiver)).await
     }
 }

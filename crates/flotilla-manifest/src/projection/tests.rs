@@ -296,6 +296,7 @@ fn direct_cleat_recipe_contract_covers_remote_local_fallback_and_withdrawal() {
     let convoy = ConvoyRow::builder()
         .resource(reference)
         .name("remote")
+        .project_ref("flotilla")
         .workflow_ref("implement")
         .phase(ConvoyPhase::Active)
         .message("waiting for a reviewer")
@@ -385,6 +386,7 @@ fn vessel_on_another_machine_attaches_through_its_acting_daemon_only() {
     let convoy = ConvoyRow::builder()
         .resource(reference)
         .name("ssh")
+        .project_ref("flotilla")
         .workflow_ref("implement")
         .phase(ConvoyPhase::Active)
         .vessels(vec![terminal])
@@ -776,7 +778,13 @@ fn awareness_children_use_their_convoys_canonical_origin() {
         .entries(vec![issue])
         .build();
     let reference = convoy_ref("dev", "cutover");
-    let convoy = ConvoyRow::builder().resource(reference).name("cutover").workflow_ref("implement").phase(ConvoyPhase::Active).build();
+    let convoy = ConvoyRow::builder()
+        .resource(reference)
+        .name("cutover")
+        .project_ref("flotilla")
+        .workflow_ref("implement")
+        .phase(ConvoyPhase::Active)
+        .build();
 
     let patches = project_catalog(
         &CatalogInput {
@@ -871,12 +879,18 @@ fn catalog_diff_unsets_removed_entity_facts() {
     let with_message = ConvoyRow::builder()
         .resource(reference.clone())
         .name("cutover")
+        .project_ref("flotilla")
         .workflow_ref("implement")
         .phase(ConvoyPhase::Failed)
         .message("boom")
         .build();
-    let without_message =
-        ConvoyRow::builder().resource(reference).name("cutover").workflow_ref("implement").phase(ConvoyPhase::Active).build();
+    let without_message = ConvoyRow::builder()
+        .resource(reference)
+        .name("cutover")
+        .project_ref("flotilla")
+        .workflow_ref("implement")
+        .phase(ConvoyPhase::Active)
+        .build();
     let previous = project_catalog(
         &CatalogInput {
             subjects: None,
@@ -919,6 +933,7 @@ fn an_unreadable_convoy_asks_for_attention_with_its_reason_and_no_phase() {
     let unreadable = ConvoyRow::builder()
         .resource(convoy_ref("dev", "broken"))
         .name("broken")
+        .project_ref("flotilla")
         .workflow_ref("implement")
         .unreadable("admission document does not decode")
         .build();
@@ -937,6 +952,7 @@ fn convoy_summary_surfaces_status_message_ahead_of_progress() {
     let convoy = ConvoyRow::builder()
         .resource(reference.clone())
         .name("waiting")
+        .project_ref("flotilla")
         .workflow_ref("implement")
         .phase(ConvoyPhase::Pending)
         .message("2 in pool, all leased")
@@ -977,6 +993,7 @@ fn crew_roles_remain_a_flat_fact() {
     let convoy = ConvoyRow::builder()
         .resource(reference)
         .name("cutover")
+        .project_ref("flotilla")
         .workflow_ref("implement")
         .phase(ConvoyPhase::Active)
         .vessels(vec![coder])
@@ -1004,6 +1021,7 @@ fn awareness_retains_exact_convoy_phase_for_visibility_controls() {
         let convoy = ConvoyRow::builder()
             .resource(reference.clone())
             .name("governor".to_owned())
+            .project_ref("flotilla")
             .workflow_ref("standing-governor")
             .phase(phase)
             .build();
@@ -1550,6 +1568,7 @@ fn replicated_subjects_publish_entities_edges_and_reference_labels() {
     let mut convoy = ConvoyRow::builder()
         .resource(convoy_ref("flotilla", "ship-it"))
         .name("ship-it")
+        .project_ref("flotilla")
         .workflow_ref("workflow/dev")
         .phase(ConvoyPhase::Active)
         .build();
@@ -1632,6 +1651,7 @@ fn subject_window_and_successive_role_attempts_exclude_unlinked_records() {
     let mut old = ConvoyRow::builder()
         .resource(convoy_ref("flotilla", "old"))
         .name("old")
+        .project_ref("flotilla")
         .workflow_ref("workflow/dev")
         .phase(ConvoyPhase::Landed)
         .finished_at("2026-10-01T12:00:00Z".parse().expect("time"))
@@ -1864,6 +1884,7 @@ async fn replicated_declared_and_discovered_subjects_publish_the_same_multi_repo
         "ship-it",
         &ConvoySpec::builder()
             .workflow_ref("dev".into())
+            .project_ref("flotilla".into())
             .subjects(vec![
                 DeclaredSubject { subject: first.clone(), relationship: Relationship::Produces, issue: None, change_request: None },
                 DeclaredSubject { subject: issue.clone(), relationship: Relationship::WorksOn, issue: None, change_request: None },
@@ -2030,7 +2051,7 @@ fn subject_project_is_unambiguous(tc: hegel::TestCase) {
     let mut expected = std::collections::BTreeSet::new();
     let mut convoys = Vec::new();
     for index in 0..count {
-        let project = tc.draw(gs::integers::<usize>().min_value(0).max_value(3));
+        let project = tc.draw(gs::integers::<usize>().min_value(0).max_value(2));
         let relationship =
             [Relationship::Produces, Relationship::Adopts, Relationship::WorksOn, Relationship::Supersedes, Relationship::References]
                 [tc.draw(gs::integers::<usize>().min_value(0).max_value(4))];
@@ -2038,12 +2059,14 @@ fn subject_project_is_unambiguous(tc: hegel::TestCase) {
         if tc.draw(gs::booleans()) {
             resource.host = None;
         }
-        let mut convoy =
-            ConvoyRow::builder().resource(resource).name(format!("convoy-{index}")).workflow_ref("dev").phase(ConvoyPhase::Active).build();
-        if project < 3 {
-            convoy.project_ref = Some(format!("project/dev/p{project}"));
-            expected.insert(format!("dev/p{project}@fleet"));
-        }
+        let mut convoy = ConvoyRow::builder()
+            .resource(resource)
+            .name(format!("convoy-{index}"))
+            .project_ref(format!("project/dev/p{project}"))
+            .workflow_ref("dev")
+            .phase(ConvoyPhase::Active)
+            .build();
+        expected.insert(format!("dev/p{project}@fleet"));
         convoy.subjects = subjects
             .iter()
             .map(|subject| ConvoySubjectRow {
@@ -2230,8 +2253,13 @@ fn duplicate_request_subjects_have_one_observation(tc: hegel::TestCase) {
         );
     }
     let convoys = [42, 43].map(|number| {
-        let mut row =
-            ConvoyRow::builder().resource(convoy_ref("dev", "live")).name("live").workflow_ref("dev").phase(ConvoyPhase::Active).build();
+        let mut row = ConvoyRow::builder()
+            .resource(convoy_ref("dev", "live"))
+            .name("live")
+            .project_ref("flotilla")
+            .workflow_ref("dev")
+            .phase(ConvoyPhase::Active)
+            .build();
         row.subjects.push(flotilla_protocol::result_set::ConvoySubjectRow {
             subject: flotilla_protocol::Subject {
                 kind: flotilla_protocol::SubjectKind::ChangeRequest,
@@ -2402,8 +2430,13 @@ fn builtin_github_forge_resolves_subjects(tc: hegel::TestCase) {
         Subject { kind: SubjectKind::ChangeRequest, source: source.clone(), id: number.to_string() },
         Subject { kind: SubjectKind::Issue, source, id: number.to_string() },
     ];
-    let mut convoy =
-        ConvoyRow::builder().resource(convoy_ref("dev", "work")).name("work").workflow_ref("dev").phase(ConvoyPhase::Active).build();
+    let mut convoy = ConvoyRow::builder()
+        .resource(convoy_ref("dev", "work"))
+        .name("work")
+        .project_ref("flotilla")
+        .workflow_ref("dev")
+        .phase(ConvoyPhase::Active)
+        .build();
     convoy.subjects = (0..count)
         .flat_map(|_| {
             subjects.iter().map(|subject| ConvoySubjectRow {
@@ -2546,6 +2579,7 @@ fn catalog_readiness_explains_unavailable_attachment_and_clears_on_recovery(tc: 
     let mut convoy = ConvoyRow::builder()
         .resource(reference)
         .name("governor")
+        .project_ref("flotilla")
         .workflow_ref("governor")
         .phase(ConvoyPhase::Active)
         .vessels(vec![work])
@@ -2594,6 +2628,7 @@ fn catalog_readiness_multi_vessel_attachment_and_unknown_evidence() {
     let mut convoy = ConvoyRow::builder()
         .resource(reference)
         .name("governor")
+        .project_ref("flotilla")
         .workflow_ref("governor")
         .phase(ConvoyPhase::Active)
         .vessels(vec![work])
@@ -2703,6 +2738,7 @@ fn placement_catalog_preserves_raw_facts(tc: hegel::TestCase) {
     let convoy = ConvoyRow::builder()
         .resource(reference)
         .name("placement")
+        .project_ref("flotilla")
         .workflow_ref("code")
         .phase(ConvoyPhase::Active)
         .placement_decision(row.placement_decision.clone().expect("recorded placement decision"))
@@ -2763,6 +2799,7 @@ fn placement_catalog_omits_unknown_facts() {
     let convoy = ConvoyRow::builder()
         .resource(reference)
         .name("unknown")
+        .project_ref("flotilla")
         .workflow_ref("code")
         .phase(ConvoyPhase::Pending)
         .vessels(vec![row])
@@ -3063,7 +3100,10 @@ async fn convoy_inbox_facts_are_raw_and_retractable() {
         let backend = ResourceBackend::new(InMemoryBackend::default());
         let mut convoy = backend
             .using::<Convoy>("dev")
-            .create(&InputMeta::builder().name("inbox".into()).build(), &ConvoySpec::builder().workflow_ref("single-agent".into()).build())
+            .create(
+                &InputMeta::builder().name("inbox".into()).build(),
+                &ConvoySpec::builder().workflow_ref("single-agent".into()).project_ref("dev".into()).build(),
+            )
             .await
             .expect("convoy");
         let mut status = ConvoyStatus::default();
@@ -3093,6 +3133,7 @@ async fn convoy_inbox_facts_are_raw_and_retractable() {
         let row = ConvoyRow::builder()
             .resource(convoy_ref("dev", "inbox"))
             .name("inbox")
+            .project_ref("flotilla")
             .workflow_ref("single-agent")
             .phase(ConvoyPhase::Active)
             .build();

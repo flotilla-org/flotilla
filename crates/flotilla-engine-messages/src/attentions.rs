@@ -137,7 +137,7 @@ impl MessagePrimitives {
             Err(error) => return Err(error.to_string()),
         };
         let principal = format!("principal:{}", convoy.spec.dispatching_principal_ref.name);
-        self.person_inbox(namespace, roles, &principal, convoy.spec.project_ref.as_deref()).await.map(Some)
+        self.person_inbox(namespace, roles, &principal, Some(&convoy.spec.project_ref)).await.map(Some)
     }
 }
 
@@ -260,11 +260,11 @@ impl MessagePrimitives {
             .map_err(|error| error.to_string())?
             .ok_or_else(|| format!("convoy `{name}` is not in this home's records"))?;
         let held = Read {
-            address: super::convoy_reference_address(name, convoy.object.spec.project_ref.as_deref().unwrap_or(namespace))?,
+            address: super::convoy_reference_address(name, &convoy.object.spec.project_ref)?,
             revision: convoy.object.metadata.resource_version.clone(),
         };
         let principal = format!("principal:{}", convoy.object.spec.dispatching_principal_ref.name);
-        let inbox = self.person_inbox(namespace, roles, &principal, convoy.object.spec.project_ref.as_deref()).await?;
+        let inbox = self.person_inbox(namespace, roles, &principal, Some(&convoy.object.spec.project_ref)).await?;
         let cause = match fact {
             Fact::Hold { .. } => Cause::Hold { convoy: held },
             Fact::ReclaimRefused { .. } => Cause::ReclaimRefused { convoy: held },

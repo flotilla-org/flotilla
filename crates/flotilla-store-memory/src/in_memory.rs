@@ -1747,7 +1747,10 @@ mod read_accounting_tests {
         let counted = crate::ResourceBackend::new(memory.clone().with_read_observer(events.clone()));
         let convoys = counted.using::<Convoy>("test");
         convoys
-            .create(&InputMeta::builder().name("record".into()).build(), &ConvoySpec::builder().workflow_ref("workflow".into()).build())
+            .create(
+                &InputMeta::builder().name("record".into()).build(),
+                &ConvoySpec::builder().workflow_ref("workflow".into()).project_ref("test".into()).build(),
+            )
             .await
             .expect("valid record");
         events.0.lock().expect("read events").clear();

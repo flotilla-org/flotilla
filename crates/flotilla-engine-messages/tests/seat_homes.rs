@@ -59,7 +59,7 @@ async fn seat_spelled(others: usize) -> VesselReads {
     let backend = ResourceBackend::new(InMemoryBackend::default());
     designate_fleet(&backend, NAMESPACE).await;
     // The convoy, held here, names vessel `work` for the role.
-    let spec = ConvoySpec::builder().workflow_ref("workflow".into()).role("crew".into()).build();
+    let spec = ConvoySpec::builder().workflow_ref("workflow".into()).project_ref(NAMESPACE.into()).role("crew".into()).build();
     crewed_convoy(&backend, NAMESPACE, "crew", &spec, &["coder"]).await;
 
     // The vessel and its session are launched at `third`, whose log arrives here.

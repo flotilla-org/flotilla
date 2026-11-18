@@ -167,7 +167,7 @@ async fn a_project_gaining_a_member_leaves_a_running_convoys_checkouts_unchanged
     let convoy = create_convoy_with_single_task(&backend, NAMESPACE, "convoy-a", "implement", repository_url, "fix/members").await;
     let convoys = backend.clone().using::<Convoy>(NAMESPACE);
     let mut spec = convoy.spec.clone();
-    spec.project_ref = Some("suite".to_string());
+    spec.project_ref = "suite".to_string();
     convoys.update(&InputMeta::from(&convoy.metadata), &convoy.metadata.resource_version, &spec).await.expect("bind project");
     let admitted = convoy.spec.repositories.clone();
     let projects = backend.clone().using::<Project>(NAMESPACE);
@@ -272,7 +272,7 @@ async fn controller_materializes_a_missing_repository_for_a_multi_repository_con
                         .build(),
                 ],
                 r#ref: Some("fix/multi".to_string()),
-                project_ref: Some("flotilla-suite".to_string()),
+                project_ref: "flotilla-suite".to_string(),
                 adopted_checkout_refs: BTreeMap::new(),
                 issues: Vec::new(),
                 change_request: None,

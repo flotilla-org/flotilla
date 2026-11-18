@@ -23,13 +23,12 @@ pub(super) fn supervision_policy(
     seat: Option<(&str, &str)>,
 ) -> Result<Vec<SupervisionTarget>, String> {
     let status = convoy.status.as_ref().ok_or("convoy has no status")?;
-    let project_policy = convoy.spec.project_ref.as_ref().and_then(|project| {
-        projects
-            .iter()
-            .map(|source| source.borrow())
-            .find(|source| source.object.metadata.name == *project)
-            .and_then(|source| source.object.spec.supervision.clone())
-    });
+    let project = convoy.spec.project_ref.as_str();
+    let project_policy = projects
+        .iter()
+        .map(|source| source.borrow())
+        .find(|source| source.object.metadata.name == project)
+        .and_then(|source| source.object.spec.supervision.clone());
     let mut policy =
         status.workflow_snapshot.as_ref().and_then(|workflow| workflow.supervision.clone()).or(project_policy).unwrap_or_else(|| {
             vec![
@@ -37,18 +36,16 @@ pub(super) fn supervision_policy(
                 SupervisionTarget::ProjectCrew { convoy_role: "governor".into(), vessel: String::new(), role: "governor".into() },
             ]
         });
-    if let Some(project) = convoy.spec.project_ref.as_deref() {
-        let sender = seat
-            .map(|(vessel, role)| crew_role_address(project, &convoy.metadata.name, vessel, role))
-            .unwrap_or_else(|| format!("{project}/{}", convoy.spec.role));
-        let path = flotilla_messaging::supervision_path(routes.declarations, routes.receivers, project, &sender)
-            .map_err(|error| error.to_string())?;
-        if !path.is_empty() {
-            // Explicit convoy supervision remains first; Project and fleet
-            // routing comes from subscriptions, not role-name guesses.
-            policy.retain(|target| matches!(target, SupervisionTarget::ConvoyCrew { .. }));
-            policy.extend(path.into_iter().map(|contact| SupervisionTarget::Address { address: contact.address }));
-        }
+    let sender = seat
+        .map(|(vessel, role)| crew_role_address(project, &convoy.metadata.name, vessel, role))
+        .unwrap_or_else(|| format!("{project}/{}", convoy.spec.role));
+    let path =
+        flotilla_messaging::supervision_path(routes.declarations, routes.receivers, project, &sender).map_err(|error| error.to_string())?;
+    if !path.is_empty() {
+        // Explicit convoy supervision remains first; Project and fleet
+        // routing comes from subscriptions, not role-name guesses.
+        policy.retain(|target| matches!(target, SupervisionTarget::ConvoyCrew { .. }));
+        policy.extend(path.into_iter().map(|contact| SupervisionTarget::Address { address: contact.address }));
     }
     Ok(policy)
 }
@@ -76,8 +73,7 @@ pub(super) fn resolve_target(
                 .iter()
                 .map(|source| &source.borrow().object)
                 .filter(|candidate| {
-                    convoy.spec.project_ref.is_some()
-                        && candidate.spec.project_ref == convoy.spec.project_ref
+                    candidate.spec.project_ref == convoy.spec.project_ref
                         && candidate.spec.role == *convoy_role
                         && candidate.metadata.name != convoy.metadata.name
                         && candidate.status.as_ref().is_some_and(|status| !status.phase.is_terminal())
@@ -99,28 +95,23 @@ pub(super) fn resolve_target(
                 })
             });
             if supervisor.is_none() {
-                if let Some(project) = convoy.spec.project_ref.as_deref() {
-                    let missing = if candidate.is_some() { " crew" } else { "" };
-                    let detail = if candidate.is_some() {
-                        format!("required crew {vessel}/{role} is absent")
-                    } else {
-                        let matching = available_convoys
-                            .iter()
-                            .map(|source| source.borrow())
-                            .filter(|source| {
-                                source.object.spec.project_ref.as_deref() == Some(project) && source.object.spec.role == *convoy_role
-                            })
-                            .count();
-                        if matching == 0 {
-                            "no matching convoy in replica view".to_string()
-                        } else {
-                            "matching convoys are terminal or the stalled convoy itself".to_string()
-                        }
-                    };
-                    condition.evidence.push_str(&format!("; no live {convoy_role}{missing} for project {project} ({detail})"));
+                let project = &convoy.spec.project_ref;
+                let missing = if candidate.is_some() { " crew" } else { "" };
+                let detail = if candidate.is_some() {
+                    format!("required crew {vessel}/{role} is absent")
                 } else {
-                    condition.evidence.push_str(&format!("; cannot find {convoy_role}: convoy has no project_ref"));
-                }
+                    let matching = available_convoys
+                        .iter()
+                        .map(|source| source.borrow())
+                        .filter(|source| source.object.spec.project_ref == *project && source.object.spec.role == *convoy_role)
+                        .count();
+                    if matching == 0 {
+                        "no matching convoy in replica view".to_string()
+                    } else {
+                        "matching convoys are terminal or the stalled convoy itself".to_string()
+                    }
+                };
+                condition.evidence.push_str(&format!("; no live {convoy_role}{missing} for project {project} ({detail})"));
             }
             supervisor
         }
@@ -211,17 +202,19 @@ impl super::LeafSubscriptionTable {
             {
                 continue;
             }
-            let target_project = convoys
-                .iter()
-                .find(|candidate| candidate.object.metadata.name == target_convoy)
-                .and_then(|candidate| candidate.object.spec.project_ref.as_deref())
-                .unwrap_or(namespace);
             let (receiver, addressed) = match target {
                 SupervisionTarget::Address { address } => (address.clone(), super::Party::of_policy_address(address)?),
-                _ => (
-                    crew_role_address(target_project, &target_convoy, &vessel, &role),
-                    super::Party::Seat { project: target_project.to_owned(), convoy: target_convoy.clone(), role: role.clone() },
-                ),
+                _ => {
+                    let target_project = std::iter::once(convoy)
+                        .chain(convoys.iter().map(|candidate| &candidate.object))
+                        .find(|candidate| candidate.metadata.name == target_convoy)
+                        .map(|candidate| candidate.spec.project_ref.as_str())
+                        .ok_or_else(|| format!("supervising convoy `{target_convoy}` is not in the replica view"))?;
+                    (
+                        crew_role_address(target_project, &target_convoy, &vessel, &role),
+                        super::Party::Seat { project: target_project.to_owned(), convoy: target_convoy.clone(), role: role.clone() },
+                    )
+                }
             };
             // A declared crew state is not a receiver binding. Turn admission
             // can queue an unbound role, so check the binding before calling it.
@@ -250,7 +243,7 @@ impl super::LeafSubscriptionTable {
                 .relation(flotilla_resources::MessageRelation::Supervisor)
                 .expectation(super::stalls::supervision_expectation(rung))
                 .references(vec![super::stalls::convoy_reference(convoy)?])
-                .maybe_stall_of((rung != StallRung::Operator).then(|| super::stalls::stall_of(namespace, convoy, stalled)))
+                .maybe_stall_of((rung != StallRung::Operator).then(|| super::stalls::stall_of(convoy, stalled)))
                 .build();
             let actuator = self.inner.turn_delivery.lock().await.clone();
             let admission = match actuator.deliver(&intent).await {

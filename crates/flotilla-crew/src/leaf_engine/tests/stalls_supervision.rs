@@ -823,30 +823,6 @@ async fn replicated_governor_receives_stall_in_one_pass() {
     assert_eq!(requests[0].expectation, flotilla_messaging::IntentExpectation::Reply);
 }
 
-// ProjectCrew requires project scope; a missing ref must be diagnostic,
-// never a match with an unrelated projectless governor.
-#[tokio::test]
-async fn stalled_work_without_project_records_lookup_failure() {
-    let case = project_supervision_case(&[]).await;
-    // A governor of no project is at work.
-    let spec = ConvoySpec::builder().workflow_ref("workflow".into()).role("governor".into()).generation(1).build();
-    let mut status = single_agent("governor");
-    status.workflow_snapshot.as_mut().expect("workflow").vessels[0].name = "govern".into();
-    let governor = case.home.admit("governor", spec, status).await;
-    let vessel = case.home.vessel(&governor, "govern", "env");
-    case.home.session(&vessel, "governor", "governor-1-governor", "env");
-    // The work as a caller holds it names no project.
-    let mut source = case.convoy().await;
-    case.caught_up(&case.wake).await;
-    source.spec.project_ref = None;
-    case.wake.judge_stalls_at("flotilla", &HashMap::from([(case.work.clone(), source)]), Utc::now()).await.expect("judge stalls");
-    let stall = case.status().await.stalled.expect("stall");
-    assert_eq!(stall.rung, StallRung::Operator);
-    assert!(stall.evidence.contains("convoy has no project_ref"), "{}", stall.evidence);
-    assert!(!stall.supervision_exhausted);
-    assert!(case.delivery.requests.lock().expect("deliveries").is_empty());
-}
-
 // Supervision commands must preserve identifiers containing shell metacharacters.
 // Formatting glue: spaces and an apostrophe exercise the shared shell quoting helper.
 #[tokio::test]
@@ -1088,11 +1064,11 @@ async fn read_by_one_judgement(others: usize) -> (u64, u64, u64) {
     let wake = supervision_wake(&backend, &home);
     let mut objects = HashMap::new();
     for index in 0..=others {
-        let spec = ConvoySpec::builder().workflow_ref("workflow".into()).build();
+        let spec = ConvoySpec::builder().workflow_ref("workflow".into()).project_ref("flotilla".into()).build();
         let launch = home.admit(&format!("convoy-{index}"), spec, single_agent("coder")).await;
         home.vessel(&launch, "work", "env");
         let convoy = home.view(&backend, &launch).await;
-        let seat = flotilla_resources::convoy_crew_seats("flotilla", &convoy).remove(0);
+        let seat = flotilla_resources::convoy_crew_seats(&convoy).remove(0);
         let intent = flotilla_messaging::Intent::new(
             flotilla_engine_messages_testkit::party("system:turn-rules"),
             flotilla_resources::convoy::engine::role_inbox(&seat).expect("the seat's inbox"),
@@ -1664,11 +1640,11 @@ async fn supervision_records_have_a_subject_and_operator_notices_expect_nothing(
     case.judge(&case.wake, Utc::now()).await;
     let source = case.convoy().await;
     let mut condition = source.status.as_ref().expect("status").stalled.clone().expect("stall");
-    assert_eq!(super::super::stalls::stall_subject("flotilla", &source, &condition), case.coder());
+    assert_eq!(super::super::stalls::stall_subject(&source, &condition), case.coder());
     condition.leaves.clear();
     let launch = flotilla_resources::convoy::engine::launch_address(&flotilla_address::Address::project("wheelhouse").unwrap(), &case.work)
         .expect("a launch address");
-    assert_eq!(super::super::stalls::stall_subject("flotilla", &source, &condition), launch.to_string());
+    assert_eq!(super::super::stalls::stall_subject(&source, &condition), launch.to_string());
     assert_eq!(super::super::stalls::supervision_expectation(StallRung::Operator), flotilla_messaging::IntentExpectation::Nothing);
     assert_eq!(super::super::stalls::supervision_expectation(StallRung::Governor), flotilla_messaging::IntentExpectation::Reply);
 }

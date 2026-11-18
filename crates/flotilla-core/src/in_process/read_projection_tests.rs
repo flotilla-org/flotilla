@@ -204,7 +204,7 @@ mod tests {
         let launch = home
             .admit(
                 "stalled",
-                ConvoySpec::builder().workflow_ref("scratch".into()).build(),
+                ConvoySpec::builder().workflow_ref("scratch".into()).project_ref("flotilla".into()).build(),
                 ConvoyStatus { workflow_snapshot: Some(snapshot), ..Default::default() },
             )
             .await;
@@ -276,7 +276,7 @@ mod tests {
         let launch = home
             .admit(
                 "stalled",
-                ConvoySpec::builder().workflow_ref("scratch".into()).build(),
+                ConvoySpec::builder().workflow_ref("scratch".into()).project_ref("flotilla".into()).build(),
                 ConvoyStatus { workflow_snapshot: Some(snapshot), ..Default::default() },
             )
             .await;
@@ -315,7 +315,7 @@ mod tests {
         let launch = home_a
             .admit(
                 "stalled",
-                ConvoySpec::builder().workflow_ref("scratch".into()).build(),
+                ConvoySpec::builder().workflow_ref("scratch".into()).project_ref("flotilla".into()).build(),
                 flotilla_engine_convoys_testkit::single_agent("coder"),
             )
             .await;
@@ -377,7 +377,7 @@ mod tests {
         let launch = home
             .admit(
                 "demo",
-                ConvoySpec::builder().workflow_ref("scratch".into()).build(),
+                ConvoySpec::builder().workflow_ref("scratch".into()).project_ref("flotilla".into()).build(),
                 flotilla_engine_convoys_testkit::single_agent("coder"),
             )
             .await;
@@ -1116,6 +1116,7 @@ mod tests {
                 "fresh",
                 ConvoySpec::builder()
                     .workflow_ref("review".to_string())
+                    .project_ref("flotilla".to_string())
                     .subjects(vec![DeclaredSubject {
                         subject: subject.clone(),
                         relationship: Relationship::References,
@@ -1171,7 +1172,11 @@ mod tests {
         let launch = fixture
             .admit(
                 "subjects",
-                ConvoySpec::builder().workflow_ref("review".to_string()).subjects(declared.to_vec()).build(),
+                ConvoySpec::builder()
+                    .workflow_ref("review".to_string())
+                    .project_ref("flotilla".to_string())
+                    .subjects(declared.to_vec())
+                    .build(),
                 flotilla_engine_convoys_testkit::single_agent("coder"),
             )
             .await;
@@ -1222,7 +1227,11 @@ mod tests {
         let previous = fixture
             .admit(
                 "previous",
-                ConvoySpec::builder().workflow_ref("review".to_string()).subjects(vec![declared[1].clone()]).build(),
+                ConvoySpec::builder()
+                    .workflow_ref("review".to_string())
+                    .project_ref("flotilla".to_string())
+                    .subjects(vec![declared[1].clone()])
+                    .build(),
                 flotilla_engine_convoys_testkit::single_agent("coder"),
             )
             .await;
@@ -1245,7 +1254,7 @@ mod tests {
         let launch = fixture
             .admit(
                 "finished",
-                ConvoySpec::builder().workflow_ref("review".to_string()).build(),
+                ConvoySpec::builder().workflow_ref("review".to_string()).project_ref("flotilla".to_string()).build(),
                 ConvoyStatus { phase: ConvoyPhase::Failed, ..flotilla_engine_convoys_testkit::single_agent("coder") },
             )
             .await;
@@ -1267,7 +1276,11 @@ mod tests {
             newest = fixture
                 .admit(
                     &flotilla_resources::convoy_address::convoy_record_name(),
-                    ConvoySpec::builder().workflow_ref("review".to_string()).role("start-fail".to_string()).build(),
+                    ConvoySpec::builder()
+                        .workflow_ref("review".to_string())
+                        .project_ref("flotilla".to_string())
+                        .role("start-fail".to_string())
+                        .build(),
                     ConvoyStatus { phase, ..flotilla_engine_convoys_testkit::single_agent("coder") },
                 )
                 .await;
@@ -1309,7 +1322,7 @@ mod tests {
         let launch = fixture
             .admit(
                 "held",
-                ConvoySpec::builder().workflow_ref("review".to_string()).build(),
+                ConvoySpec::builder().workflow_ref("review".to_string()).project_ref("flotilla".to_string()).build(),
                 flotilla_engine_convoys_testkit::single_agent("coder"),
             )
             .await;
@@ -1346,7 +1359,7 @@ mod tests {
         let launch = fixture
             .admit(
                 "health-convoy",
-                ConvoySpec::builder().workflow_ref("review".to_string()).build(),
+                ConvoySpec::builder().workflow_ref("review".to_string()).project_ref("flotilla".to_string()).build(),
                 flotilla_engine_convoys_testkit::single_agent("coder"),
             )
             .await;
@@ -1446,6 +1459,7 @@ mod tests {
                 "ledger-artifact",
                 ConvoySpec::builder()
                     .workflow_ref("review".into())
+                    .project_ref("flotilla".into())
                     .subjects(if pr_bound {
                         vec![flotilla_resources::DeclaredSubject {
                             subject: Subject {
@@ -1770,7 +1784,7 @@ mod tests {
                 fixture
                     .admit(
                         &format!("unrelated-{index}"),
-                        ConvoySpec::builder().workflow_ref("review".into()).build(),
+                        ConvoySpec::builder().workflow_ref("review".into()).project_ref("flotilla".into()).build(),
                         flotilla_engine_convoys_testkit::single_agent("coder"),
                     )
                     .await;

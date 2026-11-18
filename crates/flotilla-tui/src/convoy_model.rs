@@ -187,7 +187,7 @@ pub struct ConvoySummary {
     pub disposition: Option<String>,
     pub repo_hint: Option<RepoKey>,
     /// The Project this convoy belongs to (`ConvoySpec.project_ref`).
-    pub project_ref: Option<String>,
+    pub project_ref: String,
     #[builder(default)]
     pub issues: Vec<wire::ConvoyIssueRow>,
     #[builder(default)]
@@ -244,11 +244,11 @@ impl ConvoySummary {
     }
 
     pub fn address(&self) -> String {
-        self.project_ref.as_ref().map_or_else(|| self.name.clone(), |project| format!("{}@{project}", self.name))
+        format!("{}@{}", self.name, self.project_ref)
     }
 
     pub fn display_name(&self) -> String {
-        self.project_ref.as_ref().map_or_else(|| self.name.clone(), |project| format!("{} @ {project}", self.name))
+        format!("{} @ {}", self.name, self.project_ref)
     }
 }
 
@@ -285,7 +285,7 @@ fn vessel_summary(row: &wire::ConvoyRow, vessel: &wire::VesselRow) -> VesselSumm
 }
 
 fn wire_convoy_address(row: &wire::ConvoyRow) -> String {
-    row.project_ref.as_ref().map_or_else(|| row.name.clone(), |project| format!("{}@{project}", row.name))
+    format!("{}@{}", row.name, row.project_ref)
 }
 
 #[cfg(test)]
@@ -315,6 +315,7 @@ mod tests {
             .resource(ResourceRef::new("flotilla.work/v1", "Convoy", "flotilla", "remote-convoy").on_host(HostName::new("feta")))
             .name("remote-convoy")
             .workflow_ref("review-and-fix")
+            .project_ref("flotilla")
             .phase(wire::ConvoyPhase::Failed)
             .build();
 

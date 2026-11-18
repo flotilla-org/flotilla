@@ -659,7 +659,7 @@ mod tests {
             placement_policy: None,
             repositories: vec![],
             r#ref: None,
-            project_ref: None,
+            project_ref: "flotilla".to_string(),
             adopted_checkout_refs: BTreeMap::new(),
             issues: vec![],
             change_request: None,

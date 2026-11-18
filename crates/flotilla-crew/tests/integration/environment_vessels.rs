@@ -26,7 +26,7 @@ fn home() -> (OtherHome, EngineFixture, EngineConvoysHome) {
 /// Launches convoy `name` with one work, and that work's vessel realised in `environment` with
 /// its agent crew requested there; returns the vessel's launch.
 async fn vessel_in(engine: &EngineFixture, convoys: &EngineConvoysHome, name: &str, environment: &str) -> String {
-    let spec = ConvoySpec::builder().workflow_ref("workflow".into()).build();
+    let spec = ConvoySpec::builder().project_ref(NAMESPACE.into()).workflow_ref("workflow".into()).build();
     let launch = convoys.launch(convoy(NAMESPACE, name, spec, single_agent("coder"))).await;
     let vessel = engine.vessels.request(&launch, "work", "host");
     engine.terminals.request(&TerminalsFixture::agent(&vessel, "coder", environment));

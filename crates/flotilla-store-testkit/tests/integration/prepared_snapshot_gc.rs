@@ -42,7 +42,11 @@ async fn create_convoy(
                     (PLACEMENT_SNAPSHOT_ANNOTATION.to_string(), placement_snapshot.to_string()),
                 ]))
                 .build(),
-            &ConvoySpec::builder().workflow_ref("logical-workflow".to_string()).placement_policy("logical-placement".to_string()).build(),
+            &ConvoySpec::builder()
+                .workflow_ref("logical-workflow".to_string())
+                .placement_policy("logical-placement".to_string())
+                .project_ref("flotilla".to_string())
+                .build(),
         )
         .await
         .map(|_| ())

@@ -30,7 +30,7 @@ async fn credential_refresh_attention_appears_and_clears_on_recovery() {
         }),
         ..ConvoyStatus::default()
     };
-    let spec = ConvoySpec::builder().workflow_ref("test".to_string()).build();
+    let spec = ConvoySpec::builder().project_ref(NAMESPACE.into()).workflow_ref("test".to_string()).build();
     let convoy = flotilla_engine_convoys_testkit::launch(
         &daemon.convoy_engine_path(),
         flotilla_engine_convoys_testkit::convoy(NAMESPACE, "credential-convoy", spec, status),
@@ -887,7 +887,7 @@ async fn slow_work_credential_phase_keeps_heartbeat_available_and_completes() {
         }),
         ..ConvoyStatus::default()
     };
-    let spec = ConvoySpec::builder().workflow_ref("test".to_string()).build();
+    let spec = ConvoySpec::builder().project_ref(NAMESPACE.into()).workflow_ref("test".to_string()).build();
     let convoy = flotilla_engine_convoys_testkit::launch(
         &daemon.convoy_engine_path(),
         flotilla_engine_convoys_testkit::convoy(NAMESPACE, "credential-work", spec, status),
@@ -1002,7 +1002,7 @@ async fn credential_attention_reads_only_live_convoys() {
     let backend = home.backend().clone();
     // 300 landed launches and 10 live ones.
     for index in 0..310 {
-        let spec = ConvoySpec::builder().workflow_ref("workflow".into()).build();
+        let spec = ConvoySpec::builder().project_ref(NAMESPACE.into()).workflow_ref("workflow".into()).build();
         let launch = home.admit(&format!("history-{index}"), spec, single_agent("coder")).await;
         if index < 300 {
             land(&home.convoys.path(), &home.convoy(&launch).await).await;
@@ -1143,7 +1143,7 @@ impl RunningCards {
                 }),
                 ..ConvoyStatus::default()
             };
-            let spec = ConvoySpec::builder().workflow_ref("test".to_string()).build();
+            let spec = ConvoySpec::builder().project_ref(NAMESPACE.into()).workflow_ref("test".to_string()).build();
             let launch =
                 admit_convoy(&daemon, flotilla_engine_convoys_testkit::convoy(NAMESPACE, &format!("cards-{n}"), spec, status)).await;
             let vessel = fixture.vessels.request(&launch, "work", &host);

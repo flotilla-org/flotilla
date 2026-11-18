@@ -829,6 +829,7 @@ fn linked_subject_convoy() -> ConvoyRow {
         .resource(ResourceRef::new("flotilla.work/v1", "Convoy", "flotilla", "ship-it").on_host(HostName::new("kiwi")))
         .name("ship-it")
         .workflow_ref("dev")
+        .project_ref("flotilla")
         .phase(flotilla_protocol::result_set::ConvoyPhase::Active)
         .subjects(vec![flotilla_protocol::result_set::ConvoySubjectRow {
             subject: flotilla_protocol::Subject {
@@ -1642,7 +1643,7 @@ fn connector_admits_hold_ledger_and_message_records() {
             "Convoy",
             "convoys",
             "ship-it",
-            serde_json::json!({"workflow_ref":"dev"}),
+            serde_json::json!({"workflow_ref":"dev","project_ref":"flotilla"}),
             serde_json::json!({"phase":"Active","turn_deliveries":{"checks-settled":{"hold":{"source":"checks-settled","reason":"episode limit","raised_at":"2026-10-07T12:00:00Z"}}}}),
         ),
         (

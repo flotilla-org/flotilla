@@ -305,7 +305,7 @@ impl FleetService {
             .flatten()
             .map(|convoy| {
                 let role = convoy.address_role.as_deref().unwrap_or(&convoy.name);
-                let address = convoy.project_ref.as_ref().map_or_else(|| role.to_string(), |project| format!("{role} @ {project}"));
+                let address = format!("{role} @ {}", convoy.project_ref);
                 (convoy.resource.name.clone(), address)
             })
             .collect::<HashMap<_, _>>();
@@ -581,7 +581,7 @@ fn append_crewless_convoy_rows(
             if !convoys_with_crew.insert(row.resource.name.clone()) {
                 continue;
             }
-            let display = row.project_ref.as_ref().map_or_else(|| row.name.clone(), |project| format!("{} @ {project}", row.name));
+            let display = format!("{} @ {}", row.name, row.project_ref);
             rows.push(
                 FleetListRow::builder()
                     .convoy(display)
@@ -655,6 +655,7 @@ mod tests {
             .resource(ResourceRef::new("flotilla.work/v1", "Convoy", "flotilla", "convoy").on_host(remote.clone()))
             .name("convoy".to_string())
             .workflow_ref("workflow".to_string())
+            .project_ref("flotilla".to_string())
             .landing_reason("landed: coder complete (#2973) after merged-unclaimed")
             .phase(ConvoyPhase::Landed)
             .build();
@@ -674,6 +675,7 @@ mod tests {
             .resource(ResourceRef::new("flotilla.work/v1", "Convoy", "flotilla", "convoy"))
             .name("convoy".to_string())
             .workflow_ref("workflow".to_string())
+            .project_ref("flotilla".to_string())
             .unreadable("admission document does not decode")
             .build();
         let result_sets = vec![ResultSet { seq: 1, rows: Rows::Convoys { scope: None, rows: vec![convoy] }, state: Default::default() }];

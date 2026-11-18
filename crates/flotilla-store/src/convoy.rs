@@ -323,7 +323,10 @@ mod live_query_tests {
         let convoys = backend.using::<Convoy>("ns");
         let mut expected = std::collections::BTreeSet::from(["missing".to_string()]);
         convoys
-            .create(&InputMeta::builder().name("missing".into()).build(), &ConvoySpec::builder().workflow_ref("workflow".into()).build())
+            .create(
+                &InputMeta::builder().name("missing".into()).build(),
+                &ConvoySpec::builder().workflow_ref("workflow".into()).project_ref("ns".into()).build(),
+            )
             .await
             .expect("missing status");
         for phase in [
@@ -345,7 +348,10 @@ mod live_query_tests {
                 ConvoyPhase::Abandoned => "abandoned",
             };
             let created = convoys
-                .create(&InputMeta::builder().name(name.into()).build(), &ConvoySpec::builder().workflow_ref("workflow".into()).build())
+                .create(
+                    &InputMeta::builder().name(name.into()).build(),
+                    &ConvoySpec::builder().workflow_ref("workflow".into()).project_ref("ns".into()).build(),
+                )
                 .await
                 .expect("phase record");
             convoys
@@ -367,17 +373,11 @@ mod lookup_tests {
     use super::*;
     use flotilla_resources::{Convoy, ConvoyPhase, ConvoySpec, ConvoyStatus, InputMeta, PROJECT_LABEL, ROLE_LABEL};
 
-    /// Creates convoy `record` holding `role` in `project`, labelled as admission labels it: a
-    /// convoy of no project carries an empty project label.
-    async fn convoy(backend: &crate::ResourceBackend, record: &str, role: &str, project: Option<&str>, phase: Option<ConvoyPhase>) {
+    /// Creates convoy `record` holding `role` in `project`, labelled as admission labels it.
+    async fn convoy(backend: &crate::ResourceBackend, record: &str, role: &str, project: &str, phase: Option<ConvoyPhase>) {
         let convoys = backend.clone().using::<Convoy>("ns");
-        let labels =
-            BTreeMap::from([(ROLE_LABEL.to_owned(), role.to_owned()), (PROJECT_LABEL.to_owned(), project.unwrap_or_default().to_owned())]);
-        let spec = ConvoySpec::builder()
-            .workflow_ref("workflow".into())
-            .maybe_project_ref(project.map(str::to_owned))
-            .role(role.to_owned())
-            .build();
+        let labels = BTreeMap::from([(ROLE_LABEL.to_owned(), role.to_owned()), (PROJECT_LABEL.to_owned(), project.to_owned())]);
+        let spec = ConvoySpec::builder().workflow_ref("workflow".into()).project_ref(project.to_owned()).role(role.to_owned()).build();
         let created = convoys.create(&InputMeta::builder().name(record.into()).labels(labels).build(), &spec).await.unwrap();
         if let Some(phase) = phase {
             let status = ConvoyStatus { phase, ..Default::default() };
@@ -397,12 +397,13 @@ mod lookup_tests {
     #[tokio::test]
     async fn a_convoy_address_names_a_role_or_a_record_in_its_project() {
         let backend = crate::test_store::memory_backend();
-        convoy(&backend, "convoy-0123", "reviewer", Some("flotilla"), None).await;
-        convoy(&backend, "convoy-0456", "lander", None, None).await;
+        convoy(&backend, "convoy-0123", "reviewer", "flotilla", None).await;
+        convoy(&backend, "convoy-0456", "lander", "other", None).await;
         for (address, record) in [
             ("project:flotilla/convoy:reviewer", Some("convoy-0123")),
             ("project:flotilla/convoy:convoy-0123", Some("convoy-0123")),
-            ("convoy:lander", Some("convoy-0456")),
+            ("project:other/convoy:lander", Some("convoy-0456")),
+            ("convoy:lander", None),
             ("convoy:convoy-0456", Some("convoy-0456")),
             ("convoy:reviewer", None),
             ("convoy:convoy-0123", Some("convoy-0123")),
@@ -420,15 +421,15 @@ mod lookup_tests {
     #[tokio::test]
     async fn the_role_answers_ahead_of_a_record_named_like_it() {
         let backend = crate::test_store::memory_backend();
-        convoy(&backend, "lander", "coder", Some("flotilla"), None).await;
-        convoy(&backend, "convoy-1", "lander", Some("flotilla"), Some(ConvoyPhase::Landed)).await;
-        convoy(&backend, "convoy-2", "lander", Some("flotilla"), Some(ConvoyPhase::Active)).await;
+        convoy(&backend, "lander", "coder", "flotilla", None).await;
+        convoy(&backend, "convoy-1", "lander", "flotilla", Some(ConvoyPhase::Landed)).await;
+        convoy(&backend, "convoy-2", "lander", "flotilla", Some(ConvoyPhase::Active)).await;
         assert_eq!(lookup(&backend, "project:flotilla/convoy:lander").await, Ok(Some("convoy-2".into())));
         assert_eq!(lookup(&backend, "project:flotilla/convoy:coder").await, Ok(Some("lander".into())));
 
-        convoy(&backend, "convoy-3", "reviewer", Some("flotilla"), Some(ConvoyPhase::Landed)).await;
+        convoy(&backend, "convoy-3", "reviewer", "flotilla", Some(ConvoyPhase::Landed)).await;
         assert_eq!(lookup(&backend, "project:flotilla/convoy:reviewer").await, Ok(Some("convoy-3".into())));
-        convoy(&backend, "convoy-4", "reviewer", Some("flotilla"), Some(ConvoyPhase::Abandoned)).await;
+        convoy(&backend, "convoy-4", "reviewer", "flotilla", Some(ConvoyPhase::Abandoned)).await;
         let ambiguous = lookup(&backend, "project:flotilla/convoy:reviewer").await.unwrap_err();
         assert_eq!(ambiguous, "convoy `reviewer@flotilla` is held by several records; name one by its record: convoy-3, convoy-4");
     }

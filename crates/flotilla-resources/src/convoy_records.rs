@@ -166,7 +166,7 @@ impl UnreadableLaunch {
             spec: ConvoySpec::builder()
                 .workflow_ref(self.workflow_ref.clone())
                 .generation(self.launch)
-                .maybe_project_ref((!self.project.is_empty()).then(|| self.project.clone()))
+                .project_ref(self.project.clone())
                 .build(),
             status: None,
         }
@@ -567,7 +567,7 @@ impl ConvoyRecord {
             placement_policy: document.placement_policy.clone(),
             repositories: document.repositories.clone(),
             r#ref: document.r#ref.clone(),
-            project_ref: (!self.project.is_empty()).then(|| self.project.clone()),
+            project_ref: self.project.clone(),
             adopted_checkout_refs: document.adopted_checkout_refs.clone(),
             subjects: document.subjects.clone(),
             issues: document.subjects.iter().filter_map(|subject| subject.issue.clone()).collect::<Vec<ConvoyIssue>>(),

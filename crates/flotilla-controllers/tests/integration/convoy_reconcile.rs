@@ -212,6 +212,7 @@ async fn reconcile_with_observed_digest(phase: ConvoyPhase, observed_digest: Opt
         .create(
             &convoy_meta("digest-anchor"),
             &flotilla_resources::ConvoySpec::builder()
+                .project_ref("flotilla".into())
                 .workflow_ref("reviewless".to_string())
                 .adopted_checkout_refs(BTreeMap::from([(repo_ref.clone(), "checkout-a".to_string())]))
                 .build(),
@@ -385,7 +386,7 @@ fn landing_many_old_merged_observations(tc: hegel::TestCase) {
             change_request: None,
         })
         .collect();
-    let spec = ConvoySpec::builder().workflow_ref("interactive".to_string()).subjects(subjects).build();
+    let spec = ConvoySpec::builder().project_ref("flotilla".into()).workflow_ref("interactive".to_string()).subjects(subjects).build();
     let mut status = bootstrapped_convoy_status();
     status.phase = ConvoyPhase::Landing;
     status.observed_workflow_ref = Some("interactive".to_string());
@@ -476,6 +477,7 @@ fn landing_requires_each_active_subject_to_reach_either_world_terminal() {
         (request("flotilla-org/flotilla", "2339"), flotilla_protocol::Relationship::Supersedes),
     ];
     let spec = flotilla_resources::ConvoySpec::builder()
+        .project_ref("flotilla".into())
         .workflow_ref("interactive".to_string())
         .subjects(
             subjects
@@ -1329,7 +1331,10 @@ async fn three_pr_promises_hold_completion_and_landing() {
                 );
             }
             let created = convoys
-                .create(&convoy_meta("three-pr"), &flotilla_resources::ConvoySpec::builder().workflow_ref("review-and-fix".into()).build())
+                .create(
+                    &convoy_meta("three-pr"),
+                    &flotilla_resources::ConvoySpec::builder().project_ref("flotilla".into()).workflow_ref("review-and-fix".into()).build(),
+                )
                 .await
                 .unwrap();
             convoys.update_status("three-pr", &created.metadata.resource_version, &status).await.unwrap();

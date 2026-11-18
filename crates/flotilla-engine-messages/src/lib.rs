@@ -1399,10 +1399,10 @@ impl MessagePrimitives {
         // The convoy's own record names its project: one keyed read.
         let project = match self.backend()?.including_replicas::<Convoy>(namespace).get(convoy).await {
             Ok(read) => read.object.spec.project_ref,
-            Err(ResourceError::NotFound { .. }) => None,
+            Err(ResourceError::NotFound { .. }) => return Err(format!("convoy `{convoy}` is not held here")),
             Err(error) => return Err(error.to_string()),
         };
-        let authority = convoy_reference_address(convoy, project.as_deref().unwrap_or(namespace))?;
+        let authority = convoy_reference_address(convoy, &project)?;
         self.world.update(|world| world.authority.put(&flotilla_state_machines::Ref::new(authority.as_str()), true));
         self.inbox.drop(&id, DropReason::Withdrawn { by: by.clone(), authority }).await.map_err(|error| error.to_string())?;
         self.withdraw_awaiting(&id, &by, "withdrawn by an operator").await;
@@ -2393,24 +2393,27 @@ impl OldStoreRecords {
         })
     }
 
-    /// The project a convoy belongs to, if it declares one.
+    /// The project a convoy belongs to; `None` when the convoy is not held.
     pub fn convoy_project(&self, name: &str) -> Option<String> {
-        self.convoy(name)?.spec.project_ref.clone()
+        Some(self.convoy(name)?.spec.project_ref.clone())
+    }
+
+    fn held_convoy_project(&self, name: &str) -> Result<String, String> {
+        self.convoy_project(name).ok_or_else(|| format!("convoy `{name}` was not read"))
     }
 
     fn convoy_address(&self, name: &str) -> Result<Address, String> {
-        convoy_reference_address(name, &self.convoy_project(name).unwrap_or_else(|| self.namespace.clone()))
+        convoy_reference_address(name, &self.held_convoy_project(name)?)
     }
 
     /// A crew session's seat, the address its convoy role's messages are received at (the crew's
-    /// receiver spelling, under the convoy's project or else the namespace): a capability card is
-    /// about the session's seat.
+    /// receiver spelling, under the convoy's project): a capability card is about the session's seat.
     fn seat(&self, session: &str) -> Result<Address, String> {
         let terminal = self.terminal(session).ok_or_else(|| format!("session `{session}` was not read"))?;
         let TerminalSessionSource::Agent { context, .. } = &terminal.spec.source else {
             return Err(format!("session `{session}` is no crew session"));
         };
-        let project = self.convoy_project(&context.convoy).unwrap_or_else(|| self.namespace.clone());
+        let project = self.held_convoy_project(&context.convoy)?;
         // A launch's convoy is addressed as `launch_address` names it: a standing launch's record
         // name is its address, not a segment.
         Address::project(&project)

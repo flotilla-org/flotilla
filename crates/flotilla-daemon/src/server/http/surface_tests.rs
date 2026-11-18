@@ -635,7 +635,7 @@ impl Daemon {
 
     /// Admits a launch of convoy `name`, returning the launch.
     async fn convoy(&self, name: &str) -> String {
-        let spec = ConvoySpec::builder().workflow_ref("workflow".into()).build();
+        let spec = ConvoySpec::builder().project_ref("flotilla".into()).workflow_ref("workflow".into()).build();
         let convoy =
             flotilla_engine_convoys_testkit::convoy("flotilla", name, spec, flotilla_engine_convoys_testkit::single_agent("coder"));
         admit_convoy(&self.daemon, convoy).await
@@ -960,7 +960,7 @@ fn named_query_summaries_match_fresh_reads(tc: hegel::TestCase) {
     runtime.block_on(async move {
         let daemon = Daemon::start().await;
         for (index, workflow) in convoys.iter().enumerate() {
-            let spec = ConvoySpec::builder().workflow_ref(format!("w{}", workflow + 1)).build();
+            let spec = ConvoySpec::builder().project_ref("flotilla".into()).workflow_ref(format!("w{}", workflow + 1)).build();
             let convoy = flotilla_engine_convoys_testkit::convoy(
                 "flotilla",
                 &format!("r{index}"),

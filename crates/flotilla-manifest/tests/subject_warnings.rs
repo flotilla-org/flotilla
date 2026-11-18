@@ -98,6 +98,7 @@ fn uncovered_subject_service_warns_with_service() {
     let mut convoy = ConvoyRow::builder()
         .resource(ResourceRef::new("flotilla/v1", "Convoy", "dev", "work"))
         .name("work")
+        .project_ref("flotilla")
         .workflow_ref("dev")
         .phase(ConvoyPhase::Active)
         .build();

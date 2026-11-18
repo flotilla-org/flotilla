@@ -107,7 +107,7 @@ async fn turn_delivery_reopens_work_and_stages_credentials_before_queuing_every_
         let convoy = super::admit_snapshot(
             &daemon,
             "turn-credential-work",
-            ConvoySpec::builder().workflow_ref("implement-review".to_string()).build(),
+            ConvoySpec::builder().project_ref("flotilla".into()).workflow_ref("implement-review".to_string()).build(),
             snapshot,
         )
         .await;

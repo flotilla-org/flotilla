@@ -1,4 +1,3 @@
-use flotilla_resources::convoy_address::convoy_record_name;
 use flotilla_store_memory::engine_home_backend;
 use std::collections::{BTreeMap, BTreeSet};
 use std::sync::Arc;
@@ -9,36 +8,12 @@ use flotilla_protocol::{HostName, PlacementDecision, PlacementTargetHost};
 use flotilla_resources::{
     CapabilityNeed, Convoy as ResourceConvoy, ConvoyPhase, ConvoySpec, ConvoyStatus, FulfilmentFacts, FulfilmentGrant, FulfilmentKind,
     FulfilmentKindSpec, FulfilmentRealisation, HarnessFacts, Host as ResourceHost, HostSpec, HostStatus, InputMeta, WorkflowTemplateSpec,
-    GENERATION_LABEL, PROJECT_LABEL, ROLE_LABEL,
 };
 use flotilla_store::ResourceBackend;
 
 use super::support::{create_docker_placement, host_direct_kind, put_host, read_host, test_meta};
 use crate::in_process::{placement_target_host, InProcessDaemon};
 use crate::testkits::discovery::fake_discovery;
-use flotilla_admission::convoy_admission::refuse_live_convoy_in;
-
-#[tokio::test]
-async fn projectless_convoys_do_not_share_an_identity_bucket_with_a_project_named_standalone() {
-    let home = flotilla_engine_convoys_testkit::EngineHome::open("home");
-    let backend = home.backend();
-    refuse_live_convoy_in(backend, "flotilla", None, "worker").await.expect("projectless identity");
-    let generation = 1;
-    let mut convoy = flotilla_engine_convoys_testkit::convoy(
-        "flotilla",
-        &convoy_record_name(),
-        ConvoySpec::builder().workflow_ref("work".to_string()).role("worker".to_string()).generation(generation).build(),
-        flotilla_engine_convoys_testkit::single_agent("worker"),
-    );
-    convoy.metadata.labels = BTreeMap::from([
-        (PROJECT_LABEL.to_string(), String::new()),
-        (ROLE_LABEL.to_string(), "worker".to_string()),
-        (GENERATION_LABEL.to_string(), generation.to_string()),
-    ]);
-    home.convoys.launch(convoy).await;
-
-    assert!(refuse_live_convoy_in(backend, "flotilla", Some("standalone"), "worker").await.is_ok());
-}
 
 #[tokio::test]
 async fn capability_admission_resolves_display_name_kind_and_policy_host_refs() {
@@ -522,7 +497,13 @@ async fn fleet_health_does_not_materialize_convoy_inventory() {
     let remote = flotilla_engine_convoys_testkit::EngineHome::open("remote");
     for index in 0..320 {
         let status = ConvoyStatus { message: Some("x".repeat(30_000)), ..flotilla_engine_convoys_testkit::single_agent("coder") };
-        remote.admit(&format!("remote-{index}"), ConvoySpec::builder().workflow_ref("scratch".into()).build(), status).await;
+        remote
+            .admit(
+                &format!("remote-{index}"),
+                ConvoySpec::builder().workflow_ref("scratch".into()).project_ref("flotilla".into()).build(),
+                status,
+            )
+            .await;
     }
     flotilla_provisioning_testkit::replicate_home(remote.service(), "remote", &daemon.decided_store().expect("decided store"));
     for _ in 0..2 {
@@ -683,7 +664,7 @@ async fn admit_placed(daemon: &InProcessDaemon, name: &str, decision: PlacementD
     super::support::admit(
         daemon,
         name,
-        ConvoySpec::builder().workflow_ref("missing".to_string()).build(),
+        ConvoySpec::builder().workflow_ref("missing".to_string()).project_ref("flotilla".to_string()).build(),
         ConvoyStatus { placement_decision: Some(decision), ..flotilla_engine_convoys_testkit::single_agent("coder") },
     )
     .await

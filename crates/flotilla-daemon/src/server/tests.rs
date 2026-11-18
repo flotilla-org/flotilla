@@ -223,7 +223,7 @@ async fn daemon_discovery_path_is_independent_of_its_config_and_socket_paths() {
 #[tokio::test]
 async fn resource_http_lists_and_watches_over_a_unix_socket() {
     use flotilla_engine_convoys_testkit::{single_agent, EngineHome};
-    let spec = || ConvoySpec::builder().workflow_ref("workflow".to_string()).build();
+    let spec = || ConvoySpec::builder().workflow_ref("workflow".to_string()).project_ref("flotilla".to_string()).build();
     // One convoy admitted here, and one admitted at another home and received here.
     let home = EngineHome::open_in("source-root", "flotilla");
     let source = home.backend().clone();
@@ -1086,7 +1086,7 @@ async fn managed_hook_turns_update_attention_through_terminal_session() {
             }),
             ..Default::default()
         };
-        let spec = ConvoySpec::builder().workflow_ref("hook-test".into()).build();
+        let spec = ConvoySpec::builder().workflow_ref("hook-test".into()).project_ref("flotilla".into()).build();
         let convoy_name =
             admit_convoy(&daemon, flotilla_engine_convoys_testkit::convoy("flotilla", &format!("hook-{harness_name}"), spec, status)).await;
         let name = format!("terminal-{harness_name}");
@@ -1528,7 +1528,7 @@ async fn dispatch_execute_remote_convoy_failure_names_transport_target_and_cause
         .launch(flotilla_engine_convoys_testkit::convoy(
             "flotilla",
             "stranded",
-            ConvoySpec::builder().workflow_ref("scratch".to_string()).build(),
+            ConvoySpec::builder().workflow_ref("scratch".to_string()).project_ref("flotilla".to_string()).build(),
             flotilla_engine_convoys_testkit::single_agent("coder"),
         ))
         .await;
@@ -4779,7 +4779,7 @@ async fn slow_startup_reconciliation_does_not_delay_listening_or_fleet_health() 
         let mut convoy = flotilla_engine_convoys_testkit::convoy(
             "flotilla",
             &format!("stored-{index}"),
-            ConvoySpec::builder().workflow_ref("finished-workflow".to_string()).build(),
+            ConvoySpec::builder().workflow_ref("finished-workflow".to_string()).project_ref("flotilla".to_string()).build(),
             flotilla_engine_convoys_testkit::single_agent("coder"),
         );
         convoy.metadata.name = flotilla_engine_convoys_testkit::launch(&path, convoy.clone()).await;
@@ -4816,7 +4816,7 @@ async fn slow_startup_reconciliation_does_not_delay_listening_or_fleet_health() 
         }),
         ..ConvoyStatus::default()
     };
-    let spec = ConvoySpec::builder().workflow_ref("test".into()).build();
+    let spec = ConvoySpec::builder().workflow_ref("test".into()).project_ref("flotilla".into()).build();
     let convoy = flotilla_engine_convoys_testkit::launch(
         &daemon.convoy_engine_path(),
         flotilla_engine_convoys_testkit::convoy("flotilla", "live-credential-work", spec, status),
@@ -5226,7 +5226,7 @@ pub(super) async fn place_crew(daemon: &InProcessDaemon, environment: &str, plac
         }),
         ..Default::default()
     };
-    let spec = ConvoySpec::builder().workflow_ref("single-agent".into()).build();
+    let spec = ConvoySpec::builder().workflow_ref("single-agent".into()).project_ref("flotilla".into()).build();
     let convoy = admit_convoy(daemon, flotilla_engine_convoys_testkit::convoy("flotilla", placed.convoy, spec, status)).await;
     let vessel = install_engine(daemon).vessels.request(&convoy, "work", daemon.local_host_id().expect("local host").as_str());
     let spec = TerminalSessionSpec {

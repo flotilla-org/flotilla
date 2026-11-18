@@ -71,7 +71,7 @@ pub enum PlacementPurpose {
 #[derive(Clone, Copy)]
 struct PlacementContext<'a> {
     namespace: &'a str,
-    project_ref: Option<&'a str>,
+    project_ref: &'a str,
     repositories: &'a [ConvoyRepositorySpec],
     intent: &'a flotilla_protocol::ConvoyStartIntent,
     purpose: PlacementPurpose,
@@ -89,7 +89,7 @@ pub struct ConvoyCreateAdmission<'a> {
     inputs: &'a [(String, String)],
     repositories: Vec<ConvoyRepositorySpec>,
     source_ref: Option<String>,
-    project_ref: Option<String>,
+    project_ref: String,
     adopted_checkout_refs: BTreeMap<RepositoryKey, String>,
     /// The checkout the convoy adopts, recorded on it for its vessel to request (#3108).
     adopted_checkout: Option<flotilla_resources::ObservedCheckoutSpec>,
@@ -696,7 +696,7 @@ impl ConvoyAdmission {
         intent: &flotilla_protocol::ConvoyStartIntent,
     ) -> Result<(PlacementResolution, Vec<String>), String> {
         self.decide_capability_placement(
-            &PlacementContext { namespace, project_ref: Some(project_ref), repositories, intent, purpose: PlacementPurpose::Admission },
+            &PlacementContext { namespace, project_ref, repositories, intent, purpose: PlacementPurpose::Admission },
             workflow,
             needs,
         )
@@ -741,7 +741,7 @@ impl ConvoyAdmission {
         )
         .await?;
         Self::refuse_live_continuation_holder(&admission.spec, &inventory)?;
-        refuse_live_convoy(&inventory, admission.spec.project_ref.as_deref(), &admission.spec.role)?;
+        refuse_live_convoy(&inventory, &admission.spec.project_ref, &admission.spec.role)?;
         admission.name = self.reserve_launch(&convoy_record_name()).await?;
         let bindings = self
             .choose_account_bindings(
@@ -775,7 +775,7 @@ impl ConvoyAdmission {
         )
         .await?;
         self.accounts.open(namespace, bindings).await?;
-        let address = convoy_address(&admission.spec.role, admission.spec.project_ref.as_deref());
+        let address = convoy_address(&admission.spec.role, &admission.spec.project_ref);
         let warnings = admission.spec.issues.iter().flat_map(|issue| issue.placement_needs().1).collect();
         Ok((admission.name, address, admission.naming, warnings))
     }
@@ -952,7 +952,7 @@ impl ConvoyAdmission {
         })?;
         let spec = ConvoySpec { generation, ..spec.clone() };
         let labels = BTreeMap::from([
-            (PROJECT_LABEL.to_string(), spec.project_ref.clone().unwrap_or_default()),
+            (PROJECT_LABEL.to_string(), spec.project_ref.clone()),
             (ROLE_LABEL.to_string(), spec.role.clone()),
             (GENERATION_LABEL.to_string(), generation.to_string()),
         ]);
@@ -993,7 +993,7 @@ impl ConvoyAdmission {
         {
             return Ok(None);
         }
-        let Some(project) = spec.project_ref.as_deref() else { return Ok(None) };
+        let project = spec.project_ref.as_str();
         let projects = flotilla_store::read_definition_catalog::<Project>(reads, namespace).await?;
         let defaults = flotilla_store::read_definition_catalog::<CrewDefaults>(reads, namespace).await?;
         let fleet = reads
@@ -1028,20 +1028,17 @@ impl ConvoyAdmission {
                 .await
                 .map_err(|error| error.to_string())?,
         )?;
-        if spec.project_ref.is_some() {
-            // Every graph/default layer participates in cascade/topic refusal.
-            snapshot.insert_definitions::<Project>(flotilla_store::read_definition_catalog::<Project>(&self.backend, namespace).await?)?;
-            snapshot.insert_definitions::<CrewDefaults>(
-                flotilla_store::read_definition_catalog::<CrewDefaults>(&self.backend, namespace).await?,
-            )?;
-            snapshot.insert_definitions::<FleetDesignation>(
-                self.backend
-                    .definitions::<FleetDesignation>(namespace)
-                    .list_names([FLEET_DESIGNATION_NAME.into()])
-                    .await
-                    .map_err(|error| error.to_string())?,
-            )?;
-        }
+        // Every graph/default layer participates in cascade/topic refusal.
+        snapshot.insert_definitions::<Project>(flotilla_store::read_definition_catalog::<Project>(&self.backend, namespace).await?)?;
+        snapshot
+            .insert_definitions::<CrewDefaults>(flotilla_store::read_definition_catalog::<CrewDefaults>(&self.backend, namespace).await?)?;
+        snapshot.insert_definitions::<FleetDesignation>(
+            self.backend
+                .definitions::<FleetDesignation>(namespace)
+                .list_names([FLEET_DESIGNATION_NAME.into()])
+                .await
+                .map_err(|error| error.to_string())?,
+        )?;
         Ok(snapshot.finish())
     }
 
@@ -1068,61 +1065,53 @@ impl ConvoyAdmission {
             .map_err(|error| error.to_string())?;
         let mut snapshot = flotilla_store::RequestSnapshot::new(&self.backend, namespace)?;
         snapshot.insert::<Repository>(repositories)?;
-        if let Some(project) = spec.project_ref.as_deref() {
-            // Every graph/default layer participates in topic and cascade refusals.
-            let projects = flotilla_store::read_definition_catalog::<Project>(read_source, namespace).await?;
-            let defaults = flotilla_store::read_definition_catalog::<CrewDefaults>(read_source, namespace).await?;
-            let fleet = read_source
-                .definitions::<FleetDesignation>(namespace)
-                .list_names([FLEET_DESIGNATION_NAME.into()])
-                .await
-                .map_err(|error| error.to_string())?;
-            let (convoy_query, visible) = brief_convoy_query(project, name, workflow, &projects, &defaults, &fleet)?;
-            let convoys = ReadResourceList { items: evidence.convoys.to_vec() };
-            let terminal_query = StoreQuery {
-                any_of: Some(
-                    std::iter::once(StoreQuery::related_kind(
-                        "metadata.labels.\"flotilla.work/convoy\"",
-                        "Convoy",
-                        "metadata.name",
-                        convoy_query,
-                    ))
-                    .chain(visible.iter().map(|project| StoreQuery {
-                        field_prefixes: BTreeMap::from([(
-                            "metadata.annotations.\"flotilla.work/role-address\"".into(),
-                            format!("{project}/"),
-                        )]),
-                        ..Default::default()
-                    }))
-                    .collect(),
-                ),
-                include_replicas: true,
-                ..Default::default()
-            };
-            let terminals = self
-                .backend
-                .query_declared::<ResourceTerminalSession>(namespace, &terminal_query)
-                .await
-                .map_err(|error| error.to_string())?;
-            let ensures = self
-                .backend
-                .query_declared::<ConvoyEnsure>(
-                    namespace,
-                    &StoreQuery {
-                        field_values: BTreeMap::from([("spec.project_ref".into(), visible.into_iter().collect())]),
-                        include_replicas: true,
-                        ..Default::default()
-                    },
-                )
-                .await
-                .map_err(|error| error.to_string())?;
-            snapshot.insert_definitions::<Project>(projects)?;
-            snapshot.insert_definitions::<CrewDefaults>(defaults)?;
-            snapshot.insert_definitions::<FleetDesignation>(fleet)?;
-            snapshot.insert::<ResourceConvoy>(convoys)?;
-            snapshot.insert::<ResourceTerminalSession>(terminals)?;
-            snapshot.insert::<ConvoyEnsure>(ensures)?;
-        }
+        // Every graph/default layer participates in topic and cascade refusals.
+        let projects = flotilla_store::read_definition_catalog::<Project>(read_source, namespace).await?;
+        let defaults = flotilla_store::read_definition_catalog::<CrewDefaults>(read_source, namespace).await?;
+        let fleet = read_source
+            .definitions::<FleetDesignation>(namespace)
+            .list_names([FLEET_DESIGNATION_NAME.into()])
+            .await
+            .map_err(|error| error.to_string())?;
+        let (convoy_query, visible) = brief_convoy_query(&spec.project_ref, name, workflow, &projects, &defaults, &fleet)?;
+        let convoys = ReadResourceList { items: evidence.convoys.to_vec() };
+        let terminal_query = StoreQuery {
+            any_of: Some(
+                std::iter::once(StoreQuery::related_kind(
+                    "metadata.labels.\"flotilla.work/convoy\"",
+                    "Convoy",
+                    "metadata.name",
+                    convoy_query,
+                ))
+                .chain(visible.iter().map(|project| StoreQuery {
+                    field_prefixes: BTreeMap::from([("metadata.annotations.\"flotilla.work/role-address\"".into(), format!("{project}/"))]),
+                    ..Default::default()
+                }))
+                .collect(),
+            ),
+            include_replicas: true,
+            ..Default::default()
+        };
+        let terminals =
+            self.backend.query_declared::<ResourceTerminalSession>(namespace, &terminal_query).await.map_err(|error| error.to_string())?;
+        let ensures = self
+            .backend
+            .query_declared::<ConvoyEnsure>(
+                namespace,
+                &StoreQuery {
+                    field_values: BTreeMap::from([("spec.project_ref".into(), visible.into_iter().collect())]),
+                    include_replicas: true,
+                    ..Default::default()
+                },
+            )
+            .await
+            .map_err(|error| error.to_string())?;
+        snapshot.insert_definitions::<Project>(projects)?;
+        snapshot.insert_definitions::<CrewDefaults>(defaults)?;
+        snapshot.insert_definitions::<FleetDesignation>(fleet)?;
+        snapshot.insert::<ResourceConvoy>(convoys)?;
+        snapshot.insert::<ResourceTerminalSession>(terminals)?;
+        snapshot.insert::<ConvoyEnsure>(ensures)?;
         Ok(snapshot.finish())
     }
 
@@ -1278,7 +1267,7 @@ impl ConvoyAdmission {
                 };
                 let mut options = templates.render_options_with_fork_stance(
                     brief_template.as_deref(),
-                    spec.project_ref.as_deref(),
+                    Some(&spec.project_ref),
                     roots.clone(),
                     fork_stance,
                 );
@@ -1305,28 +1294,27 @@ impl ConvoyAdmission {
                     &requirement.credential_scopes,
                     None,
                 );
-                if let Some(project) = spec.project_ref.as_deref() {
-                    let address = flotilla_resources::crew_role_address(project, name, &requirement.name, &process.role);
-                    let mut book =
-                        flotilla_messaging::crew_address_book(&reads, namespace, &address).await.map_err(|error| error.to_string())?;
-                    for peer_vessel in &workflow.vessels {
-                        for peer in &peer_vessel.crew {
-                            let peer_address = flotilla_resources::crew_role_address(project, name, &peer_vessel.name, &peer.role);
-                            if peer_address != address {
-                                book.contacts.push(flotilla_messaging::RoleContact {
-                                    address: peer_address,
-                                    relation: flotilla_resources::MessageRelation::Peer,
-                                    project: project.into(),
-                                    terminal: None,
-                                });
-                            }
+                let project = spec.project_ref.as_str();
+                let address = flotilla_resources::crew_role_address(project, name, &requirement.name, &process.role);
+                let mut book =
+                    flotilla_messaging::crew_address_book(&reads, namespace, &address).await.map_err(|error| error.to_string())?;
+                for peer_vessel in &workflow.vessels {
+                    for peer in &peer_vessel.crew {
+                        let peer_address = flotilla_resources::crew_role_address(project, name, &peer_vessel.name, &peer.role);
+                        if peer_address != address {
+                            book.contacts.push(flotilla_messaging::RoleContact {
+                                address: peer_address,
+                                relation: flotilla_resources::MessageRelation::Peer,
+                                project: project.into(),
+                                terminal: None,
+                            });
                         }
                     }
-                    book.contacts.sort_by(|a, b| a.address.cmp(&b.address));
-                    book.contacts.dedup_by(|a, b| a.address == b.address);
-                    brief.content.push('\n');
-                    brief.content.push_str(&book.render());
                 }
+                book.contacts.sort_by(|a, b| a.address.cmp(&b.address));
+                book.contacts.dedup_by(|a, b| a.address == b.address);
+                brief.content.push('\n');
+                brief.content.push_str(&book.render());
                 writer.put_brief(namespace, name, &process.role, name, brief.content.as_bytes(), options.charter_commit.as_deref()).await?;
             }
         }
@@ -1359,7 +1347,7 @@ impl ConvoyAdmission {
     pub async fn join_convoy_placement_builds(
         &self,
         namespace: &str,
-        project_ref: Option<&str>,
+        project_ref: &str,
         workflow: &WorkflowTemplateSpec,
         placement: &mut PlacementResolution,
         decision: Option<&PlacementDecision>,
@@ -1374,13 +1362,13 @@ impl ConvoyAdmission {
     pub async fn resolve_created_convoy_placement(
         &self,
         namespace: &str,
-        project_ref: Option<&str>,
+        project_ref: &str,
         repositories: &[ConvoyRepositorySpec],
         workflow: &WorkflowTemplateSpec,
         pin: Option<&str>,
     ) -> Result<PlacementResolution, String> {
         let intent = flotilla_protocol::ConvoyStartIntent::builder()
-            .project_ref(project_ref.unwrap_or_default().to_string())
+            .project_ref(project_ref.to_string())
             .namespace(namespace.to_string())
             .maybe_placement_policy(pin.map(str::to_owned))
             .maybe_escalation_reason(pin.map(|pin| format!("convoy create pins `{pin}`")))
@@ -1426,13 +1414,10 @@ impl ConvoyAdmission {
         {
             return Ok(existing.metadata.name.clone());
         }
-        if existing
-            .iter()
-            .any(|convoy| convoy.spec.project_ref.as_deref() == Some(&ensure.spec.project_ref) && convoy.spec.role == ensure.spec.role)
-        {
+        if existing.iter().any(|convoy| convoy.spec.project_ref == ensure.spec.project_ref && convoy.spec.role == ensure.spec.role) {
             return Err(format!(
                 "live convoy {} already exists outside this ensure",
-                convoy_address(&ensure.spec.role, Some(&ensure.spec.project_ref))
+                convoy_address(&ensure.spec.role, &ensure.spec.project_ref)
             ));
         }
         let launch_of = standing_name(&ensure.spec.project_ref, &ensure.spec.role)?;
@@ -1500,7 +1485,7 @@ impl ConvoyAdmission {
             image_builds,
         } = request;
         // The caller is told the launch it admitted, by its address.
-        let address = match flotilla_address::Address::project(project_ref.as_deref().unwrap_or(namespace))
+        let address = match flotilla_address::Address::project(&project_ref)
             .map_err(|error| error.to_string())
             .and_then(|project| flotilla_resources::convoy::engine::launch_address(&project, name))
         {
@@ -1537,7 +1522,7 @@ impl ConvoyAdmission {
             Ok(inventory) => inventory,
             Err(message) => return CommandValue::Error { message },
         };
-        if let Err(message) = refuse_live_convoy(&inventory, spec.project_ref.as_deref(), role) {
+        if let Err(message) = refuse_live_convoy(&inventory, &spec.project_ref, role) {
             return CommandValue::Error { message };
         }
         let bindings = match self
@@ -1606,7 +1591,7 @@ impl ConvoyAdmission {
         crate::account_access::choose_bindings(
             &self.backend,
             namespace,
-            spec.project_ref.as_deref(),
+            Some(&spec.project_ref),
             &spec.repositories,
             convoy,
             workflow,
@@ -1689,7 +1674,7 @@ impl PlacementBuildJoiner<'_> {
     async fn compose_placement_images(
         &self,
         namespace: &str,
-        project_ref: Option<&str>,
+        project_ref: &str,
         workflow: &WorkflowTemplateSpec,
         placement: &PlacementResolution,
     ) -> Result<(BTreeMap<String, FulfilmentKindSpec>, Vec<crate::image_build::PlannedImageBuild>), String> {
@@ -1751,31 +1736,27 @@ fn apply_vessel_images(
 async fn resolve_vessel_images(
     backend: &ResourceBackend,
     namespace: &str,
-    project_ref: Option<&str>,
+    project_ref: &str,
     workflow: &WorkflowTemplateSpec,
 ) -> Result<BTreeMap<String, flotilla_resources::ResolvedImage>, String> {
-    let selection = match project_ref {
-        Some(project) => match backend.including_replicas::<Project>(namespace).get(project).await {
-            Ok(project) => project.object.spec.image,
-            // A named project that is absent must not silently compose from
-            // installation defaults: that would build an image the project
-            // never selected.
-            Err(ResourceError::NotFound { .. }) => {
-                return Err(format!("composed image: project `{project}` is not defined, so its image selection is unknown"))
-            }
-            Err(error) => return Err(error.to_string()),
-        },
-        None => None,
+    let selection = match backend.including_replicas::<Project>(namespace).get(project_ref).await {
+        Ok(project) => project.object.spec.image,
+        // A named project that is absent must not silently compose from
+        // installation defaults: that would build an image the project
+        // never selected.
+        Err(ResourceError::NotFound { .. }) => {
+            return Err(format!("composed image: project `{project_ref}` is not defined, so its image selection is unknown"))
+        }
+        Err(error) => return Err(error.to_string()),
     };
     let defaults = match workflow.cascade.as_deref() {
         Some(cascade) => cascade.image_defaults.clone(),
-        None => installation_image_defaults(backend, namespace, project_ref).await?,
+        None => installation_image_defaults(backend, namespace, Some(project_ref)).await?,
     };
     let catalogue = crate::image_build::read_image_catalogue(backend, namespace).await?;
     let mut resolved = BTreeMap::new();
     for vessel in &workflow.vessels {
-        let request =
-            crate::image_build::vessel_image_request(project_ref.unwrap_or_default(), selection.as_ref(), defaults.as_ref(), vessel)?;
+        let request = crate::image_build::vessel_image_request(project_ref, selection.as_ref(), defaults.as_ref(), vessel)?;
         let image = flotilla_resources::resolve_image(&catalogue, &request)
             .map_err(|error| format!("vessel `{}` composed image: {error}", vessel.name))?;
         resolved.insert(vessel.name.clone(), image);
@@ -1912,7 +1893,7 @@ impl AdmissionReadContext<'_> {
             self.decide_capability_placement(
                 &PlacementContext {
                     namespace: &namespace,
-                    project_ref: Some(project_ref),
+                    project_ref,
                     repositories: &[],
                     intent: &intent,
                     purpose: PlacementPurpose::Routing,
@@ -1946,7 +1927,7 @@ impl AdmissionReadContext<'_> {
             self.decide_vessel_placements(
                 &PlacementContext {
                     namespace: &namespace,
-                    project_ref: Some(project_ref),
+                    project_ref,
                     repositories: &repositories,
                     intent: &intent,
                     purpose: PlacementPurpose::Routing,
@@ -3015,7 +2996,7 @@ impl AdmissionReadContext<'_> {
                     resolve_and_validate_workflow_credentials_for_capability_admission(
                         &self.backend,
                         namespace,
-                        project_ref,
+                        Some(project_ref),
                         repositories,
                         resolution.selected.as_ref(),
                         &mut one,
@@ -3059,7 +3040,7 @@ impl AdmissionReadContext<'_> {
                 resolve_and_validate_workflow_credentials_for_capability_admission(
                     &self.backend,
                     namespace,
-                    project_ref,
+                    Some(project_ref),
                     repositories,
                     result.0.selected.as_ref(),
                     workflow,
@@ -3282,7 +3263,7 @@ impl AdmissionReadContext<'_> {
             .decide_vessel_placements(
                 &PlacementContext {
                     namespace,
-                    project_ref: Some(project_ref),
+                    project_ref,
                     repositories: &repositories_snapshot,
                     intent,
                     purpose: PlacementPurpose::Admission,
@@ -3322,7 +3303,7 @@ impl AdmissionReadContext<'_> {
             placement_policy,
             repositories: repositories_snapshot,
             r#ref: Some(branch),
-            project_ref: Some(project_ref.to_string()),
+            project_ref: project_ref.to_string(),
             adopted_checkout_refs: BTreeMap::new(),
             subjects: Vec::new(),
             issues,
@@ -3795,11 +3776,10 @@ fn brief_convoy_query(
     Ok((convoy_query, visible))
 }
 
-/// The convoys of `role` in `project`. A convoy that names no project is a launch in its
-/// namespace's project, as the engine holds every launch under one (#3108).
-fn convoy_identity_query(namespace: &str, project: Option<&str>, role: &str) -> flotilla_store::StoreQuery {
+/// The convoys of `role` in `project`.
+fn convoy_identity_query(project: &str, role: &str) -> flotilla_store::StoreQuery {
     flotilla_store::StoreQuery {
-        fields: BTreeMap::from([("spec.role".into(), role.into()), ("spec.project_ref".into(), project.unwrap_or(namespace).into())]),
+        fields: BTreeMap::from([("spec.role".into(), role.into()), ("spec.project_ref".into(), project.into())]),
         include_replicas: true,
         ..Default::default()
     }
@@ -3813,7 +3793,7 @@ async fn convoy_admission_inventory(
     extra: Option<StoreQuery>,
 ) -> Result<Vec<ReadResourceObject<ResourceConvoy>>, String> {
     use flotilla_store::StoreQuery;
-    let mut selections = vec![convoy_identity_query(namespace, spec.project_ref.as_deref(), &spec.role)];
+    let mut selections = vec![convoy_identity_query(&spec.project_ref, &spec.role)];
     selections.extend(extra);
     if let Some(ensure) = ensure {
         selections.push(StoreQuery {
@@ -3857,9 +3837,9 @@ async fn convoy_admission_inventory(
 }
 
 /// Refuses a convoy of `role` in `project` while one is live, at any home.
-pub async fn refuse_live_convoy_in(backend: &ResourceBackend, namespace: &str, project: Option<&str>, role: &str) -> Result<(), String> {
+pub async fn refuse_live_convoy_in(backend: &ResourceBackend, namespace: &str, project: &str, role: &str) -> Result<(), String> {
     let generations = backend
-        .query_declared::<ResourceConvoy>(namespace, &convoy_identity_query(namespace, project, role))
+        .query_declared::<ResourceConvoy>(namespace, &convoy_identity_query(project, role))
         .await
         .map_err(|error| error.to_string())?;
     refuse_live_convoy(&generations.items, project, role)
@@ -3867,11 +3847,8 @@ pub async fn refuse_live_convoy_in(backend: &ResourceBackend, namespace: &str, p
 
 /// The identity guard and continuation guard share a single selected inventory
 /// taken under the admission lock. Neither performs reads in a candidate loop.
-fn refuse_live_convoy(generations: &[ReadResourceObject<ResourceConvoy>], project: Option<&str>, role: &str) -> Result<(), String> {
-    // A convoy that names no project is held in its namespace's.
-    let in_project =
-        |convoy: &ResourceObject<ResourceConvoy>| convoy.spec.project_ref.as_deref() == Some(project.unwrap_or(&convoy.metadata.namespace));
-    for source in generations.iter().filter(|source| in_project(&source.object) && source.object.spec.role == role) {
+fn refuse_live_convoy(generations: &[ReadResourceObject<ResourceConvoy>], project: &str, role: &str) -> Result<(), String> {
+    for source in generations.iter().filter(|source| source.object.spec.project_ref == project && source.object.spec.role == role) {
         let convoy = &source.object;
         if convoy.status.as_ref().is_none_or(|status| !status.phase.is_terminal()) {
             let provenance = match &source.provenance {
@@ -5126,7 +5103,7 @@ mod tests {
                     flotilla_engine_convoys_testkit::convoy(
                         "flotilla",
                         &format!("unrelated-{index}"),
-                        ConvoySpec::builder().workflow_ref("scratch".into()).build(),
+                        ConvoySpec::builder().workflow_ref("scratch".into()).project_ref("flotilla".into()).build(),
                         flotilla_engine_convoys_testkit::single_agent("coder"),
                     ),
                 )
@@ -5288,7 +5265,7 @@ mod tests {
             let admission = PreparedConvoyAdmission::builder()
                 .evidence(evidence.finish())
                 .name("prepared".into())
-                .spec(ConvoySpec::builder().workflow_ref("scratch".into()).build())
+                .spec(ConvoySpec::builder().workflow_ref("scratch".into()).project_ref("flotilla".into()).build())
                 .workflow(WorkflowTemplateSpec::builder().build())
                 .placement_decision(PlacementDecision {
                     provider_instance: None,
@@ -5333,7 +5310,7 @@ mod tests {
                 .build()])
             .build();
         let placement =
-            fixture.owner.resolve_created_convoy_placement("flotilla", None, &[], &workflow, None).await.expect("live kind places");
+            fixture.owner.resolve_created_convoy_placement("flotilla", "flotilla", &[], &workflow, None).await.expect("live kind places");
         assert_eq!(placement.selected.as_ref().map(|kind| kind.metadata.name.as_str()), Some("host-direct-host"));
         let considered = placement
             .refused_candidates
@@ -5343,7 +5320,8 @@ mod tests {
             .chain(placement.allocation.iter().flat_map(|allocation| allocation.candidates.iter().map(|candidate| candidate.kind.as_str())))
             .collect::<Vec<_>>();
         assert!(!considered.contains(&"frozen-by-label"), "snapshots must not be considered: {considered:?}");
-        let error = fixture.owner.resolve_created_convoy_placement("flotilla", None, &[], &workflow, Some("frozen-by-label")).await.err();
+        let error =
+            fixture.owner.resolve_created_convoy_placement("flotilla", "flotilla", &[], &workflow, Some("frozen-by-label")).await.err();
         assert_eq!(error, Some("fulfilment kind `frozen-by-label` does not exist".to_owned()));
     }
 
@@ -5389,7 +5367,7 @@ mod tests {
             }];
             status.capabilities.insert(flotilla_resources::ENVIRONMENT_PROVIDERS_CAPABILITY.into(), serde_json::json!(providers));
             hosts.update_status("host", &host.metadata.resource_version, &status).await.unwrap();
-            let placement = fixture.owner.resolve_created_convoy_placement("flotilla", None, &[], &workflow, None).await;
+            let placement = fixture.owner.resolve_created_convoy_placement("flotilla", "flotilla", &[], &workflow, None).await;
             match readiness {
                 ProviderReadiness::Ready => {
                     let placement = placement.expect("a ready Docker provider places");
@@ -5534,7 +5512,7 @@ mod tests {
                     flotilla_engine_convoys_testkit::convoy(
                         "flotilla",
                         &format!("unrelated-{index}"),
-                        ConvoySpec::builder().workflow_ref("unrelated".into()).build(),
+                        ConvoySpec::builder().workflow_ref("unrelated".into()).project_ref("flotilla".into()).build(),
                         flotilla_engine_convoys_testkit::single_agent("coder"),
                     ),
                 )
@@ -6014,7 +5992,7 @@ mod tests {
             let intent = flotilla_protocol::ConvoyStartIntent::builder().project_ref("project".into()).build();
             let context = PlacementContext {
                 namespace: "flotilla",
-                project_ref: Some("project"),
+                project_ref: "project",
                 repositories: &[],
                 intent: &intent,
                 purpose: PlacementPurpose::Admission,

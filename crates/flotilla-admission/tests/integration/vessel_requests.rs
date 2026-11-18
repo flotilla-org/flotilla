@@ -68,7 +68,11 @@ async fn admit(home: &EngineHome, name: &str, host: Option<&str>, work: WorkPhas
         work: BTreeMap::from([("work".to_owned(), WorkState::builder().phase(work).build())]),
         ..ConvoyStatus::default()
     };
-    let spec = ConvoySpec::builder().workflow_ref("workflow".to_owned()).placement_policy("host-direct".to_owned()).build();
+    let spec = ConvoySpec::builder()
+        .project_ref(NAMESPACE.into())
+        .workflow_ref("workflow".to_owned())
+        .placement_policy("host-direct".to_owned())
+        .build();
     home.admit(name, spec, status).await
 }
 

@@ -184,7 +184,7 @@ pub(super) fn project_subjects(catalog: &mut Catalog, input: &CatalogInput<'_>, 
     let mut convoy_edges = BTreeMap::new();
     for convoy in input.convoys {
         let convoy_entity = entity::convoy(&convoy.resource.namespace, &convoy.resource.name, &entity::resource_origin(&convoy.resource));
-        if let Some((project, _)) = super::project_fact(convoy.project_ref.as_deref(), "fleet") {
+        if let Some((project, _)) = super::project_fact(Some(&convoy.project_ref), "fleet") {
             projects.insert(convoy_entity.clone(), project.id);
         }
         // A future finished_at from clock skew remains in the window until

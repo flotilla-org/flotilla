@@ -180,8 +180,9 @@ pub struct ConvoySpec {
     #[builder(default)]
     pub repositories: Vec<ConvoyRepositorySpec>,
     pub r#ref: Option<String>,
-    /// The [`Project`](crate::Project) whose repository set was snapshotted at admission.
-    pub project_ref: Option<String>,
+    /// The [`Project`](crate::Project) the convoy belongs to, whose repository set was
+    /// snapshotted at admission.
+    pub project_ref: String,
     #[builder(default)]
     pub adopted_checkout_refs: BTreeMap<RepositoryKey, String>,
     #[builder(default)]
@@ -344,8 +345,7 @@ struct ConvoySpecRecord {
     repositories: Vec<ConvoyRepositorySpec>,
     #[serde(default, rename = "ref", skip_serializing_if = "Option::is_none")]
     r#ref: Option<String>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    project_ref: Option<String>,
+    project_ref: String,
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     adopted_checkout_refs: BTreeMap<RepositoryKey, String>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
@@ -3562,7 +3562,7 @@ mod subject_tests {
                     creation_timestamp: Utc::now(),
                     merge: None,
                 },
-                spec: ConvoySpec::builder().workflow_ref("interactive".to_string()).build(),
+                spec: ConvoySpec::builder().workflow_ref("interactive".to_string()).project_ref("default".to_string()).build(),
                 status: Some(status),
             }
         };
@@ -3609,7 +3609,7 @@ mod subject_tests {
                 creation_timestamp: Utc::now(),
                 merge: None,
             },
-            spec: ConvoySpec::builder().workflow_ref("interactive".to_string()).build(),
+            spec: ConvoySpec::builder().workflow_ref("interactive".to_string()).project_ref("default".to_string()).build(),
             status: Some(status),
         };
         let addresses =
@@ -3947,7 +3947,7 @@ mod subject_tests {
     // decode; empty sets stay unwritten, and frozen promises round-trip.
     #[test]
     fn dispatch_promises_are_an_additive_spec_field() {
-        let old = serde_json::json!({"workflow_ref": "implement-review", "role": "api", "instruction": "Split the API"});
+        let old = serde_json::json!({"workflow_ref": "implement-review", "project_ref": "flotilla", "role": "api", "instruction": "Split the API"});
         let spec: ConvoySpec = serde_json::from_value(old.clone()).expect("previous-generation spec decodes");
         assert!(spec.promises.is_empty());
         assert_eq!(serde_json::to_value(&spec).expect("write").get("promises"), None);
@@ -3969,6 +3969,7 @@ mod subject_tests {
     fn legacy_subject_fields_decode_and_write_only_the_new_set() {
         let old = serde_json::json!({
             "workflow_ref": "interactive",
+            "project_ref": "flotilla",
             "repositories": [{
                 "url": "https://github.com/flotilla-org/flotilla",
                 "repo_ref": "github-flotilla",
@@ -3995,6 +3996,7 @@ mod subject_tests {
 
         let opaque = serde_json::json!({
             "workflow_ref": "interactive",
+            "project_ref": "flotilla",
             "issues": [{
                 "reference": {"source": {"service": "tracker.example", "scope": "team/project"}, "id": "ABC-42"},
                 "snapshot": {"title": "Opaque issue", "state": "open", "as_of": "2026-09-29T00:00:00Z"}
@@ -4477,7 +4479,7 @@ mod selected_child_provenance_tests {
                 creation_timestamp: chrono::DateTime::UNIX_EPOCH,
                 merge: None,
             },
-            spec: ConvoySpec::builder().workflow_ref("workflow".into()).build(),
+            spec: ConvoySpec::builder().workflow_ref("workflow".into()).project_ref("test".into()).build(),
             status: None,
         };
         let mut child = convoy.clone();

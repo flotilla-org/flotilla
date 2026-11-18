@@ -18,7 +18,7 @@ async fn binding_daemon(temp: &Path) -> (Arc<InProcessDaemon>, String) {
 }
 
 async fn admit(daemon: &InProcessDaemon, name: &str) -> String {
-    let spec = ConvoySpec::builder().workflow_ref("test".to_string()).build();
+    let spec = ConvoySpec::builder().project_ref(NAMESPACE.into()).workflow_ref("test".to_string()).build();
     admit_convoy(
         daemon,
         flotilla_engine_convoys_testkit::convoy(NAMESPACE, name, spec, flotilla_engine_convoys_testkit::single_agent("coder")),

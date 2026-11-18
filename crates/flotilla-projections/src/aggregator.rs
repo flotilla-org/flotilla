@@ -2835,17 +2835,16 @@ impl Aggregator {
                 .unreadable(reason.clone())
                 .generation(convoy.spec.generation)
                 .workflow_ref(&convoy.spec.workflow_ref)
-                .maybe_project_ref(convoy.spec.project_ref.clone())
+                .project_ref(&convoy.spec.project_ref)
                 .build();
         }
         let name = if convoy.spec.role.is_empty() { &convoy.metadata.name } else { &convoy.spec.role };
         let status = convoy.status.as_ref();
         let subject_conflicts = subject_relationship_conflicts(convoy);
-        let project =
-            convoy.spec.project_ref.as_ref().and_then(|name| self.projects.get(&(convoy.metadata.namespace.clone(), name.clone())));
+        let project = self.projects.get(&(convoy.metadata.namespace.clone(), convoy.spec.project_ref.clone()));
         let reference_context = flotilla_resources::convoy_reference_context(
             &convoy.spec.repositories,
-            convoy.spec.project_ref.as_deref(),
+            Some(&convoy.spec.project_ref),
             project.map(|project| &project.spec),
             &[],
             |key| self.repositories.get(key).map(|record| &record.spec),
@@ -2896,15 +2895,9 @@ impl Aggregator {
             .min()
             .filter(|_| !phase.is_terminal());
         // A standing role's drift is about the role, told on its running convoy.
-        let drift = convoy
-            .spec
-            .project_ref
-            .as_ref()
-            .filter(|_| convoy.metadata.annotations.contains_key(ENSURED_FROM_ANNOTATION) && !phase.is_terminal())
-            .and_then(|project| {
-                let role = AttentionSubject::StandingRole { project: project.clone(), role: convoy.spec.role.clone() };
-                self.attentions.iter().find(|open| open.sender == Sender::Standing && open.subject == role)
-            });
+        let drift = (convoy.metadata.annotations.contains_key(ENSURED_FROM_ANNOTATION) && !phase.is_terminal())
+            .then(|| AttentionSubject::StandingRole { project: convoy.spec.project_ref.clone(), role: convoy.spec.role.clone() })
+            .and_then(|role| self.attentions.iter().find(|open| open.sender == Sender::Standing && open.subject == role));
         let attention_demand = attentions
             .iter()
             .copied()
@@ -2992,7 +2985,7 @@ impl Aggregator {
             .maybe_started_at(status.and_then(|status| status.started_at))
             .maybe_finished_at(status.and_then(|status| status.finished_at))
             .maybe_observed_workflow_ref(status.and_then(|status| status.observed_workflow_ref.clone()))
-            .maybe_project_ref(convoy.spec.project_ref.clone())
+            .project_ref(&convoy.spec.project_ref)
             .issues(
                 convoy
                     .spec
@@ -3027,7 +3020,7 @@ impl Aggregator {
         convoy.spec.repositories.iter().find_map(|repository| {
             let context = flotilla_resources::convoy_reference_context(
                 std::slice::from_ref(repository),
-                convoy.spec.project_ref.as_deref(),
+                Some(&convoy.spec.project_ref),
                 None,
                 &[],
                 |key| self.repositories.get(key).map(|record| &record.spec),
@@ -4307,7 +4300,7 @@ mod tests {
         let provenance = ResourceProvenance::Replica { origin_root: flotilla_protocol::NodeId::new("udder-node-id"), last_synced_at: now };
         let mut convoy = convoy_with_vessel("governor-andamento-01234567").await;
         convoy.spec.role = "governor".to_string();
-        convoy.spec.project_ref = Some("andamento".to_string());
+        convoy.spec.project_ref = "andamento".to_string();
         aggregator.replace_replica_convoys(vec![ReadResourceObject { object: convoy, provenance: provenance.clone() }]).await;
 
         let mut session = session_object("terminal-governor-implement-coder").await;
@@ -5360,7 +5353,7 @@ mod tests {
             .using::<Convoy>("flotilla")
             .create(
                 &InputMeta::builder().name(name.to_string()).build(),
-                &ConvoySpec::builder().workflow_ref("scratch".to_string()).build(),
+                &ConvoySpec::builder().workflow_ref("scratch".to_string()).project_ref("flotilla".to_string()).build(),
             )
             .await
             .expect("create scripted convoy")
@@ -5390,6 +5383,7 @@ mod tests {
                 &InputMeta::builder().name(name.to_string()).build(),
                 &ConvoySpec::builder()
                     .workflow_ref("scratch".to_string())
+                    .project_ref("flotilla".to_string())
                     .r#ref("feat/convoy".to_string())
                     .repositories(vec![ConvoyRepositorySpec::builder()
                         .url("https://github.com/flotilla-org/flotilla".to_string())
@@ -5418,7 +5412,7 @@ mod tests {
         let created = resolver
             .create(
                 &InputMeta::builder().name(name.to_string()).build(),
-                &ConvoySpec::builder().workflow_ref("scratch".to_string()).build(),
+                &ConvoySpec::builder().workflow_ref("scratch".to_string()).project_ref("flotilla".to_string()).build(),
             )
             .await
             .expect("create convoy with vessel");
@@ -5621,14 +5615,14 @@ mod tests {
         let mut convoy = convoy_with_branch("convoy-0123456789abcdef").await;
         convoy.spec.role = "governor".to_string();
         convoy.spec.generation = 3;
-        convoy.spec.project_ref = Some("andamento".to_string());
+        convoy.spec.project_ref = "andamento".to_string();
         let reference = ResourceRef::new("flotilla.work/v1", "Convoy", "flotilla", "convoy-0123456789abcdef");
 
         let row = aggregator.summarize(&reference, &convoy);
 
         assert_eq!(row.name, "governor");
         assert_eq!(row.generation, 3);
-        assert_eq!(row.project_ref.as_deref(), Some("andamento"));
+        assert_eq!(row.project_ref, "andamento");
         assert_eq!(row.resource.name, "convoy-0123456789abcdef");
     }
 
@@ -5864,7 +5858,7 @@ mod tests {
         let mut initial = Vec::new();
         for index in 0..512 {
             let mut convoy = convoy_with_branch(&format!("work-{index}")).await;
-            convoy.spec.project_ref = Some(format!("project-{}", index % 32));
+            convoy.spec.project_ref = format!("project-{}", index % 32);
             initial.push(convoy);
         }
         let events = (0..100)
@@ -5908,9 +5902,9 @@ mod tests {
         state.replace_subscriber(Uuid::new_v4(), &[flotilla_protocol::QueryCursor { query: scoped_query.clone(), since: None }]);
         let (event_tx, mut event_rx) = broadcast::channel(8);
         let mut convoy = convoy_with_branch("convoy-a").await;
-        convoy.spec.project_ref = Some("roadmap".into());
+        convoy.spec.project_ref = "roadmap".into();
         let mut unrelated_convoy = convoy_with_branch("convoy-b").await;
-        unrelated_convoy.spec.project_ref = Some("other".into());
+        unrelated_convoy.spec.project_ref = "other".into();
         let mut deleting_convoy = convoy.clone();
         deleting_convoy.metadata.deletion_timestamp = Some(Utc::now());
         let durable_convoys = ScriptedSource::new(
@@ -6896,7 +6890,7 @@ mod tests {
                 creation_timestamp: Utc::now(),
                 merge: None,
             },
-            spec: ConvoySpec::builder().workflow_ref("scratch".to_string()).build(),
+            spec: ConvoySpec::builder().workflow_ref("scratch".to_string()).project_ref("flotilla".to_string()).build(),
             status: Some(ConvoyStatus {
                 phase: convoy_phase,
                 workflow_snapshot: Some(WorkflowSnapshot {
@@ -8356,6 +8350,7 @@ mod tests {
                 .resource(stale_ref)
                 .name("deleted-during-outage")
                 .workflow_ref("scratch")
+                .project_ref("flotilla")
                 .phase(ConvoyPhase::Active)
                 .build(),
         );
@@ -8859,7 +8854,10 @@ mod tests {
             convoys
                 .create(
                     &InputMeta::builder().name("prompt-local".to_string()).build(),
-                    &flotilla_resources::ConvoySpec::builder().workflow_ref("latency".to_string()).build(),
+                    &flotilla_resources::ConvoySpec::builder()
+                        .workflow_ref("latency".to_string())
+                        .project_ref("flotilla".to_string())
+                        .build(),
                 )
                 .await
                 .expect("local write");

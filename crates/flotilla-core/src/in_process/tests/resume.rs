@@ -116,7 +116,7 @@ async fn declared_access_stall_routes_to_project_governor_and_resumes() {
     // role, its coder at work under the standard exit table.
     let clock = Arc::new(SkippingClock::default());
     let (daemon, backend, probe) = resume_staging_fixture_shaped(engine_home_backend(), clock.clone(), false, |spec, snapshot| {
-        spec.project_ref = Some("project".to_string());
+        spec.project_ref = "project".to_string();
         spec.role = "graphql-budget".to_string();
         snapshot.exit = Some(flotilla_resources::ExitDeclaration::standard_table());
     })

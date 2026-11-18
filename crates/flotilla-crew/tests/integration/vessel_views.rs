@@ -25,7 +25,7 @@ async fn a_watched_listing_reads_a_convoy_end_its_watch_has_not_told() {
     let views = Arc::new(VesselViews::new(backend.clone(), NAMESPACE, Arc::clone(convoys.reads())));
     backend.install_engine_records(Arc::clone(&views) as _);
     backend.serve_engine_in(NAMESPACE);
-    let spec = ConvoySpec::builder().workflow_ref("workflow".into()).build();
+    let spec = ConvoySpec::builder().project_ref(NAMESPACE.into()).workflow_ref("workflow".into()).build();
     let launch = convoys.launch(convoy(NAMESPACE, "convoy-a", spec, single_agent("coder"))).await;
     let vessel = engine.vessels.request(&launch, "work", "host");
     engine.vessels.ready(&vessel, "env");
@@ -54,7 +54,7 @@ async fn a_watcher_is_told_a_released_launch_is_gone() {
     let views = Arc::new(VesselViews::new(backend.clone(), NAMESPACE, Arc::clone(convoys.reads())));
     backend.install_engine_records(Arc::clone(&views) as _);
     backend.serve_engine_in(NAMESPACE);
-    let spec = ConvoySpec::builder().workflow_ref("workflow".into()).build();
+    let spec = ConvoySpec::builder().project_ref(NAMESPACE.into()).workflow_ref("workflow".into()).build();
     let launch = convoys.launch(convoy(NAMESPACE, "convoy-a", spec, single_agent("coder"))).await;
     let vessel = engine.vessels.request(&launch, "work", "host");
     let vessels = backend.using::<Vessel>(NAMESPACE);

@@ -12,7 +12,7 @@ use flotilla_store::{ResolvedCascadeStoreExt, StoreQuery};
 async fn binding(daemon: &InProcessDaemon, crew: &CallerCrew) -> Result<String, String> {
     let backend = daemon.resource_backend();
     let convoy = backend.using::<Convoy>(&crew.namespace).get(&crew.convoy).await.map_err(|e| e.to_string())?;
-    let project = convoy.spec.project_ref.ok_or("EnvironmentCommandDenied: no project binding")?;
+    let project = convoy.spec.project_ref;
     let terminal = crew.terminal_session.as_ref().ok_or("EnvironmentCommandDenied: no terminal binding")?;
     let session = backend.using::<TerminalSession>(&crew.namespace).get(terminal).await.map_err(|e| e.to_string())?;
     let mut addresses = Vec::new();
@@ -71,7 +71,7 @@ async fn convoy_scope(
         return Err("EnvironmentIdentityMismatch: foreign namespace".into());
     }
     let convoy = daemon.resource_backend().including_replicas::<Convoy>(&crew.namespace).get(name).await.map_err(|e| e.to_string())?;
-    if convoy.object.spec.project_ref.as_deref() != Some(project) {
+    if convoy.object.spec.project_ref != project {
         return Err("EnvironmentIdentityMismatch: foreign project".into());
     }
     Ok(())

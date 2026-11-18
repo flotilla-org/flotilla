@@ -363,7 +363,13 @@ fn unchanged_subscription_decisions_log_once() {
             let (backend, home) = engine_backend().await;
             let wake = supervision_wake(&backend, &home);
             let status = ConvoyStatus { workflow_snapshot: Some(stock_snapshot("single-agent")), ..Default::default() };
-            let launch = home.admit("checks-wake", ConvoySpec::builder().workflow_ref("single-agent".into()).build(), status).await;
+            let launch = home
+                .admit(
+                    "checks-wake",
+                    ConvoySpec::builder().project_ref("flotilla".into()).workflow_ref("single-agent".into()).build(),
+                    status,
+                )
+                .await;
             let vessel = home.vessel(&launch, "work", "env");
             let convoy = home.view(&backend, &launch).await;
             home.engine().link(&convoy, &produced_pr(), SubjectDiscoverySource::Claim, "crew").await.expect("the crew claims its PR");
@@ -403,6 +409,7 @@ async fn declared_exit_entry_name_is_recorded_when_its_instantiated_leaf_fires()
     let table = engine_table(backend.clone(), &home, broadcast_test_sink(event_tx), refresher);
     let repo_ref = RepositoryKey("repo".to_string());
     let spec = ConvoySpec::builder()
+        .project_ref("flotilla".into())
         .workflow_ref("workflow".to_string())
         .repositories(vec![ConvoyRepositorySpec::builder()
             .url("https://github.com/flotilla-org/flotilla".to_string())

@@ -310,8 +310,7 @@ impl<'a> AttachResolver<'a> {
 
         let role = requested.as_ref().map_or(reference, |address| address.role.as_str());
         let matching_convoy_exists = sources.iter().any(|source| {
-            source.object.spec.role == role
-                && requested.as_ref().is_none_or(|address| source.object.spec.project_ref.as_deref() == Some(&address.project))
+            source.object.spec.role == role && requested.as_ref().is_none_or(|address| source.object.spec.project_ref == address.project)
         });
         let durable_sessions = &observations.sessions;
         let mut sessions_by_convoy = HashMap::<String, Vec<_>>::new();
@@ -327,7 +326,7 @@ impl<'a> AttachResolver<'a> {
             .filter(|source| {
                 source.object.spec.role == role
                     && sessions_by_convoy.contains_key(&source.object.metadata.name)
-                    && requested.as_ref().is_none_or(|address| source.object.spec.project_ref.as_deref() == Some(&address.project))
+                    && requested.as_ref().is_none_or(|address| source.object.spec.project_ref == address.project)
             })
             .collect::<Vec<_>>();
         candidates.sort_by(|left, right| {
@@ -370,12 +369,7 @@ impl<'a> AttachResolver<'a> {
                 if unique_projects.len() == 1
                     && candidates.get(1).is_none_or(|(next, _)| source.object.spec.generation > next.object.spec.generation) =>
             {
-                let project = source
-                    .object
-                    .spec
-                    .project_ref
-                    .clone()
-                    .ok_or_else(|| format!("live convoy {} has no project identity", source.object.metadata.name))?;
+                let project = source.object.spec.project_ref.clone();
                 Ok(Some(LiveConvoyRecord {
                     address: RoleAddress { project, role: role.to_string() },
                     record_name: source.object.metadata.name.clone(),
@@ -385,13 +379,9 @@ impl<'a> AttachResolver<'a> {
             candidates => {
                 let addresses = candidates
                     .iter()
-                    .filter_map(|(source, _)| {
-                        source
-                            .object
-                            .spec
-                            .project_ref
-                            .as_ref()
-                            .map(|project| RoleAddress { project: project.clone(), role: source.object.spec.role.clone() })
+                    .map(|(source, _)| RoleAddress {
+                        project: source.object.spec.project_ref.clone(),
+                        role: source.object.spec.role.clone(),
                     })
                     .collect::<BTreeSet<_>>()
                     .into_iter()
@@ -463,7 +453,7 @@ impl<'a> AttachResolver<'a> {
                     source.object.metadata.name == reference
                         || (source.object.spec.role == reference)
                         || requested_role.as_ref().is_some_and(|address| {
-                            source.object.spec.role == address.role && source.object.spec.project_ref.as_deref() == Some(&address.project)
+                            source.object.spec.role == address.role && source.object.spec.project_ref == address.project
                         })
                 });
                 if let Some(source) = named {
@@ -522,7 +512,7 @@ impl<'a> AttachResolver<'a> {
         let convoy_addresses = convoy_sources
             .into_iter()
             .map(|source| {
-                let address = convoy_address(&source.object.spec.role, source.object.spec.project_ref.as_deref());
+                let address = convoy_address(&source.object.spec.role, &source.object.spec.project_ref);
                 ((source.object.metadata.namespace, source.object.metadata.name, replica_origin(&source.provenance).cloned()), address)
             })
             .collect::<HashMap<_, _>>();
@@ -2159,8 +2149,8 @@ mod tests {
     #[tokio::test]
     async fn attach_resolves_role_addresses_to_the_live_record_before_planning_the_hop() {
         let (daemon, backend, _temp) = attach_fixture().await;
-        let andamento = create_identity_convoy(&daemon, "convoy-andamento", "governor", Some("andamento")).await;
-        let flotilla = create_identity_convoy(&daemon, "convoy-flotilla", "governor", Some("flotilla")).await;
+        let andamento = create_identity_convoy(&daemon, "convoy-andamento", "governor", "andamento").await;
+        let flotilla = create_identity_convoy(&daemon, "convoy-flotilla", "governor", "flotilla").await;
         let local_host = daemon.local_host_id().expect("local host identity").to_string();
         backend
             .using::<ResourceHost>("flotilla")
@@ -2226,7 +2216,7 @@ mod tests {
     #[tokio::test]
     async fn failed_convoy_with_live_session_remains_attachable_and_listed() {
         let (daemon, backend, _temp) = attach_fixture().await;
-        let failed = create_identity_convoy(&daemon, "convoy-failed", "coder", Some("flotilla")).await;
+        let failed = create_identity_convoy(&daemon, "convoy-failed", "coder", "flotilla").await;
         let host = daemon.local_host_id().expect("local host identity").to_string();
         backend
             .using::<ResourceHost>("flotilla")
@@ -2264,9 +2254,13 @@ mod tests {
     #[tokio::test]
     async fn bare_role_prefers_newest_connectable_generation() {
         let (daemon, backend, _temp) = attach_fixture().await;
-        let convoy_old = create_identity_convoy(&daemon, "convoy-old", "coder", Some("flotilla")).await;
-        let mut successor = ConvoySpec::builder().workflow_ref("review".to_string()).role("coder".to_string()).generation(2).build();
-        successor.project_ref = Some("flotilla".to_string());
+        let convoy_old = create_identity_convoy(&daemon, "convoy-old", "coder", "flotilla").await;
+        let successor = ConvoySpec::builder()
+            .workflow_ref("review".to_string())
+            .project_ref("flotilla".to_string())
+            .role("coder".to_string())
+            .generation(2)
+            .build();
         let convoy_new = identity_launch(&daemon, "convoy-new", successor.clone()).await;
         let host = daemon.local_host_id().expect("local host identity").to_string();
         backend
@@ -2323,7 +2317,7 @@ mod tests {
         use flotilla_store::load_metrics::{measure, ReadCounts};
         async fn attach_reads(reference: &str, unrelated: usize) -> ReadCounts {
             let (daemon, backend, _temp) = attach_fixture().await;
-            let main = create_identity_convoy(&daemon, "convoy-main", "coder", Some("flotilla")).await;
+            let main = create_identity_convoy(&daemon, "convoy-main", "coder", "flotilla").await;
             // The record is a launch of `convoy-main`; it is attached by the launch's name.
             let reference = if reference == "convoy-main" { main.as_str() } else { reference };
             let convoy = backend.using::<ResourceConvoy>("flotilla").get(&main).await.expect("convoy");
@@ -2338,7 +2332,7 @@ mod tests {
             let environment = create_test_environment(&engine.environments, "env-main", &host);
             create_running_session(&engine, &environment, "terminal-main", &main, "coder").await;
             for n in 0..unrelated {
-                create_identity_convoy(&daemon, &format!("unrelated-{n}"), "other", Some("other")).await;
+                create_identity_convoy(&daemon, &format!("unrelated-{n}"), "other", "other").await;
                 let noise = flotilla_engine_messages_testkit::intent(
                     "other/source",
                     "other/receiver",
@@ -2382,7 +2376,7 @@ mod tests {
     #[tokio::test]
     async fn unstarted_convoy_attach_never_claims_session_disappeared() {
         let (daemon, _backend, _temp) = attach_fixture().await;
-        let starting = create_identity_convoy(&daemon, "convoy-starting", "coder", Some("flotilla")).await;
+        let starting = create_identity_convoy(&daemon, "convoy-starting", "coder", "flotilla").await;
         for reference in [starting.as_str(), "coder", "coder@flotilla"] {
             let error = daemon.attach_resolver().resolve_attach(reference, None, false, AttachMode::Default, None).await.unwrap_err();
             assert!(!error.contains("no longer exists"), "{error}");
@@ -2393,7 +2387,7 @@ mod tests {
     #[tokio::test]
     async fn deleted_terminal_session_is_named_in_attach_error() {
         let (daemon, backend, _temp) = attach_fixture().await;
-        let convoy_gone = create_identity_convoy(&daemon, "convoy-gone", "coder", Some("flotilla")).await;
+        let convoy_gone = create_identity_convoy(&daemon, "convoy-gone", "coder", "flotilla").await;
         let host = daemon.local_host_id().expect("local host identity").to_string();
         backend
             .using::<ResourceHost>("flotilla")

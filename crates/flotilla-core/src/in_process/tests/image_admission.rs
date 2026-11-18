@@ -147,7 +147,7 @@ async fn admit(
     let mut placement = PlacementResolution::selected(kind);
     let demanded = fixture.engine.image_builds.demands();
     let (pins, builds) =
-        fixture.daemon.admission.join_convoy_placement_builds(NS, Some("flotilla"), workflow, &mut placement, Some(&decision())).await?;
+        fixture.daemon.admission.join_convoy_placement_builds(NS, "flotilla", workflow, &mut placement, Some(&decision())).await?;
     assert_eq!(fixture.engine.image_builds.demands(), demanded, "planning demands nothing");
     // Admission demands its planned builds with the convoy.
     flotilla_admission::image_build::demand_planned_builds(fixture.daemon.lifecycle_reads(), &builds).await?;
@@ -370,7 +370,7 @@ async fn cloud_composed_image_builds_for_amd64_through_the_image_cache() {
     assert_eq!(spec.delivery, ImageDelivery::Registry { repository: "registry.test/flotilla/crew-images".into() });
     let kind = fixture.backend.using::<FulfilmentKind>(NS).get("crew-policy").await.expect("kind");
     let mut placement = PlacementResolution::selected(kind);
-    fixture.daemon.admission.join_convoy_placement_builds(NS, Some("flotilla"), &workflow, &mut placement, None).await.expect("join");
+    fixture.daemon.admission.join_convoy_placement_builds(NS, "flotilla", &workflow, &mut placement, None).await.expect("join");
     assert!(
         matches!(
             placement.selected.expect("selected").spec.realisation,
@@ -387,14 +387,14 @@ async fn cloud_composed_image_without_an_image_cache_is_refused() {
     let fixture = fixture(catalogue(), None).await;
     make_cloud(&fixture).await;
     let workflow = WorkflowTemplateSpec::builder().vessels(vec![vessel("work", Vec::new(), &[])]).build();
-    let refused =
-        match fixture.daemon.admission.resolve_created_convoy_placement(NS, Some("flotilla"), &[], &workflow, Some("crew-policy")).await {
-            Ok(placement) => {
-                assert!(placement.selected.is_none(), "a cloud kind without an image cache must not be selected");
-                placement.refused_candidates.into_iter().map(|candidate| candidate.reason).collect::<Vec<_>>().join("\n")
-            }
-            Err(error) => error,
-        };
+    let refused = match fixture.daemon.admission.resolve_created_convoy_placement(NS, "flotilla", &[], &workflow, Some("crew-policy")).await
+    {
+        Ok(placement) => {
+            assert!(placement.selected.is_none(), "a cloud kind without an image cache must not be selected");
+            placement.refused_candidates.into_iter().map(|candidate| candidate.reason).collect::<Vec<_>>().join("\n")
+        }
+        Err(error) => error,
+    };
     assert!(refused.contains("declares no `image_cache`"), "{refused}");
     let error = admit(&fixture, &workflow).await.expect_err("no build is planned without an image cache");
     assert!(error.contains("declares no `image_cache`"), "{error}");

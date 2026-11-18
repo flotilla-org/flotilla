@@ -217,7 +217,7 @@ async fn touch(backend: &ResourceBackend, home: &EngineHome, launch: &str) {
 }
 
 fn convoy_spec() -> ConvoySpec {
-    ConvoySpec::builder().workflow_ref("workflow".to_string()).build()
+    ConvoySpec::builder().workflow_ref("workflow".to_string()).project_ref("flotilla".to_string()).build()
 }
 
 fn leaf(address: LeafAddress, field_path: &str, literal: &str) -> Leaf {
@@ -1218,7 +1218,9 @@ fn stock_snapshot(workflow_ref: &str) -> WorkflowSnapshot {
 /// claimed [`produced_pr`] as what it produces, and whose `role` seat reads `phase`.
 async fn produced_pr_launch(backend: &ResourceBackend, home: &EngineHome, workflow_ref: &str, role: &str, phase: CrewWorkPhase) -> String {
     let status = ConvoyStatus { workflow_snapshot: Some(stock_snapshot(workflow_ref)), ..Default::default() };
-    let launch = home.admit("checks-wake", ConvoySpec::builder().workflow_ref(workflow_ref.into()).build(), status).await;
+    let launch = home
+        .admit("checks-wake", ConvoySpec::builder().workflow_ref(workflow_ref.into()).project_ref("flotilla".into()).build(), status)
+        .await;
     let vessel = home.vessel(&launch, "work", "env");
     let convoy = home.view(backend, &launch).await;
     home.engine().link(&convoy, &produced_pr(), SubjectDiscoverySource::Claim, "crew").await.expect("the crew claims its PR");
@@ -1615,6 +1617,7 @@ async fn assert_turn_delivery_enforces_head_identity_and_records_rungs(
     let repo_ref = RepositoryKey("repo".to_string());
     let convoy_spec = ConvoySpec::builder()
         .workflow_ref("workflow".to_string())
+        .project_ref("flotilla".to_string())
         .repositories(vec![ConvoyRepositorySpec::builder()
             .url("https://github.com/flotilla-org/flotilla".to_string())
             .repo_ref(repo_ref.clone())

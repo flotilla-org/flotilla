@@ -381,7 +381,7 @@ mod tests {
         let launch = home
             .admit(
                 "convoy-cross-host",
-                flotilla_resources::ConvoySpec::builder().workflow_ref("workflow".to_string()).build(),
+                flotilla_resources::ConvoySpec::builder().project_ref("flotilla".into()).workflow_ref("workflow".to_string()).build(),
                 single_agent("coder"),
             )
             .await;
@@ -464,7 +464,11 @@ mod tests {
         let home = EngineHome::open_in("home", namespace);
         let backend = home.backend().clone();
         let launch = home
-            .admit("demo", flotilla_resources::ConvoySpec::builder().workflow_ref("workflow".into()).build(), single_agent("coder"))
+            .admit(
+                "demo",
+                flotilla_resources::ConvoySpec::builder().project_ref("flotilla".into()).workflow_ref("workflow".into()).build(),
+                single_agent("coder"),
+            )
             .await;
         let engine = &home.engine.engine;
         let vessel = engine.vessels.request(&launch, "work", "home");

@@ -1886,7 +1886,11 @@ mod tests {
         let convoy = convoys
             .create(
                 &InputMeta::builder().name("convoy".into()).build(),
-                &ConvoySpec::builder().workflow_ref("workflow".into()).placement_policy("kind".into()).build(),
+                &ConvoySpec::builder()
+                    .project_ref("flotilla".into())
+                    .workflow_ref("workflow".into())
+                    .placement_policy("kind".into())
+                    .build(),
             )
             .await
             .expect("convoy");
@@ -2009,7 +2013,7 @@ mod tests {
             .using::<Convoy>("flotilla")
             .create(
                 &InputMeta::builder().name("same-name".to_string()).build(),
-                &ConvoySpec::builder().workflow_ref("scratch".to_string()).build(),
+                &ConvoySpec::builder().project_ref("flotilla".into()).workflow_ref("scratch".to_string()).build(),
             )
             .await
             .expect("create convoy");

@@ -20,6 +20,7 @@ async fn reconciler_wake_rederives_at_boot_and_lands_without_resync() {
     let table = engine_table(backend.clone(), &home, broadcast_test_sink(event_tx), refresher);
     let repo_ref = RepositoryKey("repo".to_string());
     let spec = ConvoySpec::builder()
+        .project_ref("flotilla".into())
         .workflow_ref("workflow".to_string())
         .repositories(vec![ConvoyRepositorySpec::builder()
             .url("https://github.com/flotilla-org/flotilla".to_string())
@@ -180,6 +181,7 @@ async fn change_request_bound_after_claims_instantiates_and_settles() {
     let refresher = ChangeRequestRefresher::new(backend.clone(), "authority".to_string(), source.clone(), cadence);
     let table = engine_table(backend.clone(), &home, broadcast_test_sink(event_tx), refresher);
     let spec = ConvoySpec::builder()
+        .project_ref("flotilla".into())
         .workflow_ref("workflow".to_string())
         .repositories(vec![ConvoyRepositorySpec::builder()
             .url("https://github.com/flotilla-org/flotilla".to_string())
@@ -277,7 +279,7 @@ fn retracted_unlinked_submission_does_not_recreate_observation(tc: hegel::TestCa
         let address = flotilla_resources::address::stored_change_request_address("github.com", "flotilla-org/rigging", 70, &[]).unwrap();
         let subject = flotilla_resources::address::subject_for(&address).unwrap();
         let status = ConvoyStatus { workflow_snapshot: Some(stock_snapshot("single-agent")), ..Default::default() };
-        let mistaken = home.admit("mistaken-submission", ConvoySpec::builder().workflow_ref("single-agent".into()).build(), status).await;
+        let mistaken = home.admit("mistaken-submission", ConvoySpec::builder().project_ref("flotilla".into()).workflow_ref("single-agent".into()).build(), status).await;
         let mistaken = mistaken.as_str();
         let vessel = home.vessel(mistaken, "work", "env");
         home.seat(&backend, mistaken, (&vessel, "work"), ("coder", "mistaken-coder"), CrewWorkPhase::Working).await;
@@ -334,7 +336,7 @@ fn retracted_unlinked_submission_does_not_recreate_observation(tc: hegel::TestCa
             .last_seen(Utc::now())
             .build()];
         if other_holder {
-            let spec = ConvoySpec::builder().workflow_ref("single-agent".into()).build();
+            let spec = ConvoySpec::builder().project_ref("flotilla".into()).workflow_ref("single-agent".into()).build();
             let other = standard_landing(&backend, &home, "other-holder", spec).await;
             let convoy = convoys.get(&other).await.unwrap();
             home.engine().link(&convoy, &subject, SubjectDiscoverySource::Operator, "operator").await.expect("the other holder's PR");

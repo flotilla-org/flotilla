@@ -234,7 +234,7 @@ mod tests {
             });
             let convoy_record = ResourceObject {
                 metadata: meta(&name, index as i64),
-                spec: ConvoySpec::builder().workflow_ref("work".to_string()).build(),
+                spec: ConvoySpec::builder().workflow_ref("work".to_string()).project_ref("flotilla".to_string()).build(),
                 status: Some(ConvoyStatus {
                     placement_decision: Some(decision(HOSTS[convoy.host])),
                     workflow_snapshot: snapshot,

@@ -527,7 +527,7 @@ fn convoy_phase_represents_issues(phase: ConvoyPhase) -> bool {
 }
 
 fn convoy_scopes(row: &ConvoyRow) -> Vec<QueryScope> {
-    let Some(project) = row.project_ref.as_deref() else { return Vec::new() };
+    let project = row.project_ref.as_str();
     let mut scopes = vec![QueryScope::new(&row.resource.namespace, project)];
     if let Some(name) = project.strip_prefix(&format!("{}/", row.resource.namespace)) {
         scopes.push(QueryScope::new(&row.resource.namespace, name));
@@ -537,10 +537,7 @@ fn convoy_scopes(row: &ConvoyRow) -> Vec<QueryScope> {
 
 fn convoy_matches_scope(row: &ConvoyRow, scope: &QueryScope) -> bool {
     row.resource.namespace == scope.namespace
-        && row
-            .project_ref
-            .as_deref()
-            .is_some_and(|project| project == scope.name || project == format!("{}/{}", scope.namespace, scope.name))
+        && (row.project_ref == scope.name || row.project_ref == format!("{}/{}", scope.namespace, scope.name))
 }
 
 fn merged_issue_state(issue_sets: &[(QueryScope, ResultSet)]) -> ResultSetState {
@@ -871,7 +868,7 @@ mod tests {
             for (index, project, action, replica) in ops {
                 let mut row = convoy_row("flotilla", &format!("work-{index}"), &format!("project-{project}"));
                 if action == 3 {
-                    row.project_ref = Some(format!("flotilla/project-{project}"));
+                    row.project_ref = format!("flotilla/project-{project}");
                 }
                 if replica {
                     row.resource.host = Some(HostName::new("remote"));

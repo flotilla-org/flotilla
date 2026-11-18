@@ -15,13 +15,11 @@ pub enum MessageAdmission {
 /// Each standing role's current generations among `convoys`, by project and role: the newest live
 /// convoy of each ensure the role is ensured from. Derived from the generations alone (#3108).
 fn standing_generations<'a>(
-    namespace: &str,
     convoys: impl IntoIterator<Item = &'a crate::ResourceObject<Convoy>>,
 ) -> BTreeMap<(String, String), Vec<String>> {
     let mut standing = BTreeMap::<_, Vec<String>>::new();
     for convoy in crate::newest_live_generations(convoys).into_values() {
-        let project = convoy.spec.project_ref.as_deref().unwrap_or(namespace).to_string();
-        standing.entry((project, convoy.spec.role.clone())).or_default().push(convoy.metadata.name.clone());
+        standing.entry((convoy.spec.project_ref.clone(), convoy.spec.role.clone())).or_default().push(convoy.metadata.name.clone());
     }
     standing
 }
@@ -31,7 +29,6 @@ fn standing_generations<'a>(
 /// Resolution after loading is pure, including adopted-role validation.
 #[derive(Debug)]
 pub struct MessageReceiverSnapshot {
-    namespace: String,
     convoys: std::sync::Arc<crate::ReadResourceList<Convoy>>,
     terminals: std::sync::Arc<crate::ReadResourceList<TerminalSession>>,
     /// Each standing role's current generations in this batch, by project and role: the newest
@@ -103,7 +100,7 @@ impl MessageReceiverSnapshot {
         };
         // Only the requested roles' generations: a named convoy may itself be one, but a
         // four-part address needs no standing-role holders.
-        let standing_convoys = standing_generations(namespace, convoys.iter().map(|row| &row.object))
+        let standing_convoys = standing_generations(convoys.iter().map(|row| &row.object))
             .into_iter()
             .filter(|(key, _)| standing_roles.contains(key))
             .flat_map(|(_, names)| names)
@@ -185,8 +182,8 @@ impl MessageReceiverSnapshot {
         }
         let hierarchy =
             ProjectHierarchy::from_declared(projects.iter().map(|(name, spec)| (name.clone(), spec.parent.clone())).collect(), fleet);
-        let standing = standing_generations(namespace, convoys.items.iter().map(|source| &source.object));
-        Ok(Self { namespace: namespace.into(), convoys, terminals, standing, projects, hierarchy, defaults })
+        let standing = standing_generations(convoys.items.iter().map(|source| &source.object));
+        Ok(Self { convoys, terminals, standing, projects, hierarchy, defaults })
     }
 
     /// Cheap candidate filter before resolving message addresses. Two-part roles
@@ -285,7 +282,7 @@ impl MessageReceiverSnapshot {
             .iter()
             .filter(|source| {
                 let object = &source.object;
-                object.spec.project_ref.as_deref().unwrap_or(&self.namespace) == project
+                object.spec.project_ref == project
                     && object.status.as_ref().is_none_or(|status| !status.phase.is_terminal())
                     && convoy.map_or_else(|| declared_convoy.as_ref() == Some(&object.metadata.name), |name| object.metadata.name == name)
             })

@@ -13,6 +13,7 @@ async fn authority_reconciler_wakes_from_replicated_checkout_and_change_request(
     let remote = ResourceBackend::new(InMemoryBackend::default());
     let repo_ref = RepositoryKey("repo".to_string());
     let spec = ConvoySpec::builder()
+        .project_ref("flotilla".into())
         .workflow_ref("workflow".to_string())
         .r#ref("feature/reconciler-wake".to_string())
         .repositories(vec![ConvoyRepositorySpec::builder()

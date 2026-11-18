@@ -85,7 +85,7 @@ async fn http_list_decodes_owner_references() {
                 "creationTimestamp": "2026-04-14T11:00:00Z"
             },
             "spec": {
-                "workflow_ref": "review",
+                "workflow_ref": "review", "project_ref": "flotilla",
                 "inputs": {},
                 "placement_policy": "laptop-docker"
             },
@@ -127,7 +127,7 @@ async fn http_create_serializes_owner_references() {
             "creationTimestamp": "2026-04-14T11:00:00Z"
         },
         "spec": {
-            "workflow_ref": "review",
+            "workflow_ref": "review", "project_ref": "flotilla",
             "inputs": {},
             "placement_policy": "laptop-docker"
         }

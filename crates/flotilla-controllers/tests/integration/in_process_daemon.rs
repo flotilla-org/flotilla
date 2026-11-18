@@ -1193,7 +1193,7 @@ async fn resource_list_and_get_queries_return_wire_json() {
     let launch = launch_convoy(
         &daemon,
         "resource-demo",
-        flotilla_resources::ConvoySpec::builder().workflow_ref("wf".to_string()).build(),
+        flotilla_resources::ConvoySpec::builder().workflow_ref("wf".to_string()).project_ref("flotilla".to_string()).build(),
         Default::default(),
     )
     .await;
@@ -1311,6 +1311,7 @@ async fn convoy_explain_discharges_terminal_checkout_only_after_vessel_teardown(
         "terminal-checkout",
         flotilla_resources::ConvoySpec::builder()
             .workflow_ref("implement-review".to_string())
+            .project_ref("flotilla".to_string())
             .repositories(vec![flotilla_resources::ConvoyRepositorySpec::builder()
                 .url("https://github.com/owner/repo".to_string())
                 .repo_ref(repo_ref.clone())
@@ -3842,7 +3843,7 @@ async fn convoy_start_accepts_project_list_identifier() {
             }
         );
         let convoy = admitted_convoy(&backend, &name).await;
-        assert_eq!(convoy.spec.project_ref.as_deref(), Some("flotilla"));
+        assert_eq!(convoy.spec.project_ref, "flotilla");
     }
 }
 
@@ -4169,7 +4170,7 @@ async fn convoy_start_admits_fully_specified_issue_intent_as_one_persisted_snaps
         }
     );
     let persisted = admitted_convoy(&backend, "issue-732").await;
-    assert_eq!(persisted.spec.project_ref.as_deref(), Some("flotilla"));
+    assert_eq!(persisted.spec.project_ref, "flotilla");
     assert_eq!(persisted.spec.workflow_ref, "single-agent");
     assert_eq!(persisted.spec.dispatching_principal_ref, flotilla_protocol::PrincipalRef::implicit_for_namespace("flotilla"));
     assert_eq!(persisted.spec.r#ref.as_deref(), Some("fix/issue-732"));
@@ -4864,7 +4865,7 @@ async fn convoy_delete_reaps_a_landed_pre_identity_record() {
     let launch = launch_convoy(
         &daemon,
         "command-builder",
-        flotilla_resources::ConvoySpec::builder().workflow_ref("legacy-workflow".to_string()).build(),
+        flotilla_resources::ConvoySpec::builder().workflow_ref("legacy-workflow".to_string()).project_ref("flotilla".to_string()).build(),
         flotilla_resources::ConvoyStatus { phase: ConvoyPhase::Landed, ..Default::default() },
     )
     .await;
@@ -4904,6 +4905,7 @@ async fn landed_convoy_teardown_accepts_clean_squash_merge_after_branch_deletion
         "merged-deleted-branch",
         flotilla_resources::ConvoySpec::builder()
             .workflow_ref("implement-review".to_string())
+            .project_ref("flotilla".to_string())
             .repositories(vec![flotilla_resources::ConvoyRepositorySpec::builder()
                 .url("https://github.com/owner/repo".to_string())
                 .repo_ref(repo_ref.clone())
@@ -5046,6 +5048,7 @@ async fn landed_convoy_teardown_accepts_merged_produced_subject_when_checkout_st
         "landed-missing-status",
         flotilla_resources::ConvoySpec::builder()
             .workflow_ref("implement-review".to_string())
+            .project_ref("flotilla".to_string())
             .repositories(vec![flotilla_resources::ConvoyRepositorySpec::builder()
                 .url("https://github.com/owner/repo".to_string())
                 .repo_ref(repo_ref.clone())
@@ -6469,7 +6472,7 @@ async fn daemon_restart_preserves_standing_convoy() {
     convoys
         .create(
             &InputMeta::builder().name("standing-convoy".to_string()).build(),
-            &flotilla_resources::ConvoySpec::builder().workflow_ref("standing".to_string()).build(),
+            &flotilla_resources::ConvoySpec::builder().workflow_ref("standing".to_string()).project_ref("flotilla".to_string()).build(),
         )
         .await
         .expect("create standing convoy");
@@ -8561,7 +8564,7 @@ async fn handoff_uses_remote_session_origin_and_refuses_remote_only_anchor() {
     let convoy = launch_convoy(
         &authority,
         "handoff-convoy",
-        flotilla_resources::ConvoySpec::builder().workflow_ref("wf".to_string()).build(),
+        flotilla_resources::ConvoySpec::builder().workflow_ref("wf".to_string()).project_ref("flotilla".to_string()).build(),
         flotilla_resources::ConvoyStatus { workflow_snapshot: Some(snapshot), ..Default::default() },
     )
     .await;
@@ -8693,7 +8696,7 @@ async fn convoy_resume_finds_a_terminal_session_on_another_host() {
     let convoy = launch_convoy(
         &authority,
         "split-convoy",
-        flotilla_resources::ConvoySpec::builder().workflow_ref("wf".to_string()).build(),
+        flotilla_resources::ConvoySpec::builder().workflow_ref("wf".to_string()).project_ref("flotilla".to_string()).build(),
         Default::default(),
     )
     .await;
@@ -8775,7 +8778,7 @@ async fn convoy_resume_queues_a_brief_while_crew_is_working() {
     let launch = launch_convoy(
         &daemon,
         "busy-convoy",
-        flotilla_resources::ConvoySpec::builder().workflow_ref("workflow".to_string()).build(),
+        flotilla_resources::ConvoySpec::builder().workflow_ref("workflow".to_string()).project_ref("flotilla".to_string()).build(),
         Default::default(),
     )
     .await;
@@ -8851,7 +8854,7 @@ async fn convoy_resume_queues_confirmed_delivery_when_working_crew_is_already_id
     let launch = launch_convoy(
         &daemon,
         "idle-convoy",
-        flotilla_resources::ConvoySpec::builder().workflow_ref("workflow".to_string()).build(),
+        flotilla_resources::ConvoySpec::builder().workflow_ref("workflow".to_string()).project_ref("flotilla".to_string()).build(),
         flotilla_resources::ConvoyStatus { workflow_snapshot: Some(snapshot), ..Default::default() },
     )
     .await;
@@ -8964,7 +8967,7 @@ async fn convoy_explain_reports_completed_work_without_a_crew_claim() {
     let launch = launch_convoy(
         &daemon,
         "unclaimed-work",
-        flotilla_resources::ConvoySpec::builder().workflow_ref("workflow".to_string()).build(),
+        flotilla_resources::ConvoySpec::builder().workflow_ref("workflow".to_string()).project_ref("flotilla".to_string()).build(),
         flotilla_resources::ConvoyStatus {
             workflow_snapshot: Some(one_vessel_snapshot(vec![flotilla_engine_convoys_testkit::agent("lead"), coder])),
             ..Default::default()
@@ -9012,7 +9015,7 @@ async fn operator_forced_completion_settles_a_ledger_less_crew() {
     let launch = launch_convoy(
         &daemon,
         "missing-ledger",
-        flotilla_resources::ConvoySpec::builder().workflow_ref("workflow".to_string()).build(),
+        flotilla_resources::ConvoySpec::builder().workflow_ref("workflow".to_string()).project_ref("flotilla".to_string()).build(),
         flotilla_resources::ConvoyStatus {
             workflow_snapshot: Some(flotilla_resources::WorkflowSnapshot {
                 cascade: None,
@@ -9589,7 +9592,7 @@ async fn message_apply_uses_document_namespace_and_status_patches_are_refused() 
         flotilla_engine_convoys_testkit::convoy(
             "flotilla",
             "namespace-convoy",
-            flotilla_resources::ConvoySpec::builder().workflow_ref("workflow".into()).build(),
+            flotilla_resources::ConvoySpec::builder().workflow_ref("workflow".into()).project_ref("flotilla".into()).build(),
             flotilla_engine_convoys_testkit::single_agent("coder"),
         ),
     )
@@ -9690,7 +9693,11 @@ async fn convoy_resume_milliseconds_after_complete_still_lands() {
     let launch = launch_convoy(
         &daemon,
         "claimed-resume",
-        flotilla_resources::ConvoySpec::builder().workflow_ref("workflow".into()).role("claimed-resume".into()).build(),
+        flotilla_resources::ConvoySpec::builder()
+            .workflow_ref("workflow".into())
+            .project_ref("flotilla".into())
+            .role("claimed-resume".into())
+            .build(),
         flotilla_resources::ConvoyStatus {
             workflow_snapshot: Some(WorkflowSnapshot {
                 cascade: None,

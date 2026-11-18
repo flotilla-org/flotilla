@@ -539,6 +539,7 @@ async fn github_observation_credential_failure_is_visible_and_recovers() {
     assert_eq!(conditions[0].message, error);
     assert!(!conditions[0].blocks_readiness() && !conditions[0].blocks_forge_observation());
     let spec = ConvoySpec::builder()
+        .project_ref("flotilla".into())
         .workflow_ref("work".into())
         .repositories(vec![ConvoyRepositorySpec::builder()
             .repo_ref(key)
@@ -551,7 +552,13 @@ async fn github_observation_credential_failure_is_visible_and_recovers() {
         .build();
     let single_agent = flotilla_engine_convoys_testkit::single_agent;
     let affected = admit(&daemon, "affected", spec, single_agent("coder")).await;
-    let unrelated = admit(&daemon, "unrelated", ConvoySpec::builder().workflow_ref("work".into()).build(), single_agent("coder")).await;
+    let unrelated = admit(
+        &daemon,
+        "unrelated",
+        ConvoySpec::builder().project_ref("flotilla".into()).workflow_ref("work".into()).build(),
+        single_agent("coder"),
+    )
+    .await;
     assert!(daemon.explain_convoy_internal(Some("flotilla"), &affected).await.expect("explain").warnings.contains(&error));
     assert!(daemon.explain_convoy_internal(Some("flotilla"), &unrelated).await.expect("explain").warnings.is_empty());
     tokio::time::advance(Duration::from_secs(29)).await;

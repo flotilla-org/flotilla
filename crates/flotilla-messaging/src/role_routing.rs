@@ -229,7 +229,7 @@ pub async fn crew_address_book(backend: &ResourceBackend, namespace: &str, own_a
     }
     for source in convoys {
         let convoy = &source.object;
-        let candidate_project = convoy.spec.project_ref.as_deref().unwrap_or(namespace);
+        let candidate_project = convoy.spec.project_ref.as_str();
         if !visible_projects.contains(candidate_project) || convoy.status.as_ref().is_some_and(|status| status.phase.is_terminal()) {
             continue;
         }
@@ -421,7 +421,7 @@ async fn reconcile_charter_notifications_from_receivers(
             }
             (project.to_string(), role.to_string(), address.clone())
         } else {
-            let Some(project) = convoy.and_then(|convoy| convoy.spec.project_ref.as_ref()) else { continue };
+            let Some(project) = convoy.map(|convoy| &convoy.spec.project_ref) else { continue };
             let (Some(vessel), Some(role)) = (labels.get(VESSEL_LABEL), labels.get(ROLE_LABEL)) else { continue };
             (project.clone(), role.clone(), flotilla_resources::crew_role_address(project, &context.convoy, vessel, role))
         };

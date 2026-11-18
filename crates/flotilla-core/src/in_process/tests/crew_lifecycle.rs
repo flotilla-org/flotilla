@@ -45,7 +45,7 @@ async fn crew_fail_requires_operator_force() {
     let failure = admit_snapshot(
         &daemon,
         "operator-failure",
-        ConvoySpec::builder().workflow_ref("test".into()).build(),
+        ConvoySpec::builder().workflow_ref("test".into()).project_ref("flotilla".into()).build(),
         stall_workflow_snapshot(vec![claim_crew("coder")]),
     )
     .await;
@@ -80,7 +80,13 @@ async fn active_idle_crew_stalls_and_working_crew_clears() {
         "work/coder".into(),
         flotilla_resources::StallNudgePolicy { max_per_episode: 2, max_refusals: None, idle_grace_seconds: Some(3) },
     );
-    let idle_crew = admit_snapshot(&daemon, "idle-crew", ConvoySpec::builder().workflow_ref("test".into()).build(), snapshot).await;
+    let idle_crew = admit_snapshot(
+        &daemon,
+        "idle-crew",
+        ConvoySpec::builder().workflow_ref("test".into()).project_ref("flotilla".into()).build(),
+        snapshot,
+    )
+    .await;
     // The screen read Idle six seconds ago: quiet from a second ago, after the screen debounce,
     // so the three-second grace runs out two seconds from now.
     let idle_at = Utc::now() - chrono::Duration::seconds(6);
@@ -100,8 +106,7 @@ async fn active_idle_crew_stalls_and_working_crew_clears() {
     let stalled = status.stalled.expect("stalled");
     assert!(matches!(stalled.maker, Some(flotilla_resources::LeafMaker::Actor { ref role, .. }) if role == "coder"));
     // The idle evidence explains why the default ProjectCrew rung cannot supply a supervisor
-    // (#2522). A launch's project is its project_ref or, without one, its namespace, so the
-    // fixture's convoy is the namespace project's, which has no governor.
+    // (#2522): the fixture's convoy is project flotilla's, which has no governor.
     assert_eq!(stalled.evidence, "idle; no live governor for project flotilla (no matching convoy in replica view)");
     assert_eq!(stalled.source, flotilla_resources::StallEvidenceSource::Screen);
     let mut events = daemon.subscribe();
@@ -149,7 +154,13 @@ async fn an_agent_working_again_clears_its_stall_from_its_session_alone() {
         "work/coder".into(),
         flotilla_resources::StallNudgePolicy { max_per_episode: 2, max_refusals: None, idle_grace_seconds: Some(0) },
     );
-    let idle_crew = admit_snapshot(&daemon, "idle-crew", ConvoySpec::builder().workflow_ref("test".into()).build(), snapshot).await;
+    let idle_crew = admit_snapshot(
+        &daemon,
+        "idle-crew",
+        ConvoySpec::builder().workflow_ref("test".into()).project_ref("flotilla".into()).build(),
+        snapshot,
+    )
+    .await;
     let idle_at = Utc::now() - chrono::Duration::seconds(6);
     let launch = stall_test_session(
         &engine,
@@ -174,7 +185,7 @@ async fn stale_working_attention_does_not_stall_crew() {
     let stale_crew = admit_snapshot(
         &daemon,
         "stale-crew",
-        ConvoySpec::builder().workflow_ref("test".into()).build(),
+        ConvoySpec::builder().workflow_ref("test".into()).project_ref("flotilla".into()).build(),
         stall_workflow_snapshot(vec![claim_crew("coder")]),
     )
     .await;
@@ -201,6 +212,7 @@ async fn landing_done_crew_with_idle_session_has_no_actor_stall() {
     let repository = flotilla_resources::RepositoryKey("repo".into());
     let spec = ConvoySpec::builder()
         .workflow_ref("test".into())
+        .project_ref("flotilla".into())
         .repositories(vec![flotilla_resources::ConvoyRepositorySpec::builder()
             .url("https://github.com/flotilla-org/flotilla".into())
             .repo_ref(repository.clone())
@@ -283,7 +295,7 @@ async fn landing_without_armed_exit_rows_stalls() {
     let unarmed = admit_snapshot(
         &daemon,
         "unarmed-landing",
-        ConvoySpec::builder().workflow_ref("test".into()).build(),
+        ConvoySpec::builder().workflow_ref("test".into()).project_ref("flotilla".into()).build(),
         stall_workflow_snapshot(vec![claim_crew("coder")]),
     )
     .await;
@@ -303,6 +315,7 @@ async fn stale_change_request_observation_stalls_landing_convoy() {
     let repository = flotilla_resources::RepositoryKey("repo".into());
     let spec = ConvoySpec::builder()
         .workflow_ref("test".into())
+        .project_ref("flotilla".into())
         .repositories(vec![flotilla_resources::ConvoyRepositorySpec::builder()
             .url("https://github.com/flotilla-org/flotilla".into())
             .repo_ref(repository.clone())
@@ -416,7 +429,7 @@ async fn replica_wake_engine_does_not_write_stalled_condition() {
     let launch = authority
         .admit(
             "replicated",
-            ConvoySpec::builder().workflow_ref("test".into()).build(),
+            ConvoySpec::builder().workflow_ref("test".into()).project_ref("flotilla".into()).build(),
             flotilla_engine_convoys_testkit::single_agent("coder"),
         )
         .await;
@@ -533,6 +546,7 @@ async fn promise_retractions_stall_unless_crew_sourced() {
         .build();
     let spec = ConvoySpec::builder()
         .workflow_ref("test".into())
+        .project_ref("flotilla".into())
         .promises(vec![flotilla_resources::promises::DispatchPromise {
             label: "dispatch".into(),
             kind: PromiseKind::Pr,

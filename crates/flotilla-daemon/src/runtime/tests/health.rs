@@ -21,7 +21,7 @@ async fn reconcile_now_queues_the_launch_at_the_convoy_controller() {
         flotilla_engine_convoys_testkit::convoy(
             NAMESPACE,
             "teardown",
-            ConvoySpec::builder().workflow_ref("workflow".to_string()).build(),
+            ConvoySpec::builder().project_ref(NAMESPACE.into()).workflow_ref("workflow".to_string()).build(),
             single_agent("coder"),
         ),
     )
@@ -123,6 +123,7 @@ async fn clone_controller_failure_is_visible_in_convoy_explain() {
         ..Default::default()
     };
     let spec = ConvoySpec::builder()
+        .project_ref(NAMESPACE.into())
         .workflow_ref("missing-workflow".to_string())
         .adopted_checkout_refs(BTreeMap::from([(repository_key.clone(), "clone-failure-checkout".to_string())]))
         .build();

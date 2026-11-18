@@ -168,7 +168,7 @@ impl AdmissionActions<'_> {
                 self.finish_admission(id, empty_identity, CommandValue::Error { message });
                 return Ok(id);
             }
-            let project_identity = Some(project_ref.as_str());
+            let project_identity = project_ref.as_str();
             if let Err(message) = validate_convoy_name(&role) {
                 let result = CommandValue::Error { message };
                 self.finish_admission(id, empty_identity, result);
@@ -187,7 +187,7 @@ impl AdmissionActions<'_> {
             // Use the admission transaction before checking identity or writing
             // adopted checkout resources. A duplicate must have no side effects.
             let admission_guard = self.admission.lock().await;
-            if let Err(message) = refuse_live_convoy_in(self.resource_backend, &namespace, project_identity, &role).await {
+            if let Err(message) = refuse_live_convoy_in(self.resource_backend, &namespace, project_ref, &role).await {
                 let result = CommandValue::Error { message };
                 self.finish_admission(id, empty_identity, result);
                 return Ok(id);
@@ -286,7 +286,7 @@ impl AdmissionActions<'_> {
             let credential_result = resolve_and_validate_workflow_credentials(
                 self.resource_backend,
                 &namespace,
-                project_identity,
+                Some(project_identity),
                 &repositories,
                 placement.selected.as_ref(),
                 &mut workflow.spec,

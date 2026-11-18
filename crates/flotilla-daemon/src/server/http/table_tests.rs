@@ -366,7 +366,7 @@ async fn convoys_table_watch_delivers_a_launch_on_both_carriers() {
             engine.reads(),
         );
         let launch = |name: &str| {
-            let spec = ConvoySpec::builder().workflow_ref("workflow".into()).build();
+            let spec = ConvoySpec::builder().workflow_ref("workflow".into()).project_ref("test".into()).build();
             convoys.launch(flotilla_engine_convoys_testkit::convoy(
                 "test",
                 name,
@@ -413,7 +413,7 @@ async fn a_notes_change_reaches_a_convoys_table_watch_and_moves_its_sequence() {
         Arc::new(flotilla_resources::SystemClock),
         engine.reads(),
     );
-    let spec = ConvoySpec::builder().workflow_ref("workflow".into()).build();
+    let spec = ConvoySpec::builder().workflow_ref("workflow".into()).project_ref("test".into()).build();
     let launched = convoys
         .launch(flotilla_engine_convoys_testkit::convoy("test", "noted", spec, flotilla_engine_convoys_testkit::single_agent("coder")))
         .await;
@@ -1183,8 +1183,8 @@ async fn convoy_rows_name_their_subject_by_address() {
         engine.reads(),
     );
     let mut launched = Vec::new();
-    for (name, project) in [("convoy-1", Some("flotilla")), ("convoy-2", Some("flotilla2")), ("convoy-3", None)] {
-        let spec = ConvoySpec::builder().workflow_ref("workflow".into()).maybe_project_ref(project.map(str::to_owned)).build();
+    for (name, project) in [("convoy-1", "flotilla"), ("convoy-2", "flotilla2"), ("convoy-3", "test")] {
+        let spec = ConvoySpec::builder().workflow_ref("workflow".into()).project_ref(project.into()).build();
         let convoy = flotilla_engine_convoys_testkit::convoy("test", name, spec, flotilla_engine_convoys_testkit::single_agent("coder"));
         launched.push(convoys.launch(convoy).await);
     }
@@ -1211,7 +1211,6 @@ async fn convoy_rows_name_their_subject_by_address() {
         [
             (json!(launched[0]), json!(address("flotilla", &launched[0]))),
             (json!(launched[1]), json!(address("flotilla2", &launched[1]))),
-            // The engine holds a convoy admitted without a project under its namespace's project.
             (json!(launched[2]), json!(address("test", &launched[2]))),
         ]
     );

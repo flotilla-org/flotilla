@@ -55,7 +55,7 @@ async fn launches_read_by_of_convoy(others: usize) -> (u64, KeyedGets) {
     let convoys = EngineConvoysHome::over(store.service(), NAMESPACE, &backend, Arc::new(SystemClock), engine.reads());
     let mut launches = Vec::new();
     for n in 0..=others {
-        let spec = ConvoySpec::builder().workflow_ref("workflow".into()).build();
+        let spec = ConvoySpec::builder().workflow_ref("workflow".into()).project_ref(NAMESPACE.into()).build();
         let launch = convoys.launch(convoy(NAMESPACE, &format!("convoy-{n}"), spec, single_agent("coder"))).await;
         engine.vessels.request(&launch, "work", "host");
         launches.push(launch);
@@ -90,7 +90,7 @@ async fn launches_read_by_a_pass(others: usize) -> (u64, KeyedGets) {
     let convoys = EngineConvoysHome::over(store.service(), NAMESPACE, &backend, Arc::new(SystemClock), engine.reads());
     let mut launches = Vec::new();
     for n in 0..=others {
-        let spec = ConvoySpec::builder().workflow_ref("workflow".into()).build();
+        let spec = ConvoySpec::builder().workflow_ref("workflow".into()).project_ref(NAMESPACE.into()).build();
         let launch = convoys.launch(convoy(NAMESPACE, &format!("convoy-{n}"), spec, single_agent("coder"))).await;
         engine.vessels.request(&launch, "work", "host");
         launches.push(launch);
@@ -150,7 +150,7 @@ async fn queued_by_one_brief(others: usize) -> (Vec<String>, u64, KeyedGets) {
     let convoys = EngineConvoysHome::over(store.service(), NAMESPACE, &backend, Arc::new(SystemClock), engine.reads());
     let mut launches = Vec::new();
     for n in 0..=others + 1 {
-        let spec = ConvoySpec::builder().workflow_ref("workflow".into()).build();
+        let spec = ConvoySpec::builder().workflow_ref("workflow".into()).project_ref(NAMESPACE.into()).build();
         let launch = convoys.launch(convoy(NAMESPACE, &format!("convoy-{n}"), spec, single_agent("coder"))).await;
         let vessel = engine.vessels.request(&launch, "work", "host");
         launches.push((launch, vessel));
@@ -203,7 +203,7 @@ async fn queued_by_one_checkout(others: usize) -> (Vec<String>, u64, KeyedGets) 
     let convoys = EngineConvoysHome::over(store.service(), NAMESPACE, &backend, Arc::new(SystemClock), engine.reads());
     let mut launches = Vec::new();
     for n in 0..=others + 1 {
-        let spec = ConvoySpec::builder().workflow_ref("workflow".into()).build();
+        let spec = ConvoySpec::builder().workflow_ref("workflow".into()).project_ref(NAMESPACE.into()).build();
         launches.push(convoys.launch(convoy(NAMESPACE, &format!("convoy-{n}"), spec, single_agent("coder"))).await);
     }
     let checkout = |name: &str| {
@@ -279,7 +279,7 @@ async fn vessels_in_one_environment(others: usize) -> (Vec<EnvironmentVessel>, u
     let backend = ResourceBackend::new(InMemoryBackend::default());
     let convoys = EngineConvoysHome::over(store.service(), NAMESPACE, &backend, Arc::new(SystemClock), engine.reads());
     for n in 0..others + 2 {
-        let spec = ConvoySpec::builder().workflow_ref("workflow".into()).build();
+        let spec = ConvoySpec::builder().workflow_ref("workflow".into()).project_ref(NAMESPACE.into()).build();
         let launch = convoys.launch(convoy(NAMESPACE, &format!("convoy-{n}"), spec, single_agent("coder"))).await;
         let vessel = engine.vessels.request(&launch, "work", "host");
         let environment = if n < 2 { "shared".to_owned() } else { format!("env-{n}") };
@@ -353,7 +353,7 @@ async fn read_by_cards(others: usize, scope: impl FnOnce(&[String]) -> CardScope
     engine.environments.request("shared", &host_direct, None);
     let mut launches = Vec::new();
     for n in 0..others + 2 {
-        let spec = ConvoySpec::builder().workflow_ref("workflow".into()).build();
+        let spec = ConvoySpec::builder().workflow_ref("workflow".into()).project_ref(NAMESPACE.into()).build();
         let launch = convoys.launch(convoy(NAMESPACE, &format!("convoy-{n}"), spec, single_agent("coder"))).await;
         let vessel = engine.vessels.request(&launch, "work", "host");
         launches.push(launch);
@@ -449,7 +449,7 @@ async fn read_by_open_launches(others: usize) -> (usize, u64, KeyedGets) {
     let mut sent = reads.changes();
     let home = &convoys;
     let admit = |n: usize| async move {
-        let spec = ConvoySpec::builder().workflow_ref("workflow".into()).build();
+        let spec = ConvoySpec::builder().workflow_ref("workflow".into()).project_ref(NAMESPACE.into()).build();
         let mut admitted = convoy(NAMESPACE, &format!("convoy-{n}"), spec, single_agent("coder"));
         admitted.metadata.name = home.launch(admitted.clone()).await;
         admitted
@@ -525,7 +525,7 @@ async fn first_pass(count: usize) -> ControllerLoadSnapshot {
     let backend = ResourceBackend::new(InMemoryBackend::default());
     let convoys = EngineConvoysHome::over(store.service(), NAMESPACE, &backend, Arc::new(SystemClock), engine.reads());
     for n in 0..count {
-        let spec = ConvoySpec::builder().workflow_ref("workflow".into()).build();
+        let spec = ConvoySpec::builder().workflow_ref("workflow".into()).project_ref(NAMESPACE.into()).build();
         convoys.launch(convoy(NAMESPACE, &format!("convoy-{n}"), spec, single_agent("coder"))).await;
     }
     let metrics = Arc::new(ControllerLoadMetrics::default());

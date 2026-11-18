@@ -668,7 +668,7 @@ const CONVOY_ATTACH_WAIT: Duration = Duration::from_secs(60);
 
 fn convoy_start_failure(convoy: &ResourceObject<ResourceConvoy>) -> Option<String> {
     let role = if convoy.spec.role.is_empty() { &convoy.metadata.name } else { &convoy.spec.role };
-    let identity = convoy.spec.project_ref.as_ref().map_or_else(|| role.clone(), |project| format!("{role}@{project}"));
+    let identity = format!("{role}@{}", convoy.spec.project_ref);
     let status = convoy.status.as_ref()?;
     if let Some((work, state)) = status.work.iter().find(|(_, state)| state.phase == ResourceWorkPhase::Failed) {
         let detail = state.message.as_deref().filter(|message| !message.trim().is_empty()).unwrap_or("work failed without a message");
@@ -2916,7 +2916,7 @@ impl InProcessDaemon {
             .map(|row| flotilla_store::ConvoyIdentity {
                 record: &row.resource.name,
                 role: row.address_role.as_deref(),
-                project: row.project_ref.as_deref(),
+                project: Some(&row.project_ref),
                 terminal: row.is_ended(),
             })
             .collect::<Vec<_>>();
@@ -3471,18 +3471,20 @@ impl InProcessDaemon {
             .into_iter()
             .map(|forge| forge.spec)
             .collect::<Vec<_>>();
-        let project = if let Some(project_ref) = &convoy.spec.project_ref {
-            self.resource_backend.including_replicas::<Project>(namespace).get(project_ref).await.ok().map(|project| project.object)
-        } else {
-            None
-        };
+        let project = self
+            .resource_backend
+            .including_replicas::<Project>(namespace)
+            .get(&convoy.spec.project_ref)
+            .await
+            .ok()
+            .map(|project| project.object);
         let repositories =
             self.resource_backend.including_replicas::<Repository>(namespace).list().await.map_err(|error| error.to_string())?;
         let repository_specs =
             repositories.items.iter().map(|record| (record.object.spec.key(), &record.object.spec)).collect::<HashMap<_, _>>();
         Ok(flotilla_resources::convoy_reference_context(
             &convoy.spec.repositories,
-            convoy.spec.project_ref.as_deref(),
+            Some(&convoy.spec.project_ref),
             project.as_ref().map(|project| &project.spec),
             &forges,
             |key| repository_specs.get(key).copied(),
@@ -5308,7 +5310,7 @@ impl InProcessDaemon {
             .await
             .map_err(|error| error.to_string())?
             .ok_or_else(|| format!("inbox `{inbox}` has no admitted convoy"))?;
-        if convoy.object.spec.project_ref.as_deref().unwrap_or(namespace) != project {
+        if convoy.object.spec.project_ref != project {
             return Err(format!("inbox `{inbox}` does not belong to the convoy's project"));
         }
         let vessel = flotilla_messaging::seated_vessel(&convoy.object, role);
@@ -5935,9 +5937,7 @@ impl InProcessDaemon {
         convoy: &ResourceObject<ResourceConvoy>,
     ) -> Result<BTreeMap<String, flotilla_protocol::DispatchScore>, String> {
         use flotilla_admission::dispatch_missions::{issue_from_convoy, MissionBoard, MissionOccupancy};
-        let Some(project_name) = &convoy.spec.project_ref else {
-            return Ok(BTreeMap::new());
-        };
+        let project_name = &convoy.spec.project_ref;
         let projects = self
             .resource_backend
             .query_declared::<Project>(namespace, &flotilla_store::StoreQuery::names([project_name.clone()], true))

@@ -30,7 +30,7 @@ async fn interactive_crew_reads_ignore_unrelated_resources() {
             held.engine
                 .admit(
                     &name,
-                    ConvoySpec::builder().workflow_ref("workflow".into()).role("other".into()).build(),
+                    ConvoySpec::builder().project_ref("flotilla".into()).workflow_ref("workflow".into()).role("other".into()).build(),
                     flotilla_engine_convoys_testkit::single_agent("coder"),
                 )
                 .await;
@@ -233,6 +233,7 @@ impl crate::ports::CheckoutIntegrationInspector for FreshDeleteInspection {
 /// inspected; returns the checkout's launch.
 async fn active_delete_fixture() -> (Arc<CrewService>, ResourceBackend, String, Held) {
     let spec = ConvoySpec::builder()
+        .project_ref("flotilla".into())
         .workflow_ref("workflow".into())
         .role("crew".into())
         .adopted_checkout_refs(BTreeMap::from([(flotilla_protocol::RepositoryKey("repo".into()), "checkout".into())]))

@@ -146,14 +146,18 @@ async fn assert_independent_placement_snapshots(factory: &dyn EnsureScenarioCont
 }
 
 /// Admits convoy `record` at `daemon`'s home with `role`'s identity in `project`; returns its launch.
-async fn create_identity_convoy(daemon: &InProcessDaemon, record: &str, role: &str, project: Option<&str>) -> String {
+async fn create_identity_convoy(daemon: &InProcessDaemon, record: &str, role: &str, project: &str) -> String {
     let labels = BTreeMap::from([
-        (PROJECT_LABEL.to_string(), project.unwrap_or_default().to_string()),
+        (PROJECT_LABEL.to_string(), project.to_string()),
         (ROLE_LABEL.to_string(), role.to_string()),
         (GENERATION_LABEL.to_string(), "1".to_string()),
     ]);
-    let mut spec = ConvoySpec::builder().workflow_ref("review".to_string()).role(role.to_string()).generation(1).build();
-    spec.project_ref = project.map(str::to_string);
+    let spec = ConvoySpec::builder()
+        .workflow_ref("review".to_string())
+        .project_ref(project.to_string())
+        .role(role.to_string())
+        .generation(1)
+        .build();
     let mut convoy = flotilla_engine_convoys_testkit::convoy("flotilla", record, spec, flotilla_engine_convoys_testkit::single_agent(role));
     convoy.metadata.labels = labels;
     flotilla_engine_convoys_testkit::launch(&daemon.convoy_engine_path(), convoy).await
@@ -182,19 +186,19 @@ async fn seed_convoy_routing_row(
     daemon: &InProcessDaemon,
     record: &str,
     role: Option<&str>,
-    project: Option<&str>,
+    project: &str,
     phase: flotilla_protocol::ConvoyPhase,
 ) {
     let resource =
         flotilla_protocol::ResourceRef::new("flotilla.work/v1", "Convoy", "flotilla", record).on_host(daemon.host_name().clone());
-    let mut row = flotilla_protocol::ConvoyRow::builder()
+    let row = flotilla_protocol::ConvoyRow::builder()
         .resource(resource.clone())
         .maybe_address_role(role.map(str::to_string))
         .name(role.unwrap_or(record).to_string())
         .workflow_ref("review".to_string())
+        .project_ref(project.to_string())
         .phase(phase)
         .build();
-    row.project_ref = project.map(str::to_string);
     daemon.aggregator_projection_state().await.write().await.local_rows.insert(resource, row);
 }
 

@@ -53,7 +53,7 @@ async fn docker_placement_refuses_instance_readiness_before_selection() {
         for policy in [Some("docker-kiwi"), None] {
             let error = daemon
                 .admission
-                .resolve_created_convoy_placement("flotilla", None, &[], &workflow, policy)
+                .resolve_created_convoy_placement("flotilla", "flotilla", &[], &workflow, policy)
                 .await
                 .expect_err("ineligible host must refuse admission");
             assert!(error.contains("kiwi: fixture-1"), "{error}");

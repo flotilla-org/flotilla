@@ -142,10 +142,12 @@ impl RoleBindings for RoleRouting {
             let Some(status) = terminal.status.as_ref().filter(|status| status.phase == TerminalSessionPhase::Running) else { continue };
             let Some(session_id) = status.session_id.clone() else { continue };
             let held = observed.convoy(keyed, namespace, &context.convoy).await?;
-            let project = held.as_ref().and_then(|(convoy, _)| convoy.spec.project_ref.clone()).unwrap_or_else(|| namespace.to_owned());
+            let project = held.as_ref().map(|(convoy, _)| convoy.spec.project_ref.clone());
             let labels = &terminal.metadata.labels;
             let mut addresses = Vec::new();
-            if let (Some(convoy), Some(vessel), Some(role)) = (labels.get(CONVOY_LABEL), labels.get(VESSEL_LABEL), labels.get(ROLE_LABEL)) {
+            if let (Some(project), Some(convoy), Some(vessel), Some(role)) =
+                (project, labels.get(CONVOY_LABEL), labels.get(VESSEL_LABEL), labels.get(ROLE_LABEL))
+            {
                 // A standing generation's record name holds `/`; the address escapes it.
                 addresses.push(crew_role_address(&project, convoy, vessel, role));
                 if let Some((_, home)) = observed.convoy(keyed, namespace, convoy).await? {

@@ -52,7 +52,7 @@ fn session(role: &str) -> (InputMeta, TerminalSessionSpec) {
 async fn a_turn_header_frames_as_the_old_view_did() {
     let backend = ResourceBackend::new(InMemoryBackend::default());
     designate_fleet(&backend, NAMESPACE).await;
-    let spec = ConvoySpec::builder().workflow_ref("workflow".into()).build();
+    let spec = ConvoySpec::builder().workflow_ref("workflow".into()).project_ref(NAMESPACE.into()).build();
     crewed_convoy(&backend, NAMESPACE, "crew", &spec, &["coder", "reviewer"]).await;
     for role in ["coder", "reviewer"] {
         let (meta, spec) = session(role);

@@ -567,7 +567,7 @@ impl LeafSubscriptionTable {
             })
             .sender(Party::fleet("turn-rules"))
             .references(message_subject.into_iter().collect())
-            .delivery_condition(leaf_condition(leaf, Some(convoy.spec.project_ref.as_deref().unwrap_or(&namespace)), &forges)?)
+            .delivery_condition(leaf_condition(leaf, Some(&convoy.spec.project_ref), &forges)?)
             .build();
         let run = status.turn_deliveries.get(source).map_or(0, |delivery| unprogressed_run(&delivery.episodes, &progress));
         let now = Utc::now();

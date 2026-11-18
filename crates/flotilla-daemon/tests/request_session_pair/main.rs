@@ -1810,7 +1810,7 @@ async fn artifact_environment_reference_contract() {
         let namespace = "flotilla";
         let convoy = "artifact-demo";
         let workspace = tempfile::tempdir().expect("crew workspace");
-        let mut convoy_spec = ConvoySpec::builder().workflow_ref("scratch".to_string()).build();
+        let mut convoy_spec = ConvoySpec::builder().workflow_ref("scratch".to_string()).project_ref("flotilla".to_string()).build();
         if two_repositories {
             for (repo, number) in [("first", 42), ("second", 43)] {
                 convoy_spec.repositories.push(
@@ -2773,7 +2773,7 @@ async fn hostless_convoy_command_explains_missing_home_route() {
     )
     .launch(engine_convoy(
         "stranded",
-        ConvoySpec::builder().workflow_ref("scratch".to_string()).role("stranded".to_string()).build(),
+        ConvoySpec::builder().workflow_ref("scratch".to_string()).project_ref("flotilla".to_string()).role("stranded".to_string()).build(),
         ConvoyStatus::default(),
     ))
     .await;

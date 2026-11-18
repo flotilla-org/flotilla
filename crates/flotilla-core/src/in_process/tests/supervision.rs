@@ -66,7 +66,7 @@ async fn supervisor_turn_reconciliation_noop_contract() {
         let convoy = super::support::admit(
             &daemon,
             "convoy",
-            ConvoySpec::builder().workflow_ref("governor".to_string()).build(),
+            ConvoySpec::builder().project_ref("flotilla".into()).workflow_ref("governor".to_string()).build(),
             ConvoyStatus {
                 workflow_snapshot: Some(flotilla_resources::WorkflowSnapshot {
                     cascade: None,
@@ -176,7 +176,7 @@ async fn standing_governor_on_another_host_receives_a_stalled_crew_turn() {
     let governor = super::support::admit(
         &daemon,
         "governor-convoy",
-        ConvoySpec::builder().workflow_ref("governor".to_string()).role("governor".to_string()).build(),
+        ConvoySpec::builder().project_ref("flotilla".into()).workflow_ref("governor".to_string()).role("governor".to_string()).build(),
         ConvoyStatus {
             workflow_snapshot: Some(flotilla_resources::WorkflowSnapshot {
                 cascade: None,

@@ -199,7 +199,7 @@ impl ReadProjections<'_> {
                 .map_err(|error| error.to_string())?;
             let projects = backend
                 .definitions::<Project>(&namespace)
-                .list_names(convoys.items.iter().filter_map(|source| source.object.spec.project_ref.clone()))
+                .list_names(convoys.items.iter().map(|source| source.object.spec.project_ref.clone()))
                 .await
                 .map_err(|error| error.to_string())?;
             let artifacts = backend
@@ -264,9 +264,10 @@ impl ReadProjections<'_> {
                         obligations.insert((None, role.clone()), None);
                     }
                 }
-                let project_display_name = convoy.spec.project_ref.as_ref().and_then(|name| {
-                    projects.iter().find(|project| &project.metadata.name == name).map(|project| project.spec.display_name.clone())
-                });
+                let project_display_name = projects
+                    .iter()
+                    .find(|project| project.metadata.name == convoy.spec.project_ref)
+                    .map(|project| project.spec.display_name.clone());
                 for ((vessel, role), stall) in obligations {
                     // With no stall noted here, the seat's view holds what its stall record carries.
                     let crew = vessel.as_ref().and_then(|vessel| status.crew_work.get(vessel)).and_then(|crew| crew.get(&role));
@@ -296,7 +297,7 @@ impl ReadProjections<'_> {
                     rows.push(
                         flotilla_protocol::CrewStallRow::builder()
                             .namespace(namespace.clone())
-                            .maybe_project(convoy.spec.project_ref.clone())
+                            .project(convoy.spec.project_ref.clone())
                             .maybe_project_display_name(project_display_name.clone())
                             .convoy(convoy.metadata.name.clone())
                             .convoy_display_name(if convoy.spec.role.is_empty() {
@@ -1196,15 +1197,14 @@ impl ReadProjections<'_> {
                         .object
                         .spec
                         .project_ref
-                        .clone()
-                        .ok_or_else(|| format!("crew convoy `{name}` has no project"))?,
+                        .clone(),
                 )
             }
         };
         let matching = convoys
             .items
             .iter()
-            .filter(|source| selected_project.as_deref().is_none_or(|project| source.object.spec.project_ref.as_deref() == Some(project)))
+            .filter(|source| selected_project.as_deref().is_none_or(|project| source.object.spec.project_ref == project))
             .map(|source| source.object.metadata.name.clone())
             .collect::<BTreeSet<_>>();
         let mut host_names =
@@ -1370,7 +1370,7 @@ impl ReadProjections<'_> {
             repositories.items.iter().map(|record| (record.object.spec.key(), &record.object.spec)).collect::<HashMap<_, _>>();
         let reference_context = flotilla_resources::convoy_reference_context(
             &convoy.spec.repositories,
-            convoy.spec.project_ref.as_deref(),
+            Some(&convoy.spec.project_ref),
             project.as_ref().map(|project| &project.spec),
             &forges,
             |key| repository_specs.get(key).copied(),
@@ -2061,7 +2061,7 @@ pub async fn convoy_receiver_evidence(
     convoy: &ResourceObject<ResourceConvoy>,
 ) -> Result<(Box<dyn MessageReceiverRead>, Option<ResourceObject<Project>>, BTreeSet<String>), String> {
     use flotilla_resources::{CrewDefaults, FleetDesignation, FLEET_DESIGNATION_NAME, ROLE_ADDRESS_ANNOTATION};
-    let project_name = convoy.spec.project_ref.as_deref().unwrap_or(namespace);
+    let project_name = convoy.spec.project_ref.as_str();
     let target = StoreQuery::labels(&BTreeMap::from([(CONVOY_LABEL.into(), convoy.metadata.name.clone())]), true, true);
     let terminals = backend
         .query_declared::<ResourceTerminalSession>(
@@ -2102,10 +2102,7 @@ pub async fn convoy_receiver_evidence(
     let projects = if adopted {
         project_ops::read_definition_catalog::<Project>(backend, namespace).await?
     } else {
-        match &convoy.spec.project_ref {
-            Some(name) => backend.definitions::<Project>(namespace).list_names([name.clone()]).await.map_err(|error| error.to_string())?,
-            None => Vec::new(),
-        }
+        backend.definitions::<Project>(namespace).list_names([convoy.spec.project_ref.clone()]).await.map_err(|error| error.to_string())?
     };
     let project = projects.iter().find(|project| project.metadata.name == project_name).cloned();
     let mut snapshot = project_ops::RequestSnapshot::new(backend, namespace)?;
@@ -2123,8 +2120,8 @@ pub async fn convoy_receiver_evidence(
     }
     // The messages this convoy's view reads: those to its crew seats and aliases, and the turns
     // its status names.
-    let seats = flotilla_resources::convoy_crew_seats(namespace, convoy).into_iter().chain(aliases.iter().cloned()).collect::<Vec<_>>();
-    let named = flotilla_resources::convoy_seat_turns(namespace, convoy);
+    let seats = flotilla_resources::convoy_crew_seats(convoy).into_iter().chain(aliases.iter().cloned()).collect::<Vec<_>>();
+    let named = flotilla_resources::convoy_seat_turns(convoy);
     let receivers = loader.load(&snapshot.finish(), namespace, convoys.to_vec(), terminals.items, &seats, &named).await?;
     Ok((receivers, project, aliases))
 }
@@ -2279,10 +2276,7 @@ pub async fn message_views(
                 StoreQuery {
                     field_prefixes: BTreeMap::from([(
                         "spec.receiver".into(),
-                        flotilla_resources::crew_convoy_prefix(
-                            convoy.spec.project_ref.as_deref().unwrap_or(namespace),
-                            &convoy.metadata.name,
-                        ),
+                        flotilla_resources::crew_convoy_prefix(&convoy.spec.project_ref, &convoy.metadata.name),
                     )]),
                     ..Default::default()
                 },
@@ -2299,10 +2293,7 @@ pub async fn message_views(
             .filter(|record| record.object.status.as_ref().is_none_or(|status| !status.phase.is_terminal()))
             .filter(|record| {
                 convoy.is_none_or(|convoy| {
-                    let prefix = flotilla_resources::crew_convoy_prefix(
-                        convoy.spec.project_ref.as_deref().unwrap_or(namespace),
-                        &convoy.metadata.name,
-                    );
+                    let prefix = flotilla_resources::crew_convoy_prefix(&convoy.spec.project_ref, &convoy.metadata.name);
                     record.object.spec.receiver.starts_with(&prefix) || aliases.contains(&record.object.spec.receiver)
                 })
             })
@@ -2325,13 +2316,8 @@ pub async fn message_views(
         }
     };
     if let Some(convoy) = convoy {
-        records.retain(|record| {
-            receivers.may_address_convoy(
-                &record.object.spec.receiver,
-                convoy.spec.project_ref.as_deref().unwrap_or(namespace),
-                &convoy.metadata.name,
-            )
-        });
+        records
+            .retain(|record| receivers.may_address_convoy(&record.object.spec.receiver, &convoy.spec.project_ref, &convoy.metadata.name));
     }
     records.sort_by_key(|record| {
         (record.object.metadata.creation_timestamp, record.object.status.as_ref().and_then(|status| status.accepted_sequence))

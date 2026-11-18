@@ -238,7 +238,7 @@ fn bound_change_request_identity_uses_matching_declared_or_discovered_subject() 
         source: flotilla_protocol::IssueSource { service: "github.com".into(), scope: "team/repo".into() },
         id: "42".into(),
     };
-    let spec = ConvoySpec::builder().workflow_ref("review".to_string()).build();
+    let spec = ConvoySpec::builder().workflow_ref("review".to_string()).project_ref("flotilla".to_string()).build();
     let mut status = ConvoyStatus::default();
     status.discover_subject(
         subject.clone(),
