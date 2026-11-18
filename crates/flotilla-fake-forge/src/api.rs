@@ -130,6 +130,7 @@ enum Route<'a> {
     Pull(RepoRef, u64),
     PullMerge(RepoRef, u64),
     PullReviews(RepoRef, u64),
+    CommitStatus(RepoRef, &'a str),
     Issues(RepoRef),
     Issue(RepoRef, u64),
     Unknown(&'a str),
@@ -208,6 +209,13 @@ impl Call<'_> {
                 let body = Value::Array(reviews.items.iter().map(|review| render::review(&urls.as_urls(), number, review)).collect());
                 Ok(self.paged(json_response(StatusCode::OK, &body), reviews.total, page, limit, &query))
             }
+            (Method::GET, Route::CommitStatus(repo, sha)) => {
+                query.only(&["limit", "page"])?;
+                query.limit()?;
+                query.page(true)?;
+                let status = self.forge.commit_status(&repo, sha)?;
+                Ok(json_response(StatusCode::OK, &render::combined_status(&self.urls(&repo)?.as_urls(), sha, status)))
+            }
             (Method::GET, Route::Issues(repo)) => self.list_issues(&repo, &query),
             (Method::GET, Route::Issue(repo, number)) => {
                 query.only(&[])?;
@@ -230,6 +238,7 @@ impl Call<'_> {
             ["repos", owner, name, "pulls", number] => Route::Pull(repo(owner, name), parse_number(number)?),
             ["repos", owner, name, "pulls", number, "merge"] => Route::PullMerge(repo(owner, name), parse_number(number)?),
             ["repos", owner, name, "pulls", number, "reviews"] => Route::PullReviews(repo(owner, name), parse_number(number)?),
+            ["repos", owner, name, "commits", reference, "status"] => Route::CommitStatus(repo(owner, name), reference),
             ["repos", owner, name, "issues"] => Route::Issues(repo(owner, name)),
             ["repos", owner, name, "issues", number] => Route::Issue(repo(owner, name), parse_number(number)?),
             _ => Route::Unknown(self.path),

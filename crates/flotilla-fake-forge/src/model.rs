@@ -584,6 +584,17 @@ impl FakeForge {
         Ok(Page::of(item.pull.expect("pull").reviews, page, limit))
     }
 
+    /// The commit status set on the pull request whose head is commit `sha`, and when it was
+    /// set; none for any other commit, as Forgejo reports a commit no CI has reported on.
+    pub fn commit_status(&self, repo: &RepoRef, sha: &str) -> Result<Option<(CheckState, DateTime<Utc>)>, ForgeError> {
+        let mut inner = self.lock();
+        let repository = inner.repository(repo)?;
+        Ok(repository.items.values().find_map(|item| {
+            let pull = item.pull.as_ref().filter(|pull| pull.head_sha == sha)?;
+            Some((pull.checks?, item.updated_at))
+        }))
+    }
+
     pub fn set_checks(&self, repo: &RepoRef, number: u64, checks: CheckState) -> Result<Item, ForgeError> {
         self.change_pull(repo, number, |pull| pull.checks = Some(checks))
     }

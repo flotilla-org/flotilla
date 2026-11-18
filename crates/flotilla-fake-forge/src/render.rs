@@ -5,7 +5,7 @@
 use chrono::{DateTime, SecondsFormat, Utc};
 use serde_json::{json, Value};
 
-use crate::model::{Item, ItemState, Label, Repository, Review};
+use crate::model::{CheckState, Item, ItemState, Label, Repository, Review};
 
 /// URLs for one repository on one forge.
 pub(crate) struct Urls<'a> {
@@ -189,6 +189,34 @@ pub(crate) fn issue(urls: &Urls<'_>, item: &Item) -> Value {
             "full_name": urls.repository.full_name(),
         },
         "pin_order": 0,
+    })
+}
+
+/// The combined status of commit `sha`: its one CI status, if one was set. A commit without one
+/// gets Forgejo's empty answer, as the lab forge sends it (16.0.2): every field zero, `statuses`
+/// null.
+pub(crate) fn combined_status(urls: &Urls<'_>, sha: &str, status: Option<(CheckState, DateTime<Utc>)>) -> Value {
+    let Some((state, at)) = status else {
+        return json!({"state": "", "sha": "", "total_count": 0, "statuses": null, "repository": null, "commit_url": "", "url": ""});
+    };
+    json!({
+        "state": state,
+        "sha": sha,
+        "total_count": 1,
+        "statuses": [{
+            "id": 1,
+            "status": state,
+            "target_url": "",
+            "description": "",
+            "url": format!("{}/statuses/{sha}", urls.api()),
+            "context": "ci",
+            "creator": user("ci"),
+            "created_at": time(at),
+            "updated_at": time(at),
+        }],
+        "repository": repository(urls.service_url, urls.repository),
+        "commit_url": format!("{}/commits/{sha}", urls.api()),
+        "url": format!("{}/commits/{sha}/status", urls.api()),
     })
 }
 

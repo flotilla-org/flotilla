@@ -10,7 +10,8 @@ use flotilla_provider_runtime::CommandRunner;
 use flotilla_provider_runtime::HttpClient;
 use flotilla_provider_runtime::ObservationError;
 use flotilla_resources::{
-    ChangeRequestReviewObservation, ChangeRequestStatus as ObservedStatus, Observation, ObservedChangeRequestState, ObservedReviewDecision,
+    ChangeRequestReviewObservation, ChangeRequestStatus as ObservedStatus, Observation, ObservedChangeRequestState, ObservedChecks,
+    ObservedMergeability, ObservedReviewDecision,
 };
 
 use flotilla_change_request::ChangeRequestAdmission;
@@ -99,6 +100,12 @@ impl ForgejoChangeRequestProvider {
         } else {
             None
         };
+        // Forgejo's `mergeable` is false for a draft too, which says nothing about conflicts.
+        let mergeable = match (value["mergeable"].as_bool(), state) {
+            (Some(true), _) => Some(ObservedMergeability::Mergeable),
+            (Some(false), Some(ObservedChangeRequestState::Open)) => Some(ObservedMergeability::Conflicting),
+            _ => None,
+        };
         let requested = self.operator_login.as_deref().and_then(|operator| {
             value["requested_reviewers"].as_array().map(|reviewers| {
                 reviewers.iter().any(|reviewer| reviewer["login"].as_str().is_some_and(|login| login.eq_ignore_ascii_case(operator)))
@@ -112,9 +119,10 @@ impl ForgejoChangeRequestProvider {
             review_requested_from_owner: Observation { value: requested, observed_at },
             state: Observation { value: state, observed_at },
             head_sha: Observation { value: value["head"]["sha"].as_str().map(str::to_string), observed_at },
+            // The commit status endpoint supplies this during bound observation.
             checks: Observation::unknown(observed_at),
             review: ChangeRequestReviewObservation { actionable_at_head: Observation::unknown(observed_at) },
-            mergeable: Observation::unknown(observed_at),
+            mergeable: Observation { value: mergeable, observed_at },
         }
     }
 
@@ -148,6 +156,48 @@ impl ForgejoChangeRequestProvider {
             }
         }
         Err(format!("Forgejo review page limit ({MAX_PAGES}) reached for pull request {number}").into())
+    }
+
+    /// What CI reports on commit `sha`: the worst of its statuses, every page of them, since
+    /// Forgejo combines only the page it returns. A commit with none reports none, which is a
+    /// fact and reads as passing, as an empty GitHub check rollup does.
+    async fn read_checks(&self, sha: &str) -> Result<Option<ObservedChecks>, ObservationError> {
+        const PAGE_SIZE: usize = 50;
+        const MAX_PAGES: usize = 100;
+        let mut statuses = Vec::new();
+        for page in 1..=MAX_PAGES {
+            let value = crate::observation::execute(
+                &self.forge,
+                &self.repo_slug,
+                &format!("commits/{sha}/status"),
+                &[("limit", PAGE_SIZE.to_string()), ("page", page.to_string())],
+            )
+            .await?;
+            let total = value["total_count"].as_u64().ok_or("Forgejo combined status has no total_count")?;
+            let batch = match &value["statuses"] {
+                serde_json::Value::Null => Vec::new(),
+                serde_json::Value::Array(batch) => batch.clone(),
+                _ => return Err("Forgejo combined status statuses was not an array".to_string().into()),
+            };
+            let exhausted = batch.is_empty();
+            statuses.extend(batch);
+            if exhausted || statuses.len() as u64 >= total {
+                let mut checks = ObservedChecks::Pass;
+                for status in &statuses {
+                    match status["status"].as_str() {
+                        Some("failure" | "error") => return Ok(Some(ObservedChecks::Fail)),
+                        Some("pending") => checks = ObservedChecks::Pending,
+                        Some("success" | "warning") => {}
+                        state => {
+                            tracing::warn!(?state, "Unknown Forgejo commit status");
+                            return Ok(None);
+                        }
+                    }
+                }
+                return Ok(Some(checks));
+            }
+        }
+        Err(format!("Forgejo commit status page limit ({MAX_PAGES}) reached for {sha}").into())
     }
 
     fn parse(&self, value: &serde_json::Value) -> Option<(String, ChangeRequest)> {
@@ -230,6 +280,19 @@ impl ChangeRequestTracker for ForgejoChangeRequestProvider {
                             Observation::unknown(observed_at)
                         }
                     };
+                    if let Some(head) = status.head_sha.value.clone() {
+                        status.checks = match self.read_checks(&head).await {
+                            Ok(value) => Observation { value, observed_at: Utc::now() },
+                            Err(error @ ObservationError::RateLimited { .. }) => {
+                                statuses.insert(*number, Err(error));
+                                continue;
+                            }
+                            Err(error) => {
+                                tracing::warn!(number, %error, "Forgejo commit status unavailable");
+                                Observation::unknown(Utc::now())
+                            }
+                        };
+                    }
                     Ok(status)
                 }
                 Err(error) => Err(error),
@@ -685,6 +748,29 @@ mod tests {
         let provider = provider(http.clone());
         assert!(provider.read_review_decision(7).await.expect_err("page limit").to_string().contains("page limit"));
         assert_eq!(http.urls.lock().expect("urls").len(), 100);
+    }
+
+    // Forgejo combines only the page it returns, so every page is read and combined here: a
+    // failure on the second page outranks a pending status on the first, which outranks success.
+    #[tokio::test]
+    async fn checks_combine_every_page_of_statuses() {
+        let page = |statuses: &[&str]| {
+            json_response(&serde_json::json!({
+                "state": statuses[0], "total_count": 3,
+                "statuses": statuses.iter().map(|status| serde_json::json!({"status": status})).collect::<Vec<_>>(),
+            }))
+        };
+        for (second, expected) in [("failure", ObservedChecks::Fail), ("warning", ObservedChecks::Pending)] {
+            let http = Arc::new(MockHttp {
+                responses: Mutex::new(VecDeque::from([page(&["success", "pending"]), page(&[second])])),
+                urls: Mutex::new(Vec::new()),
+            });
+            assert_eq!(provider(http.clone()).read_checks("abc").await.expect("checks"), Some(expected), "{second}");
+            assert_eq!(
+                *http.urls.lock().expect("urls"),
+                [1, 2].map(|page| format!("https://forgejo.example/api/v1/repos/team/repo/commits/abc/status?limit=50&page={page}"))
+            );
+        }
     }
 
     #[tokio::test]
@@ -1172,6 +1258,39 @@ mod tests {
             provider.find_change_request_by_branch("feature/one").await.expect("find").map(|(id, request)| (id, request.status)),
             Some(("2".into(), ChangeRequestStatus::Closed))
         );
+        assert_no_refusals(&fake);
+    }
+
+    // Behaviour: a bound observation reads CI on the request's head: none reported is a fact,
+    // read as passing; a reported status is its state; a new head has none again. Mergeable is
+    // Forgejo's flag on an open request, and unknown on a draft, whose flag is false regardless.
+    #[tokio::test]
+    async fn bound_observation_reads_head_checks_and_mergeable() {
+        use flotilla_fake_forge::CheckState;
+        let (fake, _clock, provider) = empty_fake();
+        let repo = team_repo();
+        fake.create_pull(
+            &repo,
+            NewPull { title: "Work".into(), head: "work".into(), base: "main".into(), body: String::new(), user: None, draft: false },
+        )
+        .expect("pull");
+        let status = observe(&provider, 1).await;
+        assert_eq!(status.checks.value, Some(ObservedChecks::Pass), "no status reported");
+        assert_eq!(status.mergeable.value, Some(ObservedMergeability::Mergeable));
+        for (state, checks) in [
+            (CheckState::Pending, ObservedChecks::Pending),
+            (CheckState::Failure, ObservedChecks::Fail),
+            (CheckState::Error, ObservedChecks::Fail),
+            (CheckState::Success, ObservedChecks::Pass),
+            (CheckState::Pending, ObservedChecks::Pending),
+        ] {
+            fake.set_checks(&repo, 1, state).expect("checks");
+            assert_eq!(observe(&provider, 1).await.checks.value, Some(checks), "{state:?}");
+        }
+        fake.push_head(&repo, 1).expect("push");
+        assert_eq!(observe(&provider, 1).await.checks.value, Some(ObservedChecks::Pass), "the new head has no status");
+        fake.set_draft(&repo, 1, true).expect("draft");
+        assert_eq!(observe(&provider, 1).await.mergeable.value, None);
         assert_no_refusals(&fake);
     }
 

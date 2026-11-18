@@ -215,9 +215,11 @@ Forgejo's statuses:
 - 409 for a second open pull request with the same head and base.
 - 422 for invalid input.
 
-Check state is stored and reported by `GET /state`. Flotilla's Forgejo
-provider does not read commit statuses yet, so check state does not reach
-flotilla.
+Check state is stored and reported by `GET /state`. The Forgejo API reports it
+as the combined status of the pull request's head commit
+(`GET /repos/{owner}/{repo}/commits/{sha}/status`), one status with context
+`ci`. A commit with none gets Forgejo's empty answer, as the lab forge sends it.
+A new head has no status until one is set.
 
 ```sh
 ADMIN="https://fake-forge.rehearsal:3444/admin/v1"
