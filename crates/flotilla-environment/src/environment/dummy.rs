@@ -110,7 +110,16 @@ pub type DummyVendorJournal = Arc<dyn Fn(DummyVendorChange) + Send + Sync>;
 #[serde(tag = "vendor", rename_all = "snake_case")]
 pub enum DummyVendorChange {
     /// The vendor realised a backing.
-    Provisioned { id: String, image: String, mounts: Vec<ProvisionedMount>, environment: BTreeMap<String, String> },
+    ///
+    /// A journal keeps the names in `environment` but not their values, which are the
+    /// provisioning's tokens; only the dummy's own markers keep theirs.
+    Provisioned {
+        id: String,
+        image: String,
+        mounts: Vec<ProvisionedMount>,
+        #[serde(serialize_with = "serialize_withholding_tokens")]
+        environment: BTreeMap<String, String>,
+    },
     /// The daemon destroyed it.
     Destroyed { id: String },
     /// The vendor deleted it of its own accord.
@@ -123,14 +132,36 @@ pub enum DummyVendorChange {
     Counts { provisioned: u64, destroyed: u64, vanished: u64 },
 }
 
+/// The environment's names, with only the dummy's own markers' values: the rest are tokens.
+fn serialize_withholding_tokens<S: serde::Serializer>(environment: &BTreeMap<String, String>, serializer: S) -> Result<S::Ok, S::Error> {
+    serializer.collect_map(environment.iter().map(|(name, value)| {
+        let kept = name == DUMMY_FLEET_ENV || name == "FLOTILLA_ENVIRONMENT_ID";
+        (name, if kept { value.as_str() } else { "" })
+    }))
+}
+
 /// A change to the file tree inside a dummy environment.
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 #[serde(tag = "op", rename_all = "snake_case")]
 pub enum DummyFileChange {
-    Wrote { path: PathBuf, content: String },
-    Made { paths: Vec<PathBuf> },
-    Removed { path: PathBuf },
-    Moved { from: PathBuf, to: PathBuf },
+    /// A journal keeps the path but never the content: delivered credentials, gitconfig and the
+    /// composed agent environment reach a vessel as ordinary files, and the dummy cannot tell
+    /// them apart. A restored file is present and empty.
+    Wrote {
+        path: PathBuf,
+        #[serde(skip_serializing, default)]
+        content: String,
+    },
+    Made {
+        paths: Vec<PathBuf>,
+    },
+    Removed {
+        path: PathBuf,
+    },
+    Moved {
+        from: PathBuf,
+        to: PathBuf,
+    },
 }
 
 pub struct DummyEnvironmentProvider {
@@ -1093,5 +1124,47 @@ mod tests {
         use flotilla_discovery_api::detectors::resolve_binary_path;
         assert_eq!(resolve_binary_path(&runner, "claude").await, None);
         assert_eq!(resolve_binary_path(&runner, DUMMY_CREW_BINARY).await, Some(PathBuf::from("/usr/local/bin/flotilla-dummy-crew")));
+    }
+
+    // The vendor's journal, as the fleet writes it to disk, holds no secret: provisioning tokens
+    // keep their names but not their values, and written files their paths but not their
+    // contents. A vendor restored from it holds the same backing, its files present and empty.
+    #[tokio::test]
+    async fn the_journal_keeps_no_token_or_file_content() {
+        let journalled = Arc::new(Mutex::new(Vec::new()));
+        let captured = Arc::clone(&journalled);
+        let provider = DummyEnvironmentProvider::new(DummyEnvironmentBehaviour::default())
+            .with_journal(Arc::new(move |change| captured.lock().expect("journal").push(serde_json::to_string(&change).expect("json"))));
+        let prepared = provider.prepare(&docker_spec("dummy/crew:latest"), &PrepareOpts::default()).await.expect("prepare");
+        let tokens = vec![("GH_TOKEN".into(), "ghs-secret-token".into())];
+        let handle =
+            provider.provision(EnvironmentId::new("one"), &prepared, ProvisionOpts { tokens, ..Default::default() }).await.expect("one");
+        let runner = handle.runner();
+        runner.write_file_with_mode(Path::new("/home/crew/.claude/.credentials.json"), "oauth-secret", 0o600).await.expect("credential");
+        runner.write_file(Path::new("/home/crew/.config/agent-environment"), "ANTHROPIC_API_KEY=sk-secret\n").await.expect("environment");
+
+        let lines = journalled.lock().expect("journal").clone();
+        let written = lines.join("\n");
+        for secret in ["ghs-secret-token", "oauth-secret", "sk-secret"] {
+            assert!(!written.contains(secret), "{secret} reached the journal: {written}");
+        }
+        assert!(written.contains("GH_TOKEN") && written.contains(".credentials.json"), "{written}");
+
+        let restored = DummyEnvironmentProvider::new(DummyEnvironmentBehaviour::default());
+        for line in &lines {
+            restored.restore(serde_json::from_str(line).expect("a journal line decodes"));
+        }
+        let handle = restored.backing("one").expect("restored backing");
+        let environment = handle.env_vars().await.expect("environment");
+        assert_eq!(
+            (environment.get("GH_TOKEN").map(String::as_str), environment.get(DUMMY_FLEET_ENV).map(String::as_str)),
+            (Some(""), Some("1"))
+        );
+        let runner = handle.runner();
+        assert!(runner.path_exists(Path::new("/home/crew/.claude/.credentials.json")).await.expect("exists"));
+        assert_eq!(
+            runner.run("cat", &["/home/crew/.claude/.credentials.json"], Path::new("/"), &ChannelLabel::Default).await,
+            Ok(String::new())
+        );
     }
 }
