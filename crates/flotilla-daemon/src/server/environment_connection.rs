@@ -218,7 +218,9 @@ pub(super) async fn serve(
             caller,
         )
         .with_placed_terminal_hooks();
-        let mut response = dispatcher.dispatch(id, request).await;
+        // One span per served request: its dispatch and, for a command, the wait for its outcome.
+        let span = tracing::info_span!("environment_connection.serve", environment = %environment, request = id);
+        let mut response = tracing::Instrument::instrument(dispatcher.dispatch(id, request), span.clone()).await;
         if let Some(project) = &scope {
             super::environment_supervision::scope_response(&mut response, &caller_namespace, project);
         }
@@ -238,7 +240,10 @@ pub(super) async fn serve(
         // Relay only this request's completion, never the host's event stream.
         if let Some(command_id) = command_id {
             let completion = tokio::select! {
-                result = command_completion(&mut completions, command_id) => result,
+                result = tracing::Instrument::instrument(
+                    command_completion(&mut completions, command_id),
+                    tracing::info_span!(parent: &span, "environment_connection.completion_wait", command_id),
+                ) => result,
                 _ = shutdown.changed() => return,
             };
             let lost = completion.is_err();

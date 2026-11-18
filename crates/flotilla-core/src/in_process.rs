@@ -5655,6 +5655,7 @@ impl InProcessDaemon {
 
     // This executor has many async arms. Box substantial nested futures below
     // so their combined state fits on the default Tokio test-thread stack.
+    #[tracing::instrument(name = "execute_impl", skip_all, fields(command = %command.description()))]
     async fn execute_impl(
         &self,
         command: Command,

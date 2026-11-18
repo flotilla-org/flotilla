@@ -298,7 +298,7 @@ pub struct CredentialStore {
     ledger_delivery_environment: Mutex<BTreeMap<String, LedgerDeliveryRecord>>,
     materials: Mutex<BTreeMap<(String, String), String>>,
     git_config_fragments: Mutex<BTreeMap<String, BTreeMap<String, Fragment>>>,
-    github_app_deliveries: Mutex<BTreeMap<(String, String), GithubAppDelivery>>,
+    github_app_deliveries: Mutex<GithubAppDeliveries>,
     github_app_delivery_locks: Mutex<GithubAppDeliveryLocks>,
     github_app_adoption_failures: Mutex<BTreeMap<String, usize>>,
     github_app_installations: Mutex<BTreeMap<GithubAppInstallationRequest, u64>>,
@@ -380,6 +380,147 @@ impl GithubAppDelivery {
         } else {
             Some(github_app_refresh_at(self.issued_at, self.expires_at))
         }
+    }
+}
+
+type GithubAppKey = (String, String);
+
+/// The registered GitHub App deliveries, keyed by environment and credential, with the
+/// indexes a refresh pass reads instead of walking every delivery: when each falls due, which
+/// scopes changed, which gave up, which are failing, and which projects scope which.
+#[derive(Default)]
+struct GithubAppDeliveries {
+    deliveries: BTreeMap<GithubAppKey, GithubAppDelivery>,
+    due: BTreeSet<(DateTime<Utc>, GithubAppKey)>,
+    dirty: BTreeSet<GithubAppKey>,
+    gave_up: BTreeSet<GithubAppKey>,
+    failing: BTreeSet<GithubAppKey>,
+    by_project: BTreeMap<String, BTreeSet<GithubAppKey>>,
+}
+
+impl GithubAppDeliveries {
+    fn get(&self, key: &GithubAppKey) -> Option<&GithubAppDelivery> {
+        self.deliveries.get(key)
+    }
+
+    fn contains_key(&self, key: &GithubAppKey) -> bool {
+        self.deliveries.contains_key(key)
+    }
+
+    #[cfg(test)]
+    fn is_empty(&self) -> bool {
+        self.deliveries.is_empty()
+    }
+
+    fn index(&mut self, key: &GithubAppKey, delivery: &GithubAppDelivery) {
+        if let Some(at) = delivery.due_at() {
+            self.due.insert((at, key.clone()));
+        }
+        if delivery.scope_dirty {
+            self.dirty.insert(key.clone());
+        }
+        if delivery.gave_up() {
+            self.gave_up.insert(key.clone());
+        }
+        if delivery.refresh_failures > 0 {
+            self.failing.insert(key.clone());
+        }
+        for project in delivery.scope.iter().flat_map(|scope| &scope.projects) {
+            self.by_project.entry(project.clone()).or_default().insert(key.clone());
+        }
+    }
+
+    fn unindex(&mut self, key: &GithubAppKey, delivery: &GithubAppDelivery) {
+        if let Some(at) = delivery.due_at() {
+            self.due.remove(&(at, key.clone()));
+        }
+        self.dirty.remove(key);
+        self.gave_up.remove(key);
+        self.failing.remove(key);
+        for project in delivery.scope.iter().flat_map(|scope| &scope.projects) {
+            if let Some(keys) = self.by_project.get_mut(project) {
+                keys.remove(key);
+                if keys.is_empty() {
+                    self.by_project.remove(project);
+                }
+            }
+        }
+    }
+
+    fn insert(&mut self, key: GithubAppKey, delivery: GithubAppDelivery) {
+        if let Some(before) = self.deliveries.remove(&key) {
+            self.unindex(&key, &before);
+        }
+        self.index(&key, &delivery);
+        self.deliveries.insert(key, delivery);
+    }
+
+    fn extend(&mut self, deliveries: impl IntoIterator<Item = (GithubAppKey, GithubAppDelivery)>) {
+        for (key, delivery) in deliveries {
+            self.insert(key, delivery);
+        }
+    }
+
+    fn remove(&mut self, key: &GithubAppKey) -> Option<GithubAppDelivery> {
+        let removed = self.deliveries.remove(key)?;
+        self.unindex(key, &removed);
+        Some(removed)
+    }
+
+    /// Changes `key`'s delivery, if held and `keep` accepts it, keeping the indexes in step.
+    fn update<T>(
+        &mut self,
+        key: &GithubAppKey,
+        keep: impl FnOnce(&GithubAppDelivery) -> bool,
+        change: impl FnOnce(&mut GithubAppDelivery) -> T,
+    ) -> Option<T> {
+        let mut delivery = self.deliveries.remove(key)?;
+        if !keep(&delivery) {
+            self.deliveries.insert(key.clone(), delivery);
+            return None;
+        }
+        self.unindex(key, &delivery);
+        let changed = change(&mut delivery);
+        self.index(key, &delivery);
+        self.deliveries.insert(key.clone(), delivery);
+        Some(changed)
+    }
+
+    /// Forgets every delivery to `environment`, found by its key range.
+    fn remove_environment(&mut self, environment: &str) {
+        let keys = self
+            .deliveries
+            .range((environment.to_owned(), String::new())..)
+            .take_while(|((held, _), _)| held == environment)
+            .map(|(key, _)| key.clone())
+            .collect::<Vec<_>>();
+        for key in keys {
+            self.remove(&key);
+        }
+    }
+
+    /// The deliveries a refresh pass at `now` woken by `wake` tries: those due, those whose scope
+    /// changed or names a project the wake names, and, when it retries them, those that gave up.
+    fn candidates(&self, now: DateTime<Utc>, wake: &GithubAppRefreshWake) -> Vec<(GithubAppKey, GithubAppDelivery)> {
+        let mut keys = self.due.iter().take_while(|(at, _)| *at <= now).map(|(_, key)| key).collect::<BTreeSet<_>>();
+        keys.extend(&self.dirty);
+        keys.extend(wake.projects.iter().filter_map(|project| self.by_project.get(project)).flatten());
+        if wake.retry_given_up {
+            keys.extend(&self.gave_up);
+        }
+        keys.into_iter().filter_map(|key| self.deliveries.get(key).map(|delivery| (key.clone(), delivery.clone()))).collect()
+    }
+
+    /// When the next refresh or retry falls due: now while a scope waits to be resolved again.
+    fn next_at(&self, now: DateTime<Utc>) -> Option<DateTime<Utc>> {
+        if !self.dirty.is_empty() {
+            return Some(now);
+        }
+        self.due.first().map(|(at, _)| *at)
+    }
+
+    fn failing(&self) -> impl Iterator<Item = (&GithubAppKey, &GithubAppDelivery)> {
+        self.failing.iter().filter_map(|key| self.deliveries.get_key_value(key))
     }
 }
 
@@ -617,7 +758,7 @@ impl CredentialStore {
             ledger_delivery_environment: Mutex::new(BTreeMap::new()),
             materials: Mutex::new(BTreeMap::new()),
             git_config_fragments: Mutex::new(BTreeMap::new()),
-            github_app_deliveries: Mutex::new(BTreeMap::new()),
+            github_app_deliveries: Mutex::default(),
             github_app_delivery_locks: Mutex::new(BTreeMap::new()),
             github_app_adoption_failures: Mutex::new(BTreeMap::new()),
             github_app_installations: Mutex::new(BTreeMap::new()),
@@ -1328,7 +1469,7 @@ impl CredentialStore {
             self.prepared.lock().await.retain(|(cached_environment, _)| cached_environment != environment_ref);
             self.materials.lock().await.retain(|(cached_environment, _), _| cached_environment != environment_ref);
             self.git_config_fragments.lock().await.remove(environment_ref);
-            self.github_app_deliveries.lock().await.retain(|(cached_environment, _), _| cached_environment != environment_ref);
+            self.github_app_deliveries.lock().await.remove_environment(environment_ref);
             self.github_app_adoption_failures.lock().await.remove(environment_ref);
             Ok(())
         })
@@ -1396,6 +1537,11 @@ impl CredentialStore {
 
     pub fn tracked_work_deliveries(&self) -> BoxFuture<'_, BTreeMap<String, BTreeSet<String>>> {
         Box::pin(async move { self.work_deliveries.lock().await.clone() })
+    }
+
+    /// The credentials this daemon delivered to `environment_ref`, read by its key.
+    pub fn tracked_work_delivery<'a>(&'a self, environment_ref: &'a str) -> BoxFuture<'a, BTreeSet<String>> {
+        Box::pin(async move { self.work_deliveries.lock().await.get(environment_ref).cloned().unwrap_or_default() })
     }
 
     /// Reconcile the files and cached material for one work environment. The
@@ -1506,8 +1652,8 @@ impl CredentialStore {
     pub fn refresh_github_app_tokens<'a>(&'a self, wake: &'a GithubAppRefreshWake) -> BoxFuture<'a, GithubAppRefresh> {
         Box::pin(async move {
             let now = self.clock.now();
-            let deliveries =
-                self.github_app_deliveries.lock().await.iter().map(|(key, delivery)| (key.clone(), delivery.clone())).collect::<Vec<_>>();
+            // Only the deliveries the indexes name: never a walk over every delivery.
+            let deliveries = self.github_app_deliveries.lock().await.candidates(now, wake);
             let mut errors = Vec::new();
             let mut reminted = BTreeSet::new();
             for (key, delivery) in deliveries {
@@ -1567,19 +1713,24 @@ impl CredentialStore {
                     });
                 }
                 let mut deliveries = self.github_app_deliveries.lock().await;
-                if let Some(current) = deliveries.get_mut(&key).filter(|current| current.generation == delivery.generation) {
-                    current.expires_at = token.expires_at;
-                    current.issued_at = self.clock.now();
-                    current.refresh_failures = 0;
-                    current.next_refresh_attempt_at = None;
-                    current.first_refresh_failure_at = None;
-                    current.last_refresh_error = None;
-                    current.scope_dirty = false;
-                    // Successful remints accept the explicit request when the response omits it;
-                    // no request and no response still means unknown.
-                    current.effective_permissions = token.permissions.or_else(|| request.permissions.clone());
-                    current.request = request;
-                }
+                let generation = delivery.generation;
+                deliveries.update(
+                    &key,
+                    |current| current.generation == generation,
+                    |current| {
+                        current.expires_at = token.expires_at;
+                        current.issued_at = self.clock.now();
+                        current.refresh_failures = 0;
+                        current.next_refresh_attempt_at = None;
+                        current.first_refresh_failure_at = None;
+                        current.last_refresh_error = None;
+                        current.scope_dirty = false;
+                        // Successful remints accept the explicit request when the response omits it;
+                        // no request and no response still means unknown.
+                        current.effective_permissions = token.permissions.or_else(|| request.permissions.clone());
+                        current.request = request;
+                    },
+                );
                 drop(deliveries);
                 self.record_delivered_capabilities(std::slice::from_ref(&key)).await;
                 reminted.insert(key.0);
@@ -1594,12 +1745,7 @@ impl CredentialStore {
     pub fn next_github_app_refresh_at(&self) -> BoxFuture<'_, Option<DateTime<Utc>>> {
         Box::pin(async move {
             let now = self.clock.now();
-            self.github_app_deliveries
-                .lock()
-                .await
-                .values()
-                .filter_map(|delivery| if delivery.scope_dirty { Some(now) } else { delivery.due_at() })
-                .min()
+            self.github_app_deliveries.lock().await.next_at(now)
         })
     }
 
@@ -1611,8 +1757,7 @@ impl CredentialStore {
             self.github_app_deliveries
                 .lock()
                 .await
-                .iter()
-                .filter(|(_, delivery)| delivery.refresh_failures > 0)
+                .failing()
                 .map(|((environment_ref, name), delivery)| CredentialRefreshError {
                     environment_ref: environment_ref.clone(),
                     credential_name: Some(name.clone()),
@@ -1648,12 +1793,14 @@ impl CredentialStore {
         Box::pin(async move {
             let mut deliveries = self.github_app_deliveries.lock().await;
             for (name, scope) in scopes {
-                if let Some(delivery) = deliveries.get_mut(&(environment_ref.to_string(), name.clone())) {
-                    if delivery.scope.as_ref() != Some(scope) {
+                deliveries.update(
+                    &(environment_ref.to_string(), name.clone()),
+                    |delivery| delivery.scope.as_ref() != Some(scope),
+                    |delivery| {
                         delivery.scope = Some(scope.clone());
                         delivery.scope_dirty = true;
-                    }
-                }
+                    },
+                );
             }
         })
     }
@@ -1679,24 +1826,32 @@ impl CredentialStore {
         delivery: &GithubAppDelivery,
         error: &str,
     ) -> Option<CredentialRefreshError> {
+        let now = self.clock.now();
         let mut deliveries = self.github_app_deliveries.lock().await;
-        let current = deliveries.get_mut(key).filter(|current| current.generation == delivery.generation)?;
-        let message = self.refresh_failure_message(&key.1, current.expires_at, error);
-        let should_surface = current.record_refresh_failure(self.clock.now(), error.to_owned());
-        Some(CredentialRefreshError {
-            environment_ref: key.0.clone(),
-            credential_name: Some(key.1.clone()),
-            message,
-            should_surface,
-            first_failure_at: current.first_refresh_failure_at,
-        })
+        deliveries.update(
+            key,
+            |current| current.generation == delivery.generation,
+            |current| {
+                let message = self.refresh_failure_message(&key.1, current.expires_at, error);
+                let should_surface = current.record_refresh_failure(now, error.to_owned());
+                CredentialRefreshError {
+                    environment_ref: key.0.clone(),
+                    credential_name: Some(key.1.clone()),
+                    message,
+                    should_surface,
+                    first_failure_at: current.first_refresh_failure_at,
+                }
+            },
+        )
     }
 
     /// The scope `delivery` was given resolves to what it already holds.
     async fn settle_scope(&self, key: &(String, String), generation: uuid::Uuid) {
-        if let Some(current) = self.github_app_deliveries.lock().await.get_mut(key).filter(|current| current.generation == generation) {
-            current.scope_dirty = false;
-        }
+        self.github_app_deliveries.lock().await.update(
+            key,
+            |current| current.generation == generation,
+            |current| current.scope_dirty = false,
+        );
     }
 
     /// A bound credential's current declaration and material, for its account binding's delivery

@@ -18,10 +18,19 @@
 //! naming its environment. Failures are traced and, for refreshes, told to a person as an
 //! attention; nothing about them is stored on the vessel or the environment. A restart rebuilds
 //! everything from the start pass, which prepares the running crews' credentials again.
+//!
+//! Delivery is keyed by environment. A request to deliver one environment (a crew handoff, a
+//! person) runs in the requester's task under that environment's lock, never queued behind other
+//! environments or a pass; different environments deliver concurrently, the loop's too. Delivering
+//! one environment reads only what it needs: its vessels by key and index, the repositories its
+//! crews' scopes name by key, and the credential grants held from their watch.
 
 use std::{
     collections::{BTreeMap, BTreeSet},
-    sync::{Arc, Mutex as StdMutex},
+    sync::{
+        atomic::{AtomicU64, Ordering},
+        Arc, Mutex as StdMutex, MutexGuard, Weak,
+    },
     time::Duration,
 };
 
@@ -32,13 +41,13 @@ use flotilla_resources::{
     environment_records::EnvironmentChange,
     image_build_records::ImageBuildChange,
     vessel_records::{environment_vessels, EnvironmentVessel, EnvironmentVessels, VesselWithoutConvoy},
-    CredentialGrant, CredentialSpec, FulfilmentGrant, FulfilmentKind, Project, ReadWatchEvent, Repository, RepositoryKey, RepositoryTrust,
-    TerminalSession, TerminalSessionPhase, WatchEvent,
+    CredentialGrant, CredentialGrantSpec, CredentialSpec, FulfilmentGrant, FulfilmentKind, Project, ReadWatchEvent, Repository,
+    RepositoryKey, RepositoryTrust, ResourceError, TerminalSession, TerminalSessionPhase, WatchEvent,
 };
-use flotilla_store::load_metrics::{inherit, ControllerLoadMetrics};
-use futures::StreamExt;
-use tokio::sync::{mpsc, oneshot, Notify};
-use tracing::{debug, info, warn};
+use flotilla_store::load_metrics::{attributed, inherit, ControllerLoadMetrics};
+use futures::{stream, StreamExt};
+use tokio::sync::{Mutex as AsyncMutex, Notify};
+use tracing::{debug, info, info_span, warn, Instrument};
 
 use super::access_layer::redeliver_central_logins;
 use super::credentials::{github_app_scope_from_grants, reconcile_credential_refresh_attention_in, redeliver_codex_credentials};
@@ -55,6 +64,8 @@ const RETRY_MAXIMUM: Duration = Duration::from_secs(120);
 const RETRY_LIMIT: u32 = 5;
 /// Consecutive failures reopening a watch before it stops; other events still wake the controller.
 const WATCH_RETRY_LIMIT: u32 = 5;
+/// Environments one pass delivers at once; each environment's own deliveries stay one at a time.
+const CONCURRENT_DELIVERIES: usize = 16;
 
 /// What woke the controller since its last pass.
 #[derive(Debug, Default)]
@@ -73,26 +84,15 @@ struct Pending {
     cards: CardScope,
 }
 
-/// A request to deliver one environment now, answered once it has been tried.
-struct Request {
-    environment: String,
-    reply: oneshot::Sender<Result<(), String>>,
-}
-
-/// The controller's inbox: the events its sources record, and the requests crew operations and
-/// people send. Held by the runtime state so either can reach the controller.
+/// The controller's inbox: the events its sources record, and the way in for the requests crew
+/// operations and people send. Held by the runtime state so either can reach the controller.
+#[derive(Default)]
 pub(super) struct CredentialEvents {
     pending: StdMutex<Pending>,
     wake: Notify,
-    requests: mpsc::UnboundedSender<Request>,
-    receiver: StdMutex<Option<mpsc::UnboundedReceiver<Request>>>,
-}
-
-impl Default for CredentialEvents {
-    fn default() -> Self {
-        let (requests, receiver) = mpsc::unbounded_channel();
-        Self { pending: StdMutex::default(), wake: Notify::new(), requests, receiver: StdMutex::new(Some(receiver)) }
-    }
+    /// The deliveries of the controller built over this state; none before it is built or after
+    /// it is dropped.
+    deliveries: StdMutex<Weak<Deliveries>>,
 }
 
 impl CredentialEvents {
@@ -110,14 +110,17 @@ impl CredentialEvents {
         self.record(|pending| pending.codex_rotated = true);
     }
 
-    /// Delivers `environment` now, whatever its backoff, and answers how that went. Fails when no
-    /// controller is running to answer.
+    /// Delivers `environment` now, whatever its backoff, and answers how that went. It runs here,
+    /// in the caller's task, waiting only for an earlier delivery to the same environment. Fails
+    /// when no controller is built to deliver.
     pub(super) async fn deliver(&self, environment: &str) -> Result<(), String> {
-        let (reply, answer) = oneshot::channel();
-        self.requests
-            .send(Request { environment: environment.to_owned(), reply })
-            .map_err(|_| "the credential delivery controller is not running".to_string())?;
-        answer.await.map_err(|_| "the credential delivery controller stopped before answering".to_string())?
+        let deliveries = self
+            .deliveries
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .upgrade()
+            .ok_or_else(|| "the credential delivery controller is not running".to_string())?;
+        deliveries.request(environment).instrument(info_span!("credential_delivery.request_wait", environment)).await
     }
 }
 
@@ -155,33 +158,75 @@ struct Wanted {
     conflict: Option<String>,
 }
 
-pub(super) struct CredentialDelivery {
+/// What delivering an environment needs, shared by the controller's loop and the requests run in
+/// requesters' tasks. One environment's deliveries run one at a time under its lock; different
+/// environments' run concurrently.
+pub(super) struct Deliveries {
     state: Arc<ControllerRuntimeState>,
     namespace: String,
     store: Arc<CredentialStore>,
     events: Arc<CredentialEvents>,
-    failures: BTreeMap<String, Failure>,
+    /// The loop's metrics, which every pass and request counts into.
+    metrics: Arc<ControllerLoadMetrics>,
+    failures: StdMutex<BTreeMap<String, Failure>>,
+    /// Each environment's delivery lock, while some delivery holds or waits for it.
+    locks: StdMutex<BTreeMap<String, Weak<AsyncMutex<()>>>>,
+    /// The number of each environment's latest delivery, from `sequence`, while a fleet-wide pass
+    /// runs: one whose reading is older reads the environment again under its lock.
+    delivered: StdMutex<BTreeMap<String, u64>>,
+    sequence: AtomicU64,
+    every_in_flight: std::sync::atomic::AtomicUsize,
+    /// The credential grants by name, as their watch last left them; none until first read.
+    grants: AsyncMutex<Option<BTreeMap<String, CredentialGrantSpec>>>,
+    /// The grant watch stopped: nothing keeps held grants current.
+    grants_unfollowed: std::sync::atomic::AtomicBool,
+}
+
+fn locked<T>(mutex: &StdMutex<T>) -> MutexGuard<'_, T> {
+    mutex.lock().unwrap_or_else(|poisoned| poisoned.into_inner())
+}
+
+pub(super) struct CredentialDelivery {
+    deliveries: Arc<Deliveries>,
+    state: Arc<ControllerRuntimeState>,
+    namespace: String,
+    store: Arc<CredentialStore>,
+    events: Arc<CredentialEvents>,
     /// The Docker environments' Codex login copies failing to follow a rotation.
     codex_failure: Option<Failure>,
     /// When the earliest failed push of the Codex login into a crew's home is retried.
     login_retry_at: Option<tokio::time::Instant>,
     /// The refresh failures last told to the attention reconciler.
     told: Vec<(String, Option<String>, bool)>,
-    /// The loop's metrics, which every pass, the start pass too, counts into.
-    metrics: Arc<ControllerLoadMetrics>,
 }
 
 impl CredentialDelivery {
-    /// The controller over `state`'s credential store; none without one.
+    /// The controller over `state`'s credential store; none without one. Requests reach its
+    /// deliveries from when it is built until it is dropped.
     pub(super) fn new(state: Arc<ControllerRuntimeState>) -> Option<Self> {
         let store = state.credential_store.clone()?;
-        Some(Self {
-            metrics: state.controller_metrics.for_kind(METRICS_KIND),
+        let events = Arc::clone(&state.credential_events);
+        let deliveries = Arc::new(Deliveries {
+            state: Arc::clone(&state),
             namespace: state.namespace.clone(),
-            events: Arc::clone(&state.credential_events),
+            store: Arc::clone(&store),
+            events: Arc::clone(&events),
+            metrics: state.controller_metrics.for_kind(METRICS_KIND),
+            failures: StdMutex::default(),
+            locks: StdMutex::default(),
+            delivered: StdMutex::default(),
+            sequence: AtomicU64::new(0),
+            every_in_flight: std::sync::atomic::AtomicUsize::new(0),
+            grants: AsyncMutex::new(None),
+            grants_unfollowed: std::sync::atomic::AtomicBool::new(false),
+        });
+        *locked(&events.deliveries) = Arc::downgrade(&deliveries);
+        Some(Self {
+            deliveries,
+            namespace: state.namespace.clone(),
+            events,
             state,
             store,
-            failures: BTreeMap::new(),
             codex_failure: None,
             login_retry_at: None,
             told: Vec::new(),
@@ -191,17 +236,15 @@ impl CredentialDelivery {
     /// The start pass: delivers every environment some vessel stands on or this daemon delivered
     /// to, adopting running crews' GitHub App tokens again, and tells refresh failures.
     pub(super) async fn start(&mut self) -> Result<(), String> {
-        let result = self.deliver(None, true).await;
+        let result = self.deliveries.deliver_every(true).instrument(info_span!("credential_delivery.start")).await;
         self.tell_refresh_failures().await;
         result
     }
 
-    /// Runs on events and the next deadline, after [`CredentialDelivery::start`].
+    /// Runs on events and the next deadline, after [`CredentialDelivery::start`]. Requests do not
+    /// come through here: they deliver in their own tasks and record their cards for the next
+    /// pass, which coalesces everything recorded since the last.
     pub(super) async fn run(mut self, metrics: Arc<flotilla_store::load_metrics::ControllerLoadMetrics>) {
-        let Some(mut requests) = self.events.receiver.lock().unwrap_or_else(|poisoned| poisoned.into_inner()).take() else {
-            warn!("credential delivery is already running");
-            return;
-        };
         let mut sources = tokio::task::JoinSet::new();
         let backend = self.state.daemon.resource_backend();
         // Each source's reads count for delivery.
@@ -223,9 +266,7 @@ impl CredentialDelivery {
                 pending.definitions = true;
             },
         )));
-        sources.spawn(inherit(watch_named::<CredentialGrant>(backend, self.namespace.clone(), Arc::clone(&self.events), |pending, _| {
-            pending.definitions = true;
-        })));
+        sources.spawn(inherit(watch_grants(backend, Arc::clone(&self.deliveries))));
         sources.spawn(inherit(watch_bindings(Arc::clone(&self.state), self.namespace.clone(), Arc::clone(&self.events))));
         sources.spawn(inherit(watch_fulfilment_kinds(
             self.state.daemon.resource_backend(),
@@ -237,19 +278,6 @@ impl CredentialDelivery {
             let deadline = self.next_deadline().await;
             tokio::select! {
                 () = self.events.wake.notified() => {}
-                Some(request) = requests.recv() => {
-                    metrics.wakes.increment();
-                    metrics.woke(&request.environment);
-                    let _busy = metrics.busy();
-                    self.failures.remove(&request.environment);
-                    let result = self.deliver(Some(&BTreeSet::from([request.environment.clone()])), false).await;
-                    // The environment's cards follow what was delivered at the next pass.
-                    self.events.record(|pending| {
-                        pending.cards.environments.insert(request.environment.clone());
-                    });
-                    let _ = request.reply.send(result);
-                    continue;
-                }
                 () = sleep_until(deadline) => { metrics.requeues.increment(); }
                 Some(_) = sources.join_next(), if !sources.is_empty() => { continue; }
             }
@@ -258,7 +286,7 @@ impl CredentialDelivery {
             let started = tokio::time::Instant::now();
             {
                 let _busy = metrics.busy();
-                if let Err(error) = self.pass().await {
+                if let Err(error) = self.pass().instrument(info_span!("credential_delivery.pass")).await {
                     metrics.failures.increment();
                     debug!(%error, "credential delivery pass left failures");
                 }
@@ -274,45 +302,54 @@ impl CredentialDelivery {
         let mut environments = pending.environments.clone();
         // Environments whose timed retry fell due.
         environments.extend(
-            self.failures.iter().filter(|(_, failure)| failure.next_at.is_some_and(|next| next <= now)).map(|(name, _)| name.clone()),
+            locked(&self.deliveries.failures)
+                .iter()
+                .filter(|(_, failure)| failure.next_at.is_some_and(|next| next <= now))
+                .map(|(name, _)| name.clone()),
         );
         // The cards of every environment an event named or a retry reached, delivered or still in
         // backoff; every card when every environment is delivered or the Codex login rotated.
         let mut cards = std::mem::take(&mut pending.cards);
         cards.every |= pending.all || pending.definitions || pending.codex_rotated;
         cards.environments.extend(environments.iter().cloned());
+        // Every environment only for a fleet-wide trigger: the start of a watch that may have
+        // missed changes, or a definition changing.
         let result = if pending.all || pending.definitions {
             if pending.definitions {
-                self.failures.clear();
+                locked(&self.deliveries.failures).clear();
             }
-            self.deliver(None, false).await
+            self.deliveries.deliver_every(false).await
         } else if !environments.is_empty() {
             // An event retries an environment that gave up; one in backoff waits for it.
-            let due: BTreeSet<String> = environments
-                .into_iter()
-                .filter(|environment| self.failures.get(environment).is_none_or(|failure| failure.next_at.is_none_or(|next| next <= now)))
-                .collect();
+            let due: BTreeSet<String> = {
+                let failures = locked(&self.deliveries.failures);
+                environments
+                    .into_iter()
+                    .filter(|environment| failures.get(environment).is_none_or(|failure| failure.next_at.is_none_or(|next| next <= now)))
+                    .collect()
+            };
             if due.is_empty() {
                 Ok(())
             } else {
-                self.deliver(Some(&due), false).await
+                self.deliveries.deliver_named(&due).await
             }
         } else {
             Ok(())
         };
-        self.follow_codex_login(pending.codex_rotated, now).await;
+        self.follow_codex_login(pending.codex_rotated, now).instrument(info_span!("credential_delivery.codex_login")).await;
         let wake = GithubAppRefreshWake { projects: pending.projects, retry_given_up: pending.definitions };
-        let refreshed = self.store.refresh_github_app_tokens(&wake).await;
+        let refreshed = self.store.refresh_github_app_tokens(&wake).instrument(info_span!("credential_delivery.github_app_refresh")).await;
         for error in &refreshed.errors {
             warn!(error = %error.message, environment = %error.environment_ref, "failed to refresh GitHub App credential delivery");
         }
         // A re-mint, failed or not, may change what its environment reports delivered.
         cards.environments.extend(refreshed.environments);
         // Cards read committed delivery observations, never the preparation index.
-        if let Err(error) = self.state.daemon.refresh_capability_cards(&self.namespace, &cards).await {
+        let span = info_span!("credential_delivery.cards", every = cards.every, environments = cards.environments.len());
+        if let Err(error) = self.state.daemon.refresh_capability_cards(&self.namespace, &cards).instrument(span).await {
             warn!(%error, "failed to refresh session capability cards");
         }
-        self.tell_refresh_failures().await;
+        self.tell_refresh_failures().instrument(info_span!("credential_delivery.refresh_failures")).await;
         result
     }
 
@@ -353,7 +390,8 @@ impl CredentialDelivery {
             let wait = (at - chrono::Utc::now()).to_std().unwrap_or_default();
             tokio::time::Instant::now() + wait
         });
-        self.failures
+        // Failing environments only: the failures map holds no other.
+        locked(&self.deliveries.failures)
             .values()
             .chain(&self.codex_failure)
             .filter_map(|failure| failure.next_at)
@@ -382,47 +420,128 @@ impl CredentialDelivery {
             Err(error) => warn!(%error, "failed to reconcile credential refresh attention"),
         }
     }
+}
 
-    /// Delivers `environments`, or every environment some vessel stands on or this daemon
-    /// delivered to. `adopt` prepares the running crews' GitHub App tokens again, as the start
-    /// pass does after a restart.
-    async fn deliver(&mut self, environments: Option<&BTreeSet<String>>, adopt: bool) -> Result<(), String> {
-        let wanted = match self.wanted(environments).await {
-            Ok(wanted) => wanted,
-            Err(error) => {
-                // The records could not be read: each environment named is retried at its backoff.
-                for environment in environments.into_iter().flatten() {
-                    self.fail(environment, &error, true);
-                }
-                return Err(error);
-            }
-        };
-        let mut errors = Vec::new();
-        for (environment, wanted) in wanted {
-            match self.deliver_environment(&environment, wanted, adopt).await {
-                Ok(()) => {
-                    if self.failures.remove(&environment).is_some() {
-                        info!(%environment, "credential delivery recovered");
-                    }
-                }
-                Err((error, retryable)) => {
-                    self.fail(&environment, &error, retryable);
-                    errors.push(error);
-                }
-            }
+impl Deliveries {
+    /// A request to deliver `environment` now, whatever its backoff, run in the requester's task.
+    /// Its cards follow what was delivered at the loop's next pass.
+    async fn request(&self, environment: &str) -> Result<(), String> {
+        let started = tokio::time::Instant::now();
+        self.metrics.wakes.increment();
+        self.metrics.woke(environment);
+        locked(&self.failures).remove(environment);
+        let result = attributed(Arc::clone(&self.metrics.reads), self.deliver_held(environment, None, false)).await;
+        self.metrics.reconcile.record(started.elapsed());
+        if result.is_err() {
+            self.metrics.failures.increment();
         }
-        if errors.is_empty() {
-            Ok(())
-        } else {
-            Err(errors.join("; "))
-        }
+        self.events.record(|pending| {
+            pending.cards.environments.insert(environment.to_owned());
+        });
+        result
     }
 
-    fn fail(&mut self, environment: &str, error: &str, retryable: bool) {
-        let attempts = self.failures.get(environment).map_or(0, |failure| failure.attempts).saturating_add(1);
+    /// Delivers each of `environments`, several at once, each read by its key.
+    async fn deliver_named(&self, environments: &BTreeSet<String>) -> Result<(), String> {
+        let results = stream::iter(environments.iter().cloned())
+            .map(|environment| async move { self.deliver_held(&environment, None, false).await })
+            .buffer_unordered(CONCURRENT_DELIVERIES)
+            .collect::<Vec<_>>()
+            .await;
+        joined(results)
+    }
+
+    /// Delivers every environment some vessel stands on or this daemon delivered to, from one
+    /// fleet-wide reading. Only a fleet-wide trigger runs it. `adopt` prepares the running crews'
+    /// GitHub App tokens again, as the start pass does after a restart.
+    async fn deliver_every(&self, adopt: bool) -> Result<(), String> {
+        self.every_in_flight.fetch_add(1, Ordering::SeqCst);
+        let read_at = self.sequence.load(Ordering::SeqCst);
+        let result = async {
+            let wanted = self.wanted(None).instrument(info_span!("credential_delivery.wanted", every = true)).await?;
+            let results = stream::iter(wanted)
+                .map(|(environment, wanted)| async move { self.deliver_held(&environment, Some((wanted, read_at)), adopt).await })
+                .buffer_unordered(CONCURRENT_DELIVERIES)
+                .collect::<Vec<_>>()
+                .await;
+            joined(results)
+        }
+        .await;
+        // The numbers matter only while a fleet-wide reading is in use.
+        let mut delivered = locked(&self.delivered);
+        if self.every_in_flight.fetch_sub(1, Ordering::SeqCst) == 1 {
+            delivered.clear();
+        }
+        result
+    }
+
+    /// Delivers `environment` under its lock: what `read` holds, when no delivery to it has run
+    /// since that reading was taken, else what reading it by its key finds.
+    async fn deliver_held(&self, environment: &str, read: Option<(Wanted, u64)>, adopt: bool) -> Result<(), String> {
+        let lock = {
+            let mut locks = locked(&self.locks);
+            match locks.get(environment).and_then(Weak::upgrade) {
+                Some(lock) => lock,
+                None => {
+                    let lock = Arc::new(AsyncMutex::new(()));
+                    locks.insert(environment.to_owned(), Arc::downgrade(&lock));
+                    lock
+                }
+            }
+        };
+        let result = async {
+            let _held = lock.lock().instrument(info_span!("credential_delivery.environment_wait")).await;
+            let current = read.filter(|(_, read_at)| locked(&self.delivered).get(environment).is_none_or(|at| at <= read_at));
+            let wanted = match current {
+                Some((wanted, _)) => wanted,
+                None => {
+                    let named = BTreeSet::from([environment.to_owned()]);
+                    match self.wanted(Some(&named)).instrument(info_span!("credential_delivery.wanted", every = false)).await {
+                        Ok(mut wanted) => wanted.remove(environment).unwrap_or_default(),
+                        Err(error) => {
+                            // The records could not be read: the environment is retried at its backoff.
+                            self.fail(environment, &error, true);
+                            return Err(error);
+                        }
+                    }
+                }
+            };
+            let delivered = self.deliver_environment(environment, wanted, adopt).await;
+            let number = self.sequence.fetch_add(1, Ordering::SeqCst) + 1;
+            let mut numbers = locked(&self.delivered);
+            if self.every_in_flight.load(Ordering::SeqCst) > 0 {
+                numbers.insert(environment.to_owned(), number);
+            }
+            drop(numbers);
+            match delivered {
+                Ok(()) => {
+                    if locked(&self.failures).remove(environment).is_some() {
+                        info!(%environment, "credential delivery recovered");
+                    }
+                    Ok(())
+                }
+                Err((error, retryable)) => {
+                    self.fail(environment, &error, retryable);
+                    Err(error)
+                }
+            }
+        }
+        .instrument(info_span!("credential_delivery.environment", environment))
+        .await;
+        // The last holder drops the environment's lock entry.
+        let mut locks = locked(&self.locks);
+        if Arc::strong_count(&lock) == 1 {
+            locks.remove(environment);
+        }
+        result
+    }
+
+    fn fail(&self, environment: &str, error: &str, retryable: bool) {
+        let mut failures = locked(&self.failures);
+        let attempts = failures.get(environment).map_or(0, |failure| failure.attempts).saturating_add(1);
         let failure = Failure::after(attempts, retryable);
         warn!(%environment, %error, attempts = failure.attempts, retry = failure.next_at.is_some(), "credential delivery failed");
-        self.failures.insert(environment.to_owned(), failure);
+        failures.insert(environment.to_owned(), failure);
     }
 
     async fn deliver_environment(&self, environment: &str, wanted: Wanted, adopt: bool) -> Result<(), (String, bool)> {
@@ -474,32 +593,26 @@ impl CredentialDelivery {
             warn!(%vessel, %convoy, %convoy_home, "credential delivery: the vessel's convoy record is missing; its credentials are left out");
             self.metrics.skipped.increment();
         }
-        let needs_grants = vessels.iter().any(|vessel| !vessel.requirement.credential_scopes.is_empty());
-        let (grants, repository_trust) = if needs_grants {
-            let grants = backend
-                .including_replicas::<CredentialGrant>(namespace)
-                .list()
-                .await
-                .map_err(|error| format!("list credential grants: {error}"))?
-                .items
-                .into_iter()
-                .map(|grant| grant.object.spec)
-                .collect::<Vec<_>>();
-            let repository_trust = backend
-                .including_replicas::<Repository>(namespace)
-                .list()
-                .await
-                .map_err(|error| format!("list repositories for credential grants: {error}"))?
-                .items
-                .into_iter()
-                .map(|source| {
-                    let trust = if source.object.spec.is_fork() { RepositoryTrust::Fork } else { RepositoryTrust::Own };
-                    (RepositoryKey(source.object.metadata.name), trust)
-                })
-                .collect::<BTreeMap<_, _>>();
-            (grants, repository_trust)
-        } else {
+        // The repositories the crews' scopes name, each read by its key, and the grants as held.
+        let scoped =
+            vessels.iter().flat_map(|vessel| vessel.requirement.credential_scopes.values().flatten()).collect::<BTreeSet<&RepositoryKey>>();
+        let (grants, repository_trust) = if vessels.iter().all(|vessel| vessel.requirement.credential_scopes.is_empty()) {
             (Vec::new(), BTreeMap::new())
+        } else {
+            let grants = self.grants().await?;
+            let repositories = backend.including_replicas::<Repository>(namespace);
+            let mut repository_trust = BTreeMap::new();
+            for key in scoped {
+                match repositories.get(&key.0).await {
+                    Ok(source) => {
+                        let trust = if source.object.spec.is_fork() { RepositoryTrust::Fork } else { RepositoryTrust::Own };
+                        repository_trust.insert(key.clone(), trust);
+                    }
+                    Err(ResourceError::NotFound { .. }) => {}
+                    Err(error) => return Err(format!("read repository `{}` for credential grants: {error}", key.0)),
+                }
+            }
+            (grants, repository_trust)
         };
         let mut wanted = BTreeMap::<String, Wanted>::new();
         for EnvironmentVessel { environment, requirement, project, live, .. } in &vessels {
@@ -541,9 +654,19 @@ impl CredentialDelivery {
             }
         }
         // What this daemon delivered before, so a settled crew's credentials are withdrawn.
-        for (environment, delivered) in self.store.tracked_work_deliveries().await {
-            if environments.is_none_or(|set| set.contains(&environment)) {
-                wanted.entry(environment).or_default().granted.extend(delivered);
+        match environments {
+            None => {
+                for (environment, delivered) in self.store.tracked_work_deliveries().await {
+                    wanted.entry(environment).or_default().granted.extend(delivered);
+                }
+            }
+            Some(environments) => {
+                for environment in environments {
+                    let delivered = self.store.tracked_work_delivery(environment).await;
+                    if !delivered.is_empty() {
+                        wanted.entry(environment.clone()).or_default().granted.extend(delivered);
+                    }
+                }
             }
         }
         // An environment named but wanting nothing still answers, as delivered.
@@ -551,6 +674,112 @@ impl CredentialDelivery {
             wanted.entry(environment.clone()).or_default();
         }
         Ok(wanted)
+    }
+
+    /// The credential grants as held, read whole only when none are held yet: at the start, or
+    /// after their watch could not read them again.
+    async fn grants(&self) -> Result<Vec<CredentialGrantSpec>, String> {
+        if self.grants_unfollowed.load(Ordering::SeqCst) {
+            return Ok(self.list_grants().await?.into_values().collect());
+        }
+        let mut held = self.grants.lock().await;
+        if held.is_none() {
+            *held = Some(self.list_grants().await?);
+        }
+        Ok(held.iter().flat_map(BTreeMap::values).cloned().collect())
+    }
+
+    async fn list_grants(&self) -> Result<BTreeMap<String, CredentialGrantSpec>, String> {
+        Ok(self
+            .state
+            .daemon
+            .resource_backend()
+            .including_replicas::<CredentialGrant>(&self.namespace)
+            .list()
+            .await
+            .map_err(|error| format!("list credential grants: {error}"))?
+            .items
+            .into_iter()
+            .map(|grant| (grant.object.metadata.name, grant.object.spec))
+            .collect())
+    }
+}
+
+/// The deliveries' outcome: their failures joined.
+fn joined(results: Vec<Result<(), String>>) -> Result<(), String> {
+    let errors = results.into_iter().filter_map(Result::err).collect::<Vec<_>>();
+    if errors.is_empty() {
+        Ok(())
+    } else {
+        Err(errors.join("; "))
+    }
+}
+
+/// Keeps the held credential grants in step with their changes, local or replicated, and wakes a
+/// redelivery of every environment for each. The grants are read whole once each time the watch
+/// opens, as it may have missed changes; each change after is applied by its name.
+async fn watch_grants(backend: flotilla_store::ResourceBackend, deliveries: Arc<Deliveries>) {
+    let mut failures = 0_u32;
+    loop {
+        match backend.including_replicas::<CredentialGrant>(&deliveries.namespace).watch().await {
+            Ok(mut changes) => {
+                // Opened after the reading below could miss nothing: the watch holds what follows.
+                match deliveries.list_grants().await {
+                    Ok(listed) => {
+                        let mut held = deliveries.grants.lock().await;
+                        if held.as_ref() != Some(&listed) {
+                            // A first reading at the start changed nothing the start pass did not see.
+                            let changed = held.is_some();
+                            *held = Some(listed);
+                            if changed {
+                                deliveries.events.record(|pending| pending.definitions = true);
+                            }
+                        }
+                    }
+                    Err(error) => {
+                        debug!(%error, "credential delivery could not read the credential grants; the next delivery reads them");
+                        *deliveries.grants.lock().await = None;
+                    }
+                }
+                while let Some(change) = changes.next().await {
+                    let change = match change {
+                        Ok(change) => change,
+                        Err(error) => {
+                            debug!(%error, "credential delivery grant watch failed");
+                            break;
+                        }
+                    };
+                    failures = 0;
+                    {
+                        let mut held = deliveries.grants.lock().await;
+                        if let Some(held) = held.as_mut() {
+                            match change {
+                                ReadWatchEvent::Added(read) | ReadWatchEvent::Modified(read) => {
+                                    held.insert(read.object.metadata.name, read.object.spec);
+                                }
+                                ReadWatchEvent::Deleted(read) => {
+                                    held.remove(&read.object.metadata.name);
+                                }
+                                ReadWatchEvent::DeletedByName { tombstone, .. } => {
+                                    held.remove(&tombstone.name);
+                                }
+                            }
+                        }
+                    }
+                    deliveries.events.record(|pending| pending.definitions = true);
+                }
+            }
+            Err(error) => debug!(%error, "credential delivery grant watch did not open"),
+        }
+        failures = failures.saturating_add(1);
+        if failures > WATCH_RETRY_LIMIT {
+            // Held grants would go stale unseen: each delivery reads them whole from now on.
+            deliveries.grants_unfollowed.store(true, Ordering::SeqCst);
+            *deliveries.grants.lock().await = None;
+            warn!(failures, "credential delivery stops watching credential grants; other events still wake it");
+            return;
+        }
+        tokio::time::sleep(RETRY_INITIAL.min(Duration::from_secs(u64::from(failures)))).await;
     }
 }
 

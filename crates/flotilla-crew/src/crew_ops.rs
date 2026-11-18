@@ -1803,6 +1803,7 @@ impl CrewService {
     /// Hand work to `target` with `message`, referring to `carries`. The sender keeps its own
     /// promises (#3574 decision 3) except those it names in `reassign`, each its own and open,
     /// which move to the target.
+    #[tracing::instrument(name = "crew_handoff", skip_all, fields(to = %target))]
     pub async fn handoff_with(
         &self,
         requested: &CrewCommandContext,
