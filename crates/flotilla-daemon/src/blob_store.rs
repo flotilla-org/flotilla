@@ -127,7 +127,8 @@ impl LocalBlobStore {
         tokio::fs::create_dir_all(parent).await.map_err(|error| format!("create blob directory: {error}"))?;
         // Re-read an existing blob so a repeated put can repair corruption.
         // The read costs O(blob size), but a plain stat would preserve a bad copy.
-        if self.get(digest).await.ok().flatten().is_some() {
+        // A copy that cannot be marked written now is written again instead.
+        if self.get(digest).await.ok().flatten().is_some() && touch(&path).await.is_ok() {
             return Ok(());
         }
         let temp = parent.join(format!(".{}-{}.tmp", digest.0, uuid::Uuid::new_v4()));
@@ -176,7 +177,7 @@ impl LocalBlobStore {
         let path = self.path(digest);
         let parent = path.parent().expect("blob path has parent");
         tokio::fs::create_dir_all(parent).await.map_err(|error| error.to_string())?;
-        if self.verified_file_size(digest).await.ok().flatten().is_some() {
+        if self.verified_file_size(digest).await.ok().flatten().is_some() && touch(&path).await.is_ok() {
             return Ok(());
         }
         let temp = parent.join(format!(".{}-{}.tmp", digest.as_str(), uuid::Uuid::new_v4()));
@@ -543,6 +544,10 @@ pub struct TieredBlobStore {
     wake: Notify,
     inventory: Mutex<SyncInventory>,
     sync_lock: Mutex<()>,
+    /// A put's write of a blob and a collection's judgement and deletion of it, one at a time:
+    /// a collection judging a copy past its grace never deletes it after a put has written it
+    /// again. Striped by the digest's first hex digit.
+    writing: [Mutex<()>; 16],
     /// The blobs put for artifacts whose write then failed, told to artifact retention.
     unwritten: broadcast::Sender<BlobDigest>,
 }
@@ -602,8 +607,23 @@ impl TieredBlobStore {
             wake: Notify::new(),
             inventory: Mutex::new(SyncInventory::default()),
             sync_lock: Mutex::new(()),
+            writing: std::array::from_fn(|_| Mutex::new(())),
             unwritten: broadcast::channel(UNWRITTEN).0,
         }
+    }
+    async fn writing(&self, digest: &BlobDigest) -> tokio::sync::MutexGuard<'_, ()> {
+        let stripe = u8::from_str_radix(&digest.as_str()[..1], 16).expect("a digest is hex");
+        self.writing[usize::from(stripe)].lock().await
+    }
+    /// Marks each fleet copy already synced written now, as the put's local copy is.
+    async fn touch_markers(&self, digest: &BlobDigest) -> Result<(), String> {
+        for target in &self.fleet {
+            let marker = self.marker(&target.id, digest);
+            if tokio::fs::try_exists(&marker).await.map_err(|error| error.to_string())? {
+                touch(&marker).await?;
+            }
+        }
+        Ok(())
     }
     /// The blobs put for artifacts whose write failed from now on.
     pub fn follow_unwritten(&self) -> broadcast::Receiver<BlobDigest> {
@@ -697,6 +717,7 @@ impl TieredBlobStore {
             if referenced.contains(&digest) {
                 continue;
             }
+            let _writing = self.writing(&digest).await;
             if let Some(left) = grace_left(&self.local.path(&digest), grace).await? {
                 next = next.min(Some(left)).or(Some(left));
                 continue;
@@ -723,6 +744,7 @@ impl TieredBlobStore {
                 if referenced.contains(&digest) {
                     continue;
                 }
+                let _writing = self.writing(&digest).await;
                 if let Some(left) = grace_left(&entry.path(), grace).await? {
                     next = next.min(Some(left)).or(Some(left));
                     continue;
@@ -750,6 +772,7 @@ impl TieredBlobStore {
     pub async fn collect(&self, digest: &BlobDigest, grace: Duration) -> Result<Option<Duration>, String> {
         let mut failures = Vec::new();
         let mut next = None;
+        let _writing = self.writing(digest).await;
         let local = self.local.path(digest);
         if tokio::fs::try_exists(&local).await.map_err(|error| error.to_string())? {
             match grace_left(&local, grace).await? {
@@ -879,6 +902,15 @@ impl TieredBlobStore {
     }
 }
 
+/// Marks `path` written now: a blob put again has its grace from that put.
+async fn touch(path: &Path) -> Result<(), String> {
+    let file = tokio::fs::File::open(path).await.map_err(|error| error.to_string())?.into_std().await;
+    tokio::task::spawn_blocking(move || file.set_modified(std::time::SystemTime::now()))
+        .await
+        .map_err(|error| error.to_string())?
+        .map_err(|error| format!("touch {}: {error}", path.display()))
+}
+
 /// How much of `grace` is left since `path` was written; `None` once it has passed.
 async fn grace_left(path: &Path, grace: Duration) -> Result<Option<Duration>, String> {
     let modified = tokio::fs::metadata(path).await.map_err(|error| error.to_string())?.modified().map_err(|error| error.to_string())?;
@@ -908,14 +940,18 @@ async fn digest_file(path: &Path) -> Result<(BlobDigest, u64), String> {
 impl BlobStore for TieredBlobStore {
     async fn put(&self, bytes: &[u8]) -> Result<BlobDigest, String> {
         let digest = BlobDigest::of(bytes);
+        let _writing = self.writing(&digest).await;
         self.local.write_digest(&digest, bytes).await?;
+        self.touch_markers(&digest).await?;
         self.queue_new(&digest, None).await;
         Ok(digest)
     }
 
     async fn put_with_media_type(&self, bytes: &[u8], media_type: &str) -> Result<BlobDigest, String> {
         let digest = BlobDigest::of(bytes);
+        let _writing = self.writing(&digest).await;
         self.local.write_digest(&digest, bytes).await?;
+        self.touch_markers(&digest).await?;
         // The first successful metadata write fixes the type for subsequent
         // deduplicated artifacts, whose declared media types may differ.
         self.record_media_type(&digest, media_type).await?;
@@ -925,14 +961,18 @@ impl BlobStore for TieredBlobStore {
 
     async fn put_file(&self, path: &Path) -> Result<(BlobDigest, u64), String> {
         let (digest, size) = digest_file(path).await?;
+        let _writing = self.writing(&digest).await;
         self.local.write_file(&digest, path).await?;
+        self.touch_markers(&digest).await?;
         self.queue_new(&digest, None).await;
         Ok((digest, size))
     }
 
     async fn put_file_with_media_type(&self, path: &Path, media_type: &str) -> Result<(BlobDigest, u64), String> {
         let (digest, size) = digest_file(path).await?;
+        let _writing = self.writing(&digest).await;
         self.local.write_file(&digest, path).await?;
+        self.touch_markers(&digest).await?;
         self.record_media_type(&digest, media_type).await?;
         self.queue_new(&digest, None).await;
         Ok((digest, size))
@@ -1009,6 +1049,7 @@ impl BlobStore for TieredBlobStore {
         Ok(false)
     }
     async fn delete(&self, digest: &BlobDigest) -> Result<(), String> {
+        let _writing = self.writing(digest).await;
         self.local.delete(digest).await?;
         let _ = tokio::fs::remove_file(self.media_types.join(digest.as_str())).await;
         {
@@ -1496,5 +1537,80 @@ mod tests {
         assert!(!tiered.local.has(&gone).await.expect("local copy collected"));
         assert!(!fleet.has(&gone).await.expect("fleet copy collected"));
         assert!(tiered.has(&kept).await.expect("another blob kept") && fleet.has(&kept).await.expect("its fleet copy kept"));
+    }
+
+    const GRACE: Duration = Duration::from_secs(24 * 3600);
+
+    /// Backdates a copy's write past the grace, as a blob unreferenced for days.
+    fn age(path: &Path) {
+        let written = std::time::SystemTime::now() - 2 * GRACE;
+        std::fs::File::open(path).expect("open copy").set_modified(written).expect("backdate copy");
+    }
+
+    // Behaviour (#3108): a blob put again is written afresh by that put, here and in the fleet. An
+    // artifact referencing it is written after the put, so a sweep or a collection judged from
+    // references read before then must leave it its grace.
+    #[tokio::test]
+    async fn a_blob_put_again_has_its_grace_from_that_put() {
+        let state = tempfile::tempdir().expect("state dir");
+        let fleet = Arc::new(MemoryBlobStore::default());
+        let tiered = TieredBlobStore::new(state.path(), vec![("fleet".into(), fleet.clone())]);
+        let digest = tiered.put(b"repeated output").await.expect("put");
+        assert_eq!(tiered.sync_once().await.expect("sync").pending_count, 0);
+        age(&tiered.local.path(&digest));
+        age(&tiered.marker("fleet", &digest));
+
+        assert_eq!(tiered.put(b"repeated output").await.expect("put again"), digest);
+        let left = tiered.collect(&digest, GRACE).await.expect("collect");
+        assert!(left.is_some_and(|left| left > GRACE - Duration::from_secs(60)), "{left:?}");
+        assert!(tiered.local.has(&digest).await.expect("local copy"), "collected the local copy of a blob just put");
+        assert!(fleet.has(&digest).await.expect("fleet copy"), "collected the fleet copy of a blob just put");
+        tiered.gc_unreferenced(&HashSet::new(), GRACE).await.expect("sweep");
+        assert!(tiered.local.has(&digest).await.expect("local copy"), "swept the local copy of a blob just put");
+        assert!(fleet.has(&digest).await.expect("fleet copy"), "swept the fleet copy of a blob just put");
+    }
+
+    // Behaviour (#3108): a sweep racing puts of blobs past their grace never deletes a copy whose
+    // put has returned; one deleted before its put is written again and synced again.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn a_sweep_racing_puts_leaves_every_blob_put() {
+        const BLOBS: usize = 256;
+        for round in 0..20 {
+            let state = tempfile::tempdir().expect("state dir");
+            let fleet = Arc::new(MemoryBlobStore::default());
+            let tiered = Arc::new(TieredBlobStore::new(state.path(), vec![("fleet".into(), fleet.clone())]));
+            let mut blobs: Vec<_> = (0..BLOBS).map(|index| format!("output {index}").into_bytes()).collect();
+            // In the sweep's order, so the puts keep pace with it.
+            blobs.sort_by_key(|blob| BlobDigest::of(blob).0);
+            let mut digests = Vec::new();
+            for blob in &blobs {
+                digests.push(tiered.put(blob).await.expect("put"));
+            }
+            assert_eq!(tiered.sync_once().await.expect("sync").pending_count, 0);
+            for digest in &digests {
+                age(&tiered.local.path(digest));
+                age(&tiered.marker("fleet", digest));
+            }
+
+            let sweep = {
+                let tiered = Arc::clone(&tiered);
+                tokio::spawn(async move { tiered.gc_unreferenced(&HashSet::new(), GRACE).await })
+            };
+            let puts = {
+                let tiered = Arc::clone(&tiered);
+                tokio::spawn(async move {
+                    for blob in &blobs {
+                        tiered.put(blob).await.expect("put again");
+                    }
+                })
+            };
+            puts.await.expect("join puts");
+            sweep.await.expect("join sweep").expect("sweep");
+            assert_eq!(tiered.sync_once().await.expect("sync again").last_error, None, "round {round}");
+            for (index, digest) in digests.iter().enumerate() {
+                assert!(tiered.local.has(digest).await.expect("local copy"), "round {round}: blob {index} put, then swept");
+                assert!(fleet.has(digest).await.expect("fleet copy"), "round {round}: blob {index}'s fleet copy swept");
+            }
+        }
     }
 }
