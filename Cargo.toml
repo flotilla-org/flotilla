@@ -87,31 +87,33 @@ license = "Apache-2.0 OR MIT"
 # When adding dependencies anywhere in the workspace, update the external-crate
 # allowlist in clippy.toml (use the library crate name, including any rename).
 [workspace.dependencies]
-drydock = { git = "https://github.com/flotilla-org/drydock", rev = "66d4dc98bb5fa9d1072e3c70e8a62d28ee42d922" }
-drydock-protocol = { git = "https://github.com/flotilla-org/drydock", rev = "66d4dc98bb5fa9d1072e3c70e8a62d28ee42d922" }
-drydock-agent = { git = "https://github.com/flotilla-org/drydock", rev = "66d4dc98bb5fa9d1072e3c70e8a62d28ee42d922" }
-drydock-transport = { git = "https://github.com/flotilla-org/drydock", rev = "66d4dc98bb5fa9d1072e3c70e8a62d28ee42d922" }
-drydock-host = { git = "https://github.com/flotilla-org/drydock", rev = "66d4dc98bb5fa9d1072e3c70e8a62d28ee42d922" }
-rigging-ssh = { git = "https://github.com/flotilla-org/rigging", rev = "261a4460166fc79e1b6442a693f62d4e41bef8d4" }
-rigging-stream = { git = "https://github.com/flotilla-org/rigging", rev = "261a4460166fc79e1b6442a693f62d4e41bef8d4" }
-rigging-tls = { git = "https://github.com/flotilla-org/rigging", rev = "261a4460166fc79e1b6442a693f62d4e41bef8d4" }
-rigging-process = { git = "https://github.com/flotilla-org/rigging", rev = "261a4460166fc79e1b6442a693f62d4e41bef8d4" }
-rigging-http-client = { git = "https://github.com/flotilla-org/rigging", rev = "261a4460166fc79e1b6442a693f62d4e41bef8d4" }
-rigging-replay-testkit = { git = "https://github.com/flotilla-org/rigging", rev = "261a4460166fc79e1b6442a693f62d4e41bef8d4" }
-rigging-http-serve = { git = "https://github.com/flotilla-org/rigging", rev = "261a4460166fc79e1b6442a693f62d4e41bef8d4" }
-rigging-http-wire = { git = "https://github.com/flotilla-org/rigging", rev = "261a4460166fc79e1b6442a693f62d4e41bef8d4" }
+# Rigging, drydock and binnacle are declared by branch here and in each other
+# (flotilla-org/rigging#51), so Cargo.lock holds one commit of each for the whole
+# build. Move it with `cargo update -p <crate> --precise <commit>`.
+drydock = { git = "https://github.com/flotilla-org/drydock", branch = "main" }
+drydock-protocol = { git = "https://github.com/flotilla-org/drydock", branch = "main" }
+drydock-agent = { git = "https://github.com/flotilla-org/drydock", branch = "main" }
+drydock-transport = { git = "https://github.com/flotilla-org/drydock", branch = "main" }
+drydock-host = { git = "https://github.com/flotilla-org/drydock", branch = "main" }
+rigging-ssh = { git = "https://github.com/flotilla-org/rigging", branch = "main" }
+rigging-stream = { git = "https://github.com/flotilla-org/rigging", branch = "main" }
+rigging-tls = { git = "https://github.com/flotilla-org/rigging", branch = "main" }
+rigging-process = { git = "https://github.com/flotilla-org/rigging", branch = "main" }
+rigging-http-client = { git = "https://github.com/flotilla-org/rigging", branch = "main" }
+rigging-replay-testkit = { git = "https://github.com/flotilla-org/rigging", branch = "main" }
+rigging-http-serve = { git = "https://github.com/flotilla-org/rigging", branch = "main" }
+rigging-http-wire = { git = "https://github.com/flotilla-org/rigging", branch = "main" }
 # The condition language (#4108).
-rigging-condition = { git = "https://github.com/flotilla-org/rigging", rev = "261a4460166fc79e1b6442a693f62d4e41bef8d4" }
+rigging-condition = { git = "https://github.com/flotilla-org/rigging", branch = "main" }
 # The webhook relay's wire types (flotilla-org/flotilla.work#1).
-# Every rigging pin matches drydock's and binnacle's rigging rev, so the build holds one copy of each crate; move them together.
-rigging-relay-protocol = { git = "https://github.com/flotilla-org/rigging", rev = "261a4460166fc79e1b6442a693f62d4e41bef8d4" }
-binnacle-cli = { git = "https://github.com/flotilla-org/binnacle", rev = "db69691ff6da9342ddb51ebee3da5bfa3ae1fa9f", features = ["described", "clap"] }
-binnacle-core = { git = "https://github.com/flotilla-org/binnacle", rev = "db69691ff6da9342ddb51ebee3da5bfa3ae1fa9f" }
-binnacle-described = { git = "https://github.com/flotilla-org/binnacle", rev = "db69691ff6da9342ddb51ebee3da5bfa3ae1fa9f" }
-binnacle-described-http = { git = "https://github.com/flotilla-org/binnacle", rev = "db69691ff6da9342ddb51ebee3da5bfa3ae1fa9f" }
-binnacle-format = { git = "https://github.com/flotilla-org/binnacle", rev = "db69691ff6da9342ddb51ebee3da5bfa3ae1fa9f" }
-binnacle-layout = { git = "https://github.com/flotilla-org/binnacle", rev = "db69691ff6da9342ddb51ebee3da5bfa3ae1fa9f" }
-binnacle-ratatui = { git = "https://github.com/flotilla-org/binnacle", rev = "db69691ff6da9342ddb51ebee3da5bfa3ae1fa9f", features = ["described"] }
+rigging-relay-protocol = { git = "https://github.com/flotilla-org/rigging", branch = "main" }
+binnacle-cli = { git = "https://github.com/flotilla-org/binnacle", branch = "main", features = ["described", "clap"] }
+binnacle-core = { git = "https://github.com/flotilla-org/binnacle", branch = "main" }
+binnacle-described = { git = "https://github.com/flotilla-org/binnacle", branch = "main" }
+binnacle-described-http = { git = "https://github.com/flotilla-org/binnacle", branch = "main" }
+binnacle-format = { git = "https://github.com/flotilla-org/binnacle", branch = "main" }
+binnacle-layout = { git = "https://github.com/flotilla-org/binnacle", branch = "main" }
+binnacle-ratatui = { git = "https://github.com/flotilla-org/binnacle", branch = "main", features = ["described"] }
 chrono = { version = "0.4", default-features = false, features = ["clock"] }
 serde_yml = "0.0.12"
 tokio-util = "0.7"
