@@ -5,15 +5,16 @@ use async_trait::async_trait;
 use chrono::{DateTime, Utc};
 use flotilla_resources::checkout_records::latest_launches;
 use flotilla_resources::{
-    discovered_checkouts::DiscoveredCheckouts, lifecycle_reads::LifecycleReads, resolve_default_branch, CheckoutSpec,
-    DefaultBranchObservation, DefaultBranchProvenance, ForgeIdentity, LifecycleAuthority, Repository, RepositoryCheckoutRef, RepositoryKey,
-    RepositoryStatus, RepositoryStatusPatch, ResourceError, ResourceObject,
+    discovered_checkouts::DiscoveredCheckouts, lifecycle_reads::LifecycleReads, resolve_default_branch, CheckoutSpec, CredentialConsumer,
+    CredentialSpec, DefaultBranchObservation, DefaultBranchProvenance, Forge, ForgeIdentity, ForgeSpec, LifecycleAuthority, ReadWatchEvent,
+    Repository, RepositoryCheckoutRef, RepositoryKey, RepositoryStatus, RepositoryStatusPatch, ResourceError, ResourceObject,
 };
 use flotilla_schema::reads::carry;
 use flotilla_store::{
     controller::{ReconcileOutcome, Reconciler, SecondaryWatch, WorkQueueSender},
     ResourceBackend,
 };
+use futures::StreamExt;
 use tokio::sync::broadcast::error::RecvError;
 
 #[async_trait]
@@ -46,7 +47,8 @@ impl RepositoryReconciler {
         discovered: DiscoveredCheckouts,
         service: Option<Arc<flotilla_schema_sqlite::stream::Service>>,
     ) -> Vec<Box<dyn SecondaryWatch<Primary = Repository>>> {
-        let mut watches: Vec<Box<dyn SecondaryWatch<Primary = Repository>>> = vec![Box::new(DiscoveredRepositoryWake(discovered))];
+        let mut watches: Vec<Box<dyn SecondaryWatch<Primary = Repository>>> =
+            vec![Box::new(DiscoveredRepositoryWake(discovered)), Box::new(ForgeIdentityRepositoryWake)];
         if let Some(service) = service {
             watches.push(Box::new(CheckoutRepositoryWake::new(Arc::clone(&service))));
             watches.push(Box::new(CloneRepositoryWake::new(service)));
@@ -109,6 +111,91 @@ impl SecondaryWatch for DiscoveredRepositoryWake {
                     Err(RecvError::Closed) => return Ok(()),
                 }
             }
+        })
+    }
+}
+
+/// Wakes the Repositories on a forge when the forge, or a Forgejo credential on it, changes: a
+/// repository's forge lookup runs as the daemon's identity there, which those declare.
+#[derive(Clone)]
+struct ForgeIdentityRepositoryWake;
+
+impl ForgeIdentityRepositoryWake {
+    /// The URL of the forge `event` changes the daemon's identity on: `None` when it may be any.
+    async fn forge_url(backend: &ResourceBackend, namespace: &str, event: ForgeIdentityEvent) -> Result<Option<String>, ResourceError> {
+        match event {
+            ForgeIdentityEvent::Forge(spec) => Ok(Some(spec.https_url)),
+            ForgeIdentityEvent::Credential(CredentialConsumer::Forgejo { forge_ref, .. }) => {
+                match backend.including_replicas::<Forge>(namespace).get(&forge_ref).await {
+                    Ok(forge) => Ok(Some(forge.object.spec.https_url)),
+                    // An undeclared forge has no repositories to wake; its declaration wakes them.
+                    Err(ResourceError::NotFound { .. }) => Ok(Some(String::new())),
+                    Err(error) => Err(error),
+                }
+            }
+            // Other consumers are no forge's daemon identity.
+            ForgeIdentityEvent::Credential(_) => Ok(Some(String::new())),
+            ForgeIdentityEvent::Unknown => Ok(None),
+        }
+    }
+}
+
+/// What a Forge or CredentialSpec change says about the daemon's forge identities.
+enum ForgeIdentityEvent {
+    Forge(ForgeSpec),
+    Credential(CredentialConsumer),
+    /// A deletion by name, which carries no spec.
+    Unknown,
+}
+
+impl SecondaryWatch for ForgeIdentityRepositoryWake {
+    type Primary = Repository;
+
+    fn clone_box(&self) -> Box<dyn SecondaryWatch<Primary = Self::Primary>> {
+        Box::new(self.clone())
+    }
+
+    fn spawn(
+        self: Box<Self>,
+        backend: ResourceBackend,
+        namespace: String,
+        sender: WorkQueueSender,
+    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<(), ResourceError>> + Send>> {
+        Box::pin(async move {
+            let forges = backend.including_replicas::<Forge>(&namespace).watch().await?.map(|event| {
+                event.map(|event| match event {
+                    ReadWatchEvent::Added(forge) | ReadWatchEvent::Modified(forge) | ReadWatchEvent::Deleted(forge) => {
+                        ForgeIdentityEvent::Forge(forge.object.spec)
+                    }
+                    ReadWatchEvent::DeletedByName { .. } => ForgeIdentityEvent::Unknown,
+                })
+            });
+            let credentials = backend.including_replicas::<CredentialSpec>(&namespace).watch().await?.map(|event| {
+                event.map(|event| match event {
+                    ReadWatchEvent::Added(spec) | ReadWatchEvent::Modified(spec) | ReadWatchEvent::Deleted(spec) => {
+                        ForgeIdentityEvent::Credential(spec.object.spec.consumer)
+                    }
+                    ReadWatchEvent::DeletedByName { .. } => ForgeIdentityEvent::Unknown,
+                })
+            });
+            let mut events = futures::stream::select(forges, credentials);
+            while let Some(event) = events.next().await {
+                let Some(url) = Self::forge_url(&backend, &namespace, event?).await? else {
+                    sender.send_every();
+                    continue;
+                };
+                let url = url.trim_end_matches('/');
+                if url.is_empty() {
+                    continue;
+                }
+                for repository in backend.using::<Repository>(&namespace).list().await?.items {
+                    let on_forge = repository.spec.forge().is_some_and(|forge| forge.service_url.trim_end_matches('/') == url);
+                    if on_forge && sender.send(repository.metadata.name).await.is_err() {
+                        return Ok(());
+                    }
+                }
+            }
+            Ok(())
         })
     }
 }

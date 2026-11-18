@@ -118,6 +118,26 @@ impl LabForge {
     }
 }
 
+/// Declares the daemon's identity on `forge_id`, `<forge_id>-daemon`, sourced from its token file under `dir`.
+async fn declare_identity(daemon: &InProcessDaemon, dir: &Path, forge_id: &str) {
+    let token_file = dir.join(format!("{forge_id}-daemon-token"));
+    daemon
+        .resource_backend()
+        .definitions::<CredentialSpec>(NAMESPACE)
+        .create(
+            &empty_meta(&format!("{forge_id}-daemon")),
+            &CredentialSpecSpec {
+                consumer: CredentialConsumer::Forgejo { forge_ref: forge_id.into(), username: format!("{forge_id}-bot") },
+                source: CredentialSource::File { path: token_file.to_str().expect("token path").into() },
+                lifecycle: CredentialLifecycle::Static,
+                placement: CredentialPlacementRequirements::default(),
+                authorization_epoch: flotilla_resources::INITIAL_AUTHORIZATION_EPOCH,
+            },
+        )
+        .await
+        .expect("daemon identity");
+}
+
 /// A private `acme/widgets` on the fake's `lab` forge, and a daemon whose host
 /// Git reaches it, with the forge and the daemon's file-sourced identity on it declared.
 async fn lab_forge() -> LabForge {
@@ -178,21 +198,7 @@ async fn lab_forge() -> LabForge {
             .git_ssh_host("localhost".to_string())
             .build();
         daemon.resource_backend().definitions::<Forge>(NAMESPACE).create(&empty_meta(forge_id), &forge).await.expect("Forge");
-        daemon
-            .resource_backend()
-            .definitions::<CredentialSpec>(NAMESPACE)
-            .create(
-                &empty_meta(&format!("{forge_id}-daemon")),
-                &CredentialSpecSpec {
-                    consumer: CredentialConsumer::Forgejo { forge_ref: forge_id.into(), username: format!("{forge_id}-bot") },
-                    source: CredentialSource::File { path: token_file.to_str().expect("token path").into() },
-                    lifecycle: CredentialLifecycle::Static,
-                    placement: CredentialPlacementRequirements::default(),
-                    authorization_epoch: flotilla_resources::INITIAL_AUTHORIZATION_EPOCH,
-                },
-            )
-            .await
-            .expect("daemon identity");
+        declare_identity(&daemon, temp.path(), forge_id).await;
     }
     let host_id = daemon.local_host_id().expect("local host ID").to_string();
     let host_direct = flotilla_resources::host_direct_environment_name(&host_id);
@@ -267,6 +273,69 @@ async fn an_unusable_daemon_identity_refuses_its_own_forges_git_with_the_reason(
         resolver.default_branch(&on("lab2", "acme/gadgets")).await.expect("lab2 signs in as its own identity").as_deref(),
         Some("main")
     );
+    forge.running.shutdown().await;
+}
+
+/// The daemon's forge default-branch lookups, counted as each finishes.
+struct CountedLookups {
+    inner: Arc<dyn flotilla_provisioning::reconcilers::ForgeDefaultBranchResolver>,
+    finished: std::sync::atomic::AtomicUsize,
+}
+
+#[async_trait]
+impl flotilla_provisioning::reconcilers::ForgeDefaultBranchResolver for CountedLookups {
+    async fn default_branch(&self, forge: &flotilla_resources::ForgeIdentity) -> Result<Option<String>, String> {
+        let answer = self.inner.default_branch(forge).await;
+        self.finished.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        answer
+    }
+}
+
+// F1 (run 3): a fresh host's Repository is declared before the daemon's identity on its forge.
+// Its lookup is refused until the identity is declared; the declaration wakes the Repository
+// controller, and the default branch resolves with no restart.
+#[tokio::test]
+async fn declaring_the_daemon_identity_wakes_the_repository_on_its_forge() {
+    use flotilla_provisioning::reconcilers::RepositoryReconciler;
+    use std::sync::atomic::Ordering;
+    let forge = lab_forge().await;
+    let backend = forge.daemon.resource_backend();
+    backend.definitions::<CredentialSpec>(NAMESPACE).delete("lab-daemon").await.expect("withdraw lab's identity");
+
+    let lookups = Arc::new(CountedLookups { inner: super::super::forge_default_branches(&forge.clones.state), finished: 0.into() });
+    let discovered = forge.daemon.discovered_checkouts();
+    let controller = flotilla_store::controller::ControllerLoop {
+        primary: backend.clone().using::<Repository>(NAMESPACE).with_lifecycle_status_reads(forge.daemon.lifecycle_reads()),
+        secondaries: RepositoryReconciler::secondary_watches(discovered.clone(), forge.daemon.decided_store().ok()),
+        reconciler: RepositoryReconciler::new(discovered, forge.daemon.lifecycle_reads())
+            .with_forge_default_branch_resolver(lookups.clone()),
+        backend: backend.clone(),
+    };
+    let running = tokio::spawn(controller.run());
+
+    let lab = backend.definitions::<Forge>(NAMESPACE).get("lab").await.expect("lab").spec;
+    let spec = RepositorySpec::remote(&forge.url).expect("remote").on_forge(&lab).expect("on lab");
+    let name = spec.key().to_string();
+    let repositories = backend.clone().using::<Repository>(NAMESPACE);
+    repositories.create(&empty_meta(&name), &spec).await.expect("repository");
+    let default_branch =
+        || async { repositories.get(&name).await.ok().and_then(|repository| repository.status).and_then(|status| status.default_branch) };
+
+    // The lookup is refused for want of the identity.
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
+    while lookups.finished.load(Ordering::SeqCst) == 0 {
+        assert!(tokio::time::Instant::now() < deadline, "the Repository controller never looked up its default branch");
+        tokio::time::sleep(Duration::from_millis(25)).await;
+    }
+    assert_eq!(default_branch().await, None);
+
+    declare_identity(&forge.daemon, forge.temp.path(), "lab").await;
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
+    while default_branch().await.as_deref() != Some("main") {
+        assert!(tokio::time::Instant::now() < deadline, "declaring the identity did not wake the Repository");
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    running.abort();
     forge.running.shutdown().await;
 }
 
