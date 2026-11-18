@@ -524,20 +524,19 @@ impl ImportedLaunches {
     /// These launches with a tombstone for convoy `record` in `namespace`, which records name and
     /// the old store no longer holds (#3108 import ruling (a)): launch 1 of its name homed at
     /// `home`, or the name's next free number when another record takes 1, in `project`, the one
-    /// its records address it under, else the namespace's, made at `earliest_dependent`. Every
-    /// record naming it names that launch.
+    /// its records address it under, made at `earliest_dependent`. Every record naming it names
+    /// that launch.
     pub fn with_tombstone(
         self,
         namespace: &str,
         record: &str,
-        project: Option<&str>,
+        project: &str,
         home: &str,
         earliest_dependent: chrono::DateTime<chrono::Utc>,
     ) -> Self {
         let taken: Vec<u64> = self.numbered.iter().filter(|(of, _)| of == record).map(|(_, n)| *n).collect();
         let n = if taken.contains(&1) { taken.iter().max().copied().unwrap_or_default() + 1 } else { 1 };
-        let project = project.unwrap_or(namespace).to_owned();
-        let launch = ImportedLaunch { home: home.to_owned(), project, of: record.to_owned(), n };
+        let launch = ImportedLaunch { home: home.to_owned(), project: project.to_owned(), of: record.to_owned(), n };
         let mut this = self.with(namespace, record, launch.clone());
         this.tombstones.insert((namespace.to_owned(), record.to_owned()), Tombstone { launch, earliest_dependent });
         this
@@ -613,11 +612,6 @@ impl ImportedLaunches {
             [] => Address::project(&launch.project).map_err(|error| error.to_string()).and_then(|project| launch_address(&project, &name)),
             [project] if project.kind() == Kind::Project && project.value() == launch.project => {
                 Address::project(project.value()).map_err(|error| error.to_string()).and_then(|project| launch_address(&project, &name))
-            }
-            // The old store spells a convoy whose record it lacks under the namespace: for a
-            // tombstone that is its fallback, not another project.
-            [project] if project.kind() == Kind::Project && project.value() == namespace && self.is_tombstone(namespace, record) => {
-                Address::project(&launch.project).map_err(|error| error.to_string()).and_then(|project| launch_address(&project, &name))
             }
             _ => Err(format!("the convoy is not under its project `{}`", launch.project)),
         }
@@ -894,7 +888,7 @@ mod tests {
             mapped("project:flotilla/convoy:demo/role:coder/message:m-1").as_deref(),
             Ok("project:flotilla/convoy:demo%234/role:coder/message:m-1")
         );
-        // A convoy with no project of its own is addressed under its namespace's, as it imports.
+        // An address naming no project is mapped under the launch's project, as it imports.
         assert_eq!(mapped("convoy:demo/role:coder").as_deref(), Ok("project:flotilla/convoy:demo%234/role:coder"));
         let artifact = crate::address::artifact_address("demo", "coder", "decision-ledger", "demo").expect("artifact");
         let expected = crate::address::artifact_address("demo#4", "coder", "decision-ledger", "demo#4").expect("artifact");

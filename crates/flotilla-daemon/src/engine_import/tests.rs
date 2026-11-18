@@ -693,12 +693,26 @@ fn a_checkout_held_for_a_convoy_with_no_launch_is_refused() {
         landed_there,
         held_there,
     ];
-    let summary = rehearse(&rows(documents), HERE);
+    let summary = rehearse(&rows(documents.clone()), HERE);
     assert_eq!(refused(&summary), [("Checkout", "held-for-unbooted")], "{summary:?}");
     assert_eq!(summary.tallies["Checkout"].get("refused: names a convoy that never bootstrapped"), Some(&1), "{summary:?}");
     let drops = &summary.rows["Checkout"].drops;
-    assert_eq!(drops.get("an orphaned worktree left on disk: held for a convoy gone before import"), Some(&1), "{summary:?}");
+    // No record names a project for `gone`: it has no tombstone, and the checkout naming it is
+    // dropped with why (owner ruling, #3108).
+    assert_eq!(drops.get(NAMES_UNADDRESSED), Some(&1), "{summary:?}");
+    assert_eq!(summary.tallies["Convoy"].get(UNADDRESSED), Some(&1), "{summary:?}");
     assert_eq!(drops.get("an orphaned worktree left on disk: held for an ended convoy"), Some(&1), "{summary:?}");
+
+    // Once a record names its project, `gone` has a tombstone, and the checkout held for it is
+    // left on disk as one held for a convoy gone before import.
+    let mut in_gone = message("in-gone");
+    in_gone["spec"]["receiver"] = json!("flotilla/gone/implement/coder");
+    let mut named = documents;
+    named.extend([designation(), in_gone]);
+    let summary = rehearse(&rows(named), HERE);
+    assert_eq!(refused(&summary), [("Checkout", "held-for-unbooted")], "{summary:?}");
+    let drops = &summary.rows["Checkout"].drops;
+    assert_eq!(drops.get("an orphaned worktree left on disk: held for a convoy gone before import"), Some(&1), "{summary:?}");
 }
 
 #[test]
@@ -1294,7 +1308,12 @@ fn attention_records() -> Vec<Value> {
 fn open_demands_import_as_the_attentions_their_writers_send() {
     use flotilla_state_machines::machines::message::{DropReason, MessageState};
 
-    let source = rows(attention_records());
+    // A message names the lost convoy `gone` under its project, so it has a tombstone there.
+    let mut records = attention_records();
+    let mut in_gone = message("in-gone");
+    in_gone["spec"]["receiver"] = json!("flotilla/gone/implement/coder");
+    records.push(in_gone);
+    let source = rows(records);
     let summary = rehearse(&source, HERE);
     // A demand about a convoy the source no longer holds reads its tombstone (#3108 ruling (a)).
     assert_eq!(summary.kinds["Demand"], Counts { imported: 6, dropped: 4, refused: 3 }, "{summary:?}");
@@ -1782,5 +1801,11 @@ fn a_real_old_store_rehearses_its_import_in_memory() {
     }
     for ((kind, reason), count) in reasons {
         println!("refused {count} {kind}: {reason}");
+    }
+    // Named, only into a file the operator asks for beside the copy: never printed.
+    if let Some(names) = std::env::var_os("FLOTILLA_IMPORT_REHEARSAL_NAMES") {
+        let lines: String =
+            summary.refusals.iter().map(|refusal| format!("{}\t{}\t{}\n", refusal.kind, refusal.name, refusal.reason)).collect();
+        std::fs::write(names, lines).expect("write the named refusals");
     }
 }

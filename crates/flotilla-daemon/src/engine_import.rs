@@ -319,7 +319,15 @@ pub struct Summary {
     ledger: BTreeMap<String, RowCounts>,
     /// The ledger's dropped rows by old kind and reason.
     drops: BTreeMap<String, BTreeMap<String, usize>>,
+    /// The lost convoys no record names a project for: a record refused for naming one is
+    /// dropped instead, tallied (owner ruling, #3108).
+    unaddressed: BTreeSet<String>,
 }
+
+/// Why a lost convoy no record names a project for is not imported.
+const UNADDRESSED: &str = "a lost convoy whose records name no project: not imported, its records dropped";
+/// Why a record naming such a convoy is dropped.
+const NAMES_UNADDRESSED: &str = "names a lost convoy whose records name no project";
 
 impl Summary {
     fn absorb(&mut self, report: ImportReport) {
@@ -341,6 +349,12 @@ impl Summary {
             self.kinds.entry(kind.to_owned()).or_default().dropped += count;
         }
         for refusal in report.refused {
+            if NoLaunch::not_held_in(&refusal.reason).is_some_and(|record| self.unaddressed.contains(record)) {
+                self.ledger.entry(refusal.kind.to_owned()).or_default().dropped += 1;
+                *self.drops.entry(refusal.kind.to_owned()).or_default().entry(NAMES_UNADDRESSED.to_owned()).or_default() += 1;
+                self.kinds.entry(refusal.kind.to_owned()).or_default().dropped += 1;
+                continue;
+            }
             // A record naming a convoy that imports as no launch, counted by why: the work list.
             if let Some(class) = NoLaunch::class_in(&refusal.reason) {
                 *self.tallies.entry(refusal.kind.to_owned()).or_default().entry(format!("refused: {class}")).or_default() += 1;
@@ -450,7 +464,17 @@ pub fn import(source: &Source, target: &mut Import) -> Summary {
     plan_rows(source, target, &mut summary);
     let convoys = source.context::<flotilla_resources::Convoy>("convoys", None);
     let launches = ImportedLaunches::number(convoys.iter().map(|convoy| (convoy.home.as_str(), &convoy.object)));
-    let launches = tombstoned(source, launches);
+    let (launches, lost) = tombstoned(source, launches);
+    // Each counted once fleet-wide: at the home its tombstone would have been homed at.
+    let home = target.store().home().to_owned();
+    for (record, reason) in lost.refused.into_iter().filter_map(|(record, at, reason)| (at == home).then_some((record, reason))) {
+        summary.refuse("Convoy", record, reason);
+    }
+    let unaddressed = lost.unaddressed.values().filter(|at| **at == home).count();
+    if unaddressed > 0 {
+        *summary.tallies.entry("Convoy".to_owned()).or_default().entry(UNADDRESSED.to_owned()).or_default() += unaddressed;
+    }
+    summary.unaddressed = lost.unaddressed.into_keys().collect();
     steps(source, target, launches, &mut summary);
     summary.account(source, target);
     summary
@@ -472,9 +496,10 @@ fn steps(source: &Source, target: &mut Import, launches: ImportedLaunches, summa
 /// tombstones, though each imports only its own home's records, so each home's records are
 /// imported first into a scratch store of that home, and each record that would be refused for
 /// naming a convoy the old store does not hold names one. A tombstone is homed at the lowest home
-/// whose records name it, and made at the earliest of their creation times.
-fn tombstoned(source: &Source, launches: ImportedLaunches) -> ImportedLaunches {
-    let Ok(registry) = crate::runtime::decided_registry() else { return launches };
+/// whose records name it, and made at the earliest of their creation times, in the one project
+/// its records address it under. With none, or several, it is not made ([`Lost`]).
+fn tombstoned(source: &Source, launches: ImportedLaunches) -> (ImportedLaunches, Lost) {
+    let Ok(registry) = crate::runtime::decided_registry() else { return (launches, Lost::default()) };
     let created: BTreeMap<(&str, &str, String), chrono::DateTime<chrono::Utc>> = source
         .rows
         .iter()
@@ -503,21 +528,41 @@ fn tombstoned(source: &Source, launches: ImportedLaunches) -> ImportedLaunches {
             }
         }
     }
-    named.into_iter().fold(launches, |launches, (record, (homes, projects, earliest))| match (homes.first(), earliest) {
-        // Under the one project its records address it under. The old store spells a convoy whose
-        // record it lacks under the namespace, so that spelling is no evidence of its own. Records
-        // that disagree leave the namespace's, and those addressed under another are refused.
+    let mut lost = Lost::default();
+    let launches = named.into_iter().fold(launches, |launches, (record, (homes, projects, earliest))| match (homes.first(), earliest) {
+        // Under the one project its records address it under, in any spelling: the old store's
+        // namespace spelling is the project its fallback put the convoy in (governor ruling,
+        // #3108). With none there is no fallback to the namespace.
         (Some(home), Some(earliest)) => {
-            let named: Vec<&String> = projects.iter().filter(|project| *project != DEFAULT_PROVISIONING_NAMESPACE).collect();
-            let project = match named.as_slice() {
-                [project] => Some(project.as_str()),
-                _ => None,
-            };
-            launches.with_tombstone(DEFAULT_PROVISIONING_NAMESPACE, &record, project, home, earliest)
+            let named: Vec<&String> = projects.iter().collect();
+            match named.as_slice() {
+                [project] => launches.with_tombstone(DEFAULT_PROVISIONING_NAMESPACE, &record, project, home, earliest),
+                [] => {
+                    lost.unaddressed.insert(record, (*home).to_owned());
+                    launches
+                }
+                several => {
+                    let several = several.iter().map(|project| format!("`{project}`")).collect::<Vec<_>>().join(", ");
+                    let reason = format!("a lost convoy its records name under several projects ({several}): no tombstone");
+                    lost.refused.push((record, (*home).to_owned(), reason));
+                    launches
+                }
+            }
         }
         // With no dependent's time it is not made, and its dependents are refused as before.
         _ => launches,
-    })
+    });
+    (launches, lost)
+}
+
+/// The lost convoys [`tombstoned`] makes no tombstone for, each by the home it would have had.
+#[derive(Default)]
+struct Lost {
+    /// Records name it under several projects: it is refused, by name, with why.
+    refused: Vec<(String, String, String)>,
+    /// No record names a project for it: it and every record naming it are dropped, tallied
+    /// (owner ruling, #3108), the old stores staying as their backup.
+    unaddressed: BTreeMap<String, String>,
 }
 
 /// [`import`] into a store in memory homed at `home`: what an import there would write.

@@ -93,6 +93,9 @@ pub(super) fn convoys(source: &Source, target: &mut Import, carried: &mut Carrie
                                 Ok(ended) => {
                                     report.import_row(KIND, end.label());
                                     report.tally(KIND, format!("ended {}", end.label()));
+                                    if convoy.history.pre_ledger {
+                                        report.tally(KIND, format!("ended {} before the promise ledger: no promise history", end.label()));
+                                    }
                                     ended_convoys.push((key, (ended, end.at)));
                                 }
                                 Err(reason) => report.refused.push(refused(reason)),

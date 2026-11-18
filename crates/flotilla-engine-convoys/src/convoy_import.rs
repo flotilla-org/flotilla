@@ -21,9 +21,11 @@
 //! | `completion_refusal`, `legacy_checks` | dropped |
 //! | Landing | Open |
 //! | a standing convoy | a convoy-lifetime duty per agent seat |
+//! | a standing convoy that ended with no agent seat | dropped ([`StaysOldReason::EndedWithNoSeat`]) |
 //! | a standing role's generation | its own convoy, the next launch of the role's name |
 //! | a convoy's name | a launch `<engine name>#<n>`, n the home sequence its create takes |
-//! | a finite convoy with no promise | refused: [`ConvoyImportRefusal::NoObligations`] |
+//! | a finite, unfinished convoy with no promise | refused: [`ConvoyImportRefusal::NoObligations`] |
+//! | a finite convoy that ended with no promise (before the ledger) | imported ended with no promise history, [`ClaimHistory::pre_ledger`] |
 //! | Landed, its disposition | created Open, then `Deliver` with that disposition at its `finished_at` ([`ImportedEnd`]) |
 //! | Failed, Abandoned, its message | created Open, then `Abandon` (cause Failed or Operator) with that reason at its `finished_at`, under the import's grant |
 //!
@@ -132,6 +134,10 @@ pub struct ClaimHistory {
     pub crews: Vec<CrewClaim>,
     /// The old `landing_entry`, as the old status encodes it (JSON text).
     pub landing_entry: Option<String>,
+    /// It ended before the promise ledger: it imports with no promise history (owner ruling,
+    /// #3108 NoObligations option (a)). Absent in a payload means false.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub pre_ledger: bool,
 }
 
 /// One old crew's claim.
@@ -243,7 +249,7 @@ impl ImportedConvoy {
 #[derive(Debug, Clone, PartialEq)]
 pub enum ImportOutcome {
     Imported(Box<ImportedConvoy>),
-    /// Not the import's: not yet bootstrapped.
+    /// Not the import's: not yet bootstrapped, or ended holding nothing.
     StaysOld(StaysOldReason),
 }
 
@@ -252,6 +258,9 @@ pub enum ImportOutcome {
 pub enum StaysOldReason {
     /// No workflow snapshot yet: a new convoy is admitted at bootstrap.
     NotBootstrapped,
+    /// A standing convoy that ended with no agent seat: it held no duty and owes nothing, so it is
+    /// dropped (owner ruling via the governor, #3108).
+    EndedWithNoSeat,
 }
 
 impl StaysOldReason {
@@ -259,6 +268,7 @@ impl StaysOldReason {
     pub fn label(self) -> &'static str {
         match self {
             Self::NotBootstrapped => "never bootstrapped",
+            Self::EndedWithNoSeat => "a standing convoy that ended with no agent seat",
         }
     }
 }
@@ -267,6 +277,7 @@ impl std::fmt::Display for StaysOldReason {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             Self::NotBootstrapped => f.write_str("not bootstrapped: admitted at bootstrap"),
+            Self::EndedWithNoSeat => f.write_str("a standing convoy that ended with no agent seat: dropped"),
         }
     }
 }
@@ -419,7 +430,14 @@ pub fn import_convoy(
             duties.insert(id, Duty { owner, scope: DutyScope::Lifetime, terms: Terms::default() });
         }
     }
-    if promises.is_empty() && duties.is_empty() {
+    // A convoy that ended before the promise ledger has no promise history: it imports ended with
+    // none, as admission never would (owner ruling, #3108 NoObligations option (a)).
+    let ended = matches!(status.phase, ConvoyPhase::Landed | ConvoyPhase::Failed | ConvoyPhase::Abandoned);
+    let pre_ledger = promises.is_empty() && duties.is_empty() && !standing && ended;
+    if promises.is_empty() && duties.is_empty() && !pre_ledger {
+        if standing && ended {
+            return Ok(ImportOutcome::StaysOld(StaysOldReason::EndedWithNoSeat));
+        }
         return Err(if standing {
             refuse("a standing convoy with no agent seat holds no obligation".into())
         } else {
@@ -463,7 +481,7 @@ pub fn import_convoy(
     };
     let state = StoredState::<Convoy>::new(ConvoyState::Open { quota: BTreeMap::new(), retired_duties: BTreeSet::new() }, since);
     let resource = Resource::stored(launch_of, spec, state, Version(1));
-    verify(&resource, end.as_ref()).map_err(|failure| match failure {
+    verify(&resource, end.as_ref(), pre_ledger).map_err(|failure| match failure {
         Unverified::Differs(reason) => refuse(reason),
         Unverified::EndRefused { edge, refusal } => ConvoyImportRefusal::EndRefused { convoy: name.clone(), edge, refusal },
     })?;
@@ -489,7 +507,7 @@ pub fn import_convoy(
         }
     }
     let landing_entry = status.landing_entry.as_ref().map(|entry| encode("the landing entry", serde_json::to_string(entry))).transpose()?;
-    let history = ClaimHistory { crews: claims, landing_entry };
+    let history = ClaimHistory { crews: claims, landing_entry, pre_ledger };
 
     let (stall, unrecorded_stall) = match status.stalled.as_ref() {
         None => (None, None),
@@ -548,7 +566,7 @@ type PromiseShape = (PromiseId, String, SeatName, Progress, Vec<(Address, String
 /// submissions. Times are the import's, not the replay's, so they are not
 /// compared.
 pub fn check(resource: &Resource<Convoy>) -> Result<(), String> {
-    verify(resource, None).map_err(|failure| match failure {
+    verify(resource, None, false).map_err(|failure| match failure {
         Unverified::Differs(reason) => reason,
         Unverified::EndRefused { edge, refusal } => format!("the machine refuses its {edge}: {refusal}"),
     })
@@ -563,8 +581,16 @@ enum Unverified {
 }
 
 /// [`check`], then the end edge `end`, when the convoy ended, from the record the machine reached.
-fn verify(resource: &Resource<Convoy>, end: Option<&ImportedEnd>) -> Result<(), Unverified> {
-    let (mut home, name, mut world) = replayed(resource).map_err(Unverified::Differs)?;
+/// A `pre_ledger` convoy, which admission refuses for owing nothing, is taken as recorded and only
+/// its end edge is checked.
+fn verify(resource: &Resource<Convoy>, end: Option<&ImportedEnd>, pre_ledger: bool) -> Result<(), Unverified> {
+    let (mut home, name, mut world) = if pre_ledger {
+        let mut home = Home::<Convoy>::new("import").map_err(|error| Unverified::Differs(format!("{error:?}")))?;
+        home.restore(resource.clone()).map_err(|error| Unverified::Differs(format!("{error:?}")))?;
+        (home, resource.name().to_owned(), MemoryConvoyWorld::default().with_project(&resource.spec().project))
+    } else {
+        replayed(resource).map_err(Unverified::Differs)?
+    };
     let Some(end) = end else { return Ok(()) };
     end.grant(&mut world);
     let edge = match end.edge {
@@ -1027,7 +1053,12 @@ fn read_back(store: &mut flotilla_schema_sqlite::Store, convoy: &ImportedConvoy)
         id.map(|id| read.load::<Resource<Convoy>>(id)).transpose().map(Option::flatten)
     });
     match read {
-        Ok(Some(loaded)) if content(loaded.value.spec()) == content(launch.spec()) => check(&loaded.value)?,
+        // A pre-ledger convoy is one admission refuses; its read-back content is the check.
+        Ok(Some(loaded)) if content(loaded.value.spec()) == content(launch.spec()) => {
+            if !convoy.history.pre_ledger {
+                check(&loaded.value)?
+            }
+        }
         Ok(Some(_)) => return Err("the store reads back another convoy".into()),
         Ok(None) => return Err("the created convoy is missing".into()),
         Err(error) => return Err(error.to_string()),

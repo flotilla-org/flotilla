@@ -17,7 +17,7 @@ use flotilla_resources::{
 use flotilla_schema::Address;
 use flotilla_state_machines::machines::{
     awaiting_reply,
-    convoy::{DutyScope, Progress, SeatName},
+    convoy::{ConvoyEdge, DutyScope, Progress, SeatName},
     message::MessageRef,
 };
 
@@ -251,6 +251,37 @@ fn unfinished_convoys_without_promises_are_refused_by_name() {
     assert_eq!(import_convoy(&fresh, HOME, &[], &WORLD), Ok(ImportOutcome::StaysOld(StaysOldReason::NotBootstrapped)));
 }
 
+// Behaviour (owner ruling, #3108 NoObligations option (a)): a finite convoy that ended before the
+// promise ledger, owing nothing, imports ended with no promise history, marked pre-ledger; the
+// machine takes its end, Deliver or Abandon. No Kept declaration is made for it.
+#[test]
+fn an_ended_convoy_owing_nothing_imports_pre_ledger() {
+    let owing_nothing = |name: &str| {
+        let mut old = convoy(name, ConvoyPhase::Active, vec![agent("reviewer", false)]);
+        let status = old.status.as_mut().expect("status");
+        status.promises.clear();
+        status.crew_work.get_mut("work").and_then(|crew| crew.get_mut("reviewer")).expect("reviewer").phase = CrewWorkPhase::Done;
+        old
+    };
+    let mut abandoned = owing_nothing("abandoned");
+    ended(&mut abandoned);
+    let mut landed = owing_nothing("landed");
+    let status = landed.status.as_mut().expect("status");
+    status.phase = ConvoyPhase::Landed;
+    status.disposition = Some("merged".into());
+    status.finished_at = Some(Utc::now());
+    for (old, edge) in [(&abandoned, "Abandon"), (&landed, "Deliver")] {
+        let convoy = imported(import_convoy(old, HOME, &[], &WORLD));
+        assert!(convoy.history.pre_ledger, "{edge}: marked pre-ledger");
+        assert_eq!(convoy.resource.spec().promises.len(), 0, "{edge}: no promise history");
+        assert!(convoy.resource.spec().duties.is_empty(), "{edge}: no duty");
+        let end = convoy.end.as_ref().expect("ended");
+        assert_eq!(matches!(end.edge, ConvoyEdge::Deliver(_)), edge == "Deliver");
+    }
+    // One still running is refused as before.
+    assert_eq!(import_convoy(&owing_nothing("idle"), HOME, &[], &WORLD), Err(ConvoyImportRefusal::NoObligations { convoy: "idle".into() }));
+}
+
 // Behaviour (owner ruling, #3108): an agent seat bootstrapped before the default ledger existed, and
 // owing nothing, imports with the Pending template decision ledger admission now gives it.
 #[test]
@@ -305,6 +336,34 @@ fn a_standing_convoy_waits_for_the_ruling_then_holds_lifetime_duties() {
     let duties: Vec<_> = convoy.resource.spec().duties.values().map(|duty| (duty.owner.clone(), duty.scope.clone())).collect();
     assert_eq!(duties, vec![(SeatName::new("governor", ""), DutyScope::Lifetime)]);
     check(&convoy.resource).expect("the machine admits a standing convoy");
+}
+
+// Behaviour: a standing convoy with only a tool seat holds no duty. While it is open it is refused
+// by name; once it has ended it is dropped with its reason (owner ruling, #3108).
+#[test]
+fn a_standing_convoy_with_no_agent_seat_is_refused_open_and_dropped_ended() {
+    let world = World { standing_ruled: true };
+    let tool = || CrewSpec::builder().role("observer".to_string()).source(CrewSource::Tool { command: "sh".into() }).build();
+    let standing = |phase| {
+        let mut standing = convoy("usage", phase, vec![tool()]);
+        standing.metadata.annotations.insert(ENSURED_FROM_ANNOTATION.into(), "usage".into());
+        standing.spec.role = "usage".into();
+        standing
+    };
+    assert_eq!(
+        import_convoy(&standing(ConvoyPhase::Active), HOME, &[], &world),
+        Err(ConvoyImportRefusal::Unmappable {
+            convoy: "usage".into(),
+            reason: "a standing convoy with no agent seat holds no obligation".into()
+        })
+    );
+    for phase in [ConvoyPhase::Abandoned, ConvoyPhase::Failed, ConvoyPhase::Landed] {
+        assert_eq!(
+            import_convoy(&standing(phase), HOME, &[], &world),
+            Ok(ImportOutcome::StaysOld(StaysOldReason::EndedWithNoSeat)),
+            "{phase:?}"
+        );
+    }
 }
 
 // Behaviour: an open stall that a supervision message carries becomes the stalled seat's open

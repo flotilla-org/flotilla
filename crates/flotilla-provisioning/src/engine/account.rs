@@ -625,7 +625,8 @@ fn at_launch(mut spec: BindingSpec, namespace: &str, convoys: &ImportedLaunches)
         requester_parts(&spec.requester).ok_or_else(|| format!("requester `{}` names no convoy and role", spec.requester))?;
     let launch = convoys.name(namespace, &convoy).ok_or_else(|| {
         let reason = convoys.missing(namespace, &convoy).map(|reason| reason.to_string()).unwrap_or_default();
-        format!("its requester {reason} (`{convoy}`)")
+        // The requester's address first: the project it names is the tombstone's (#3108).
+        format!("its requester `{}` {reason} (`{convoy}`)", spec.requester)
     })?;
     spec.requester = requester_address(spec.requester.get(AddressKind::Project), &launch, &role)?;
     Ok(spec)
