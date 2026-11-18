@@ -595,7 +595,11 @@ fn succeeded(stdout: impl Into<String>) -> CommandOutput {
 }
 
 fn failed(stderr: impl Into<String>) -> CommandOutput {
-    CommandOutput { stdout: String::new(), stderr: stderr.into(), exit_code: Some(1) }
+    failed_with(1, stderr)
+}
+
+fn failed_with(code: i32, stderr: impl Into<String>) -> CommandOutput {
+    CommandOutput { stdout: String::new(), stderr: stderr.into(), exit_code: Some(code) }
 }
 
 /// The command world inside a dummy environment: an in-memory file tree and
@@ -722,11 +726,43 @@ impl DummyCommandRunner {
                     });
                     succeeded(lines.collect::<String>())
                 }
-                // Other scripts (staging probes) observe an empty world: they
-                // succeed and report nothing.
-                _ => succeeded(""),
+                ["-c", script, positional @ ..] => Self::script(script, positional),
+                _ => failed_with(2, format!("{cmd}: only `-c` scripts run in a dummy environment")),
             },
             program => absent(program),
+        }
+    }
+
+    /// A `sh -c` script, `positional` being `$0` and its arguments. A shell answers the
+    /// executable lookups it can make, as a real one does: found on stdout, a miss as exit 1
+    /// with nothing printed. Any other script runs programs this world does not have, so it
+    /// fails as a shell does when a program is absent (exit 127).
+    fn script(script: &str, positional: &[&str]) -> CommandOutput {
+        let lookup = match script.trim().strip_prefix("command -v ").map(str::trim) {
+            Some("\"$1\"") => positional.get(1).copied(),
+            Some(name) if !name.is_empty() && name.bytes().all(|byte| byte.is_ascii_alphanumeric() || b"-_.".contains(&byte)) => Some(name),
+            _ => None,
+        };
+        match lookup {
+            Some(name) => match Self::installed(name) {
+                Some(path) => succeeded(format!("{path}\n")),
+                None => failed(""),
+            },
+            None => {
+                let name = positional.first().copied().unwrap_or("sh");
+                failed_with(127, format!("{name}: the script's programs are not present in a dummy environment"))
+            }
+        }
+    }
+
+    /// Where a program present in a dummy environment's image is installed.
+    fn installed(name: &str) -> Option<&'static str> {
+        match name {
+            DUMMY_CREW_BINARY => Some("/usr/local/bin/flotilla-dummy-crew"),
+            "sh" => Some("/bin/sh"),
+            // Crew images carry bash; a session's shell is looked up by name.
+            "bash" => Some("/bin/bash"),
+            _ => None,
         }
     }
 }
@@ -1028,5 +1064,34 @@ mod tests {
         let git = runner.run_output("git", &["--version"], root, &ChannelLabel::Default).await.expect("spawned");
         assert_eq!(git.exit_code, Some(127));
         assert!(!CommandRunner::exists(&runner, "claude", &["--version"]).await);
+    }
+
+    // A shell's answers, as discovery reads them: a lookup finds what the image has and misses
+    // the rest with exit 1 and nothing printed; a script running absent programs exits 127.
+    #[tokio::test]
+    async fn the_shell_misses_absent_programs_as_a_real_one_does() {
+        let runner = DummyCommandRunner::default();
+        let root = Path::new("/");
+        let lookup = |name: &'static str| {
+            let runner = &runner;
+            async move { runner.run_output("sh", &["-c", "command -v \"$1\"", "probe", name], root, &ChannelLabel::Default).await }
+        };
+        let missing = lookup("claude").await.expect("spawned");
+        assert_eq!((missing.exit_code, missing.stdout.as_str(), missing.stderr.as_str()), (Some(1), "", ""));
+        assert_eq!(lookup(DUMMY_CREW_BINARY).await.expect("spawned").stdout, "/usr/local/bin/flotilla-dummy-crew\n");
+        let literal = runner.run_output("sh", &["-c", "command -v gh"], root, &ChannelLabel::Default).await.expect("spawned");
+        assert_eq!(literal.exit_code, Some(1));
+        let script = runner
+            .run_output("sh", &["-c", "umask 077 && mkdir -p \"$1\"", "flotilla-requester-home", "/x"], root, &ChannelLabel::Default)
+            .await
+            .expect("spawned");
+        assert_eq!(script.exit_code, Some(127));
+        assert!(script.stderr.starts_with("flotilla-requester-home:"), "{}", script.stderr);
+
+        // Discovery's binary lookup now resolves the crew harness and finds no other harness,
+        // rather than taking an empty success for a relative path.
+        use flotilla_discovery_api::detectors::resolve_binary_path;
+        assert_eq!(resolve_binary_path(&runner, "claude").await, None);
+        assert_eq!(resolve_binary_path(&runner, DUMMY_CREW_BINARY).await, Some(PathBuf::from("/usr/local/bin/flotilla-dummy-crew")));
     }
 }
