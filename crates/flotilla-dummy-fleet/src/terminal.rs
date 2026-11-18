@@ -757,6 +757,7 @@ mod tests {
                 fail_rate: if failed { 1.0 } else { 0.0 },
                 stall_rate: if stalled { 1.0 } else { 0.0 },
                 long_runner_turns: 1,
+                ..DummyAgentConfig::default()
             };
             let fleet = DummyFleet::new(DummyFleetConfig { agent, ..DummyFleetConfig::default() });
             let (commands, mut recorded) = mpsc::unbounded_channel();
@@ -856,7 +857,7 @@ mod tests {
         let mut token = tempfile::NamedTempFile::new().expect("token file");
         write!(token, "wrong").expect("write token");
         let config = DummyFleetConfig {
-            agent: DummyAgentConfig { turn_delay_ms: 1_500, fail_rate: 0.0, stall_rate: 0.0, long_runner_turns: 1 },
+            agent: DummyAgentConfig { turn_delay_ms: 1_500, long_runner_turns: 1, ..DummyAgentConfig::default() },
             shared_forge: Some(DummySharedForgeConfig {
                 service_url: fake.service_url("github"),
                 endpoint_url: None,
@@ -914,7 +915,7 @@ mod tests {
     async fn a_fleet_opened_from_its_state_file_resumes_where_it_stopped() {
         let state = tempfile::tempdir().expect("state directory");
         let config = DummyFleetConfig {
-            agent: DummyAgentConfig { turn_delay_ms: 1_500, fail_rate: 0.0, stall_rate: 0.0, long_runner_turns: 1 },
+            agent: DummyAgentConfig { turn_delay_ms: 1_500, long_runner_turns: 1, ..DummyAgentConfig::default() },
             ..DummyFleetConfig::default()
         };
         let port = || {

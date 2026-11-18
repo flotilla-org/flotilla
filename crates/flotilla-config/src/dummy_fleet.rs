@@ -10,6 +10,9 @@
 //! The fleet stands in for systems that outlive the daemon (vendors, cleat,
 //! forges), and keeps their state in a file it writes behind by up to 100 ms.
 //! A graceful stop writes it all out; a crash (`kill -9`) may lose that much.
+//!
+//! Dummy crews spend a configured time per turn, so a run on them measures
+//! flotilla's own work at scale, not harness latency.
 
 use serde::{Deserialize, Deserializer, Serialize};
 
@@ -106,6 +109,11 @@ pub struct DummyAgentConfig {
     /// unconfirmed, as they would for a real harness that idled at once.
     #[serde(default = "default_turn_delay_ms")]
     pub turn_delay_ms: u64,
+    /// Up to this much more on each turn, drawn per turn, so turns differ in length as a real
+    /// harness's do. The draw is fake: a run on dummy crews does not measure harness latency, and
+    /// its timings say nothing about a real agent's.
+    #[serde(default)]
+    pub turn_delay_spread_ms: u64,
     /// Probability that a crew stalls instead of finishing its script.
     #[serde(default, deserialize_with = "deserialize_rate")]
     pub stall_rate: f64,
@@ -119,7 +127,13 @@ pub struct DummyAgentConfig {
 
 impl Default for DummyAgentConfig {
     fn default() -> Self {
-        Self { turn_delay_ms: default_turn_delay_ms(), stall_rate: 0.0, fail_rate: 0.0, long_runner_turns: default_long_runner_turns() }
+        Self {
+            turn_delay_ms: default_turn_delay_ms(),
+            turn_delay_spread_ms: 0,
+            stall_rate: 0.0,
+            fail_rate: 0.0,
+            long_runner_turns: default_long_runner_turns(),
+        }
     }
 }
 

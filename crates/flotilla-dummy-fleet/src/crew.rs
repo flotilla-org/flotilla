@@ -28,6 +28,7 @@ use std::{
 };
 
 use flotilla_agent::adapter::KEPT_PROMISES_HEADING;
+use flotilla_config::dummy_fleet::DummyFleetConfig;
 use flotilla_environment::environment::dummy::dummy_draw;
 use flotilla_protocol::{
     commands::{CommandValue, CrewPromiseOperation, CrewSupervisionAction, StallProposedDisposition, StallReason},
@@ -684,9 +685,18 @@ impl Crew {
 
     async fn think(&self) {
         if !self.resuming() {
-            tokio::time::sleep(Duration::from_millis(self.fleet.config.agent.turn_delay_ms)).await;
+            let turns = self.session.record().turns.len();
+            tokio::time::sleep(turn_length(&self.fleet.config, &self.session.name, turns)).await;
         }
     }
+}
+
+/// A turn's time: `turn_delay_ms`, plus a draw over `turn_delay_spread_ms` by the session and how
+/// many turns it has had, so turns differ in length yet a replay spends the same.
+fn turn_length(config: &DummyFleetConfig, session: &str, turns: usize) -> Duration {
+    let agent = &config.agent;
+    let spread = dummy_draw(config.seed, "turn-length", &format!("{session}#{turns}")) * agent.turn_delay_spread_ms as f64;
+    Duration::from_millis(agent.turn_delay_ms + spread as u64)
 }
 
 /// Delivered turns are framed `[from <sender> (<relation>)…]`; a peer's
@@ -742,6 +752,24 @@ fn shell_words(line: &str) -> Vec<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // Turns take the configured delay plus a per-turn draw over the spread: lengths vary across
+    // turns and sessions, stay within the bounds, and are the same for the same turn. Without a
+    // spread every turn takes the delay.
+    #[test]
+    fn turn_lengths_spread_over_the_configured_range() {
+        let mut config = DummyFleetConfig::default();
+        config.agent.turn_delay_ms = 1_500;
+        let lengths = |config: &DummyFleetConfig| {
+            (0..50).flat_map(|turn| ["a", "b"].map(|session| turn_length(config, session, turn).as_millis())).collect::<Vec<_>>()
+        };
+        assert!(lengths(&config).iter().all(|&length| length == 1_500));
+        config.agent.turn_delay_spread_ms = 3_000;
+        let spread = lengths(&config);
+        assert!(spread.iter().all(|&length| (1_500..4_500).contains(&length)), "{spread:?}");
+        assert!(spread.iter().collect::<std::collections::BTreeSet<_>>().len() > 40, "lengths vary: {spread:?}");
+        assert_eq!(spread, lengths(&config), "the same turn takes the same time");
+    }
 
     #[test]
     fn a_supervisor_reads_the_resume_command_off_a_stall_turn() {
