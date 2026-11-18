@@ -2361,6 +2361,11 @@ impl InProcessDaemon {
             Err(_) => reads,
         };
         self.lifecycle_reads.install(Arc::clone(&reads))?;
+        // A checkout still to be released keeps demanding the change request it is judged against.
+        self.change_request_observer.install_checkouts(
+            Arc::new(flotilla_observation::change_request_observer::EngineUnreleasedCheckouts(Arc::clone(&reads))),
+            &action_namespace::provisioning_namespace(&self.provisioning_namespace),
+        )?;
         // The old store's Clone and Environment reads are served from the engine's records.
         self.resource_backend.install_engine_records(Arc::new(flotilla_store::LifecycleViews::new(Arc::clone(&reads))));
         // The old store's TerminalSession, Vessel and Convoy reads are served from the engine's launches.
