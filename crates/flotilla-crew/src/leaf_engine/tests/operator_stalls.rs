@@ -102,6 +102,53 @@ async fn a_declared_stall_with_no_row_reaches_the_operator() {
     }
 }
 
+// Run 4 R4-6: a coder whose PR was closed without merging stalls with its promise rejected, and
+// only a person's verdict keeps or retracts that promise. The attention that reaches the operator
+// names both verdicts as runnable commands with the convoy's and the promise's real names.
+#[tokio::test]
+async fn an_operator_stall_over_a_rejected_promise_names_its_verdict_commands() {
+    use flotilla_resources::convoy::engine::Actor;
+    use flotilla_resources::promises::{PromiseKind, PromiseOperation, PromiseSource, Submission, SubmissionVerdict};
+
+    let case = unsupervised_launch().await;
+    let engine = case.home.engine();
+    let (id, reference, submitted_at) = ("pr-18", "cr/github.com/team/one/18".to_string(), Utc::now());
+    let declare = PromiseOperation::Declare { id: id.into(), kind: PromiseKind::Pr, source: PromiseSource::Crew };
+    engine.promise(&case.convoy().await, "work", "coder", &declare, Actor::Crew).await.expect("the coder declares its PR");
+    let submission =
+        Submission { reference: reference.clone(), metadata: BTreeMap::new(), submitted_at: Some(submitted_at), verdict: None };
+    let submit = PromiseOperation::Submit { id: id.into(), kind: PromiseKind::Pr, source: PromiseSource::Crew, submission };
+    engine.promise(&case.convoy().await, "work", "coder", &submit, Actor::Crew).await.expect("the coder submits its PR");
+    let verdict = SubmissionVerdict { accepted: false, who: "forge".into(), at: submitted_at, why: "closed-unmerged".into() };
+    let reject = PromiseOperation::Verdict { id: id.into(), reference, submitted_at: Some(submitted_at), verdict };
+    engine.promise(&case.convoy().await, "work", "coder", &reject, Actor::Observer).await.expect("the forge rejects it");
+    let work = case.work.clone();
+    case.note(|status| {
+        external_patches::mark_crew_stalled(
+            work,
+            "work".into(),
+            "coder".into(),
+            Utc::now(),
+            flotilla_resources::StallReason::Decision,
+            None,
+            "my PR was closed without merging".into(),
+        )
+        .apply(status)
+    })
+    .await;
+    case.judge(&case.wake, Utc::now()).await;
+
+    let told = stall_attentions(&case).await;
+    let [attention] = told.as_slice() else { panic!("the operator is told once: {told:?}") };
+    assert!(attention.reason.contains("Its promise pr-18 was rejected"), "{}", attention.reason);
+    for verb in ["retract", "keep"] {
+        let command = format!("`flotilla convoy '{}' promise 'pr-18' {verb} --reason 'reason'`", case.work);
+        assert!(attention.reason.contains(&command), "{}", attention.reason);
+    }
+    // The supervise commands stay: resuming the crew is still a way out.
+    assert!(attention.reason.contains("flotilla crew supervise"), "{}", attention.reason);
+}
+
 // #3108: a stall that reaches the operator with no person named tells one: one open attention for
 // the stalled seat, however often it is judged, withdrawn when the crew works again.
 #[tokio::test]

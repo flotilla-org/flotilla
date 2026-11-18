@@ -438,6 +438,35 @@ pub(super) fn stall_supervision_brief(convoy: &ResourceObject<Convoy>, condition
             )
             .expect("writing to a String cannot fail");
         }
+        // A promise whose latest submission was rejected (a PR closed without merging) is kept
+        // or retracted only by a person's verdict: name both, with their real arguments. A
+        // rejection reopens a submitted promise, so an open promise with a submission is one; the
+        // view carries the verdict's reason only where it read the convoy's log.
+        let status = convoy.status.as_ref();
+        let rejected = status
+            .map(|status| flotilla_resources::convoy::promises::owned(status, vessel, role))
+            .unwrap_or_default()
+            .iter()
+            .filter(|promise| promise.state == flotilla_resources::convoy::promises::PromiseState::Open)
+            .filter_map(|promise| Some((promise, promise.submissions.last()?)));
+        for (promise, submission) in rejected {
+            let why = submission
+                .verdict
+                .as_ref()
+                .filter(|verdict| !verdict.accepted)
+                .map_or(String::new(), |verdict| format!(" ({})", verdict.why));
+            write!(brief, "\nIts promise {} was rejected{why}: retract it, or keep it, by your verdict.", promise.id)
+                .expect("writing to a String cannot fail");
+            for verb in ["retract", "keep"] {
+                write!(
+                    brief,
+                    "\n`flotilla convoy {} promise {} {verb} --reason 'reason'`",
+                    shell_quote(&convoy.metadata.name),
+                    shell_quote(&promise.id),
+                )
+                .expect("writing to a String cannot fail");
+            }
+        }
     }
     brief
 }
