@@ -176,10 +176,9 @@ pub(super) struct Deliveries {
     delivered: StdMutex<BTreeMap<String, u64>>,
     sequence: AtomicU64,
     every_in_flight: std::sync::atomic::AtomicUsize,
-    /// The credential grants by name, as their watch last left them; none until first read.
+    /// The credential grants by name, as the start's reading or their watch last left them; none
+    /// while neither holds them current, as when the watch is closed.
     grants: AsyncMutex<Option<BTreeMap<String, CredentialGrantSpec>>>,
-    /// The grant watch stopped: nothing keeps held grants current.
-    grants_unfollowed: std::sync::atomic::AtomicBool,
 }
 
 fn locked<T>(mutex: &StdMutex<T>) -> MutexGuard<'_, T> {
@@ -218,7 +217,6 @@ impl CredentialDelivery {
             sequence: AtomicU64::new(0),
             every_in_flight: std::sync::atomic::AtomicUsize::new(0),
             grants: AsyncMutex::new(None),
-            grants_unfollowed: std::sync::atomic::AtomicBool::new(false),
         });
         *locked(&events.deliveries) = Arc::downgrade(&deliveries);
         Some(Self {
@@ -236,6 +234,11 @@ impl CredentialDelivery {
     /// The start pass: delivers every environment some vessel stands on or this daemon delivered
     /// to, adopting running crews' GitHub App tokens again, and tells refresh failures.
     pub(super) async fn start(&mut self) -> Result<(), String> {
+        // The start's one reading of the grants; their watch keeps them current from `run`.
+        match self.deliveries.list_grants().await {
+            Ok(listed) => *self.deliveries.grants.lock().await = Some(listed),
+            Err(error) => warn!(%error, "credential delivery could not read the credential grants; their watch reads them when it opens"),
+        }
         let result = self.deliveries.deliver_every(true).instrument(info_span!("credential_delivery.start")).await;
         self.tell_refresh_failures().await;
         result
@@ -676,17 +679,14 @@ impl Deliveries {
         Ok(wanted)
     }
 
-    /// The credential grants as held, read whole only when none are held yet: at the start, or
-    /// after their watch could not read them again.
+    /// The credential grants as held. None held (the watch not open, and no start reading) fails
+    /// the delivery, which its environment's backoff retries: no stale grants, no scan.
     async fn grants(&self) -> Result<Vec<CredentialGrantSpec>, String> {
-        if self.grants_unfollowed.load(Ordering::SeqCst) {
-            return Ok(self.list_grants().await?.into_values().collect());
-        }
-        let mut held = self.grants.lock().await;
-        if held.is_none() {
-            *held = Some(self.list_grants().await?);
-        }
-        Ok(held.iter().flat_map(BTreeMap::values).cloned().collect())
+        let held = self.grants.lock().await;
+        let held = held
+            .as_ref()
+            .ok_or_else(|| "credential grants are not held: the credential grant watch is not open; delivery retries".to_string())?;
+        Ok(held.values().cloned().collect())
     }
 
     async fn list_grants(&self) -> Result<BTreeMap<String, CredentialGrantSpec>, String> {
@@ -717,28 +717,31 @@ fn joined(results: Vec<Result<(), String>>) -> Result<(), String> {
 
 /// Keeps the held credential grants in step with their changes, local or replicated, and wakes a
 /// redelivery of every environment for each. The grants are read whole once each time the watch
-/// opens, as it may have missed changes; each change after is applied by its name.
+/// opens, as it may have missed changes; each change after is applied by its name. While the
+/// watch is closed none are held, and it is reopened at a capped backoff for as long as it runs.
 async fn watch_grants(backend: flotilla_store::ResourceBackend, deliveries: Arc<Deliveries>) {
     let mut failures = 0_u32;
+    // The grants as the watch last saw them, so reopening wakes deliveries only for a change.
+    let mut seen = deliveries.grants.lock().await.clone();
     loop {
         match backend.including_replicas::<CredentialGrant>(&deliveries.namespace).watch().await {
             Ok(mut changes) => {
                 // Opened after the reading below could miss nothing: the watch holds what follows.
                 match deliveries.list_grants().await {
                     Ok(listed) => {
-                        let mut held = deliveries.grants.lock().await;
-                        if held.as_ref() != Some(&listed) {
-                            // A first reading at the start changed nothing the start pass did not see.
-                            let changed = held.is_some();
-                            *held = Some(listed);
-                            if changed {
-                                deliveries.events.record(|pending| pending.definitions = true);
-                            }
+                        let changed = seen.as_ref() != Some(&listed);
+                        seen = Some(listed.clone());
+                        *deliveries.grants.lock().await = Some(listed);
+                        if changed {
+                            deliveries.events.record(|pending| pending.definitions = true);
                         }
                     }
                     Err(error) => {
-                        debug!(%error, "credential delivery could not read the credential grants; the next delivery reads them");
-                        *deliveries.grants.lock().await = None;
+                        // Without a reading the watch cannot keep grants current: reopen it.
+                        warn!(%error, "credential delivery could not read the credential grants; reopening their watch");
+                        failures = failures.saturating_add(1);
+                        tokio::time::sleep(RETRY_INITIAL.min(Duration::from_secs(u64::from(failures)))).await;
+                        continue;
                     }
                 }
                 while let Some(change) = changes.next().await {
@@ -750,34 +753,29 @@ async fn watch_grants(backend: flotilla_store::ResourceBackend, deliveries: Arc<
                         }
                     };
                     failures = 0;
-                    {
-                        let mut held = deliveries.grants.lock().await;
-                        if let Some(held) = held.as_mut() {
-                            match change {
-                                ReadWatchEvent::Added(read) | ReadWatchEvent::Modified(read) => {
-                                    held.insert(read.object.metadata.name, read.object.spec);
-                                }
-                                ReadWatchEvent::Deleted(read) => {
-                                    held.remove(&read.object.metadata.name);
-                                }
-                                ReadWatchEvent::DeletedByName { tombstone, .. } => {
-                                    held.remove(&tombstone.name);
-                                }
-                            }
+                    let held = seen.get_or_insert_default();
+                    match change {
+                        ReadWatchEvent::Added(read) | ReadWatchEvent::Modified(read) => {
+                            held.insert(read.object.metadata.name, read.object.spec);
+                        }
+                        ReadWatchEvent::Deleted(read) => {
+                            held.remove(&read.object.metadata.name);
+                        }
+                        ReadWatchEvent::DeletedByName { tombstone, .. } => {
+                            held.remove(&tombstone.name);
                         }
                     }
+                    *deliveries.grants.lock().await = Some(held.clone());
                     deliveries.events.record(|pending| pending.definitions = true);
                 }
             }
             Err(error) => debug!(%error, "credential delivery grant watch did not open"),
         }
+        // Closed, changes go unseen: hold no grants until the watch reopens and reads them.
+        *deliveries.grants.lock().await = None;
         failures = failures.saturating_add(1);
-        if failures > WATCH_RETRY_LIMIT {
-            // Held grants would go stale unseen: each delivery reads them whole from now on.
-            deliveries.grants_unfollowed.store(true, Ordering::SeqCst);
-            *deliveries.grants.lock().await = None;
-            warn!(failures, "credential delivery stops watching credential grants; other events still wake it");
-            return;
+        if failures == WATCH_RETRY_LIMIT {
+            warn!(failures, "credential delivery keeps failing to watch credential grants; deliveries needing them fail until it opens");
         }
         tokio::time::sleep(RETRY_INITIAL.min(Duration::from_secs(u64::from(failures)))).await;
     }

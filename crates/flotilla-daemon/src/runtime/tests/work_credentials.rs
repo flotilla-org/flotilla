@@ -560,6 +560,14 @@ async fn a_handoffs_credential_delivery_does_not_wait_behind_other_environments(
     let delivery = CredentialDelivery::new(Arc::clone(&fixture.state)).expect("a credential store");
     let _controller = AbortOnDropHandle::new(tokio::spawn(delivery.run(fixture.state.controller_metrics.for_kind("CredentialDelivery"))));
     let reconciler = fixture.reconciler();
+    // Deliveries fail until the grant watch opens and holds the grants.
+    tokio::time::timeout(Duration::from_secs(10), async {
+        while reconciler.reconcile(NAMESPACE, "env-a").await.is_err() {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .expect("the grant watch opens");
     let stuck = (0..STUCK)
         .map(|index| {
             let reconciler = Arc::clone(&reconciler);
@@ -602,7 +610,9 @@ async fn a_deliverys_reads_do_not_grow_with_unrelated_environments() {
     let fixture = KeyedDelivery::new("credential-keyed-reads").await;
     fixture.work("measured-work", "env-a").await;
     fixture.work("other-work-0", "env-other-0").await;
-    let _delivery = CredentialDelivery::new(Arc::clone(&fixture.state)).expect("a credential store");
+    let mut delivery = CredentialDelivery::new(Arc::clone(&fixture.state)).expect("a credential store");
+    // The start reads the grants once; `env-other-0` has no runner here, so the start reports it.
+    let _ = delivery.start().await;
     let reconciler = fixture.reconciler();
     let reads = Arc::clone(&fixture.state.controller_metrics.for_kind("CredentialDelivery").reads);
     let measured = || async {
@@ -610,7 +620,7 @@ async fn a_deliverys_reads_do_not_grow_with_unrelated_environments() {
         reconciler.reconcile(NAMESPACE, "env-a").await.expect("deliver the measured environment");
         flotilla_store::load_metrics::counts_since(&reads.snapshot(), &before)
     };
-    // The first delivery reads the credential grants once; they are held after.
+    // The first delivery stages the material; later ones find it staged.
     measured().await;
     let few = measured().await;
     for index in 1..16 {
