@@ -120,6 +120,13 @@ fn namespace_lifecycles(source: &Source, namespace: &str, target: &mut Import, c
     // created under that launch's version. One whose convoy ended is not: nothing would release
     // it. One whose convoy imports as no open launch at that home is refused with why (#3108).
     let convoy_code = <Resource<EngineConvoy> as Kind>::CODE;
+    // Every home's ended convoys, as the source holds them: a checkout here may be held for a
+    // convoy homed at another, which that home imports.
+    let ended: BTreeSet<(&str, &str)> = convoys
+        .iter()
+        .filter(|convoy| convoy.object.status.as_ref().is_some_and(|status| status.phase.is_terminal()))
+        .map(|convoy| (convoy.home.as_str(), convoy.object.metadata.name.as_str()))
+        .collect();
     for record in
         source.owned::<Checkout>("checkouts", namespace, "Checkout", target, report).into_iter().map(|record| (record.object, record.home))
     {
@@ -135,7 +142,9 @@ fn namespace_lifecycles(source: &Source, namespace: &str, target: &mut Import, c
         if let Some(convoy) = record.0.metadata.labels.get(CONVOY_LABEL).filter(|convoy| holder(convoy).is_none()) {
             // Nothing on the engine reacts to an imported end, so nothing would release it. The
             // first-start counts say how many, by end.
-            if carried.ended.contains_key(&(convoy_home.clone(), convoy.clone())) {
+            if carried.ended.contains_key(&(convoy_home.clone(), convoy.clone()))
+                || ended.contains(&(convoy_home.as_str(), convoy.as_str()))
+            {
                 report.drop_rows("Checkout", "an orphaned worktree left on disk: held for an ended convoy", 1);
                 continue;
             }

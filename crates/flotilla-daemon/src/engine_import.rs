@@ -485,22 +485,36 @@ fn tombstoned(source: &Source, launches: ImportedLaunches) -> ImportedLaunches {
         })
         .collect();
     let homes: BTreeSet<&str> = source.rows.iter().map(|row| row.home.as_str()).collect();
-    let mut named = BTreeMap::<String, (BTreeSet<&str>, Option<chrono::DateTime<chrono::Utc>>)>::new();
+    // By record: the homes whose records name it, the projects they address it under, and the
+    // earliest of their creation times.
+    type Named<'a> = (BTreeSet<&'a str>, BTreeSet<String>, Option<chrono::DateTime<chrono::Utc>>);
+    let mut named = BTreeMap::<String, Named<'_>>::new();
     for home in homes {
         let Ok(mut scratch) = Import::in_memory(home, registry.clone()) else { continue };
         let mut summary = Summary::default();
         steps(source, &mut scratch, launches.clone(), &mut summary);
         for refusal in &summary.refusals {
             let Some(record) = NoLaunch::not_held_in(&refusal.reason) else { continue };
-            let (homes, earliest) = named.entry(record.to_owned()).or_default();
+            let (homes, projects, earliest) = named.entry(record.to_owned()).or_default();
             homes.insert(home);
+            projects.extend(NoLaunch::not_held_under(&refusal.reason));
             if let Some(at) = created.get(&(refusal.kind.as_str(), home, refusal.name.clone())) {
                 *earliest = Some(earliest.map_or(*at, |earliest| earliest.min(*at)));
             }
         }
     }
-    named.into_iter().fold(launches, |launches, (record, (homes, earliest))| match (homes.first(), earliest) {
-        (Some(home), Some(earliest)) => launches.with_tombstone(DEFAULT_PROVISIONING_NAMESPACE, &record, home, earliest),
+    named.into_iter().fold(launches, |launches, (record, (homes, projects, earliest))| match (homes.first(), earliest) {
+        // Under the one project its records address it under. The old store spells a convoy whose
+        // record it lacks under the namespace, so that spelling is no evidence of its own. Records
+        // that disagree leave the namespace's, and those addressed under another are refused.
+        (Some(home), Some(earliest)) => {
+            let named: Vec<&String> = projects.iter().filter(|project| *project != DEFAULT_PROVISIONING_NAMESPACE).collect();
+            let project = match named.as_slice() {
+                [project] => Some(project.as_str()),
+                _ => None,
+            };
+            launches.with_tombstone(DEFAULT_PROVISIONING_NAMESPACE, &record, project, home, earliest)
+        }
         // With no dependent's time it is not made, and its dependents are refused as before.
         _ => launches,
     })

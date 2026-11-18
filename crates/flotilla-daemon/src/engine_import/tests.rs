@@ -680,12 +680,25 @@ fn a_checkout_held_for_a_convoy_with_no_launch_is_refused() {
         held
     };
     let unbooted = document("Convoy", "unbooted", json!({"workflow_ref": "w", "inputs": {}}), Value::Null);
-    let documents = vec![clone("clone-a"), unbooted, held_for("held-for-unbooted", "unbooted"), held_for("held-for-gone", "gone")];
+    // Held here for a convoy another home holds, which ended there: left on disk as one held for
+    // an ended convoy here is.
+    let mut held_there = held_for("held-for-landed-there", "landed-there");
+    held_there["metadata"]["annotations"] = json!({ (flotilla_resources::ACTUATOR_SOURCE_ROOT_ANNOTATION): THERE });
+    let landed_there = homed(THERE, ended_convoy("landed-there", "Landed", "2026-10-19T01:00:00Z", json!({"disposition": "merged"})));
+    let documents = vec![
+        clone("clone-a"),
+        unbooted,
+        held_for("held-for-unbooted", "unbooted"),
+        held_for("held-for-gone", "gone"),
+        landed_there,
+        held_there,
+    ];
     let summary = rehearse(&rows(documents), HERE);
     assert_eq!(refused(&summary), [("Checkout", "held-for-unbooted")], "{summary:?}");
     assert_eq!(summary.tallies["Checkout"].get("refused: names a convoy that never bootstrapped"), Some(&1), "{summary:?}");
     let drops = &summary.rows["Checkout"].drops;
     assert_eq!(drops.get("an orphaned worktree left on disk: held for a convoy gone before import"), Some(&1), "{summary:?}");
+    assert_eq!(drops.get("an orphaned worktree left on disk: held for an ended convoy"), Some(&1), "{summary:?}");
 }
 
 #[test]
@@ -939,8 +952,9 @@ fn ended_convoys_import_with_their_end_and_retire_unless_held() {
 }
 
 // Behaviour (#3108 import ruling (a)): records naming a convoy the old store's garbage collection
-// removed import against a tombstone, not as refusals. The tombstone is launch 1 of the name,
-// homed at the lowest home whose records name it and made at the earliest of their times, ended
+// removed import against a tombstone, not as refusals. The tombstone is launch 1 of the name, in
+// the project its records address it under, homed at the lowest home whose records name it and
+// made at the earliest of their times, ended
 // with its end time marked unknown and retired by the import. A message pending to it is settled
 // by the import. A convoy only another home's records name is that home's to write.
 #[test]
@@ -958,14 +972,23 @@ fn records_naming_a_convoy_the_old_store_lost_import_against_a_retired_tombstone
         named["metadata"]["creationTimestamp"] = json!(created);
         named
     };
+    // Addressed under its own project, not the namespace's: the tombstone is in that project. Its
+    // reference to the convoy, which the old store spells under the namespace for a convoy whose
+    // record it lacks, reads the tombstone too.
     let mut waiting = message("for-gone");
-    waiting["spec"]["receiver"] = json!("flotilla/gone/implement/coder");
+    waiting["spec"]["receiver"] = json!("elsewhere/gone/implement/coder");
+    let convoy = flotilla_protocol::ResourceRef::new("flotilla.work/v1", "Convoy", NS, "gone");
+    waiting["spec"]["references"] = json!([{"kind": "control_record", "resource": convoy, "revision": "1"}]);
+    let mut about = message("about-gone");
+    about["spec"]["receiver"] = json!("principal:alice");
+    about["spec"]["references"] = waiting["spec"]["references"].clone();
     let documents = vec![
         designation(),
         named("brief-gone", "gone", "2026-10-18T00:00:00Z"),
         homed(THERE, named("brief-gone-there", "gone", "2026-10-17T00:00:00Z")),
         homed(THERE, named("brief-lost", "lost", "2026-10-17T00:00:00Z")),
         waiting,
+        about,
     ];
     let dir = tempfile::tempdir().expect("tempdir");
     let mut target =
@@ -999,7 +1022,8 @@ fn records_naming_a_convoy_the_old_store_lost_import_against_a_retired_tombstone
     let page = read.scan::<EngineConvoyResource>(HERE, None, 64).expect("scan");
     assert_eq!(page.ids.len(), 1, "`lost` is only another home's records' to name, so that home writes it");
 
-    let record = "project:flotilla/convoy:gone%231/role:coder/message:for-gone";
+    assert_eq!(tombstone.spec().project.as_str(), "project:elsewhere");
+    let record = "project:elsewhere/convoy:gone%231/role:coder/message:for-gone";
     let id = read.resolve(<MessageResource as Kind>::CODE, record, HERE).expect("resolve").expect("the message");
     let message = read.load::<MessageResource>(id).expect("load").expect("held").value;
     assert!(matches!(message.state(), MessageState::Dropped { reason: DropReason::Withdrawn { .. }, .. }), "{:?}", message.state());

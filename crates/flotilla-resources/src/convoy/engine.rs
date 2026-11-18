@@ -421,6 +421,15 @@ impl NoLaunch {
         }
         reason.strip_suffix("`)")?.rsplit_once("(`").map(|(_, record)| record)
     }
+
+    /// The project a [`Self::not_held_in`] reason names its convoy under, when it quotes an
+    /// address first that names one: what the record was addressed to.
+    pub fn not_held_under(reason: &str) -> Option<String> {
+        Self::not_held_in(reason)?;
+        let address: flotilla_address::Address = reason.split('`').nth(1)?.parse().ok()?;
+        address.get(flotilla_address::Kind::Convoy)?;
+        address.get(flotilla_address::Kind::Project).map(str::to_owned)
+    }
 }
 
 impl std::fmt::Display for NoLaunch {
@@ -514,12 +523,21 @@ impl ImportedLaunches {
 
     /// These launches with a tombstone for convoy `record` in `namespace`, which records name and
     /// the old store no longer holds (#3108 import ruling (a)): launch 1 of its name homed at
-    /// `home`, or the name's next free number when another record takes 1, in the namespace's
-    /// project, made at `earliest_dependent`. Every record naming it names that launch.
-    pub fn with_tombstone(self, namespace: &str, record: &str, home: &str, earliest_dependent: chrono::DateTime<chrono::Utc>) -> Self {
+    /// `home`, or the name's next free number when another record takes 1, in `project`, the one
+    /// its records address it under, else the namespace's, made at `earliest_dependent`. Every
+    /// record naming it names that launch.
+    pub fn with_tombstone(
+        self,
+        namespace: &str,
+        record: &str,
+        project: Option<&str>,
+        home: &str,
+        earliest_dependent: chrono::DateTime<chrono::Utc>,
+    ) -> Self {
         let taken: Vec<u64> = self.numbered.iter().filter(|(of, _)| of == record).map(|(_, n)| *n).collect();
         let n = if taken.contains(&1) { taken.iter().max().copied().unwrap_or_default() + 1 } else { 1 };
-        let launch = ImportedLaunch { home: home.to_owned(), project: namespace.to_owned(), of: record.to_owned(), n };
+        let project = project.unwrap_or(namespace).to_owned();
+        let launch = ImportedLaunch { home: home.to_owned(), project, of: record.to_owned(), n };
         let mut this = self.with(namespace, record, launch.clone());
         this.tombstones.insert((namespace.to_owned(), record.to_owned()), Tombstone { launch, earliest_dependent });
         this
@@ -595,6 +613,11 @@ impl ImportedLaunches {
             [] => Address::project(&launch.project).map_err(|error| error.to_string()).and_then(|project| launch_address(&project, &name)),
             [project] if project.kind() == Kind::Project && project.value() == launch.project => {
                 Address::project(project.value()).map_err(|error| error.to_string()).and_then(|project| launch_address(&project, &name))
+            }
+            // The old store spells a convoy whose record it lacks under the namespace: for a
+            // tombstone that is its fallback, not another project.
+            [project] if project.kind() == Kind::Project && project.value() == namespace && self.is_tombstone(namespace, record) => {
+                Address::project(&launch.project).map_err(|error| error.to_string()).and_then(|project| launch_address(&project, &name))
             }
             _ => Err(format!("the convoy is not under its project `{}`", launch.project)),
         }

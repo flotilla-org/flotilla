@@ -296,7 +296,7 @@ fn map(
     conversion: &Conversion<'_>,
     records: &DemandRecords<'_>,
 ) -> Result<Mapped, String> {
-    let attention = |cause, reason, project: Option<String>| {
+    let attention = |cause, reason, project: String| {
         Mapped::Attention(Box::new(Pending {
             id: record.metadata.name.clone(),
             attention: Attention { cause, reason },
@@ -305,13 +305,13 @@ fn map(
         }))
     };
     // A convoy the old store no longer holds is read as its tombstone (#3108 import ruling (a)).
-    // Its own project is unknown, so its attention goes where a convoy with none sends one.
-    let convoy = |name: &str| -> Result<Option<(Option<String>, Read)>, String> {
+    // Its attention goes to the project the tombstone is under.
+    let convoy = |name: &str| -> Result<Option<(String, Read)>, String> {
         if let Some(convoy) = records.convoys.get(name) {
             return Ok(Some((convoy.spec.project_ref.clone(), convoy_read(convoy, conversion)?)));
         }
         let Some(tombstone) = records.tombstones.get(name) else { return Ok(None) };
-        Ok(Some((None, tombstone_read(tombstone)?)))
+        Ok(Some((tombstone.project.clone(), tombstone_read(tombstone)?)))
     };
     match writer {
         Writer::Delivery { session } => {
