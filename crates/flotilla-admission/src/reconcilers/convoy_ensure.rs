@@ -640,9 +640,29 @@ impl EnsurePass<'_> {
         }
         if let Some(name) = &ensure.spec.placement_policy {
             let kinds = self.resource_backend.including_replicas::<FulfilmentKind>(namespace);
-            let version =
-                kinds.get(name).await.map(|kind| kind.object.metadata.resource_version).unwrap_or_else(|error| format!("absent:{error}"));
-            versions.insert(format!("FulfilmentKind/{name}"), version);
+            match kinds.get(name).await {
+                Ok(kind) => {
+                    versions.insert(format!("FulfilmentKind/{name}"), kind.object.metadata.resource_version.clone());
+                    // The harnesses the placement's host publishes for it, as admission reads
+                    // them: an adapter refusal ends once they change, and no other host
+                    // observation resets the refusals.
+                    let adapters = match crate::convoy_admission::placement_agent_adapters(
+                        self.resource_backend,
+                        namespace,
+                        &kind.object,
+                        false,
+                    )
+                    .await
+                    {
+                        Ok((adapters, detail)) => format!("{adapters:?} ({detail})"),
+                        Err(refused) => format!("refused:{refused}"),
+                    };
+                    versions.insert(format!("PlacementAdapters/{name}"), adapters);
+                }
+                Err(error) => {
+                    versions.insert(format!("FulfilmentKind/{name}"), format!("absent:{error}"));
+                }
+            }
         }
         let encoded = serde_json::to_vec(&versions).map_err(|error| format!("serialize ensure admission dependencies: {error}"))?;
         Ok(format!("{:x}", Sha256::digest(encoded)))
@@ -1658,6 +1678,63 @@ mod tests {
         controller.reap_ensured_convoy(&admission, "test", "standing", "absent#9", false).await.expect("fixture operation succeeds");
         assert_eq!(admission.reaps.load(Ordering::SeqCst), 1);
     }
+    // d9: a role refused because its pinned placement's host had not yet published the harness
+    // is admitted on the next pass once the host publishes it, not at the refusal's deadline.
+    // A host observation that leaves the placement's harnesses as they were changes nothing.
+    #[tokio::test]
+    async fn a_placement_harness_published_ends_the_refusal_wait() {
+        use flotilla_resources::{
+            FulfilmentFacts, FulfilmentKindSpec, FulfilmentRealisation, HarnessFacts, Host, HostSpec, HostStatus, PlacementImageSource,
+        };
+        let (controller, admission, _clock) = fixture().await;
+        let hosts = admission.backend.using::<Host>("test");
+        let host = hosts.create(&InputMeta::builder().name("home".into()).build(), &HostSpec::default()).await.expect("host");
+        hosts.update_status("home", &host.metadata.resource_version, &HostStatus::default()).await.expect("host observed");
+        admission
+            .backend
+            .using::<FulfilmentKind>("test")
+            .create(
+                &InputMeta::builder().name("crews".into()).build(),
+                &FulfilmentKindSpec::builder()
+                    .host_ref("home".into())
+                    .pool("pool".into())
+                    .realisation(FulfilmentRealisation::DockerPerVessel {
+                        image: Some(PlacementImageSource::Literal("crew:pinned".into())),
+                    })
+                    .build(),
+            )
+            .await
+            .expect("placement");
+        let ensures = admission.backend.using::<ConvoyEnsure>("test");
+        let ensure = ensures.get("standing").await.expect("ensure fixture");
+        let pinned = ConvoyEnsureSpec { placement_policy: Some("crews".into()), ..ensure.spec.clone() };
+        ensures.update(&InputMeta::from(&ensure.metadata), &ensure.metadata.resource_version, &pinned).await.expect("pinned");
+
+        admission.refused.store(true, Ordering::SeqCst);
+        assert!(controller.reconcile_convoy_ensures_once_with_backing_inspector(&admission, "test", &Backing::Dead).await.is_err());
+        admission.refused.store(false, Ordering::SeqCst);
+
+        // An observation of something else: the refusal still waits for its deadline.
+        let observed = hosts.get("home").await.expect("host");
+        let mut status = HostStatus { daemon_generation: Some("other".into()), ..HostStatus::default() };
+        hosts.update_status("home", &observed.metadata.resource_version, &status).await.expect("host observed");
+        assert!(controller.reconcile_convoy_ensures_once_with_backing_inspector(&admission, "test", &Backing::Dead).await.is_ok());
+        assert_eq!(admission.commits.load(Ordering::SeqCst), 0, "waits while the placement's harnesses are unchanged");
+
+        // The host publishes the placement's harness: the next pass admits, the clock unmoved.
+        let observed = hosts.get("home").await.expect("host");
+        status.fulfilment_facts.insert(
+            "crews".into(),
+            FulfilmentFacts {
+                harnesses: [("standing".into(), HarnessFacts { version: "1".into(), models: Default::default() })].into(),
+                ..FulfilmentFacts::default()
+            },
+        );
+        hosts.update_status("home", &observed.metadata.resource_version, &status).await.expect("harness published");
+        controller.reconcile_convoy_ensures_once_with_backing_inspector(&admission, "test", &Backing::Dead).await.expect("admitted");
+        assert_eq!(admission.commits.load(Ordering::SeqCst), 1);
+    }
+
     // #2220: a named admission dependency arriving invalidates a refusal's
     // deadline and allows the next pass to retry immediately.
     #[tokio::test]
