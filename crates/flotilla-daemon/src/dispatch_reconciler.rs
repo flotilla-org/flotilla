@@ -58,11 +58,13 @@ struct PassIssueReads {
     issues: BTreeMap<IssueRef, Result<Issue, String>>,
 }
 
+type DispatchHistogram = LatencyHistogram<DispatchWait>;
+
 /// Time from ready to dispatch, by Project and workflow, for this process. Never evicted: both keys
 /// are operator-authored names, a small set.
 #[derive(Debug, Default)]
 pub(crate) struct DispatchMetrics {
-    time_from_ready: std::sync::Mutex<BTreeMap<(String, String), Arc<LatencyHistogram<DispatchWait>>>>,
+    time_from_ready: std::sync::Mutex<BTreeMap<(String, String), Arc<DispatchHistogram>>>,
 }
 
 impl DispatchMetrics {
