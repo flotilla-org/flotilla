@@ -34,7 +34,10 @@ use flotilla_protocol::{
     ConfigLabel, ConnectionRole, EnvironmentId, GoodbyeReason, HostName, Message, NodeId, PROTOCOL_FINGERPRINT, PROTOCOL_VERSION,
 };
 
-use flotilla_store::ResourceBackend;
+use flotilla_store::{
+    load_metrics::{attributed, caller as reads_caller},
+    ResourceBackend,
+};
 use flotilla_transport::message::{unix_message_session_with_prefix, MessageSession};
 use tokio::{
     net::UnixListener,
@@ -368,60 +371,72 @@ impl Drop for ClientActivityLease {
     }
 }
 
-impl DaemonServer {
-    pub fn environment_socket_service(&self) -> environment_sockets::EnvironmentSocketService {
-        let daemon = self.daemon.clone();
-        let router = self.remote_command_router.clone();
-        let client_count = self.client_count.clone();
-        let client_notify = self.client_notify.clone();
-        let shutdown = self.shutdown_rx.clone();
-        let http_router = self.http_router.clone();
-        let directory = flotilla_protocol::DaemonHostPath::new(self.socket_path.with_extension("env"));
-        environment_sockets::EnvironmentSocketService::new(
-            self.environment_sockets.clone(),
+/// What every connection to an environment socket is served with: the framed crew transport
+/// and the HTTP router, with the same caller rules, client-activity lease and shutdown. The
+/// daemon server owns one; a harness that composes a daemon without its main socket builds one
+/// for the environment sockets alone.
+#[derive(Clone)]
+pub struct EnvironmentFrontDoor {
+    daemon: Arc<InProcessDaemon>,
+    router: RemoteCommandRouter,
+    http_router: axum::Router,
+    client_count: Arc<AtomicUsize>,
+    client_notify: Arc<Notify>,
+    shutdown: watch::Receiver<bool>,
+    sockets: Arc<tokio::sync::Mutex<EnvironmentSocketRegistry>>,
+    directory: flotilla_protocol::DaemonHostPath,
+}
+
+impl EnvironmentFrontDoor {
+    /// A front door for `daemon` alone, whose sockets live under `directory`: its HTTP router
+    /// serves the hook routes with `hooks`, and its commands have no peers to route to.
+    pub fn for_daemon(
+        daemon: &Arc<InProcessDaemon>,
+        hooks: HookEndpoint,
+        directory: flotilla_protocol::DaemonHostPath,
+        shutdown: watch::Receiver<bool>,
+    ) -> Self {
+        let peer_manager = Arc::new(Mutex::new(PeerManager::new(daemon.node_id().clone())));
+        let router = build_remote_command_router(daemon, &peer_manager);
+        let logins = Arc::new(http::LoginStore::new(daemon.clock_for_scenarios()));
+        let http_router =
+            http::HttpRouter::for_daemon(Arc::clone(daemon), logins, http::ListenerOrigin::default()).with_hooks(hooks).into_router();
+        Self {
+            daemon: Arc::clone(daemon),
+            router,
+            http_router,
+            client_count: Arc::new(AtomicUsize::new(0)),
+            client_notify: Arc::new(Notify::new()),
+            shutdown,
+            sockets: Arc::new(tokio::sync::Mutex::new(EnvironmentSocketRegistry::new())),
             directory,
+        }
+    }
+
+    pub fn install_blob_store(&self, store: Arc<crate::blob_store::TieredBlobStore>) -> Result<(), String> {
+        self.router.install_blob_store(store)
+    }
+
+    /// What reads made while serving an environment socket's connection count for: the crew
+    /// transport's identity checks and requests, and hook posts' caller resolution.
+    const ENVIRONMENT_CONNECTIONS: &str = "environment connections";
+
+    pub fn socket_service(&self) -> environment_sockets::EnvironmentSocketService {
+        let front_door = self.clone();
+        environment_sockets::EnvironmentSocketService::new(
+            self.sockets.clone(),
+            self.directory.clone(),
             move |listener, environment, reach| {
-                let daemon = daemon.clone();
-                let router = router.clone();
-                let http_router = http_router.clone();
-                let client_count = client_count.clone();
-                let client_notify = client_notify.clone();
-                let mut shutdown = shutdown.clone();
+                let front_door = front_door.clone();
+                let mut shutdown = front_door.shutdown.clone();
                 tokio::spawn(async move {
                     let mut connections = JoinSet::new();
                     loop {
                         tokio::select! {
                             result = listener.accept() => match result {
                                 Ok((stream, _)) => {
-                                    let peer = caller::reach_evidence(reach, caller::socket_peer_credential(&stream));
-                                    let daemon = daemon.clone();
-                                    let router = router.clone();
-                                    let environment = environment.clone();
-                                    let shutdown = shutdown.clone();
-                                    let http_router = http_router.clone();
-                                    let lease = ClientActivityLease::acquire(client_count.clone(), client_notify.clone());
-                                    connections.spawn(async move {
-                                        let _lease = lease;
-                                        let mut stream = stream;
-                                        let Some(first_byte) = read_preface(&mut stream).await else { return };
-                                        if http::is_http_preface(first_byte) {
-                                            // The socket binds the caller to its environment, as the framed protocol does.
-                                            let bound = environment.clone();
-                                            let caller = move |kernel_peer| http::CallerAuth::Environment {
-                                                environment: bound,
-                                                peer: caller::reach_evidence(reach, Some(kernel_peer)),
-                                            };
-                                            let serving = http::serve_sniffed(stream, first_byte, http_router, caller, shutdown_signal(shutdown.clone()));
-                                            serve_until_drained(serving, shutdown, "environment socket").await;
-                                            return;
-                                        }
-                                        let claims = match tokio::task::spawn_blocking(move || caller::claims_from_peer(peer)).await {
-                                            Ok(claims) => Some(claims),
-                                            Err(error) => { warn!(%error, "environment peer evidence unavailable"); return; }
-                                        };
-                                        let session = unix_message_session_with_prefix(stream, vec![first_byte]);
-                                        environment_connection::serve(session, daemon, router, environment, claims, shutdown).await;
-                                    });
+                                    let serving = front_door.clone().serve(stream, environment.clone(), reach);
+                                    connections.spawn(attributed(reads_caller(Self::ENVIRONMENT_CONNECTIONS), serving));
                                 }
                                 Err(error) => { warn!(%error, "environment socket accept failed"); return; }
                             },
@@ -432,6 +447,52 @@ impl DaemonServer {
                 })
             },
         )
+    }
+
+    /// Serve one connection to `environment`'s socket: HTTP when its first byte starts a
+    /// request line, otherwise the framed crew transport.
+    async fn serve(self, mut stream: tokio::net::UnixStream, environment: EnvironmentId, reach: environment_sockets::SocketReach) {
+        let Self { daemon, router, http_router, client_count, client_notify, shutdown, .. } = self;
+        let _lease = ClientActivityLease::acquire(client_count, client_notify);
+        let peer = caller::reach_evidence(reach, caller::socket_peer_credential(&stream));
+        let Some(first_byte) = read_preface(&mut stream).await else { return };
+        if http::is_http_preface(first_byte) {
+            // The socket binds the caller to its environment, as the framed protocol does.
+            let caller =
+                move |kernel_peer| http::CallerAuth::Environment { environment, peer: caller::reach_evidence(reach, Some(kernel_peer)) };
+            let serving = http::serve_sniffed(stream, first_byte, http_router, caller, shutdown_signal(shutdown.clone()));
+            serve_until_drained(serving, shutdown, "environment socket").await;
+            return;
+        }
+        let claims = match tokio::task::spawn_blocking(move || caller::claims_from_peer(peer)).await {
+            Ok(claims) => Some(claims),
+            Err(error) => {
+                warn!(%error, "environment peer evidence unavailable");
+                return;
+            }
+        };
+        let session = unix_message_session_with_prefix(stream, vec![first_byte]);
+        environment_connection::serve(session, daemon, router, environment, claims, shutdown).await;
+    }
+}
+
+impl DaemonServer {
+    /// The environment sockets' front door, sharing this server's routers, client count and shutdown.
+    pub fn environment_front_door(&self) -> EnvironmentFrontDoor {
+        EnvironmentFrontDoor {
+            daemon: self.daemon.clone(),
+            router: self.remote_command_router.clone(),
+            http_router: self.http_router.clone(),
+            client_count: self.client_count.clone(),
+            client_notify: self.client_notify.clone(),
+            shutdown: self.shutdown_rx.clone(),
+            sockets: self.environment_sockets.clone(),
+            directory: flotilla_protocol::DaemonHostPath::new(self.socket_path.with_extension("env")),
+        }
+    }
+
+    pub fn environment_socket_service(&self) -> environment_sockets::EnvironmentSocketService {
+        self.environment_front_door().socket_service()
     }
 
     /// Attach the runtime registry before serving; controller families are absent until installed.

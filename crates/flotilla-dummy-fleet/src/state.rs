@@ -106,6 +106,10 @@ pub(crate) struct LaunchedCrew {
     pub(crate) vessel: String,
     pub(crate) role: String,
     pub(crate) script: String,
+    /// Where its Claude Code hooks post, as its launch environment said; the state file keeps
+    /// the URL, not the token.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) hooks: Option<crate::link::CrewHooks>,
 }
 
 /// What a crew's command came to, as the crew saw it.

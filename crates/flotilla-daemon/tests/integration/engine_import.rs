@@ -8,7 +8,7 @@ use flotilla_config::{ConfigStore, DaemonConfig};
 use flotilla_core::in_process::InProcessDaemon;
 use flotilla_core::primitives::demand_import::retired::ENSURE_HOLD_REASON_ANNOTATION;
 use flotilla_daemon::{
-    dummy_fleet::{attach_dummy_fleet, install_dummy_fleet},
+    dummy_fleet::install_dummy_fleet,
     engine_import::{Source, ENGINE_STORE, IMPORTING, OLD_STORE},
     runtime::{engine_opener, DaemonRuntime, RuntimeOptions},
 };
@@ -140,7 +140,7 @@ impl Host {
         )
         .await?;
         assert_eq!(daemon.node_id(), &self.node, "the daemon is homed where its host's records are");
-        attach_dummy_fleet(&fleet, &daemon).expect("attach fleet");
+        fleet.resume();
         self.daemon.get_or_init(|| daemon);
         Ok(())
     }

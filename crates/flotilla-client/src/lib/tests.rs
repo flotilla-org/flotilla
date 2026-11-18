@@ -29,7 +29,7 @@ async fn hello_result(
             .await
             .expect("write daemon hello");
     });
-    let result = do_client_hello_with_surface(&client, None, policy).await;
+    let result = do_client_hello_with_surface(&client, None, policy, BTreeMap::new()).await;
     server_task.await.expect("join hello server");
     result
 }

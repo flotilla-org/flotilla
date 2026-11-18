@@ -945,7 +945,11 @@ pub(crate) fn format_convoy_explanation_human(explanation: &flotilla_protocol::C
         .as_ref()
         .map(|cascade| format!("\nResolved defaults:\n{}\n", serde_json::to_string_pretty(cascade).expect("serialize cascade")))
         .unwrap_or_default();
-    let mut output = format!("Convoy: {}/{}\nPhase: {}\n", explanation.namespace, explanation.convoy, explanation.phase);
+    let mut output = format!("Convoy: {}/{}\n", explanation.namespace, explanation.convoy);
+    if !explanation.role.is_empty() {
+        let _ = writeln!(output, "Role: {}", explanation.role);
+    }
+    let _ = writeln!(output, "Phase: {}", explanation.phase);
     for warning in &explanation.warnings {
         let _ = writeln!(output, "Warning: {warning}");
     }
@@ -1976,49 +1980,15 @@ pub async fn run_command(daemon: &dyn DaemonHandle, command: Command, format: Ou
     if command.action.is_query() {
         return run_query_command(daemon, command, format).await;
     }
-
-    let mut rx = daemon.subscribe();
-    let command_id = daemon.execute(command.clone()).await?;
-
-    loop {
-        match rx.recv().await {
-            Ok(ref event @ DaemonEvent::CommandStarted { command_id: id, .. }) if id == command_id => {
-                if matches!(format, OutputFormat::Human) {
-                    println!("{}", format_event_human(event));
-                }
-            }
-            Ok(event @ DaemonEvent::CommandStepUpdate { command_id: id, .. }) if id == command_id => {
-                if matches!(format, OutputFormat::Human) {
-                    println!("{}", format_event_human(&event));
-                }
-            }
-            Ok(ref event @ DaemonEvent::CommandFinished { command_id: id, ref result, .. }) if id == command_id => {
-                match format {
-                    OutputFormat::Human => {
-                        println!("{}", format_event_human(event));
-                    }
-                    OutputFormat::Json => {
-                        println!("{}", flotilla_protocol::output::json_pretty(&result));
-                    }
-                }
-                let result = result.clone();
-                return match result {
-                    CommandValue::Error { .. } => Ok(result),
-                    CommandValue::Cancelled => Err("command cancelled".into()),
-                    result => Ok(result),
-                };
-            }
-            Ok(_) => {}
-            Err(tokio::sync::broadcast::error::RecvError::Lagged(n)) => {
-                if matches!(format, OutputFormat::Human) {
-                    eprintln!("warning: skipped {n} events");
-                }
-            }
-            Err(tokio::sync::broadcast::error::RecvError::Closed) => {
-                return Err("daemon disconnected".into());
-            }
+    flotilla_client::wait_for_command(daemon, command, |progress| match (progress, format) {
+        (flotilla_client::CommandProgress::Event(event), OutputFormat::Human) => println!("{}", format_event_human(event)),
+        (flotilla_client::CommandProgress::Event(DaemonEvent::CommandFinished { result, .. }), OutputFormat::Json) => {
+            println!("{}", flotilla_protocol::output::json_pretty(result))
         }
-    }
+        (flotilla_client::CommandProgress::Skipped(skipped), OutputFormat::Human) => eprintln!("warning: skipped {skipped} events"),
+        (flotilla_client::CommandProgress::Event(_) | flotilla_client::CommandProgress::Skipped(_), OutputFormat::Json) => {}
+    })
+    .await
 }
 
 async fn run_query_command(daemon: &dyn DaemonHandle, command: Command, format: OutputFormat) -> Result<CommandValue, String> {

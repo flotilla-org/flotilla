@@ -172,10 +172,10 @@ async fn a_crew_members_row_follows_its_agent_session() {
     let working = daemon.wait_query(QueryId::Convoys { scope: None }, |set| activity(set, AgentActivity::Working)).await;
     let working = reading(&working).expect("working reading");
     assert_eq!(working.ended, None, "{working:?}");
-    assert_eq!(working.activity_cause.as_deref(), Some("dummy-working"), "{working:?}");
+    assert_eq!(working.activity_cause.as_deref(), Some("UserPromptSubmit"), "{working:?}");
     let idle = daemon.wait_query(QueryId::Convoys { scope: None }, |set| activity(set, AgentActivity::Idle)).await;
     let idle = reading(&idle).expect("idle reading");
-    assert_eq!(idle.activity_cause.as_deref(), Some("dummy-idle"), "{idle:?}");
+    assert_eq!(idle.activity_cause.as_deref(), Some("Stop"), "{idle:?}");
     assert!(idle.activity_since > working.activity_since, "{working:?} then {idle:?}");
 }
 

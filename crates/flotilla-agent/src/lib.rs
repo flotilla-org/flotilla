@@ -8,7 +8,7 @@ pub mod store;
 
 pub use hooks::{
     claude_code_hook_entries, claude_code_hook_entries_over, claude_code_hook_settings, claude_code_hook_settings_over,
-    codex_hook_overrides, parser_for_harness, update_codex_hooks, ClaudeCodeHookTransport, HarnessHookParser, ParsedHookEvent,
+    codex_hook_overrides, hook_event, parser_for_harness, update_codex_hooks, ClaudeCodeHookTransport, HarnessHookParser, ParsedHookEvent,
     CLAUDE_CODE_HOOK_COMMAND_PREFIX, CLAUDE_CODE_HOOK_TOKEN_ENV, CLAUDE_CODE_HOOK_URL_ENV, CODEX_NOTIFY_COMMAND,
 };
 

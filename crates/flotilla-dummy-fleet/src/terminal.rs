@@ -114,6 +114,11 @@ impl DummySession {
         Ok(())
     }
 
+    /// Where the session's command runs.
+    pub(crate) fn cwd(&self) -> &ExecutionEnvironmentPath {
+        &self.cwd
+    }
+
     pub(crate) fn set_working(&self, working: bool) {
         self.working.store(working, Ordering::Release);
     }
@@ -463,104 +468,24 @@ impl Factory for DummyTerminalPoolFactory {
 mod tests {
     use std::time::Duration;
 
-    use async_trait::async_trait;
     use flotilla_config::dummy_fleet::{DummyAgentConfig, DummyFleetConfig};
-    use flotilla_protocol::{
-        commands::{CommandValue, CrewPromiseOperation, CrewSupervisionAction, StallProposedDisposition},
-        CommandAction,
-    };
     use hegel::generators as gs;
     use tokio::sync::mpsc;
 
     use super::*;
-    use crate::{adapter::DummyAgentAdapter, CrewCommandPort, DummyFleetSnapshot, LAST_TURN_MARKER};
-    use flotilla_agent::adapter::AgentAdapter;
-    use flotilla_resources::TerminalAttentionState;
+    use crate::{
+        fake_daemon::{FakeDaemon, HOOK_TOKEN, HOOK_URL},
+        DummyFleetSnapshot, LAST_TURN_MARKER,
+    };
 
     const SESSION: &str = "terminal-convoy-a-implement-crew";
 
-    // Stands in for the daemon's command boundary: records each crew command,
-    // delays promise settlement, and reports handoffs to the test's peer.
-    struct RecordingPort {
-        /// Every submitted change-request reference starts with this.
-        reference_prefix: String,
-        handoff_refusals: std::sync::Mutex<usize>,
-        commands: mpsc::UnboundedSender<String>,
-        attention: std::sync::Mutex<Vec<(String, bool)>>,
-    }
-
-    #[async_trait]
-    impl CrewCommandPort for RecordingPort {
-        async fn execute(&self, action: CommandAction) -> Result<CommandValue, String> {
-            // A crew reads its convoy's role to key its draws; the read is not a crew command.
-            if let CommandAction::QueryResourceGet { kind, name, namespace } = &action {
-                assert_eq!(kind, "Convoy");
-                return Ok(CommandValue::ResourceObject(Box::new(flotilla_protocol::commands::ResourceJsonResponse {
-                    kind: kind.clone(),
-                    plural: "convoys".into(),
-                    namespace: namespace.clone(),
-                    value: serde_json::json!({ "metadata": { "name": name }, "spec": { "role": name } }),
-                    replica_origin: None,
-                })));
-            }
-            let (entry, value) = match action {
-                CommandAction::CrewPromise { operation: CrewPromiseOperation::Promise { .. }, .. } => {
-                    ("promise".to_string(), CommandValue::Ok)
-                }
-                CommandAction::CrewPromise { operation: CrewPromiseOperation::Submit { kind, .. }, .. } if kind == "decision-ledger" => {
-                    ("submit-ledger".to_string(), CommandValue::Ok)
-                }
-                CommandAction::CrewPromise { operation: CrewPromiseOperation::Submit { reference, .. }, .. } => {
-                    assert!(reference.starts_with(&self.reference_prefix), "{reference}");
-                    ("submit".to_string(), CommandValue::Ok)
-                }
-                CommandAction::CrewHandoff { target, message, .. } => {
-                    let mut refusals = self.handoff_refusals.lock().expect("refusals");
-                    if *refusals > 0 {
-                        *refusals -= 1;
-                        ("handoff-refused".to_string(), CommandValue::Error { message: "resource conflict".into() })
-                    } else {
-                        let last = if message.contains(LAST_TURN_MARKER) { "!" } else { "" };
-                        (format!("handoff:{target}{last}"), CommandValue::Ok)
-                    }
-                }
-                CommandAction::CrewStall { proposed_disposition, .. } => {
-                    let proposal = if proposed_disposition == Some(StallProposedDisposition::Fail) { "fail" } else { "resume" };
-                    (format!("stall:{proposal}"), CommandValue::Ok)
-                }
-                CommandAction::CrewSupervise { convoy, vessel, role, operation: CrewSupervisionAction::Resume, .. } => {
-                    (format!("resume:{convoy}/{vessel}/{role}"), CommandValue::Ok)
-                }
-                CommandAction::ResourceApply { document, .. } => {
-                    assert_eq!(document["kind"], "Artifact");
-                    ("ledger".to_string(), CommandValue::Ok)
-                }
-                other => panic!("dummy crews send only crew commands, not {other:?}"),
-            };
-            self.commands.send(entry).expect("test listens");
-            Ok(value)
-        }
-
-        async fn report_attention(&self, namespace: &str, session: &str, working: bool) -> Result<(), String> {
-            assert_eq!(namespace, "flotilla");
-            self.attention.lock().expect("attention").push((session.to_string(), working));
-            Ok(())
-        }
-    }
-
     // Behaviour: a supervisor resumes the stalled crew each supervision turn names, with the
     // command the turn gives, and goes on waiting for the next.
-    #[tokio::test(start_paused = true)]
+    #[tokio::test]
     async fn a_supervisor_resumes_each_stalled_crew_its_turns_name() {
-        let fleet = DummyFleet::new(DummyFleetConfig::default());
-        let (commands, mut recorded) = mpsc::unbounded_channel();
-        let port = Arc::new(RecordingPort {
-            reference_prefix: String::new(),
-            handoff_refusals: std::sync::Mutex::new(0),
-            commands,
-            attention: Default::default(),
-        });
-        fleet.attach(Arc::clone(&port) as Arc<dyn CrewCommandPort>).expect("attach");
+        let fleet = DummyFleet::new(DummyFleetConfig { agent: quick_crews(), ..DummyFleetConfig::default() });
+        let (_daemon, mut recorded) = FakeDaemon::serve(&fleet, "env-a", "", 0).await;
         let pool = DummyTerminalPool { fleet: Arc::clone(&fleet), environment: "env-a".into() };
         let path = ExecutionEnvironmentPath::new("/workspace");
         pool.ensure_session(SESSION, "flotilla-dummy-crew", &path, &launch_environment(&CrewScript::Supervisor), &[])
@@ -573,10 +498,10 @@ mod tests {
                  `flotilla crew supervise --convoy '{convoy}' --vessel 'work' --role 'coder' escalate --message 'guidance'`"
             );
             pool.deliver(SESSION, &turn).await.expect("deliver");
-            let acted = tokio::time::timeout(Duration::from_secs(600), recorded.recv()).await.expect("supervisor acts");
-            assert_eq!(acted.expect("port open"), format!("resume:{convoy}/work/coder"));
+            assert_eq!(next(&mut recorded).await, format!("resume:{convoy}/work/coder"));
         }
-        let after = tokio::time::timeout(Duration::from_secs(600), recorded.recv()).await;
+        settle(&fleet).await;
+        let after = recorded.try_recv();
         assert!(after.is_err(), "a supervisor acts only on its turns, and does not end: {after:?}");
         pool.kill_session(SESSION).await.expect("kill");
     }
@@ -604,7 +529,6 @@ mod tests {
     #[tokio::test]
     async fn a_pool_reaches_only_its_own_environments_sessions() {
         let fleet = DummyFleet::new(DummyFleetConfig::default());
-        fleet.attach(Arc::new(IdlePort) as Arc<dyn CrewCommandPort>).expect("attach");
         let one = DummyTerminalPool { fleet: Arc::clone(&fleet), environment: "one".into() };
         let two = DummyTerminalPool { fleet: Arc::clone(&fleet), environment: "two".into() };
         let path = ExecutionEnvironmentPath::new("/workspace");
@@ -631,7 +555,6 @@ mod tests {
         let mut config = DummyFleetConfig::default();
         config.terminal.refusal_rate = 1.0;
         let fleet = DummyFleet::new(config);
-        fleet.attach(Arc::new(IdlePort) as Arc<dyn CrewCommandPort>).expect("attach");
         let pool = DummyTerminalPool { fleet: Arc::clone(&fleet), environment: "env-a".into() };
         let path = ExecutionEnvironmentPath::new("/workspace");
         pool.ensure_session(SESSION, "flotilla-dummy-crew", &path, &launch_environment(&CrewScript::Supervisor), &[])
@@ -649,7 +572,6 @@ mod tests {
         let mut config = DummyFleetConfig::default();
         config.terminal.refusal_rate = 0.5;
         let fleet = DummyFleet::new(config);
-        fleet.attach(Arc::new(IdlePort) as Arc<dyn CrewCommandPort>).expect("attach");
         let pool = DummyTerminalPool { fleet: Arc::clone(&fleet), environment: "env-a".into() };
         pool.ensure_session(SESSION, "flotilla-dummy-crew", &path, &launch_environment(&CrewScript::Supervisor), &[])
             .await
@@ -669,14 +591,31 @@ mod tests {
         pool.kill_session(SESSION).await.expect("kill");
     }
 
-    /// A port that answers every crew command and report, for tests about the pool.
-    struct IdlePort;
+    // The crews reach the stand-in over real sockets, so these tests run in real time: paused
+    // time would advance to the next timer while a reply is still in the socket. Short turns
+    // and retries keep them quick.
+    fn quick_crews() -> DummyAgentConfig {
+        DummyAgentConfig { turn_delay_ms: 10, retry_backoff_ms: 1, long_runner_turns: 1, ..DummyAgentConfig::default() }
+    }
 
-    #[async_trait]
-    impl CrewCommandPort for IdlePort {
-        async fn execute(&self, _action: CommandAction) -> Result<CommandValue, String> {
-            Ok(CommandValue::Ok)
-        }
+    /// Long enough for a crew to act on a turn; only reached when it does not.
+    const ACT_WITHIN: Duration = Duration::from_secs(60);
+
+    /// The next command the stand-in records.
+    async fn next(recorded: &mut mpsc::UnboundedReceiver<String>) -> String {
+        tokio::time::timeout(ACT_WITHIN, recorded.recv()).await.expect("crew acts").expect("port open")
+    }
+
+    /// Wait until the session shows idle, then a few turns' length more, after which a crew
+    /// with nothing to act on has sent everything it will.
+    async fn settle(fleet: &DummyFleet) {
+        let idle = async {
+            while fleet.sessions.get(SESSION).is_some_and(|session| session.working()) {
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+        };
+        tokio::time::timeout(ACT_WITHIN, idle).await.expect("the crew goes idle");
+        tokio::time::sleep(Duration::from_millis(100)).await;
     }
 
     fn launch_environment(script: &CrewScript) -> TerminalEnvVars {
@@ -687,6 +626,8 @@ mod tests {
             ("FLOTILLA_VESSEL", "implement"),
             ("FLOTILLA_CREW_ROLE", "crew"),
             ("FLOTILLA_TERMINAL_SESSION", SESSION),
+            (flotilla_agent::CLAUDE_CODE_HOOK_URL_ENV, HOOK_URL),
+            (flotilla_agent::CLAUDE_CODE_HOOK_TOKEN_ENV, HOOK_TOKEN),
         ]
         .into_iter()
         .map(|(key, value)| (key.to_string(), value.to_string()))
@@ -732,7 +673,7 @@ mod tests {
     // working from a turn's delivery until it has acted, and idle afterwards.
     // The generator spans every script, peers present and absent, zero to two
     // handoff refusals, and each failure/stall/clean outcome.
-    // Paused time keeps a case to milliseconds, so the property affords more
+    // Short turns keep a case to a fraction of a second, so the property affords more
     // cases than the default profile to reach the rarer script/refusal pairs.
     #[test]
     fn crews_follow_their_script_through_crew_commands() {
@@ -750,28 +691,18 @@ mod tests {
         let handoff_refusals = tc.draw(gs::integers::<usize>().min_value(0).max_value(4));
         let failed = tc.draw(gs::booleans());
         let stalled = tc.draw(gs::booleans());
-        let runtime = tokio::runtime::Builder::new_current_thread().enable_all().start_paused(true).build().expect("runtime");
+        let runtime = tokio::runtime::Builder::new_current_thread().enable_all().build().expect("runtime");
         runtime.block_on(async {
             let agent = DummyAgentConfig {
-                turn_delay_ms: 1_500,
                 fail_rate: if failed { 1.0 } else { 0.0 },
                 stall_rate: if stalled { 1.0 } else { 0.0 },
-                long_runner_turns: 1,
-                ..DummyAgentConfig::default()
+                ..quick_crews()
             };
             let fleet = DummyFleet::new(DummyFleetConfig { agent, ..DummyFleetConfig::default() });
-            let (commands, mut recorded) = mpsc::unbounded_channel();
-            let port = Arc::new(RecordingPort {
-                reference_prefix: "https://forge.dummy.invalid/dummy/fleet/pulls/".into(),
-                handoff_refusals: std::sync::Mutex::new(handoff_refusals),
-                commands,
-                attention: Default::default(),
-            });
-            fleet.attach(Arc::clone(&port) as Arc<dyn CrewCommandPort>).expect("attach");
+            let (daemon, mut recorded) =
+                FakeDaemon::serve(&fleet, "env-a", "https://forge.dummy.invalid/dummy/fleet/pulls/", handoff_refusals).await;
             let pool = DummyTerminalPool { fleet: Arc::clone(&fleet), environment: "env-a".into() };
-            let adapter = DummyAgentAdapter::new(1);
-            let screen =
-                || async { adapter.classify_screen_attention(&pool.capture_screen(SESSION).await.expect("screen").expect("session")) };
+            let working = || fleet.sessions.get(SESSION).expect("session").working();
             pool.ensure_session(
                 SESSION,
                 "flotilla-dummy-crew",
@@ -781,7 +712,7 @@ mod tests {
             )
             .await
             .expect("launch");
-            assert_eq!(screen().await, Some(TerminalAttentionState::Working), "the launch prompt is the first turn");
+            assert!(working(), "the launch prompt is the first turn");
 
             let expected = expected_commands(&script, handoff_refusals, failed, stalled);
             let mut seen = Vec::new();
@@ -799,7 +730,7 @@ mod tests {
                 delivered += hand_tasks().await;
             }
             while seen.len() < expected.len() {
-                let command = tokio::time::timeout(Duration::from_secs(600), recorded.recv()).await.expect("crew acts").expect("port open");
+                let command = next(&mut recorded).await;
                 assert_eq!(command, expected[seen.len()], "command {} after {seen:?}", seen.len());
                 let resumed = command == "stall:resume" && seen.is_empty() && stalled;
                 let unblocked = command == "stall:resume" && !resumed;
@@ -813,7 +744,7 @@ mod tests {
                         "[from implement/peer (peer)]\n\nDone."
                     };
                     pool.deliver(SESSION, turn).await.expect("deliver");
-                    assert_eq!(screen().await, Some(TerminalAttentionState::Working), "a delivered turn shows as work");
+                    assert!(working(), "a delivered turn shows as work");
                     delivered += 1;
                 }
                 if resumed && responder {
@@ -821,14 +752,24 @@ mod tests {
                 }
             }
             // Let the crew settle: nothing more is sent, and it shows as idle.
-            tokio::time::sleep(Duration::from_secs(120)).await;
+            settle(&fleet).await;
             assert!(recorded.try_recv().is_err(), "no command after the script ends");
-            assert_eq!(screen().await, Some(TerminalAttentionState::Idle));
-            // Hook-style reports name the crew's session, start working on the
-            // launch prompt and end idle, matching the screen.
-            let reports = port.attention.lock().expect("attention").clone();
-            assert!(reports.iter().all(|(session, _)| session == SESSION));
-            assert_eq!((reports.first().map(|report| report.1), reports.last().map(|report| report.1)), (Some(true), Some(false)));
+            assert!(!working());
+            // Claude Code's hooks: the session starts as a command hook, then the launch prompt is
+            // submitted, tool calls pair pre and post within turns, and the crew ends stopped.
+            let hooks = daemon.hooks.lock().expect("hooks").clone();
+            assert_eq!(hooks.first().map(String::as_str), Some("command:SessionStart"), "{hooks:?}");
+            assert_eq!(hooks.get(1).map(String::as_str), Some("user-prompt-submit"), "{hooks:?}");
+            assert_eq!(hooks.last().map(String::as_str), Some("stop"), "{hooks:?}");
+            let prompts = hooks.iter().filter(|hook| *hook == "user-prompt-submit").count();
+            let stops = hooks.iter().filter(|hook| *hook == "stop").count();
+            assert_eq!(prompts, stops, "each prompt's turn stops: {hooks:?}");
+            assert!(hooks.iter().skip(1).all(|hook| !hook.starts_with("command:")), "HTTP hooks: {hooks:?}");
+            // Each connection claimed the crew its launch environment names.
+            let claims = daemon.claims.lock().expect("claims").clone();
+            assert!(!claims.is_empty());
+            assert!(claims.iter().all(|claims| claims.get("FLOTILLA_CREW_ID").map(String::as_str) == Some("crew-1")
+                && claims.get("FLOTILLA_TERMINAL_SESSION").map(String::as_str) == Some(SESSION)));
             let snapshot = fleet.snapshot();
             assert_eq!(snapshot.turns_received, delivered);
             assert_eq!((snapshot.crews_completed, snapshot.crews_failed), (u64::from(!failed), u64::from(failed)));
@@ -845,7 +786,7 @@ mod tests {
     // request's URL. When the forge refuses it (a wrong token), the crew
     // retries, stalls with the reason, and opens the pull request after
     // guidance once the token is right; the forge holds exactly one.
-    #[tokio::test(start_paused = true)]
+    #[tokio::test]
     async fn coders_open_change_requests_on_the_shared_forge() {
         use std::io::Write;
 
@@ -857,7 +798,7 @@ mod tests {
         let mut token = tempfile::NamedTempFile::new().expect("token file");
         write!(token, "wrong").expect("write token");
         let config = DummyFleetConfig {
-            agent: DummyAgentConfig { turn_delay_ms: 1_500, long_runner_turns: 1, ..DummyAgentConfig::default() },
+            agent: quick_crews(),
             shared_forge: Some(DummySharedForgeConfig {
                 service_url: fake.service_url("github"),
                 endpoint_url: None,
@@ -868,14 +809,8 @@ mod tests {
             ..DummyFleetConfig::default()
         };
         let fleet = DummyFleet::with_http(config, Arc::new(InProcessClient::new(Arc::clone(&fake))));
-        let (commands, mut recorded) = mpsc::unbounded_channel();
-        let port = Arc::new(RecordingPort {
-            reference_prefix: "https://fake-forge.test:3443/github/flotilla-org/flotilla/pulls/".into(),
-            handoff_refusals: std::sync::Mutex::new(0),
-            commands,
-            attention: Default::default(),
-        });
-        fleet.attach(Arc::clone(&port) as Arc<dyn CrewCommandPort>).expect("attach");
+        let (_daemon, mut recorded) =
+            FakeDaemon::serve(&fleet, "env-a", "https://fake-forge.test:3443/github/flotilla-org/flotilla/pulls/", 0).await;
         let pool = DummyTerminalPool { fleet: Arc::clone(&fleet), environment: "env-a".into() };
         let script = CrewScript::coder(None, "flotilla-org/flotilla".into());
         pool.ensure_session(
@@ -887,9 +822,6 @@ mod tests {
         )
         .await
         .expect("launch");
-        async fn next(recorded: &mut mpsc::UnboundedReceiver<String>) -> String {
-            tokio::time::timeout(Duration::from_secs(600), recorded.recv()).await.expect("crew acts").expect("port open")
-        }
         assert_eq!(next(&mut recorded).await, "stall:resume", "a refused open stalls after its retries");
         assert_eq!(fake.refusals().1, 3, "each attempt reached the forge and was refused");
         let repo = RepoRef::new("github", "flotilla-org", "flotilla");
@@ -911,36 +843,22 @@ mod tests {
     // that fleet held: its session, the turns delivered to it, the forge's change requests and
     // its counts. Its crew resumes where it stopped: it sends none of the commands it had sent,
     // and acts on the next turn as it would have.
-    #[tokio::test(start_paused = true)]
+    #[tokio::test]
     async fn a_fleet_opened_from_its_state_file_resumes_where_it_stopped() {
         let state = tempfile::tempdir().expect("state directory");
-        let config = DummyFleetConfig {
-            agent: DummyAgentConfig { turn_delay_ms: 1_500, long_runner_turns: 1, ..DummyAgentConfig::default() },
-            ..DummyFleetConfig::default()
-        };
-        let port = || {
-            let (commands, recorded) = mpsc::unbounded_channel();
-            let port = RecordingPort {
-                reference_prefix: "https://forge.dummy.invalid/dummy/fleet/pulls/".into(),
-                handoff_refusals: std::sync::Mutex::new(0),
-                commands,
-                attention: Default::default(),
-            };
-            (Arc::new(port), recorded)
-        };
-        async fn next(recorded: &mut mpsc::UnboundedReceiver<String>) -> String {
-            tokio::time::timeout(Duration::from_secs(600), recorded.recv()).await.expect("crew acts").expect("port open")
-        }
+        let config = DummyFleetConfig { agent: quick_crews(), ..DummyFleetConfig::default() };
+        const PULLS: &str = "https://forge.dummy.invalid/dummy/fleet/pulls/";
         let script = CrewScript::coder(Some("reviewer".into()), "dummy/fleet".into());
 
         let fleet = DummyFleet::open(config.clone(), state.path()).expect("open");
-        let (first, mut recorded) = port();
-        fleet.attach(first as Arc<dyn CrewCommandPort>).expect("attach");
+        let (_first, mut recorded) = FakeDaemon::serve(&fleet, "env-a", PULLS, 0).await;
         let pool = DummyTerminalPool { fleet: Arc::clone(&fleet), environment: "env-a".into() };
         let path = ExecutionEnvironmentPath::new("/workspace");
         pool.ensure_session(SESSION, "flotilla-dummy-crew", &path, &launch_environment(&script), &[]).await.expect("launch");
         assert_eq!(next(&mut recorded).await, "submit");
         assert_eq!(next(&mut recorded).await, "handoff:reviewer!");
+        // The crew has the handoff's result and waits for the reviewer.
+        settle(&pool.fleet).await;
         pool.deliver(SESSION, "[from implement/peer (peer)]\n\nLooks fine.").await.expect("deliver");
         let before = fleet.snapshot();
         // The process ends with the reviewer's answer delivered but not yet acted on.
@@ -949,11 +867,11 @@ mod tests {
 
         let fleet = DummyFleet::open(config, state.path()).expect("reopen");
         assert_eq!(fleet.snapshot(), DummyFleetSnapshot { live_sessions: 1, ..before }, "the counts and the session carry over");
-        let (second, mut recorded) = port();
-        fleet.attach(second as Arc<dyn CrewCommandPort>).expect("attach");
+        let (_second, mut recorded) = FakeDaemon::serve(&fleet, "env-a", PULLS, 0).await;
+        fleet.resume();
         assert_eq!(next(&mut recorded).await, "submit-ledger", "the crew acts on the delivered answer, sending nothing twice");
         assert_eq!(next(&mut recorded).await, "ledger");
-        tokio::time::sleep(Duration::from_secs(120)).await;
+        settle(&fleet).await;
         assert!(recorded.try_recv().is_err(), "no command after the script ends");
         let (number, _, opened) = fleet.forge.open(&fleet, "dummy/fleet", "dummy/convoy-a/crew", "Convoy A");
         assert_eq!((number, opened), (1, false), "the forge holds the crew's change request");

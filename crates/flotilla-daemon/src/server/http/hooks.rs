@@ -51,18 +51,19 @@ use axum::{
     Extension,
 };
 use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine as _};
-use flotilla_agent::{
-    hooks::{ClaudeCodeParser, CodexParser},
-    HarnessHookParser,
-};
-use flotilla_protocol::{AgentHarness, AgentHookEvent, AgentHookTerminalRef, EnvironmentId};
+use flotilla_protocol::{AgentHarness, AgentHookTerminalRef, EnvironmentId};
 use flotilla_resources::{ResourceError, TerminalSession, TerminalSessionPhase};
 use flotilla_store::ResourceBackend;
 use hmac::{Hmac, Mac};
 use sha2::Sha256;
 
 use super::{auth, tcp::TcpListener, CallerAuth, RouterState};
-use crate::server::request_dispatch::{handle_agent_hook, HookIdentityPolicy};
+use flotilla_store::load_metrics::{attributed, caller as reads_caller};
+
+use crate::{
+    agent_attention::AGENT_HOOKS,
+    server::request_dispatch::{handle_agent_hook, HookIdentityPolicy},
+};
 
 /// The hook routes' prefix; a harness and event follow.
 pub(in crate::server) const HOOKS_PATH: &str = "/v1/hooks";
@@ -219,7 +220,7 @@ impl HookEndpoint {
     }
 
     /// The endpoint whose key lives in flotillad's HTTP directory beneath `state_dir`.
-    pub(in crate::server) fn load(state_dir: &Path) -> Result<Self, String> {
+    pub fn load(state_dir: &Path) -> Result<Self, String> {
         Ok(Self::with_key(HookKey::load_or_create(&super::tcp::prepare_token_directory(state_dir)?)?))
     }
 
@@ -302,7 +303,7 @@ pub(super) async fn claude_code(
     headers: HeaderMap,
     body: Bytes,
 ) -> Response {
-    handle(state, caller, event, headers, body, AgentHarness::ClaudeCode).await
+    attributed(reads_caller(AGENT_HOOKS), handle(state, caller, event, headers, body, AgentHarness::ClaudeCode)).await
 }
 
 pub(super) async fn codex(
@@ -312,7 +313,7 @@ pub(super) async fn codex(
     headers: HeaderMap,
     body: Bytes,
 ) -> Response {
-    handle(state, caller, event, headers, body, AgentHarness::Codex).await
+    attributed(reads_caller(AGENT_HOOKS), handle(state, caller, event, headers, body, AgentHarness::Codex)).await
 }
 
 async fn handle(
@@ -355,28 +356,14 @@ async fn handle(
     if !json {
         return auth::refusal(StatusCode::UNSUPPORTED_MEDIA_TYPE, "agent hooks post application/json");
     }
-    let parser: &dyn HarnessHookParser = match harness {
-        AgentHarness::Codex => &CodexParser,
-        _ => &ClaudeCodeParser,
+    let harness = match harness {
+        AgentHarness::Codex => "codex",
+        _ => "claude-code",
     };
-    let parsed = match parser.parse_event(&event, &body) {
-        Ok(parsed) => parsed,
+    let event = match flotilla_agent::hook_event(harness, &event, &body, terminal, None) {
+        Ok(event) => event,
         Err(error) => return auth::refusal(StatusCode::BAD_REQUEST, &error),
     };
-    let attachable_id = flotilla_agent::attachable::terminal_hook_id(None, terminal.as_ref());
-    let cause = flotilla_agent::hooks::hook_event_name(&harness, &event).map(str::to_owned);
-    let event = AgentHookEvent::builder()
-        .attachable_id(attachable_id)
-        .harness(harness)
-        .maybe_hook_event(cause)
-        .event_type(parsed.event_type)
-        .maybe_session_id(parsed.session_id)
-        .maybe_model(parsed.model)
-        .maybe_cwd(parsed.cwd)
-        .maybe_transcript_path(parsed.transcript_path)
-        .native_codex_hook(parsed.native_codex_hook)
-        .maybe_terminal(terminal)
-        .build();
     match handle_agent_hook(agent_state_store, policy, state.daemon.clone(), event).await {
         // An empty 2xx is a command hook that exited 0 and printed nothing.
         Ok(()) => StatusCode::OK.into_response(),

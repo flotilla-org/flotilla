@@ -1859,6 +1859,7 @@ impl ReadProjections<'_> {
                 .unwrap_or_default(),
             namespace: namespace.to_string(),
             convoy: name.to_string(),
+            role: convoy.spec.role.clone(),
             phase: convoy.status.as_ref().map_or_else(|| "Unknown".to_string(), |status| format!("{:?}", status.phase)),
             role_needs: role_vessels
                 .iter()

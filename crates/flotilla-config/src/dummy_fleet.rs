@@ -114,6 +114,10 @@ pub struct DummyAgentConfig {
     /// its timings say nothing about a real agent's.
     #[serde(default)]
     pub turn_delay_spread_ms: u64,
+    /// How long a crew waits before retrying a refused command, doubling per attempt within
+    /// the turn, as an agent retrying a command does.
+    #[serde(default = "default_retry_backoff_ms")]
+    pub retry_backoff_ms: u64,
     /// Probability that a crew stalls instead of finishing its script.
     #[serde(default, deserialize_with = "deserialize_rate")]
     pub stall_rate: f64,
@@ -123,6 +127,20 @@ pub struct DummyAgentConfig {
     /// Turns a long-running (governor-like) crew handles before it completes.
     #[serde(default = "default_long_runner_turns")]
     pub long_runner_turns: u32,
+    /// The mean number of Claude Code hook events a turn sends: its prompt submission, a
+    /// pre- and post-tool-use pair per tool call, and its stop. Each turn draws its count from
+    /// a log-normal spread with this mean and [`Self::hooks_per_turn_median`], at least two.
+    ///
+    /// The defaults come from the fleet's own flotillad logs (`received agent hook event`,
+    /// ClaudeCode, counted from each prompt submission to the next stop per terminal),
+    /// 2026-11-11 to 2026-11-18: feta, 153 turns of 12 sessions, mean 27.0, median 8, p90 58;
+    /// udder, 206 turns of 19 sessions, mean 25.2, median 6, p90 46. The spread these defaults
+    /// give has a p90 of about 56.
+    #[serde(default = "default_hooks_per_turn")]
+    pub hooks_per_turn: f64,
+    /// The median of the per-turn hook count spread; see [`Self::hooks_per_turn`].
+    #[serde(default = "default_hooks_per_turn_median")]
+    pub hooks_per_turn_median: f64,
 }
 
 impl Default for DummyAgentConfig {
@@ -130,11 +148,26 @@ impl Default for DummyAgentConfig {
         Self {
             turn_delay_ms: default_turn_delay_ms(),
             turn_delay_spread_ms: 0,
+            retry_backoff_ms: default_retry_backoff_ms(),
             stall_rate: 0.0,
             fail_rate: 0.0,
             long_runner_turns: default_long_runner_turns(),
+            hooks_per_turn: default_hooks_per_turn(),
+            hooks_per_turn_median: default_hooks_per_turn_median(),
         }
     }
+}
+
+fn default_hooks_per_turn() -> f64 {
+    26.0
+}
+
+fn default_hooks_per_turn_median() -> f64 {
+    7.0
+}
+
+fn default_retry_backoff_ms() -> u64 {
+    1_000
 }
 
 fn default_turn_delay_ms() -> u64 {

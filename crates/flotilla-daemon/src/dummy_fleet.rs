@@ -1,20 +1,16 @@
 //! Composition-root switch for the dummy fleet (#3206). A daemon whose
 //! `daemon.toml` has a `[dummy_fleet]` section installs the dummy providers
-//! into its discovery factories before the daemon is built, then attaches the
-//! fleet's crews to that daemon. Without the section neither step does anything.
+//! into its discovery factories before the daemon is built. Without the section
+//! nothing is installed. The fleet's crews reach the daemon as real crews do,
+//! through their vessels' forwards to its environment sockets.
 
 use std::{path::Path, sync::Arc};
 
 use async_trait::async_trait;
 use flotilla_config::{dummy_fleet::DummyFleetConfig, DaemonConfig};
-use flotilla_core::in_process::InProcessDaemon;
-use flotilla_daemon_api::daemon::DaemonHandle;
 use flotilla_discovery::DiscoveryRuntime;
-use flotilla_dummy_fleet::{CrewCommandPort, DaemonCommandPort, DummyFleet};
-use flotilla_protocol::{commands::CommandValue, CommandAction};
+use flotilla_dummy_fleet::DummyFleet;
 use flotilla_provisioning::reconcilers::ForgeDefaultBranchResolver;
-use flotilla_resources::TerminalAttentionState;
-use flotilla_store::load_metrics::inherit_or;
 use tracing::warn;
 
 /// Install the configured dummy fleet's factories, if any: the fleet whose state file is in
@@ -39,14 +35,6 @@ pub fn install_dummy_fleet(
     Ok(Some(fleet))
 }
 
-/// Connect the fleet's crews to the daemon whose discovery installed it:
-/// their crew commands through its command path, and their attention reports
-/// through the same recording as harness hook events. Crews a previous process
-/// hosted resume.
-pub fn attach_dummy_fleet(fleet: &Arc<DummyFleet>, daemon: &Arc<InProcessDaemon>) -> Result<(), String> {
-    fleet.attach(daemon_crew_port(daemon))
-}
-
 /// The fleet as part of the daemon's process: a graceful stop stops its crews and writes out its
 /// state file before the runtime's tasks end.
 pub fn dummy_fleet_component(fleet: &Arc<DummyFleet>) -> Arc<dyn crate::runtime::ProcessComponent> {
@@ -61,63 +49,6 @@ impl crate::runtime::ProcessComponent for FleetComponent {
         self.0.shutdown().await;
     }
 }
-
-/// The port [`attach_dummy_fleet`] attaches: `daemon`'s command path and its
-/// hook-attention recording. A harness that outlives one daemon, as a crew's
-/// process outlives a daemon restart, forwards to the current daemon's port.
-pub fn daemon_crew_port(daemon: &Arc<InProcessDaemon>) -> Arc<dyn CrewCommandPort> {
-    let handle = Arc::clone(daemon) as Arc<dyn DaemonHandle>;
-    Arc::new(DaemonCrewPort { commands: DaemonCommandPort::new(&handle), daemon: Arc::downgrade(daemon) })
-}
-
-struct DaemonCrewPort {
-    commands: Arc<DaemonCommandPort>,
-    // Weak: the daemon holds its fleet, which holds this port.
-    daemon: std::sync::Weak<InProcessDaemon>,
-}
-
-#[async_trait]
-impl CrewCommandPort for DaemonCrewPort {
-    async fn execute(&self, action: CommandAction) -> Result<CommandValue, String> {
-        self.commands.execute(action).await
-    }
-
-    async fn report_attention(&self, namespace: &str, session: &str, working: bool) -> Result<(), String> {
-        // Its reads count as a harness hook's do.
-        inherit_or(crate::agent_attention::AGENT_HOOKS, self.attention(namespace, session, working)).await
-    }
-}
-
-impl DaemonCrewPort {
-    async fn attention(&self, namespace: &str, session: &str, working: bool) -> Result<(), String> {
-        use flotilla_state_machines::machines::agent_session::Activity;
-        let (state, activity, cause) = if working {
-            (TerminalAttentionState::Working, Activity::Working, DUMMY_WORKING_CAUSE)
-        } else {
-            (TerminalAttentionState::Idle, Activity::Idle, DUMMY_IDLE_CAUSE)
-        };
-        if let Some(daemon) = self.daemon.upgrade() {
-            daemon.crew_progress().hook(session, daemon.clock().now());
-            if let Some(primitives) = daemon.message_primitives() {
-                if let Err(error) =
-                    crate::agent_attention::record_agent_activity(daemon.lifecycle_reads(), &primitives, session, activity, cause).await
-                {
-                    // As for a harness hook: the AgentSession is an additional observer.
-                    warn!(%session, %error, "failed to record dummy crew activity");
-                }
-            }
-        }
-        let _ = namespace;
-        let daemon = self.daemon.upgrade().ok_or("the daemon has stopped")?;
-        let reads = daemon.lifecycle_reads();
-        crate::agent_attention::observe_hook_attention(reads.terminals()?, session, state, false)
-    }
-}
-
-/// The causes a dummy crew's reports carry on its AgentSession, in place of a harness's native
-/// hook event names.
-const DUMMY_WORKING_CAUSE: &str = "dummy-working";
-const DUMMY_IDLE_CAUSE: &str = "dummy-idle";
 
 /// Every repository on the dummy forge has the default branch `main`.
 pub(crate) fn dummy_forge_default_branches(config: Option<&DummyFleetConfig>) -> Option<Arc<dyn ForgeDefaultBranchResolver>> {

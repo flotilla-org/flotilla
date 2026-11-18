@@ -39,6 +39,7 @@ use tokio::sync::mpsc;
 
 use crate::{
     fleet::{Counter, DummyFleet},
+    link::{CrewHooks, CrewLink},
     shared_forge::SharedForge,
     state::{Event, LaunchedCrew, Outcome},
     terminal::DummySession,
@@ -179,6 +180,8 @@ pub(crate) struct CrewIdentity {
     pub(crate) convoy: String,
     pub(crate) vessel: String,
     pub(crate) role: String,
+    /// Where its Claude Code hooks post over HTTP; without it they run as commands.
+    pub(crate) hooks: Option<CrewHooks>,
 }
 
 impl CrewIdentity {
@@ -191,7 +194,22 @@ impl CrewIdentity {
             convoy: get("FLOTILLA_CONVOY")?,
             vessel: get("FLOTILLA_VESSEL")?,
             role: get("FLOTILLA_CREW_ROLE")?,
+            hooks: CrewHooks::from_environment(environment),
         })
+    }
+
+    /// The identity variable `key` of the crew's launch environment, as `flotilla` reads it for
+    /// the claims its Hello states.
+    pub(crate) fn claim(&self, key: &str) -> Option<String> {
+        match key {
+            "FLOTILLA_CREW_ID" => Some(self.crew_id.clone()),
+            "FLOTILLA_TERMINAL_SESSION" => self.session.clone(),
+            "FLOTILLA_NAMESPACE" => Some(self.namespace.clone()),
+            "FLOTILLA_CONVOY" => Some(self.convoy.clone()),
+            "FLOTILLA_VESSEL" => Some(self.vessel.clone()),
+            "FLOTILLA_CREW_ROLE" => Some(self.role.clone()),
+            _ => None,
+        }
     }
 
     /// The crew as the state file names it, running `script`.
@@ -204,6 +222,7 @@ impl CrewIdentity {
             vessel: self.vessel,
             role: self.role,
             script: script.into(),
+            hooks: self.hooks,
         }
     }
 
@@ -231,6 +250,7 @@ impl From<&LaunchedCrew> for CrewIdentity {
             convoy: crew.convoy.clone(),
             vessel: crew.vessel.clone(),
             role: crew.role.clone(),
+            hooks: crew.hooks.clone(),
         }
     }
 }
@@ -251,6 +271,10 @@ pub(crate) struct Crew {
     replay: VecDeque<Outcome>,
     /// Whether the last command's outcome was a recorded one: what followed it was counted then.
     replayed: bool,
+    /// Where the crew's session runs, as its hooks report it.
+    cwd: String,
+    /// Turns worked on since the crew started, keying each turn's hook-count draw.
+    turns_taken: u64,
 }
 
 enum Ending {
@@ -267,17 +291,24 @@ impl Crew {
         replay: VecDeque<Outcome>,
     ) -> Self {
         let replayed = !replay.is_empty();
-        Self { fleet, session, identity, turns, held: VecDeque::new(), script_finished: false, replay, replayed }
+        let cwd = session.cwd().as_path().display().to_string();
+        Self { fleet, session, identity, turns, held: VecDeque::new(), script_finished: false, replay, replayed, cwd, turns_taken: 0 }
     }
 
     fn resuming(&self) -> bool {
         !self.replay.is_empty()
     }
 
-    /// Send a crew command, or take its recorded outcome while resuming. Queries are read again.
-    async fn act(&mut self, action: CommandAction) -> Result<CommandValue, String> {
-        if action.is_query() {
-            return self.fleet.execute(action).await;
+    /// The crew's way to its daemon, as its process in the vessel has.
+    fn link(&self) -> CrewLink<'_> {
+        CrewLink { fleet: &self.fleet, environment: &self.session.environment, identity: &self.identity, cwd: &self.cwd }
+    }
+
+    /// Send a crew command or publish, or take its recorded outcome while resuming. Queries are
+    /// read again.
+    async fn act(&mut self, act: Act) -> Result<CommandValue, String> {
+        if matches!(&act, Act::Command(action) if action.is_query()) {
+            return self.send(act).await;
         }
         if let Some(outcome) = self.take_recorded().await {
             return match outcome {
@@ -287,7 +318,7 @@ impl Crew {
             };
         }
         self.replayed = false;
-        let result = self.fleet.execute(action).await;
+        let result = self.send(act).await;
         self.acted(match &result {
             Ok(value) => Outcome::Done { value: Box::new(value.clone()) },
             Err(error) => Outcome::Refused { error: error.clone() },
@@ -295,11 +326,19 @@ impl Crew {
         result
     }
 
-    /// The next recorded outcome; when it is the last, the crew shows its daemon where it is.
+    async fn send(&self, act: Act) -> Result<CommandValue, String> {
+        let link = self.link();
+        match act {
+            Act::Command(action) => self.fleet.execute(&link, action).await,
+            Act::PublishLedger(body) => self.fleet.publish_ledger(&link, &body).await,
+        }
+    }
+
+    /// The next recorded outcome; when it is the last, the crew's harness reports where it is.
     async fn take_recorded(&mut self) -> Option<Outcome> {
         let outcome = self.replay.pop_front()?;
         if self.replay.is_empty() {
-            self.mark(self.session.working()).await;
+            self.report(self.session.working()).await;
         }
         Some(outcome)
     }
@@ -316,7 +355,11 @@ impl Crew {
     }
 
     pub(crate) async fn run(mut self, script: CrewScript) {
-        // The launch prompt is the first turn.
+        // Claude Code starts its session, then takes the launch prompt as the first turn.
+        if !self.resuming() {
+            self.hook("session-start").await;
+            self.hook("user-prompt-submit").await;
+        }
         self.mark(true).await;
         self.think().await;
         let ending = match self.begin().await {
@@ -361,19 +404,14 @@ impl Crew {
         format!("{role}/{vessel}/{}", identity.role)
     }
 
-    /// The crew's convoy's role, read from the daemon as any client reads a resource.
+    /// The crew's convoy's role, as `flotilla convoy explain` shows it to the crew.
     async fn convoy_role(&self) -> Option<String> {
-        let action = CommandAction::QueryResourceGet {
-            namespace: self.identity.namespace.clone(),
-            kind: "Convoy".into(),
-            name: self.identity.convoy.clone(),
-        };
-        let object = match self.fleet.execute(action).await.ok()? {
-            CommandValue::ResourceObject(response) => response.value,
-            CommandValue::ResourceRead(read) => read.records.into_iter().find_map(|record| record.object)?,
-            _ => return None,
-        };
-        object.pointer("/spec/role")?.as_str().map(str::to_owned)
+        let action =
+            CommandAction::QueryExplainConvoy { namespace: Some(self.identity.namespace.clone()), name: self.identity.convoy.clone() };
+        match self.fleet.execute(&self.link(), action).await.ok()? {
+            CommandValue::ConvoyExplanation(explanation) if !explanation.role.is_empty() => Some(explanation.role),
+            _ => None,
+        }
     }
 
     /// Fail or stall at the configured rates before doing any work.
@@ -501,12 +539,13 @@ impl Crew {
     /// Send a command the script needs, as a real crew would: retry a refusal
     /// a few times, then stall with the error and retry after guidance.
     /// `None` once the session is gone.
-    async fn persist(&mut self, action: CommandAction) -> Option<CommandValue> {
+    async fn persist(&mut self, act: impl Into<Act>) -> Option<CommandValue> {
+        let act = act.into();
         loop {
-            let mut backoff = Duration::from_secs(1);
+            let mut backoff = Duration::from_millis(self.fleet.config.agent.retry_backoff_ms);
             let mut last_error = String::new();
             for _ in 0..COMMAND_ATTEMPTS {
-                match self.act(action.clone()).await {
+                match self.act(act.clone()).await {
                     Ok(value) => return Some(value),
                     Err(error) => {
                         tracing::warn!(crew = %self.identity.subject(), %error, "dummy crew command refused; retrying");
@@ -535,7 +574,7 @@ impl Crew {
     async fn open_on_shared_forge(&mut self, shared: &SharedForge, repository: &str, branch: &str, title: &str) -> Option<String> {
         let body = format!("Opened by dummy crew {}.", self.identity.subject());
         loop {
-            let mut backoff = Duration::from_secs(1);
+            let mut backoff = Duration::from_millis(self.fleet.config.agent.retry_backoff_ms);
             let mut last_error = String::new();
             for attempt in 1..=COMMAND_ATTEMPTS {
                 let opened = match self.take_recorded().await {
@@ -624,27 +663,19 @@ impl Crew {
             self.count(Counter::CrewsCompleted);
             self.script_finished = true;
         }
-        // The envelope names its ledger by digest, as a real crew's does; the body itself is not stored.
-        let ledger = format!("## Decision ledger\n- {} finished its script\n", self.identity.role);
-        self.persist(CommandAction::ResourceApply {
-            namespace: self.identity.namespace.clone(),
-            document: serde_json::json!({
-                "apiVersion": "flotilla.work/v1", "kind": "Artifact", "metadata": {"name": name},
-                "spec": {
-                    "convoy": self.identity.convoy, "producer": self.identity.role,
-                    "kind": "decision-ledger", "subject": self.identity.convoy,
-                    "digest": flotilla_resources::artifact::blob_digest_of(ledger.as_bytes()),
-                    "size": ledger.len(), "media_type": "text/markdown",
-                    "expires_at": chrono::Utc::now() + chrono::Duration::days(1),
-                }
-            }),
-        })
-        .await?;
+        // Publish the ledger as `flotilla artifact put` does; the daemon validates and stores it.
+        let role = &self.identity.role;
+        let ledger = format!(
+            "## Decision ledger\n\n1. **Brief silence:** the dummy script for {role} leaves nothing open.\n   \
+             - **Choice:** {role} ran its script as written.\n   - **Alternative:** stall and ask its supervisor.\n   \
+             - **If asking were free:** the same; the script decides.\n"
+        );
+        self.persist(Act::PublishLedger(ledger)).await?;
         Some(Ending::Completed)
     }
 
     async fn attempt(&mut self, action: CommandAction) -> Option<CommandValue> {
-        match self.act(action).await {
+        match self.act(Act::Command(action)).await {
             Ok(value) => Some(value),
             Err(error) => {
                 tracing::warn!(crew = %self.identity.subject(), %error, "dummy crew command failed");
@@ -666,28 +697,89 @@ impl Crew {
         Some(turn)
     }
 
+    /// Wait before retrying, still within the turn, as an agent retrying a command does.
     async fn idle_for(&self, duration: Duration) {
-        self.mark(false).await;
         if !self.resuming() {
             tokio::time::sleep(duration).await;
         }
-        self.mark(true).await;
     }
 
-    /// Show working or idle on the screen, and report it as a harness hook would. While
-    /// resuming, the screen follows the script and only where it ends up is reported.
+    /// Show working or idle on the screen. A change is what Claude Code's hooks report: a
+    /// prompt submitted, or the turn stopped. While resuming, the screen follows the script and
+    /// only where it ends up is reported.
     async fn mark(&self, working: bool) {
+        let was = self.session.working();
         self.session.set_working(working);
-        if let (Some(session), false) = (&self.identity.session, self.resuming()) {
-            self.fleet.report_attention(&self.identity.namespace, session, working).await;
+        if was != working && !self.resuming() {
+            self.report(working).await;
         }
     }
 
-    async fn think(&self) {
-        if !self.resuming() {
-            let turns = self.session.record().turns.len();
-            tokio::time::sleep(turn_length(&self.fleet.config, &self.session.name, turns)).await;
+    async fn report(&self, working: bool) {
+        self.hook(if working { "user-prompt-submit" } else { "stop" }).await;
+    }
+
+    /// Work on the turn: Claude Code's tool calls, a pre- and post-tool-use hook each, spread
+    /// over the turn's length. The turn's hook count, with its prompt and stop, is drawn from
+    /// the configured spread.
+    async fn think(&mut self) {
+        if self.resuming() {
+            return;
         }
+        self.turns_taken += 1;
+        let tool_hooks = self.hooks_this_turn().saturating_sub(2);
+        let turns = self.session.record().turns.len();
+        let turn = turn_length(&self.fleet.config, &self.session.name, turns);
+        let pause = turn / (tool_hooks + 1);
+        for hook in 0..tool_hooks {
+            tokio::time::sleep(pause).await;
+            self.hook(if hook % 2 == 0 { "pre-tool-use" } else { "post-tool-use" }).await;
+        }
+        tokio::time::sleep(pause).await;
+    }
+
+    /// This turn's hook count: log-normal with the configured mean and median, at least two
+    /// (prompt and stop) and at most [`MAX_HOOKS_PER_TURN`], drawn deterministically per turn.
+    fn hooks_this_turn(&self) -> u32 {
+        let agent = &self.fleet.config.agent;
+        let (mean, median) = (agent.hooks_per_turn, agent.hooks_per_turn_median);
+        if mean <= 0.0 || median <= 0.0 || mean < median {
+            return 2;
+        }
+        let subject = format!("{}#{}", self.identity.subject(), self.turns_taken);
+        // Box-Muller over two uniform draws; the first is kept off zero.
+        let first = dummy_draw(self.fleet.config.seed, "hooks-per-turn-a", &subject).max(f64::MIN_POSITIVE);
+        let second = dummy_draw(self.fleet.config.seed, "hooks-per-turn-b", &subject);
+        let normal = (-2.0 * first.ln()).sqrt() * (std::f64::consts::TAU * second).cos();
+        // A log-normal's mean is exp(mu + sigma^2 / 2) and its median exp(mu).
+        let sigma = (2.0 * (mean / median).ln()).sqrt();
+        let count = (median.ln() + sigma * normal).exp().round();
+        count.clamp(2.0, f64::from(MAX_HOOKS_PER_TURN)) as u32
+    }
+
+    /// Deliver Claude Code's hook `event` for the crew's session. A refused or lost hook is
+    /// logged and counted, as Claude Code goes on after a failed hook.
+    async fn hook(&self, event: &str) {
+        if let Err(error) = self.fleet.hook(&self.link(), event).await {
+            tracing::debug!(crew = %self.identity.subject(), event, %error, "dummy crew hook failed");
+        }
+    }
+}
+
+/// The most hook events one turn sends, bounding the spread's tail.
+const MAX_HOOKS_PER_TURN: u32 = 1_000;
+
+/// What a crew sends to its daemon: a crew command, or a decision ledger published as
+/// `flotilla artifact put` publishes one.
+#[derive(Clone)]
+enum Act {
+    Command(CommandAction),
+    PublishLedger(String),
+}
+
+impl From<CommandAction> for Act {
+    fn from(action: CommandAction) -> Self {
+        Self::Command(action)
     }
 }
 

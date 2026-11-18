@@ -28,9 +28,12 @@
 mod adapter;
 pub mod catalog;
 mod crew;
+#[cfg(test)]
+mod fake_daemon;
 mod fleet;
 mod forge;
 mod guard;
+mod link;
 mod shared_forge;
 mod stand_in;
 mod state;
@@ -43,7 +46,7 @@ use flotilla_discovery::DiscoveryRuntime;
 
 pub use adapter::{DummyAgentAdapter, DUMMY_AGENT_ADAPTER, DUMMY_SCRIPT_ENV};
 pub use crew::{CrewScript, LAST_TURN_MARKER, SCRIPT_LINE_PREFIX};
-pub use fleet::{CrewCommandPort, DaemonCommandPort, DummyFleet, DummyFleetSnapshot, DummyVendor};
+pub use fleet::{DummyFleet, DummyFleetSnapshot, DummyVendor};
 pub use flotilla_environment::environment::dummy::{DUMMY_ENVIRONMENT_INSTANCE, DUMMY_FLEET_ENV};
 pub use forge::DummyChangeRequestTracker;
 pub use state::STATE_FILE;

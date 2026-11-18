@@ -517,7 +517,7 @@ impl TerminalControllerRuntime {
                 // Claude Code delivers hooks over HTTP: host-direct while flotillad listens on
                 // loopback TCP, and in a Docker vessel through its agent's forward. SSH host
                 // and cloud vessels keep command hooks. The token binds the hooks to this terminal.
-                if requirement.adapter == "claude-code" {
+                if adapter.posts_claude_code_hooks() {
                     declare_claude_shell(&*launch_runner()?, &mut credential_env, name).await;
                     let hooks = if spec.env_ref == self.state.host_direct_environment_name {
                         self.host_direct_hooks(&context.namespace, name).await

@@ -234,7 +234,7 @@ mod tests {
             Arc::new(flotilla_discovery_testkit::HostPeerOverlay::default()),
         )
         .await;
-        crate::dummy_fleet::attach_dummy_fleet(&fleet, &daemon).unwrap();
+        fleet.resume();
         let runtime = crate::runtime::DaemonRuntime::start_with_options(
             daemon.clone(),
             config,

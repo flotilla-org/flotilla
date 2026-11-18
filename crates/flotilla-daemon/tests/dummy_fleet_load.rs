@@ -52,15 +52,16 @@ use chrono::Utc;
 use flotilla_config::{ConfigStore, DaemonConfig};
 use flotilla_core::in_process::InProcessDaemon;
 use flotilla_daemon::{
-    dummy_fleet::{attach_dummy_fleet, install_dummy_fleet},
+    dummy_fleet::install_dummy_fleet,
     runtime::{DaemonRuntime, RuntimeOptions},
+    server::{EnvironmentFrontDoor, HookEndpoint},
 };
 use flotilla_daemon_api::daemon::DaemonHandle;
 use flotilla_daemon_testkit::server::{spawn_in_memory_request_mesh_with_replication_metrics, InMemoryRequestMesh};
 use flotilla_discovery_testkit::fake_discovery_with_host_directories;
 use flotilla_dummy_fleet::{
     catalog::{self, CrewMix, DUMMY_FULFILMENT_KIND},
-    CrewCommandPort, DaemonCommandPort, DummyFleet, DUMMY_AGENT_ADAPTER,
+    DummyFleet, DUMMY_AGENT_ADAPTER,
 };
 use flotilla_load_driver::{ConvoyObservation, ConvoyState, FleetTarget, HomeSample, LoadPlan, TargetSample};
 use flotilla_observation::forge_observation::NO_READY_FORGE_OBSERVER;
@@ -102,7 +103,9 @@ struct Home {
     fleet: Arc<DummyFleet>,
     runtime: DaemonRuntime,
     database: PathBuf,
-    port: Arc<DaemonCommandPort>,
+    operator: Operator,
+    /// Ends the environment sockets' connections when the home goes.
+    _front_door: tokio::sync::watch::Sender<bool>,
     replication: Arc<ReplicationLoadMetrics>,
     view: Arc<HomeView>,
 }
@@ -210,27 +213,53 @@ async fn start_home(root: &std::path::Path, index: usize, dummy_fleet: &str, opt
         std::sync::Arc::new(flotilla_discovery_testkit::HostPeerOverlay::default()),
     )
     .await;
-    attach_dummy_fleet(&fleet, &daemon).expect("attach fleet");
-    let options = RuntimeOptions { namespace: NAMESPACE.into(), ..options };
+    fleet.resume();
+    // The crews reach the daemon through their environments' sockets and hook routes, as
+    // flotillad's server serves them.
+    let hooks = HookEndpoint::load(config.state_dir().as_path()).expect("hook key");
+    let (front_door, shutdown) = tokio::sync::watch::channel(false);
+    let directory = flotilla_protocol::DaemonHostPath::new(config_dir.join("env"));
+    let environments = EnvironmentFrontDoor::for_daemon(&daemon, hooks.clone(), directory, shutdown);
+    let options = RuntimeOptions {
+        namespace: NAMESPACE.into(),
+        environment_sockets: Some(environments.socket_service()),
+        hook_endpoint: Some(hooks),
+        ..options
+    };
     let runtime = DaemonRuntime::start_with_options(Arc::clone(&daemon), config, None, options).await.expect("runtime");
+    environments.install_blob_store(Arc::clone(&runtime.blob_store)).expect("blob store");
     let backend = daemon.resource_backend();
-    let port = DaemonCommandPort::new(&(Arc::clone(&daemon) as Arc<dyn DaemonHandle>));
+    let operator = Operator(Arc::clone(&daemon) as Arc<dyn DaemonHandle>);
     let view = Arc::new(HomeView::default());
     // What the harness reads to seed and observe the fleet counts for it, apart from the fleet's own work.
     attributed(caller("load harness"), async {
-        seed(&backend, &port, fleet.config()).await;
+        seed(&backend, &operator, fleet.config()).await;
         watch_convoys(&backend, Arc::clone(&view), admissions).await;
         watch_messages(&backend, Arc::clone(&view)).await;
     })
     .await;
     let primitives = daemon.message_primitives().expect("the Message path is composed");
     watch_engine_messages(Arc::clone(primitives.service()), Arc::clone(&view));
-    Home { daemon, fleet, runtime, database, port, replication: Arc::default(), view }
+    Home { daemon, fleet, runtime, database, operator, _front_door: front_door, replication: Arc::default(), view }
+}
+
+/// The driver's commands, sent as an operator's `flotilla` sends them: a query answers at once,
+/// a command once it has finished.
+struct Operator(Arc<dyn DaemonHandle>);
+
+impl Operator {
+    async fn execute(&self, action: CommandAction) -> Result<CommandValue, String> {
+        let command = flotilla_protocol::Command::builder().action(action).build();
+        if command.action.is_query() {
+            return self.0.execute_query(command, uuid::Uuid::new_v4()).await;
+        }
+        flotilla_client::wait_for_command(&*self.0, command, |_| {}).await
+    }
 }
 
 /// Apply the dummy catalog as an operator applies it to a real daemon: the
 /// documents `dummy-fleet-catalog` writes, through the resource-apply command.
-async fn seed(backend: &ResourceBackend, port: &DaemonCommandPort, config: &flotilla_config::dummy_fleet::DummyFleetConfig) {
+async fn seed(backend: &ResourceBackend, port: &Operator, config: &flotilla_config::dummy_fleet::DummyFleetConfig) {
     let host = backend.clone().using::<Host>(NAMESPACE).list().await.expect("hosts").items.into_iter().next().expect("local host");
     let mut documents =
         catalog::documents(&config.forge_service_url, &host.metadata.name, config.agent.long_runner_turns).expect("dummy catalog");
@@ -542,7 +571,7 @@ impl FleetTarget for InProcessFleet {
         }
         let _call = self.calls.begin(format!("dispatch {name}"));
         let home = &self.homes[home];
-        match home.port.execute(catalog::dispatch(name, mix.workflow_name(), DUMMY_FULFILMENT_KIND)).await? {
+        match home.operator.execute(catalog::dispatch(name, mix.workflow_name(), DUMMY_FULFILMENT_KIND)).await? {
             CommandValue::ConvoyStarted { .. } => Ok(()),
             CommandValue::Error { message } => Err(message),
             other => Err(format!("unexpected admission result {other:?}")),
@@ -562,7 +591,7 @@ impl FleetTarget for InProcessFleet {
         let resource = home.view.convoys.lock().expect("convoys").get(name).map(|(resource, _)| resource.clone());
         let resource = resource.ok_or_else(|| format!("convoy {name} is not known"))?;
         let action = CommandAction::ConvoyAbandon { namespace: Some(NAMESPACE.into()), name: resource, reason: reason.into() };
-        match home.port.execute(action).await? {
+        match home.operator.execute(action).await? {
             CommandValue::Error { message } => Err(message),
             _ => Ok(()),
         }

@@ -329,6 +329,12 @@ impl DummyEnvironmentProvider {
         self.backing(environment)?.agent.controller_forward.lock().unwrap_or_else(std::sync::PoisonError::into_inner).clone()
     }
 
+    /// The command world inside `environment`'s backing, by environment ID or backing name, as a
+    /// process running in it sees it. `None` when the vendor holds no such backing.
+    pub fn runner(&self, environment: &str) -> Option<Arc<dyn CommandRunner>> {
+        self.backing(environment).map(|handle| Arc::clone(&handle.runner) as Arc<dyn CommandRunner>)
+    }
+
     /// The vendor deletes `environment`'s backing, as a sandbox vendor evicts
     /// one: it leaves the inventory, its handles report it gone, and the
     /// processes inside it end. False when the vendor holds no such backing.

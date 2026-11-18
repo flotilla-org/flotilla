@@ -696,6 +696,11 @@ pub trait AgentAdapter: Send + Sync {
     fn classify_screen_attention(&self, _screen: &str) -> Option<TerminalAttentionState> {
         None
     }
+    /// Whether this harness reports through Claude Code's hooks, and so takes a launch's hook
+    /// URL and token (`FLOTILLA_HOOK_URL`, `FLOTILLA_HOOK_TOKEN`) to post them over HTTP.
+    fn posts_claude_code_hooks(&self) -> bool {
+        false
+    }
     /// Why a screen that reads `Unobservable` shows an agent that is idle but
     /// cannot take a turn, so attention can name it (#3460). Never changes the
     /// attention state: delivery still refuses.
@@ -871,6 +876,10 @@ impl AgentAdapter for CliAgentAdapter {
     }
     async fn cleanup(&self, cwd: &ExecutionEnvironmentPath, brief: &TerminalBrief) -> Result<(), String> {
         remove_agent_files(&*self.runner, cwd.as_path(), brief, self.flavor.managed_files()).await
+    }
+
+    fn posts_claude_code_hooks(&self) -> bool {
+        matches!(self.flavor, AdapterFlavor::ClaudeCode { .. })
     }
 
     fn classify_screen_attention(&self, screen: &str) -> Option<TerminalAttentionState> {

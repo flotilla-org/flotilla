@@ -491,6 +491,9 @@ pub struct ConvoyExplanation {
     pub environment_observations: std::collections::BTreeMap<String, crate::environment::EnvironmentRuntimeObservation>,
     pub namespace: String,
     pub convoy: String,
+    /// The convoy's role: the name its dispatcher or ensure gave it.
+    #[serde(default)]
+    pub role: String,
     pub phase: String,
     /// Each open stall, one about each stalled seat and one about no seat.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]

@@ -40,7 +40,6 @@ use std::{
     time::Duration,
 };
 
-use async_trait::async_trait;
 use flotilla_client::{
     resource::{ResourceClient, ResourceGetRequest, ResourceListRequest, ResourceWatchRequest},
     SocketDaemon,
@@ -48,17 +47,17 @@ use flotilla_client::{
 use flotilla_config::{ConfigStore, DaemonConfig};
 use flotilla_core::in_process::InProcessDaemon;
 use flotilla_daemon::{
-    dummy_fleet::{daemon_crew_port, dummy_fleet_component, install_dummy_fleet},
+    dummy_fleet::{dummy_fleet_component, install_dummy_fleet},
     peer::PeerManager,
     runtime::{engine_opener, DaemonRuntime, RuntimeOptions},
-    server::{build_remote_command_router, PeerConnectionEvent},
+    server::{build_remote_command_router, EnvironmentFrontDoor, HookEndpoint, PeerConnectionEvent},
 };
 use flotilla_daemon_api::daemon::DaemonHandle;
 use flotilla_discovery_api::detectors::{parse_first_dotted_version, CommandDetector};
 use flotilla_discovery_testkit::fake_discovery_with_host_directories;
 use flotilla_dummy_fleet::{
     catalog::{self, CrewMix, DUMMY_CLOUD_FULFILMENT_KIND, DUMMY_FULFILMENT_KIND},
-    CrewCommandPort, DummyFleet, DummyFleetSnapshot, DummyVendor, DUMMY_AGENT_ADAPTER,
+    DummyFleet, DummyFleetSnapshot, DummyVendor, DUMMY_AGENT_ADAPTER,
 };
 use flotilla_forgejo_providers::factories::{change_request::ForgejoChangeRequestFactory, issue_tracker::ForgejoIssueProviderFactory};
 use flotilla_github_providers::factories::{change_request::GitHubChangeRequestFactory, issue_tracker::GitHubIssueProviderFactory};
@@ -120,7 +119,8 @@ pub struct TestDaemon {
     daemon: Arc<InProcessDaemon>,
     fleet: Arc<DummyFleet>,
     runtime: Option<DaemonRuntime>,
-    relay: Arc<RestartRelay>,
+    /// Ends the environment sockets' connections, as the daemon process's end does.
+    front_door: watch::Sender<bool>,
     operator: Operator,
     composition: Composition,
     dispatched: AtomicU64,
@@ -194,15 +194,14 @@ impl TestDaemon {
             resync,
             forges,
         };
-        let relay = Arc::new(RestartRelay::default());
         let mut discovery = discovery(&dir, composition.forges.as_ref());
         let fleet = install_dummy_fleet(&daemon_config, config.state_dir().as_path(), &mut discovery)
             .expect("dummy fleet state")
             .expect("dummy fleet configured");
-        fleet.attach(Arc::clone(&relay) as Arc<dyn CrewCommandPort>).expect("attach the crews' command relay");
-        let (daemon, runtime) = untouched(composition.refused(), compose(&composition, config, discovery, &relay)).await;
+        fleet.resume();
+        let (daemon, runtime, front_door) = untouched(composition.refused(), compose(&composition, config, discovery, &dir)).await;
         let operator = Operator::connect(&daemon).await;
-        let started = Self { daemon, fleet, runtime: Some(runtime), relay, operator, composition, dispatched: AtomicU64::new(0), dir };
+        let started = Self { daemon, fleet, runtime: Some(runtime), front_door, operator, composition, dispatched: AtomicU64::new(0), dir };
         if seeded {
             started.seed().await;
         }
@@ -275,13 +274,16 @@ fn discovery(dir: &tempfile::TempDir, forges: Option<&ForgeTransport>) -> flotil
     discovery
 }
 
+/// The daemon and its runtime, serving its environment sockets and hook routes as `flotillad`'s
+/// server does; the sender ends those sockets' connections.
 async fn compose(
     composition: &Composition,
     config: Arc<ConfigStore>,
     discovery: flotilla_discovery::DiscoveryRuntime,
-    relay: &RestartRelay,
-) -> (Arc<InProcessDaemon>, DaemonRuntime) {
+    dir: &tempfile::TempDir,
+) -> (Arc<InProcessDaemon>, DaemonRuntime, watch::Sender<bool>) {
     let engine = engine_opener(&config);
+    let state_dir = config.state_dir();
     let daemon = InProcessDaemon::new_composed(
         vec![],
         Arc::clone(&config),
@@ -294,8 +296,16 @@ async fn compose(
     )
     .await
     .expect("compose the daemon");
-    relay.connect(&daemon);
-    let runtime = match DaemonRuntime::start_with_options(Arc::clone(&daemon), config, None, harness_options(composition.resync)).await {
+    let hooks = HookEndpoint::load(state_dir.as_path()).expect("hook key");
+    let (shutdown, shutdown_rx) = watch::channel(false);
+    let directory = flotilla_protocol::DaemonHostPath::new(dir.path().join("env"));
+    let front_door = EnvironmentFrontDoor::for_daemon(&daemon, hooks.clone(), directory, shutdown_rx);
+    let options = RuntimeOptions {
+        environment_sockets: Some(front_door.socket_service()),
+        hook_endpoint: Some(hooks),
+        ..harness_options(composition.resync)
+    };
+    let runtime = match DaemonRuntime::start_with_options(Arc::clone(&daemon), config, None, options).await {
         Ok(runtime) => runtime,
         // A start refused by the unavailable old store reports where each access came from.
         Err(error) => match composition.refused().filter(|accesses| !accesses.accesses().is_empty()) {
@@ -303,16 +313,17 @@ async fn compose(
             None => panic!("runtime: {error:?}"),
         },
     };
-    (daemon, runtime)
+    front_door.install_blob_store(Arc::clone(&runtime.blob_store)).expect("install the blob store");
+    (daemon, runtime, shutdown)
 }
 
 impl TestDaemon {
     /// Restart the daemon over the same store, as a process restart does.
     /// Vendor backings and crew processes survive; the new daemon adopts them.
     pub async fn restart(self) -> Self {
-        let Self { daemon, fleet, runtime, relay, operator, composition, dispatched, dir } = self;
+        let Self { daemon, fleet, runtime, front_door, operator, composition, dispatched, dir } = self;
         drop(operator);
-        relay.disconnect();
+        let _ = front_door.send(true);
         let node = daemon.node_id().clone();
         if let Some(runtime) = runtime {
             runtime.shutdown().await;
@@ -322,10 +333,10 @@ impl TestDaemon {
         let config = Arc::new(ConfigStore::with_base(dir.path().join("config")));
         let mut discovery = discovery(&dir, composition.forges.as_ref());
         fleet.install(&mut discovery);
-        let (daemon, runtime) = untouched(composition.refused(), compose(&composition, config, discovery, &relay)).await;
+        let (daemon, runtime, front_door) = untouched(composition.refused(), compose(&composition, config, discovery, &dir)).await;
         assert_eq!(daemon.node_id(), &node, "restart preserves the daemon's identity");
         let operator = Operator::connect(&daemon).await;
-        Self { daemon, fleet, runtime: Some(runtime), relay, operator, composition, dispatched, dir }
+        Self { daemon, fleet, runtime: Some(runtime), front_door, operator, composition, dispatched, dir }
     }
 
     /// Restart the daemon's process, as `flotillad` exiting and starting again does. The dummy
@@ -333,9 +344,8 @@ impl TestDaemon {
     /// the new process opens restores, from its state file, what outlives a real process: the
     /// vendors' backings, the sessions with their crews, the checkouts and the forge.
     pub async fn restart_process(self) -> Self {
-        let Self { daemon, fleet, runtime, relay, operator, composition, dispatched, dir } = self;
+        let Self { daemon, fleet, runtime, front_door, operator, composition, dispatched, dir } = self;
         drop(operator);
-        relay.disconnect();
         let node = daemon.node_id().clone();
         // The fleet stops with the runtime, as flotillad's graceful stop stops it.
         if let Some(mut runtime) = runtime {
@@ -344,6 +354,7 @@ impl TestDaemon {
         } else {
             fleet.stop();
         }
+        let _ = front_door.send(true);
         let ended = fleet.snapshot();
         drop(daemon);
         drop(fleet);
@@ -355,11 +366,11 @@ impl TestDaemon {
             .expect("dummy fleet state")
             .expect("dummy fleet configured");
         assert_eq!(fleet.snapshot(), ended, "a graceful stop leaves every change the fleet recorded in its state file");
-        fleet.attach(Arc::clone(&relay) as Arc<dyn CrewCommandPort>).expect("attach the crews' command relay");
-        let (daemon, runtime) = untouched(composition.refused(), compose(&composition, config, discovery, &relay)).await;
+        fleet.resume();
+        let (daemon, runtime, front_door) = untouched(composition.refused(), compose(&composition, config, discovery, &dir)).await;
         assert_eq!(daemon.node_id(), &node, "restart preserves the daemon's identity");
         let operator = Operator::connect(&daemon).await;
-        Self { daemon, fleet, runtime: Some(runtime), relay, operator, composition, dispatched, dir }
+        Self { daemon, fleet, runtime: Some(runtime), front_door, operator, composition, dispatched, dir }
     }
 
     /// Execute `action` as an operator: through the request dispatcher, as the
@@ -939,47 +950,6 @@ impl Operator {
         })
         .await
         .unwrap_or_else(|_| panic!("command {id} never finished"))
-    }
-}
-
-/// Stands in for the reconnecting command socket at the process boundary: the
-/// dummy crews' processes survive a restart, while their daemon endpoint is
-/// replaced. Commands sent while no daemon runs wait for the next one.
-#[derive(Default)]
-struct RestartRelay {
-    port: Mutex<Option<Arc<dyn CrewCommandPort>>>,
-    ready: Notify,
-}
-
-impl RestartRelay {
-    fn connect(&self, daemon: &Arc<InProcessDaemon>) {
-        *self.port.lock().expect("relay") = Some(daemon_crew_port(daemon));
-        self.ready.notify_waiters();
-    }
-
-    fn disconnect(&self) {
-        *self.port.lock().expect("relay") = None;
-    }
-
-    async fn port(&self) -> Arc<dyn CrewCommandPort> {
-        loop {
-            let ready = self.ready.notified();
-            if let Some(port) = self.port.lock().expect("relay").clone() {
-                return port;
-            }
-            ready.await;
-        }
-    }
-}
-
-#[async_trait]
-impl CrewCommandPort for RestartRelay {
-    async fn execute(&self, action: CommandAction) -> Result<CommandValue, String> {
-        self.port().await.execute(action).await
-    }
-
-    async fn report_attention(&self, namespace: &str, session: &str, working: bool) -> Result<(), String> {
-        self.port().await.report_attention(namespace, session, working).await
     }
 }
 

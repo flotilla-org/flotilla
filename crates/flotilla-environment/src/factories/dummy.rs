@@ -59,6 +59,11 @@ impl DummyEnvironmentFactory {
         self.provider.forward_target(environment)
     }
 
+    /// See [`DummyEnvironmentProvider::runner`].
+    pub fn runner(&self, environment: &str) -> Option<Arc<dyn CommandRunner>> {
+        self.provider.runner(environment)
+    }
+
     /// Act as the vendor: see [`DummyEnvironmentProvider::vanish`].
     pub fn vanish(&self, environment: &str) -> bool {
         self.provider.vanish(environment)

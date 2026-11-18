@@ -94,7 +94,7 @@ pub async fn run(
         };
         let daemon = server.daemon();
         if let Some(fleet) = &dummy_fleet {
-            crate::dummy_fleet::attach_dummy_fleet(fleet, &daemon)?;
+            fleet.resume();
         }
         let mut runtime = DaemonRuntime::start_with_options(
             daemon,

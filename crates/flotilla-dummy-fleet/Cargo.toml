@@ -18,6 +18,7 @@ path = "src/bin/dummy-fleet-catalog.rs"
 [dependencies]
 flotilla-agent = { path = "../flotilla-agent" }
 flotilla-change-request = { path = "../flotilla-change-request" }
+flotilla-client = { path = "../flotilla-client" }
 flotilla-config = { path = "../flotilla-config" }
 flotilla-daemon-api = { path = "../flotilla-daemon-api" }
 flotilla-discovery = { path = "../flotilla-discovery" }
@@ -44,6 +45,7 @@ uuid = { workspace = true, features = ["v4"] }
 [dev-dependencies]
 flotilla-discovery-testkit = { path = "../flotilla-discovery-testkit" }
 flotilla-fake-forge = { path = "../flotilla-fake-forge" }
+flotilla-transport = { path = "../flotilla-transport" }
 hegeltest = "=0.48.1"
 tempfile.workspace = true
 tokio = { workspace = true, features = ["test-util"] }

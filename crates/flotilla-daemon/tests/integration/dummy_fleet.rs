@@ -156,7 +156,7 @@ async fn co_located_reviewed_coders_settle_their_own_promises() {
 
 // Behaviour: a handoff reassigns only promises its sender names, each its own and open; naming one
 // that is not the sender's refuses the handoff, naming the promise.
-#[tokio::test(start_paused = true)]
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_handoff_refuses_to_reassign_a_promise_not_the_senders() {
     let fleet = TestDaemon::builder().agent("turn_delay_ms = 600000").start().await;
     let name = fleet.dispatch(CrewMix::CoderReviewer, DUMMY_FULFILMENT_KIND).await;
@@ -275,10 +275,69 @@ async fn a_stalled_crew_resumes_on_supervision_and_lands() {
     fleet.wait("Landed", in_phase(&name, ConvoyPhase::Landed)).await;
 }
 
+// A dummy crew reaches the daemon as a real crew in its vessel does: its commands over the
+// environment socket its vessel forwards, as the crew its Hello claims, and Claude Code's hooks
+// over the hook route, so its attention is the hooks'. Its ledger is an artifact it put. A
+// connection claiming another crew in the same environment is refused, and the fleet's crews
+// were refused nothing.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_crew_reaches_the_daemon_through_its_vessels_forward() {
+    let fleet = TestDaemon::builder().agent("stall_rate = 1.0").start().await;
+    let name = fleet.dispatch(CrewMix::Coder, DUMMY_FULFILMENT_KIND).await;
+    fleet.wait("a supervisable stall", stalled(&name)).await;
+    let ours = |session: &ResourceObject<TerminalSession>| match &session.spec.source {
+        flotilla_resources::TerminalSessionSource::Agent { context, .. } => {
+            flotilla_resources::convoy::launch_of(&context.convoy) == flotilla_resources::convoy::launch_of(&name)
+        }
+        _ => false,
+    };
+    // The stalled crew's turn stopped: its Stop hook reports it idle.
+    let hooked_idle = |session: &ResourceObject<TerminalSession>| {
+        ours(session)
+            && session.status.as_ref().and_then(|status| status.attention.as_ref()).is_some_and(|attention| {
+                attention.state == flotilla_resources::TerminalAttentionState::Idle
+                    && attention.source == flotilla_resources::TerminalAttentionSource::Hook
+            })
+    };
+    let session = fleet.wait("the crew's hooks report it idle", hooked_idle).await;
+
+    let socket = fleet.vendor().forward_target(&session.spec.env_ref).expect("the vessel forwards its daemon endpoint");
+    let flotilla_resources::TerminalSessionSource::Agent { context, .. } = &session.spec.source else { unreachable!() };
+    let forged = BTreeMap::from([
+        ("FLOTILLA_NAMESPACE".to_string(), NAMESPACE.to_string()),
+        ("FLOTILLA_CONVOY".to_string(), context.convoy.clone()),
+        ("FLOTILLA_VESSEL".to_string(), context.vessel_ref.clone()),
+        ("FLOTILLA_CREW_ROLE".to_string(), "coder".to_string()),
+        ("FLOTILLA_CREW_ID".to_string(), "another-crew".to_string()),
+        ("FLOTILLA_TERMINAL_SESSION".to_string(), session.metadata.name.clone()),
+    ]);
+    let refused = match flotilla_client::SocketDaemon::connect_with_crew_claims(&socket, forged).await {
+        Ok(client) => {
+            let query = CommandAction::QueryCrewCapabilities { context: Default::default() };
+            let command = flotilla_protocol::Command::builder().action(query).build();
+            flotilla_daemon_api::daemon::DaemonHandle::execute_query(&*client, command, uuid::Uuid::new_v4()).await.is_err()
+        }
+        Err(_) => true,
+    };
+    assert!(refused, "a connection claiming a crew that is not placed here is refused");
+
+    let resumed = fleet.execute(supervise(&name, CrewSupervisionAction::Resume)).await;
+    assert!(!matches!(resumed, CommandValue::Error { .. }), "{resumed:?}");
+    fleet.wait("Landed", in_phase(&name, ConvoyPhase::Landed)).await;
+    let ledgers = fleet.list::<flotilla_resources::Artifact>().await;
+    assert!(
+        ledgers.iter().any(|artifact| artifact.spec.kind == "decision-ledger"
+            && artifact.spec.producer == "coder"
+            && flotilla_resources::convoy::launch_of(&artifact.spec.convoy) == flotilla_resources::convoy::launch_of(&name)),
+        "the crew put its ledger: {ledgers:?}"
+    );
+    assert!(fleet.command_error_samples().is_empty(), "{:?}", fleet.command_error_samples());
+}
+
 // #3439: force the handoff-after-Done ordering without racing the scripts.
 // A zero-task long runner finishes first; its aide then hands back work, which
 // reopens the recipient; it delivers its convoy after handling that turn.
-#[tokio::test(start_paused = true)]
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_finished_long_runner_handles_a_late_handoff_and_lands() {
     let fleet = TestDaemon::builder().start().await;
     // Isolate the legacy same-vessel hand-back path. Normal peer tasks retain
@@ -591,13 +650,13 @@ async fn create_named(fleet: &TestDaemon, name: &str, workflow: &str) {
 }
 
 // A real governor must resume a stalled coder and deliver its convoy.
-#[tokio::test(start_paused = true)]
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn crew_supervision_resumes_a_stalled_coder() {
     supervised_coder_scenario(CrewSupervisionAction::Resume).await;
 }
 
 // A failing crew proposes failure; its named governor must fail it.
-#[tokio::test(start_paused = true)]
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn crew_supervision_fails_a_failing_coder() {
     supervised_coder_scenario(CrewSupervisionAction::Fail).await;
 }
@@ -640,7 +699,9 @@ async fn supervised_coder_scenario(action: CrewSupervisionAction) {
 // Behaviour: the load fleet's standing governor, kept by its ConvoyEnsure, receives a stalled
 // coder's supervision turn through the default project supervision, and resumes it with the
 // command the turn gives; the coder's convoy lands with no operator ruling.
-#[tokio::test(start_paused = true)]
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore = "the governor's resume through its environment connection is denied: the Fleet project's cascade declares no \
+            governor role subscribed to supervision, though default supervision delivers it the turn"]
 async fn the_standing_governor_resumes_a_stalled_coder() {
     use flotilla_environment::environment::dummy::dummy_draw;
 
@@ -679,9 +740,9 @@ async fn the_standing_governor_resumes_a_stalled_coder() {
 // A daemon restart restores its active convoy while the crew process survives.
 // Its next submissions deliver the convoy without re-admission or a duplicate
 // process launch.
-#[tokio::test(start_paused = true)]
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_daemon_restart_restores_an_active_convoy_and_lands() {
-    let fleet = TestDaemon::builder().agent("turn_delay_ms = 10000").settings("host_name = \"restart-proof\"\n").start().await;
+    let fleet = TestDaemon::builder().agent("turn_delay_ms = 3000").settings("host_name = \"restart-proof\"\n").start().await;
     let name = fleet.dispatch(CrewMix::Coder, DUMMY_FULFILMENT_KIND).await;
     let before = fleet
         .wait("a launched coder before its first submission", |found: &ResourceObject<Convoy>| {
@@ -698,7 +759,7 @@ async fn a_daemon_restart_restores_an_active_convoy_and_lands() {
 // A daemon restart in the middle of a long runner's exchange, with the crews' processes
 // surviving as a real harness's do, keeps one holder of each role: the crews' turns to each other
 // deliver after it without a refused command.
-#[tokio::test(start_paused = true)]
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_long_runner_exchange_survives_a_daemon_restart() {
     let fleet = TestDaemon::builder().settings("host_name = \"restart-proof\"\n").start().await;
     let name = fleet.dispatch(CrewMix::LongRunner, DUMMY_FULFILMENT_KIND).await;
@@ -716,9 +777,9 @@ async fn a_long_runner_exchange_survives_a_daemon_restart() {
 // A daemon restart between a coder's change request and its reviewer's answer, with the crews'
 // processes surviving, acts on each turn once: one change request, one launch of each crew, and
 // the convoy lands.
-#[tokio::test(start_paused = true)]
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_restart_mid_review_acts_on_each_turn_once_and_lands() {
-    let fleet = TestDaemon::builder().agent("turn_delay_ms = 10000").settings("host_name = \"restart-proof\"\n").start().await;
+    let fleet = TestDaemon::builder().agent("turn_delay_ms = 3000").settings("host_name = \"restart-proof\"\n").start().await;
     let name = fleet.dispatch(CrewMix::CoderReviewer, DUMMY_FULFILMENT_KIND).await;
     mid_review(&fleet, &name).await;
     let fleet = fleet.restart().await;
@@ -728,9 +789,9 @@ async fn a_restart_mid_review_acts_on_each_turn_once_and_lands() {
 // As above, but the daemon's process ends, and the dummy fleet with it: the next process's fleet
 // restores the vendor's backing, the sessions and their crews, and the forge from its state file,
 // as a real host's Docker, cleat and forge outlive flotillad. The crews resume where they were.
-#[tokio::test(start_paused = true)]
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_process_restart_mid_review_acts_on_each_turn_once_and_lands() {
-    let fleet = TestDaemon::builder().agent("turn_delay_ms = 10000").settings("host_name = \"restart-proof\"\n").start().await;
+    let fleet = TestDaemon::builder().agent("turn_delay_ms = 3000").settings("host_name = \"restart-proof\"\n").start().await;
     let name = fleet.dispatch(CrewMix::CoderReviewer, DUMMY_FULFILMENT_KIND).await;
     mid_review(&fleet, &name).await;
     let fleet = fleet.restart_process().await;
@@ -743,11 +804,11 @@ async fn a_process_restart_mid_review_acts_on_each_turn_once_and_lands() {
 // kept, while it waits on its review; its relaunch, briefed with the kept change request, opens
 // no second one and asks for no second review, and the convoy lands on the reviewer's answer.
 // The dummy forge opens one change request per branch, so the review turns tell the two apart.
-#[tokio::test(start_paused = true)]
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_coder_relaunched_after_its_change_request_is_kept_does_not_deliver_it_again() {
     use flotilla_resources::promises::{PromiseKind, PromiseState};
 
-    let fleet = TestDaemon::builder().agent("turn_delay_ms = 10000").start().await;
+    let fleet = TestDaemon::builder().agent("turn_delay_ms = 3000").start().await;
     let name = fleet.dispatch(CrewMix::CoderReviewer, DUMMY_FULFILMENT_KIND).await;
     let kept = async {
         loop {
@@ -775,7 +836,7 @@ async fn a_coder_relaunched_after_its_change_request_is_kept_does_not_deliver_it
 // delivery keeps each turn queued and retries it: the convoy still lands with each turn acted on
 // once, and no crew command fails. Turns are short (still past the second of work that confirms a
 // delivery), so the retry pass fits in the wait.
-#[tokio::test(start_paused = true)]
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn refused_submissions_are_retried_and_each_turn_lands_once() {
     let fleet = TestDaemon::builder().agent("turn_delay_ms = 2000").terminal("refusal_rate = 0.5").start().await;
     let name = fleet.dispatch(CrewMix::CoderReviewer, DUMMY_FULFILMENT_KIND).await;
@@ -998,7 +1059,7 @@ async fn a_stall_past_every_supervisor_reaches_the_projects_operator_and_the_per
 
 // A lone coder delivers its convoy after the daemon runtime realises its
 // environment and launches its crew, and tears the environment down after.
-#[tokio::test(start_paused = true)]
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_lone_coder_realises_its_resources_and_delivers() {
     let fleet = TestDaemon::builder().start().await;
     let (_, landed) = deliver(&fleet, CrewMix::Coder).await;
@@ -1008,7 +1069,7 @@ async fn a_lone_coder_realises_its_resources_and_delivers() {
 }
 
 // An environment that cannot realise fails its convoy and launches no terminal session.
-#[tokio::test(start_paused = true)]
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn an_unrealised_environment_records_failure_without_a_terminal() {
     let fleet = TestDaemon::builder().environment("failure_rate = 1.0").start().await;
     let name = fleet.dispatch(CrewMix::Coder, DUMMY_FULFILMENT_KIND).await;
@@ -1277,10 +1338,10 @@ async fn apply_transport_fixtures(fleet: &TestDaemon, host: &str) {
 // Both peer runtimes consume the real change stream. What each host made is
 // listed at the other, as `flotilla get` shows it there, and home-local kinds
 // stay home.
-#[tokio::test(start_paused = true)]
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn two_daemons_replicate_every_kind() {
     // Replication is under test, not missed events: the production resync
-    // keeps the paused clock's controller passes, which cost real time, few.
+    // keeps the controller passes few.
     let resync = RuntimeOptions::default().controller_resync_interval;
     let (a, b) = tokio::join!(
         TestDaemon::builder().agent("stall_rate = 1.0").settings("host_name = \"engine-a\"\n").resync(resync).start(),

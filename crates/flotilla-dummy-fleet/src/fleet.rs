@@ -1,18 +1,16 @@
 //! The fleet hub shared by every dummy provider a daemon installs.
 
 use std::{
-    collections::{BTreeSet, HashMap, HashSet},
+    collections::{BTreeSet, HashSet},
     path::{Path, PathBuf},
     sync::{
         atomic::{AtomicU64, Ordering},
-        Arc, Mutex, OnceLock, Weak,
+        Arc, Mutex, Weak,
     },
     time::Duration,
 };
 
-use async_trait::async_trait;
 use flotilla_config::dummy_fleet::DummyFleetConfig;
-use flotilla_daemon_api::daemon::DaemonHandle;
 use flotilla_environment::{
     environment::dummy::{
         DummyEnvironmentBehaviour, DummyEnvironmentCleanup, DummyEnvironmentCounts, DummyVendorJournal, DUMMY_CLOUD_ENVIRONMENT_INSTANCE,
@@ -20,33 +18,19 @@ use flotilla_environment::{
     },
     factories::dummy::DummyEnvironmentFactory,
 };
-use flotilla_protocol::{commands::CommandValue, Command, CommandAction, DaemonEvent};
-use flotilla_provider_runtime::{HttpClient, ReqwestHttpClient};
+use flotilla_protocol::{commands::CommandValue, CommandAction};
+use flotilla_provider_runtime::{CommandRunner, HttpClient, ReqwestHttpClient};
 use serde::{Deserialize, Serialize};
-use tokio::sync::{broadcast::error::RecvError, oneshot};
 
 use crate::{
     catalog::CrewMix,
     forge::DummyForge,
+    link::CrewLink,
     shared_forge::SharedForge,
     state::{self, Event, Journal},
     terminal::DummySessions,
     vcs::DummyCheckouts,
 };
-
-/// How a dummy crew reaches its daemon: the same commands a real crew sends
-/// through `flotilla crew …`, without a socket or a process.
-#[async_trait]
-pub trait CrewCommandPort: Send + Sync {
-    async fn execute(&self, action: CommandAction) -> Result<CommandValue, String>;
-
-    /// Report the crew working or idle in its terminal session, as a real
-    /// harness's hooks do. Ports without a hook path ignore it; the session's
-    /// screen still shows the same state.
-    async fn report_attention(&self, _namespace: &str, _session: &str, _working: bool) -> Result<(), String> {
-        Ok(())
-    }
-}
 
 /// One daemon's dummy fleet: its settings, the forge its crews open change
 /// requests on, the sessions its terminal pool hosts and its counters.
@@ -60,7 +44,6 @@ pub struct DummyFleet {
     pub(crate) checkouts: DummyCheckouts,
     /// The state file this fleet appends its changes to, once restored from it.
     journal: Journal,
-    port: OnceLock<Arc<dyn CrewCommandPort>>,
     counters: Counters,
     vessel_names: BTreeSet<String>,
     command_error_samples: Mutex<Vec<String>>,
@@ -136,7 +119,6 @@ impl DummyFleet {
                 checkouts: DummyCheckouts::default(),
                 journal: Journal::default(),
                 config,
-                port: OnceLock::new(),
                 counters: Counters::default(),
                 command_error_samples: Mutex::default(),
                 submissions: AtomicU64::new(0),
@@ -148,13 +130,12 @@ impl DummyFleet {
         &self.config
     }
 
-    /// Connect crews to their daemon, and resume those a previous process's fleet hosted. The
+    /// Resume the crews a previous process's fleet hosted. They reach their daemon as they
+    /// always do, through their vessels' forwards, waiting while it does not answer. The
     /// composition root calls this once, after constructing the daemon whose discovery
     /// installed this fleet.
-    pub fn attach(self: &Arc<Self>, port: Arc<dyn CrewCommandPort>) -> Result<(), String> {
-        self.port.set(port).map_err(|_| "dummy fleet is already attached to a daemon".to_string())?;
+    pub fn resume(self: &Arc<Self>) {
         self.sessions.resume(self);
-        Ok(())
     }
 
     /// End this fleet as its process's end does: its crews stop where they are, and nothing
@@ -239,19 +220,37 @@ impl DummyFleet {
         events
     }
 
-    pub(crate) async fn execute(&self, action: CommandAction) -> Result<CommandValue, String> {
-        let port = self.port.get().ok_or("dummy fleet is not attached to a daemon")?;
+    /// Send a crew's command over its link, counting a refusal.
+    pub(crate) async fn execute(&self, link: &CrewLink<'_>, action: CommandAction) -> Result<CommandValue, String> {
         // Keep only a static command kind across the ownership boundary. Format
         // diagnostics only for retained failures; successful commands allocate no diagnostic strings.
         let command = match &action {
             CommandAction::CrewPromise { .. } => "CrewPromise",
-            CommandAction::CrewComplete { .. } => "CrewComplete",
             CommandAction::CrewHandoff { .. } => "CrewHandoff",
             CommandAction::CrewStall { .. } => "CrewStall",
-            CommandAction::CrewFail { .. } => "CrewFail",
+            CommandAction::CrewSupervise { .. } => "CrewSupervise",
+            CommandAction::QueryExplainConvoy { .. } => "QueryExplainConvoy",
             _ => "dummy crew command",
         };
-        let result = port.execute(action).await;
+        self.counted(command, link.execute(action).await)
+    }
+
+    /// Publish a crew's decision ledger over its link, counting a refusal.
+    pub(crate) async fn publish_ledger(&self, link: &CrewLink<'_>, body: &str) -> Result<CommandValue, String> {
+        self.counted("ArtifactPut", link.put_ledger(body).await.map(|_| CommandValue::Ok))
+    }
+
+    /// Deliver a crew's Claude Code hook over its link, counting a failure. A hook is not a crew
+    /// command: Claude Code goes on when one fails, and so does the crew.
+    pub(crate) async fn hook(&self, link: &CrewLink<'_>, event: &str) -> Result<(), String> {
+        let result = link.hook(event).await;
+        if result.is_err() {
+            self.count(Counter::HookFailures);
+        }
+        result
+    }
+
+    fn counted(&self, command: &'static str, result: Result<CommandValue, String>) -> Result<CommandValue, String> {
         match &result {
             Ok(CommandValue::Error { .. }) | Err(_) => {
                 self.count(Counter::CommandErrors);
@@ -265,13 +264,6 @@ impl DummyFleet {
         match result {
             Ok(CommandValue::Error { message }) => Err(message),
             result => result,
-        }
-    }
-
-    pub(crate) async fn report_attention(&self, namespace: &str, session: &str, working: bool) {
-        let Some(port) = self.port.get() else { return };
-        if let Err(error) = port.report_attention(namespace, session, working).await {
-            tracing::debug!(%session, %error, "dummy crew attention report failed");
         }
     }
 
@@ -324,6 +316,7 @@ impl DummyFleet {
             change_requests_opened: read(Counter::ChangeRequestsOpened),
             command_errors: read(Counter::CommandErrors),
             submissions_refused: read(Counter::SubmissionsRefused),
+            hook_failures: read(Counter::HookFailures),
             live_sessions: self.sessions.len() as u64,
         }
     }
@@ -340,10 +333,11 @@ pub(crate) enum Counter {
     ChangeRequestsOpened,
     CommandErrors,
     SubmissionsRefused,
+    HookFailures,
 }
 
 impl Counter {
-    const ALL: [Self; 8] = [
+    const ALL: [Self; 9] = [
         Self::SessionsLaunched,
         Self::TurnsReceived,
         Self::CrewsCompleted,
@@ -352,11 +346,12 @@ impl Counter {
         Self::ChangeRequestsOpened,
         Self::CommandErrors,
         Self::SubmissionsRefused,
+        Self::HookFailures,
     ];
 }
 
 #[derive(Default)]
-struct Counters([AtomicU64; 8]);
+struct Counters([AtomicU64; 9]);
 
 impl Counters {
     fn get(&self, counter: Counter) -> &AtomicU64 {
@@ -376,6 +371,8 @@ pub struct DummyFleetSnapshot {
     pub command_errors: u64,
     /// Submissions the pools refused before writing, as cleat refuses one.
     pub submissions_refused: u64,
+    /// Claude Code hook events that did not reach the daemon.
+    pub hook_failures: u64,
     pub live_sessions: u64,
     /// Backings the environment vendors realised.
     pub environments_provisioned: u64,
@@ -416,6 +413,17 @@ impl DummyVendor {
         self.each().for_each(|vendor| vendor.refuse_provisioning(refuse));
     }
 
+    /// The controller socket `environment`'s agent forwards its daemon endpoint to, once the
+    /// daemon has asked for the forward.
+    pub fn forward_target(&self, environment: &str) -> Option<PathBuf> {
+        self.each().find_map(|vendor| vendor.forward_target(environment))
+    }
+
+    /// The commands and files inside `environment`'s backing.
+    pub(crate) fn runner(&self, environment: &str) -> Option<Arc<dyn CommandRunner>> {
+        self.each().find_map(|vendor| vendor.runner(environment))
+    }
+
     fn counts(&self) -> DummyEnvironmentCounts {
         self.each().map(DummyEnvironmentFactory::counts).fold(DummyEnvironmentCounts::default(), |sum, counts| DummyEnvironmentCounts {
             provisioned: sum.provisioned + counts.provisioned,
@@ -423,99 +431,5 @@ impl DummyVendor {
             vanished: sum.vanished + counts.vanished,
             live: sum.live + counts.live,
         })
-    }
-}
-
-/// Results unclaimed for this long belong to other callers and are dropped.
-const UNCLAIMED_RESULT_TTL: Duration = Duration::from_secs(60);
-
-/// A command that finishes later than this is reported to the crew as lost.
-const COMMAND_RESULT_TIMEOUT: Duration = Duration::from_secs(120);
-
-enum Slot {
-    Waiting(oneshot::Sender<CommandValue>),
-    Finished(Box<CommandValue>, tokio::time::Instant),
-}
-
-/// [`CrewCommandPort`] over a daemon handle. One listener routes every
-/// `CommandFinished` event to its waiting crew, so a thousand crews share one
-/// event subscription. It holds the daemon weakly: the daemon owns this port
-/// through its discovery factories.
-pub struct DaemonCommandPort {
-    daemon: Weak<dyn DaemonHandle>,
-    slots: Arc<Mutex<HashMap<u64, Slot>>>,
-}
-
-impl DaemonCommandPort {
-    pub fn new(daemon: &Arc<dyn DaemonHandle>) -> Arc<Self> {
-        let slots = Arc::new(Mutex::new(HashMap::new()));
-        let mut events = daemon.subscribe();
-        let routed = Arc::downgrade(&slots);
-        tokio::spawn(async move {
-            loop {
-                let event = events.recv().await;
-                let Some(slots) = routed.upgrade() else { return };
-                match event {
-                    Ok(DaemonEvent::CommandFinished { command_id, result, .. }) => {
-                        let mut slots = lock(&slots);
-                        let now = tokio::time::Instant::now();
-                        slots.retain(|_, slot| !matches!(slot, Slot::Finished(_, at) if now.duration_since(*at) > UNCLAIMED_RESULT_TTL));
-                        match slots.remove(&command_id) {
-                            Some(Slot::Waiting(waiter)) => {
-                                let _ = waiter.send(result);
-                            }
-                            _ => {
-                                slots.insert(command_id, Slot::Finished(Box::new(result), now));
-                            }
-                        }
-                    }
-                    Ok(_) => {}
-                    // A lagged listener loses results; their crews time out
-                    // and report the command as lost rather than hanging.
-                    Err(RecvError::Lagged(skipped)) => tracing::warn!(skipped, "dummy fleet command listener lagged"),
-                    // The daemon stopped: its commands' results are lost now, as a closed socket
-                    // tells a client at once, rather than when their wait times out.
-                    Err(RecvError::Closed) => {
-                        lock(&slots).clear();
-                        return;
-                    }
-                }
-            }
-        });
-        Arc::new(Self { daemon: Arc::downgrade(daemon), slots })
-    }
-}
-
-fn lock(slots: &Mutex<HashMap<u64, Slot>>) -> std::sync::MutexGuard<'_, HashMap<u64, Slot>> {
-    slots.lock().unwrap_or_else(std::sync::PoisonError::into_inner)
-}
-
-#[async_trait]
-impl CrewCommandPort for DaemonCommandPort {
-    async fn execute(&self, action: CommandAction) -> Result<CommandValue, String> {
-        let daemon = self.daemon.upgrade().ok_or("daemon has stopped")?;
-        // A query answers at once, as a client's read does; only commands run asynchronously.
-        if action.is_query() {
-            return daemon.execute_query(Command::builder().action(action).build(), uuid::Uuid::new_v4()).await;
-        }
-        let command_id = daemon.execute(Command::builder().action(action).build()).await?;
-        drop(daemon);
-        let (sender, receiver) = oneshot::channel();
-        {
-            let mut slots = lock(&self.slots);
-            match slots.remove(&command_id) {
-                Some(Slot::Finished(result, _)) => return Ok(*result),
-                _ => {
-                    slots.insert(command_id, Slot::Waiting(sender));
-                }
-            }
-        }
-        match tokio::time::timeout(COMMAND_RESULT_TIMEOUT, receiver).await {
-            Ok(Ok(result)) => Ok(result),
-            _ => {
-                lock(&self.slots).remove(&command_id);
-                Err(format!("result of command {command_id} was lost"))
-            }
-        }
     }
 }

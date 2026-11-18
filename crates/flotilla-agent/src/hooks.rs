@@ -288,6 +288,16 @@ impl<'a> ClaudeCodeHookTransport<'a> {
         }
     }
 
+    /// Whether Claude Code posts `event` (a `flotilla hook claude-code <event>` argument) to
+    /// the HTTP route under this transport; otherwise it runs the hook command.
+    pub fn posts(self, event: &str) -> bool {
+        matches!(self, Self::Http { .. })
+            && CLAUDE_CODE_HOOK_SUBSCRIPTIONS
+                .iter()
+                .find(|subscription| subscription.event == event)
+                .is_some_and(|subscription| !CLAUDE_CODE_COMMAND_ONLY_HOOKS.contains(&subscription.hook))
+    }
+
     fn handler(self, subscription: &ClaudeCodeHookSubscription) -> serde_json::Value {
         match self {
             Self::Http { base_url } if !CLAUDE_CODE_COMMAND_ONLY_HOOKS.contains(&subscription.hook) => serde_json::json!({
@@ -341,6 +351,35 @@ pub fn parser_for_harness(harness: &str) -> Result<(AgentHarness, Box<dyn Harnes
         "codex" => Ok((AgentHarness::Codex, Box::new(CodexParser))),
         other => Err(format!("unknown harness: {other}")),
     }
+}
+
+/// One native hook event as Flotilla records it, built the same way wherever it arrives:
+/// `flotilla hook <harness> <event>` with its stdin, an HTTP hook route with its body, or a
+/// dummy crew's scripted hooks. `harness`'s parser reads `payload`; a managed `terminal` names
+/// the agent, otherwise `explicit_id` or a fresh attachable does.
+pub fn hook_event(
+    harness: &str,
+    event: &str,
+    payload: &[u8],
+    terminal: Option<flotilla_protocol::AgentHookTerminalRef>,
+    explicit_id: Option<&str>,
+) -> Result<AgentHookEvent, String> {
+    let (harness, parser) = parser_for_harness(harness)?;
+    let parsed = parser.parse_event(event, payload)?;
+    let attachable_id = crate::attachable::terminal_hook_id(explicit_id, terminal.as_ref());
+    let cause = hook_event_name(&harness, event).map(str::to_owned);
+    Ok(AgentHookEvent::builder()
+        .attachable_id(attachable_id)
+        .harness(harness)
+        .maybe_hook_event(cause)
+        .event_type(parsed.event_type)
+        .maybe_session_id(parsed.session_id)
+        .maybe_model(parsed.model)
+        .maybe_cwd(parsed.cwd)
+        .maybe_transcript_path(parsed.transcript_path)
+        .native_codex_hook(parsed.native_codex_hook)
+        .maybe_terminal(terminal)
+        .build())
 }
 
 /// Native command input schema: openai/codex rust-v0.160.0,
