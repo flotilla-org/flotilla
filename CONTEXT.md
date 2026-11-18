@@ -715,11 +715,12 @@ reaching into or out of a vessel, which the host's instance publishes).
 
 **Binding**:
 A standing association, on one machine, between a **Publication** and a
-Local Endpoint there (a Unix socket or named pipe). A client asks its own
-machine's **Tender** instance for one; it is available, unavailable or revoked,
-and connecting to the Local Endpoint opens a stream over the current route.
-Bindings are shared on the machine, and binding never starts anything. Tender
-owns the listener and nothing behind it.
+Local Endpoint there (a Unix socket or named pipe). The machine's **Tender**
+instance keeps one for every Publication that admits the machine, at a path a
+client computes from the Publication's identity, without asking. A Binding is
+available, unavailable or revoked, and connecting to its Local Endpoint opens a
+stream over the current route. Bindings are shared on the machine, and binding
+never starts anything. Tender owns the listener and nothing behind it.
 _Avoid_: Local exposure, tunnel, forward.
 
 **Convergent Facts**:
