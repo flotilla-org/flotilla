@@ -427,6 +427,78 @@ async fn heartbeat_task_updates_host_status_without_socket_server() {
     let _ = heartbeat.await;
 }
 
+// Behaviour (real test item 5): a credential declared after the host's heartbeat published is
+// judged at once, not an interval later, so a dispatch right after the declaration finds it held.
+#[tokio::test]
+async fn a_credential_declared_after_a_heartbeat_is_held_without_waiting_for_the_next() {
+    let temp = TempDir::new().expect("tempdir");
+    fs::write(temp.path().join("daemon.toml"), "machine_id = \"heartbeat-declaration-wake-test\"\n").expect("daemon config");
+    let config = Arc::new(ConfigStore::with_base(temp.path()));
+    let daemon = in_memory_daemon(Vec::new(), Arc::clone(&config)).await;
+    engine(&daemon);
+    let host_id = daemon.local_host_id().expect("local host id").to_string();
+    let profile = own_host_profile(&daemon, false);
+    let credential_store = Arc::new(CredentialStore::new(
+        daemon.resource_backend(),
+        NAMESPACE,
+        Arc::new(TestEnvVars::new([("TEST_FORGE_TOKEN", "token".to_string())])),
+        EnvironmentBag::new(),
+        Arc::new(ProcessCommandRunner),
+        config.state_dir().as_path().to_path_buf(),
+    ));
+    // Only the first tick falls inside the test: every later publish is a wake.
+    let heartbeat = spawn_heartbeat_task_with_credentials(
+        Arc::clone(&daemon),
+        NAMESPACE.to_string(),
+        profile,
+        Arc::new(Some(credential_store)),
+        test_health_identity(),
+        RuntimeHealth::default(),
+        Duration::from_secs(3600),
+    );
+    let hosts = daemon.resource_backend().using::<Host>(NAMESPACE);
+    let held = |hosts: flotilla_store::TypedResolver<Host>, host_id: String| async move {
+        hosts.get(&host_id).await.ok().and_then(|host| host.status).and_then(|status| status.held_credentials().ok())
+    };
+    wait_until_with_timeout(Duration::from_secs(30), || {
+        let reading = held(hosts.clone(), host_id.clone());
+        async move { reading.await.is_some() }
+    })
+    .await;
+    assert_eq!(held(hosts.clone(), host_id.clone()).await, Some(BTreeSet::new()), "nothing is declared at the first heartbeat");
+
+    daemon
+        .resource_backend()
+        .definitions::<CredentialSpec>(NAMESPACE)
+        .create(
+            &empty_meta("lab-forge"),
+            &CredentialSpecSpec {
+                consumer: CredentialConsumer::GitHttpToken { host: "forge.test".to_string(), username: "crew".to_string() },
+                source: CredentialSource::Env { name: "TEST_FORGE_TOKEN".to_string() },
+                lifecycle: CredentialLifecycle::Static,
+                placement: CredentialPlacementRequirements::default(),
+                authorization_epoch: flotilla_resources::INITIAL_AUTHORIZATION_EPOCH,
+            },
+        )
+        .await
+        .expect("credential declaration");
+
+    let declared = BTreeSet::from(["lab-forge".to_string()]);
+    let judged = tokio::time::timeout(Duration::from_secs(10), async {
+        loop {
+            if held(hosts.clone(), host_id.clone()).await.as_ref() == Some(&declared) {
+                return;
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    })
+    .await;
+    assert!(judged.is_ok(), "the host holds the new declaration before its next heartbeat interval");
+
+    heartbeat.abort();
+    let _ = heartbeat.await;
+}
+
 #[tokio::test]
 async fn peer_summary_does_not_author_transitional_host_or_policy_rows() {
     let temp = TempDir::new().expect("tempdir");

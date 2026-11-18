@@ -3896,6 +3896,10 @@ impl InProcessDaemon {
                 flotilla_protocol::CommandValue::Error { message: "convoy start worker panicked".to_string() }
             }
         };
+        // The caller gets the refusal; the daemon's log keeps it too.
+        if let flotilla_protocol::CommandValue::Error { message } = &result {
+            warn!(command_id, %message, "convoy admission refused");
+        }
         self.admission.clear_pending(&key).await;
         self.finish_context_free_command(command_id, empty_repo_identity(), result);
     }

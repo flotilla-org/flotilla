@@ -22,8 +22,8 @@ use flotilla_credentials::CredentialStore;
 use flotilla_discovery::registry::{command_provider_registry, ProviderRegistry};
 use flotilla_environment::environment::EnvironmentInput;
 use flotilla_resources::{
-    Artifact, Convoy, FulfilmentFacts, Host, HostStatusPatch, ModelProbeState, Resource, ResourceError, RetryBackoff, TerminalSession,
-    Vessel,
+    Artifact, Convoy, CredentialSpec, FulfilmentFacts, Host, HostStatusPatch, ModelProbeState, Resource, ResourceError, RetryBackoff,
+    TerminalSession, Vessel,
 };
 use flotilla_store::{
     load_metrics::{attributed, caller, inherit},
@@ -633,14 +633,34 @@ pub(super) fn spawn_heartbeat_task_with_credentials(
     interval: Duration,
 ) -> JoinHandle<()> {
     // Each tick publishes, and so does a condition that must not wait for one (a remote a clone
-    // could not reach).
+    // could not reach), and so does a change to the credential declarations: the held set judges
+    // only the declarations the host can list, so one applied after a publish is judged at once.
     tokio::spawn(attributed(caller("host heartbeat"), async move {
         let mut ticker = tokio::time::interval(interval);
         ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+        let mut declarations: Option<BoxStream<'static, Result<flotilla_resources::ReadWatchEvent<CredentialSpec>, ResourceError>>> = None;
         loop {
-            tokio::select! {
-                _ = ticker.tick() => {}
-                () = runtime_health.heartbeat_now.notified() => {}
+            let declaration = async {
+                match declarations.as_mut() {
+                    Some(watch) => watch.next().await,
+                    None => std::future::pending().await,
+                }
+            };
+            let (ticked, watching) = tokio::select! {
+                _ = ticker.tick() => (true, true),
+                () = runtime_health.heartbeat_now.notified() => (false, true),
+                event = declaration => (false, matches!(event, Some(Ok(_)))),
+            };
+            if !watching {
+                declarations = None;
+            }
+            // Made at a tick, before the publish, so a declaration applied after the publish wakes
+            // the next; one that fails or closes is made again an interval later.
+            if ticked && declarations.is_none() && credential_store.is_some() {
+                match daemon.resource_backend().including_replicas::<CredentialSpec>(&namespace).watch().await {
+                    Ok(watch) => declarations = Some(watch),
+                    Err(error) => warn!(%error, "credential declarations cannot be watched; held credentials are judged each heartbeat"),
+                }
             }
             if let Err(err) =
                 apply_host_heartbeat_with_credentials(&daemon, &namespace, &profile, credential_store.as_deref(), &health, &runtime_health)

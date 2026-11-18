@@ -49,6 +49,14 @@ impl AdmissionActions<'_> {
     async fn provisioning_namespace(&self) -> String {
         flotilla_daemon_api::action_namespace::provisioning_namespace(self.namespace)
     }
+
+    /// Finishes a convoy start or create; a refusal is logged with the message its caller gets.
+    fn finish_admission(&self, id: u64, identity: flotilla_protocol::RepoIdentity, result: CommandValue) {
+        if let CommandValue::Error { message } = &result {
+            tracing::warn!(command_id = id, %message, "convoy admission refused");
+        }
+        self.events.finish(id, identity, result);
+    }
     pub async fn execute_action_ensure_roll(&self, id: u64, command: &Command) -> Result<u64, String> {
         let CommandAction::ConvoyEnsureRoll { namespace, name } = &command.action else {
             return Err("ensure roll selected the wrong handler".into());
@@ -102,7 +110,7 @@ impl AdmissionActions<'_> {
             let (namespace, intent) = match normalize_convoy_start_intent(&default_namespace, intent) {
                 Ok(resolved) => resolved,
                 Err(message) => {
-                    self.events.finish(id, empty_identity, CommandValue::Error { message });
+                    self.finish_admission(id, empty_identity, CommandValue::Error { message });
                     return Ok(id);
                 }
             };
@@ -110,7 +118,7 @@ impl AdmissionActions<'_> {
                 dispatching_principal_ref.clone().unwrap_or_else(|| PrincipalRef::implicit_for_namespace(&acting_namespace));
             let key = ConvoyStartKey::new(namespace, &intent);
             if !self.admission.mark_pending(key.clone()).await {
-                self.events.finish(
+                self.finish_admission(
                     id,
                     empty_identity,
                     CommandValue::Error { message: format!("convoy start for project {} is already in progress", intent.project_ref) },
@@ -125,7 +133,11 @@ impl AdmissionActions<'_> {
                 .build();
             if !self.port.spawn_convoy_start(task) {
                 self.admission.clear_pending(&key).await;
-                self.events.finish(id, empty_identity, CommandValue::Error { message: "convoy start worker is unavailable".to_string() });
+                self.finish_admission(
+                    id,
+                    empty_identity,
+                    CommandValue::Error { message: "convoy start worker is unavailable".to_string() },
+                );
             }
             return Ok(id);
         }
@@ -163,7 +175,7 @@ impl AdmissionActions<'_> {
             let project_identity = project_ref.as_deref();
             if let Err(message) = validate_convoy_name(&role) {
                 let result = CommandValue::Error { message };
-                self.events.finish(id, empty_identity, result);
+                self.finish_admission(id, empty_identity, result);
                 return Ok(id);
             }
             // An adopted checkout is on this host, and adoption writes its
@@ -172,7 +184,7 @@ impl AdmissionActions<'_> {
             if adopts_checkout {
                 if let Err(message) = self.admission.check_local_free_space_floor().await {
                     let result = CommandValue::Error { message };
-                    self.events.finish(id, empty_identity, result);
+                    self.finish_admission(id, empty_identity, result);
                     return Ok(id);
                 }
             }
@@ -181,14 +193,14 @@ impl AdmissionActions<'_> {
             let admission_guard = self.admission.lock().await;
             if let Err(message) = refuse_live_convoy_in(self.resource_backend, &namespace, project_identity, &role).await {
                 let result = CommandValue::Error { message };
-                self.events.finish(id, empty_identity, result);
+                self.finish_admission(id, empty_identity, result);
                 return Ok(id);
             }
             // The launch is named before anything keyed by it is written.
             let record_name = match self.admission.reserve_launch(&convoy_record_name()).await {
                 Ok(launch) => launch,
                 Err(message) => {
-                    self.events.finish(id, empty_identity, CommandValue::Error { message });
+                    self.finish_admission(id, empty_identity, CommandValue::Error { message });
                     return Ok(id);
                 }
             };
@@ -204,7 +216,7 @@ impl AdmissionActions<'_> {
             {
                 Ok(workflow) => workflow,
                 Err(message) => {
-                    self.events.finish(id, empty_identity, CommandValue::Error { message });
+                    self.finish_admission(id, empty_identity, CommandValue::Error { message });
                     return Ok(id);
                 }
             };
@@ -214,7 +226,7 @@ impl AdmissionActions<'_> {
                 {
                     Ok(repositories) => Some(repositories),
                     Err(message) => {
-                        self.events.finish(id, empty_identity, CommandValue::Error { message });
+                        self.finish_admission(id, empty_identity, CommandValue::Error { message });
                         return Ok(id);
                     }
                 }
@@ -223,7 +235,7 @@ impl AdmissionActions<'_> {
             };
             if project_repositories.is_some() && repository_url.is_some() {
                 let message = "convoy repository selection is not allowed when a project is supplied".to_string();
-                self.events.finish(id, empty_identity, CommandValue::Error { message });
+                self.finish_admission(id, empty_identity, CommandValue::Error { message });
                 return Ok(id);
             }
             let mut direct_repository_url = repository_url.clone();
@@ -264,7 +276,7 @@ impl AdmissionActions<'_> {
                         }
                         Err(message) => {
                             let result = CommandValue::Error { message };
-                            self.events.finish(id, empty_identity, result);
+                            self.finish_admission(id, empty_identity, result);
                             return Ok(id);
                         }
                     }
@@ -309,7 +321,7 @@ impl AdmissionActions<'_> {
                 match resolved {
                     Ok(repositories) => repositories,
                     Err(message) => {
-                        self.events.finish(id, empty_identity, CommandValue::Error { message });
+                        self.finish_admission(id, empty_identity, CommandValue::Error { message });
                         return Ok(id);
                     }
                 }
@@ -322,7 +334,7 @@ impl AdmissionActions<'_> {
                 if !repositories.iter().any(|repository| repository.repo_ref == repo_ref) {
                     let message =
                         format!("adopted checkout repository {repo_ref} is not part of project {}", project_ref.as_deref().unwrap_or(""));
-                    self.events.finish(id, empty_identity, CommandValue::Error { message });
+                    self.finish_admission(id, empty_identity, CommandValue::Error { message });
                     return Ok(id);
                 }
                 adopted_checkout_refs.insert(repo_ref, checkout_ref);
@@ -341,7 +353,7 @@ impl AdmissionActions<'_> {
             {
                 Ok(placement) => placement,
                 Err(message) => {
-                    self.events.finish(id, empty_identity, CommandValue::Error { message });
+                    self.finish_admission(id, empty_identity, CommandValue::Error { message });
                     return Ok(id);
                 }
             };
@@ -355,14 +367,14 @@ impl AdmissionActions<'_> {
             )
             .await;
             if let Err(message) = credential_result {
-                self.events.finish(id, empty_identity, CommandValue::Error { message });
+                self.finish_admission(id, empty_identity, CommandValue::Error { message });
                 return Ok(id);
             }
             let provider_workspace_root = match placement.selected.as_ref() {
                 Some(selected) => match crate::support::provider_workspace_root(self.resource_backend, &namespace, selected).await {
                     Ok(root) => root,
                     Err(message) => {
-                        self.events.finish(id, empty_identity, CommandValue::Error { message });
+                        self.finish_admission(id, empty_identity, CommandValue::Error { message });
                         return Ok(id);
                     }
                 },
@@ -382,7 +394,7 @@ impl AdmissionActions<'_> {
                         allocation: placement.allocation.clone(),
                     }),
                     Err(message) => {
-                        self.events.finish(id, empty_identity, CommandValue::Error { message });
+                        self.finish_admission(id, empty_identity, CommandValue::Error { message });
                         return Ok(id);
                     }
                 },
@@ -390,12 +402,12 @@ impl AdmissionActions<'_> {
             };
             if !adopts_checkout {
                 if let Err(message) = self.admission.check_admitting_host_floor(placement_decision.iter()).await {
-                    self.events.finish(id, empty_identity, CommandValue::Error { message });
+                    self.finish_admission(id, empty_identity, CommandValue::Error { message });
                     return Ok(id);
                 }
             }
             if let Err(message) = self.admission.check_remote_placement_free_space_floor(&namespace, placement_decision.as_ref()).await {
-                self.events.finish(id, empty_identity, CommandValue::Error { message });
+                self.finish_admission(id, empty_identity, CommandValue::Error { message });
                 return Ok(id);
             }
             let (vessel_placements, image_builds) = match self
@@ -411,7 +423,7 @@ impl AdmissionActions<'_> {
             {
                 Ok(vessel_placements) => vessel_placements,
                 Err(message) => {
-                    self.events.finish(id, empty_identity, CommandValue::Error { message });
+                    self.finish_admission(id, empty_identity, CommandValue::Error { message });
                     return Ok(id);
                 }
             };
@@ -439,7 +451,7 @@ impl AdmissionActions<'_> {
                     admission_guard,
                 )
                 .await;
-            self.events.finish(id, empty_identity, result);
+            self.finish_admission(id, empty_identity, result);
             return Ok(id);
         }
         Err("ConvoyCreate action selected the wrong handler".to_string())
