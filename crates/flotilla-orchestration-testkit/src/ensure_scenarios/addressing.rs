@@ -146,28 +146,36 @@ pub async fn convoy_explain_names_retired_generations_by_record_only(factory: &d
     assert_eq!(flotilla_store::resolve_convoy_record(&backend, "flotilla", "reviewer@flotilla").await, Ok(two.clone()));
     let newest = daemon.explain_convoy_internal(None, "reviewer@flotilla").await.expect("the newest explains by the plain name");
     assert_eq!(newest.phase, "Landed");
+    // A bare name places the role in the one project its retired launches hold it in (run 3 F6).
+    assert_eq!(flotilla_store::resolve_convoy_record(&backend, "flotilla", "reviewer").await, Ok(two.clone()));
+    let bare = daemon.explain_convoy_internal(None, "reviewer").await.expect("the newest explains by the bare name");
+    assert_eq!(bare.phase, "Landed");
     for record in [&one, &two] {
         let explanation = daemon.explain_convoy_internal(None, record).await.expect("a retired generation explains by its record");
         assert_eq!(explanation.phase, "Landed", "{record}");
     }
 }
 
-// #4272: the lookup is exact. Every convoy names its project, so a bare role names none; the
-// client completes a role from its context before sending it.
-pub async fn convoy_explain_names_no_convoy_by_a_bare_role(factory: &dyn EnsureScenarioController) {
+// #4272: `<role>@<project>` is exact. Every convoy names its project, so a bare role names the
+// role in whichever one project holds it (run 3 F6), and is refused with each candidate named
+// when several do.
+pub async fn convoy_explain_places_a_bare_role_in_its_one_project(factory: &dyn EnsureScenarioController) {
     let (daemon, _backend, _clock, _temp) = standing_ensure_fixture(factory).await;
     let one = create_identity_convoy(&daemon, "convoy-one", "reviewer", "flotilla").await;
-    let two = create_identity_convoy(&daemon, "convoy-two", "reviewer", "beta").await;
+    let backend = daemon.resource_backend();
+    let explained = daemon.explain_convoy_internal(None, "reviewer").await.map(|explanation| explanation.phase);
+    assert!(explained.is_ok(), "one project holds the role: {explained:?}");
+    assert_eq!(flotilla_store::resolve_convoy_record(&backend, "flotilla", "reviewer").await.as_ref(), Ok(&one));
 
+    let two = create_identity_convoy(&daemon, "convoy-two", "reviewer", "beta").await;
     for (address, record) in [("reviewer@flotilla", &one), ("reviewer@beta", &two)] {
         daemon.explain_convoy_internal(None, address).await.expect("explained");
-        let found = flotilla_store::resolve_convoy_record(&daemon.resource_backend(), "flotilla", address).await;
+        let found = flotilla_store::resolve_convoy_record(&backend, "flotilla", address).await;
         assert_eq!(found.as_ref(), Ok(record), "{address}");
     }
-    assert_eq!(
-        daemon.explain_convoy_internal(None, "reviewer").await.map(|explanation| explanation.convoy),
-        Err("no convoy matches `reviewer`".to_string())
-    );
+    let several = "convoy `reviewer` is held in several projects; name one: reviewer@beta, reviewer@flotilla".to_string();
+    assert_eq!(daemon.explain_convoy_internal(None, "reviewer").await.map(|explanation| explanation.phase), Err(several.clone()));
+    assert_eq!(flotilla_store::resolve_convoy_record(&backend, "flotilla", "reviewer").await, Err(several));
 }
 
 pub async fn ensure_roll_targets_the_running_convoy_home_over_an_explicit_other_host(factory: &dyn EnsureScenarioController) {

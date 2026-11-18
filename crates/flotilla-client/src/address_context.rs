@@ -90,9 +90,12 @@ pub fn complete_convoy(typed: &str, sources: &ContextSources, known: &[KnownConv
     if partial.kind() != Kind::Convoy {
         return Err(format!("`{typed}` is not a convoy address"));
     }
-    let candidates: Vec<Address> = known.iter().flat_map(KnownConvoy::addresses).collect();
+    // Only the caller's context places a reference here. A plain name it does not place goes as
+    // typed: the daemon names its role in the one project holding it, a retired launch's
+    // included, which the live listing cannot tell (run 3 F6).
     let context = sources.address(known);
-    let mut address = complete(&partial, context.as_ref(), &candidates).map_err(|error| error.to_string())?;
+    let candidates: Vec<Address> = known.iter().flat_map(KnownConvoy::addresses).collect();
+    let mut address = complete(&partial, context.as_ref(), &[]).map_err(|error| error.to_string())?;
     // A record name is its record's key, so a bare one the context placed where no convoy answers
     // names that record under its own project (`convoy explain convoy-<uuid>` from any checkout).
     if partial.segments().len() == 1 && !candidates.contains(&address) {
@@ -156,8 +159,8 @@ mod tests {
 
     // #4272 done-when: in a flotilla checkout `convoy:lander` (or `lander`) is flotilla's lander;
     // inside a vessel the crew's own convoy completes under its project, even with no checkout;
-    // with no context `lander` in two projects lists both, and a unique match is taken. The
-    // context is injected, never read from the real environment.
+    // with no context a plain name is left for the daemon to place. The context is injected,
+    // never read from the real environment.
     #[test]
     fn convoy_references_complete_from_the_callers_context() {
         let checkout = ContextSources { checkout_project: Some("flotilla".into()), ..ContextSources::default() };
@@ -181,11 +184,12 @@ mod tests {
         unset.checkout_project = Some("other".into());
         assert_eq!(complete_convoy("lander", &unset, &convoys()), Ok("lander@other".into()));
 
+        // With no context a plain name goes as typed, whatever the live listing holds: the daemon
+        // places it in the one project holding its role, retired launches included (run 3 F6).
         let none = ContextSources::default();
-        let ambiguous = complete_convoy("lander", &none, &convoys()).unwrap_err();
-        assert!(ambiguous.contains("project:flotilla/convoy:lander") && ambiguous.contains("project:other/convoy:lander"), "{ambiguous}");
-        assert_eq!(complete_convoy("coder", &none, &convoys()), Ok("coder@flotilla".into()));
-        assert_eq!(complete_convoy("loner", &none, &convoys()), Ok("loner".into()));
+        for typed in ["lander", "coder", "loner", "convoy:lander"] {
+            assert_eq!(complete_convoy(typed, &none, &convoys()), Ok(typed.trim_start_matches("convoy:").into()), "{typed}");
+        }
         // Whole references go as typed; an unknown one is left for the exact lookup to answer.
         assert_eq!(complete_convoy("lander@other", &checkout, &convoys()), Ok("lander@other".into()));
         // `<name>@` is the convoy of no project, never completed into the checkout's project.

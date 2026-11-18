@@ -154,10 +154,38 @@ impl<'a> ConvoyName<'a> {
         backend: &crate::ResourceBackend,
         namespace: &str,
     ) -> Result<Option<flotilla_resources::ReadResourceObject<flotilla_resources::Convoy>>, String> {
-        match self.lookup_address(backend, namespace).await? {
+        let project = self.placed(backend, namespace).await?;
+        let placed = ConvoyName { project: project.as_deref(), name: self.name };
+        match placed.lookup_address(backend, namespace).await? {
             Some(found) => Ok(Some(found)),
-            None => self.newest_launch(backend, namespace).await,
+            None => placed.newest_launch(backend, namespace).await,
         }
+    }
+
+    /// The project this name names its role in (run 3 F6): its own, or for a plain name the one
+    /// project whose convoys hold the role, live, ended or retired; `None` where none does, so it
+    /// can name only a record. `Err` naming each `<name>@<project>` when several projects do.
+    /// It reads every launch (no index names a launch by its role): plain names are typed reads.
+    pub async fn placed(&self, backend: &crate::ResourceBackend, namespace: &str) -> Result<Option<String>, String> {
+        if let Some(project) = self.project {
+            return Ok(Some(project.to_owned()));
+        }
+        let rows =
+            backend.query_declared::<flotilla_resources::Convoy>(namespace, &self.query()).await.map_err(|error| error.to_string())?;
+        let mut projects: std::collections::BTreeSet<String> = rows
+            .items
+            .iter()
+            .map(|row| ConvoyIdentity::of(&row.object))
+            .filter(|identity| identity.role == Some(self.name))
+            .filter_map(|identity| identity.project.filter(|project| !project.is_empty()).map(str::to_owned))
+            .collect();
+        if let Some(newest) = self.newest_launch(backend, namespace).await? {
+            projects.extend(ConvoyIdentity::of(&newest.object).project.filter(|project| !project.is_empty()).map(str::to_owned));
+        }
+        if projects.len() > 1 {
+            return Err(flotilla_resources::convoy_records::several_projects(self.name, &projects));
+        }
+        Ok(projects.pop_first())
     }
 
     /// The newest launch holding this name's role in its project, a retired one included: what a

@@ -603,6 +603,13 @@ pub enum ConvoyChange {
     Rescanned,
 }
 
+/// The refusal of plain name `name`, whose role convoys in each of `projects` hold: it names each
+/// candidate as `<name>@<project>`.
+pub fn several_projects<P: AsRef<str>>(name: &str, projects: impl IntoIterator<Item = P>) -> String {
+    let candidates: Vec<String> = projects.into_iter().map(|project| format!("{name}@{}", project.as_ref())).collect();
+    format!("convoy `{name}` is held in several projects; name one: {}", candidates.join(", "))
+}
+
 /// The convoys' records at this home and the replicas of other homes', with this home's notes.
 pub trait ConvoyRecords: Send + Sync {
     /// The stored kinds these launches are read from: a log entry of any other kind changes none.
@@ -623,8 +630,10 @@ pub trait ConvoyRecords: Send + Sync {
     /// when no such launch is held.
     fn holds(&self, name: &str, home: Option<&str>) -> Result<Option<LaunchHolds>, String>;
     /// The newest launch, at any home this store holds and retired or not, that holds `role` in
-    /// `project`, or in no project when `None`: what a plain name names once no live or unretired
-    /// launch answers for it. A launch that cannot be read is passed over.
+    /// `project`, or in whichever one project holds it when `None`: what a plain name names once
+    /// no live or unretired launch answers for it. `Err` ([`several_projects`]) when `project` is
+    /// `None` and launches in several projects hold the role (run 3 F6). A launch that cannot be
+    /// read is passed over.
     fn newest_holding(&self, role: &str, project: Option<&str>) -> Result<Option<ConvoyRecord>, String>;
     /// Every launch held at `home`; one that cannot be read is listed as unreadable.
     fn at(&self, home: &str) -> Result<ConvoyListing, String>;

@@ -18,7 +18,8 @@ use flotilla_resources::{
     address::subject_for,
     convoy::{admission::AdmissionDocument, engine::seat_address},
     convoy_records::{
-        ConvoyChange, ConvoyEnd, ConvoyListing, ConvoyMemory, ConvoyRecord, ConvoyRecords, LaunchHolds, SeatRecord, UnreadableLaunch,
+        several_projects, ConvoyChange, ConvoyEnd, ConvoyListing, ConvoyMemory, ConvoyRecord, ConvoyRecords, LaunchHolds, SeatRecord,
+        UnreadableLaunch,
     },
     lifecycle_reads::{ChangeCursor, CursorSince},
     promises::SubmissionVerdict,
@@ -182,7 +183,7 @@ impl ConvoyRecords for EngineConvoyRecords {
         self.read(&format!("the newest launch holding {role}"), |read| {
             // No index names a launch by its role: each launch's admission is read, and only the
             // one chosen is read whole.
-            let mut newest: Option<(DateTime<Utc>, ResourceId)> = None;
+            let mut newest_in: BTreeMap<String, (DateTime<Utc>, ResourceId)> = BTreeMap::new();
             for home in &homes {
                 let mut after = None;
                 loop {
@@ -190,7 +191,10 @@ impl ConvoyRecords for EngineConvoyRecords {
                     for id in page.ids {
                         let Some(loaded) = read.load::<Resource<Convoy>>(id)? else { continue };
                         let spec = loaded.value.spec();
-                        if spec.project.get(AddressKind::Project).filter(|project| !project.is_empty()) != project {
+                        let Some(held_in) = spec.project.get(AddressKind::Project).filter(|held_in| !held_in.is_empty()) else {
+                            continue;
+                        };
+                        if project.is_some_and(|project| project != held_in) {
                             continue;
                         }
                         let Ok(admission) = AdmissionDocument::decode(loaded.value.name(), spec.admission.value().bytes()) else {
@@ -202,8 +206,9 @@ impl ConvoyRecords for EngineConvoyRecords {
                         let admitted = read.creation_time(id)?.to_datetime();
                         // A home's launches scan in the order written: of two admitted at one
                         // instant, the later written is the newer.
-                        if newest.as_ref().is_none_or(|(at, _)| admitted >= *at) {
-                            newest = Some((admitted, id));
+                        let newest = newest_in.entry(held_in.to_owned()).or_insert((admitted, id));
+                        if admitted >= newest.0 {
+                            *newest = (admitted, id);
                         }
                     }
                     after = page.next;
@@ -212,10 +217,14 @@ impl ConvoyRecords for EngineConvoyRecords {
                     }
                 }
             }
-            let Some((_, id)) = newest else { return Ok(None) };
-            let Some(loaded) = read.load::<Resource<Convoy>>(id)? else { return Ok(None) };
-            Ok(entry(read, &self.stalls, loaded, Retired::Read)?.and_then(Result::ok))
-        })
+            // A plain name holds its role in one project, or names none (run 3 F6).
+            if newest_in.len() > 1 {
+                return Ok(Err(several_projects(role, newest_in.keys())));
+            }
+            let Some((_, (_, id))) = newest_in.pop_first() else { return Ok(Ok(None)) };
+            let Some(loaded) = read.load::<Resource<Convoy>>(id)? else { return Ok(Ok(None)) };
+            Ok(Ok(entry(read, &self.stalls, loaded, Retired::Read)?.and_then(Result::ok)))
+        })?
     }
 
     fn at(&self, home: &str) -> Result<ConvoyListing, String> {

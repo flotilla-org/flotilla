@@ -1270,8 +1270,11 @@ impl ReadProjections<'_> {
         namespace: &str,
         name: &str,
     ) -> Result<(ConvoyExplanation, ResourceObject<ResourceConvoy>), String> {
-        // The one convoy lookup (#4272): the address's role in its project, or its record.
-        let convoy_name = flotilla_store::ConvoyName::parse(name);
+        // The one convoy lookup (#4272): the address's role in its project, or its record. A plain
+        // name names its role in the one project holding it, a retired launch's included (run 3 F6).
+        let typed = flotilla_store::ConvoyName::parse(name);
+        let project = typed.placed(self.backend, namespace).await?;
+        let convoy_name = flotilla_store::ConvoyName { project: project.as_deref(), name: typed.name };
         let selected_query = convoy_name.query();
         let mut linked = Vec::new();
         for target in ["spec.subjects.*.subject", "status.subjects.*.subject"] {

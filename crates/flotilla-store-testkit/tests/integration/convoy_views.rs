@@ -301,9 +301,15 @@ impl ConvoyRecords for Convoys {
         unreachable!("the views read no holds")
     }
     fn newest_holding(&self, role: &str, project: Option<&str>) -> Result<Option<ConvoyRecord>, String> {
-        let held =
-            |record: &ConvoyRecord| record.role() == role && Some(record.project.as_str()).filter(|project| !project.is_empty()) == project;
-        Ok(self.records().into_iter().filter(held).max_by_key(|record| record.admitted_at))
+        let held = |record: &ConvoyRecord| {
+            record.role() == role && !record.project.is_empty() && project.is_none_or(|project| record.project == project)
+        };
+        let held: Vec<_> = self.records().into_iter().filter(held).collect();
+        let projects: std::collections::BTreeSet<_> = held.iter().map(|record| record.project.clone()).collect();
+        if projects.len() > 1 {
+            return Err(flotilla_resources::convoy_records::several_projects(role, projects));
+        }
+        Ok(held.into_iter().max_by_key(|record| record.admitted_at))
     }
     // A listing leaves retired launches out, as the engine's does.
     fn at(&self, home: &str) -> Result<ConvoyListing, String> {
