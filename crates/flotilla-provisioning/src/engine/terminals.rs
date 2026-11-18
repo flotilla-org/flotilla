@@ -390,6 +390,22 @@ impl TerminalRecords for EngineTerminals {
         self.scanned(&format!("at {home}"), |read| Self::scan(read, home))
     }
 
+    fn live(&self) -> Result<Vec<TerminalRecord>, String> {
+        // The writer holds this home's live launches; each is read by key, so the read follows
+        // the launches that can still change, not the history retained beside them.
+        let names: Vec<String> = self.lifecycles.live().iter().map(|launch| launch.name().to_owned()).collect();
+        let home = self.home().to_owned();
+        self.scanned("live here", |read| {
+            let mut records = Vec::with_capacity(names.len());
+            for name in &names {
+                if let Some(view) = keyed::<TerminalSessionKind>(read, name, &home)? {
+                    records.push(record(read, view)?);
+                }
+            }
+            Ok(records)
+        })
+    }
+
     fn every(&self) -> Result<Vec<TerminalRecord>, String> {
         let homes = (self.homes)();
         self.scanned("at every home", |read| {

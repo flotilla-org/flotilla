@@ -19,7 +19,7 @@ impl InProcessDaemon {
         let terminals = reads.terminals()?;
         let mut recorded = RecordedSessions::default();
         // Ended launches are retained history, not live daemon inventory.
-        for record in terminals.at(terminals.home())?.into_iter().filter(|record| record.is_running()) {
+        for record in terminals.live()?.into_iter().filter(|record| record.is_running()) {
             let vessel = record.vessel.clone().unwrap_or_else(|| record.environment.clone());
             let endpoint = record.cleat_endpoint();
             let (pool, env_ref) = (record.pool, record.environment);

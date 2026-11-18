@@ -366,6 +366,10 @@ impl TerminalRecords for CountedTerminals {
         self.port().at(home)
     }
 
+    fn live(&self) -> Result<Vec<TerminalRecord>, String> {
+        self.port().live()
+    }
+
     fn every(&self) -> Result<Vec<TerminalRecord>, String> {
         self.port().every()
     }

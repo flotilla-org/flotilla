@@ -441,6 +441,25 @@ async fn the_probe_records_what_it_observes_of_a_running_launch() {
     assert!(world.ready(&launch));
 }
 
+// Behaviour (d9): the probe reads only the launches that can still change. Ended launches are
+// retained history; with three ended and one running, a pass reads the running one alone, so an
+// idle home's probe costs nothing per launch it has ever run.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn the_probe_reads_only_the_launches_that_have_not_ended() {
+    let world = World::start(RecordingProvider::default(), true);
+    for vessel in ["v1", "v2", "v3"] {
+        let (launch, lease) = world.running_agent(vessel).await;
+        world.vessels.vessels.ready(&lease, &format!("vessel-{vessel}"));
+        world.vessels.vessels.step(&lease, VesselStep::Released);
+        world.until("released", |world| world.reading(&launch) == LifecycleReading::Released).await;
+    }
+    let (running, _lease) = world.running_agent("v4").await;
+    let before = world.terminals.terminals.launches_read();
+    assert!(world.probe.pass().await);
+    assert_eq!(world.terminals.terminals.launches_read() - before, 1, "only the running launch is read");
+    assert!(world.terminals.terminals.observations().get(&running).is_some(), "the running launch is still looked at");
+}
+
 // Behaviour: once its vessel's lease ends, a crew's session is released: a turn already typed
 // settles, then the process is killed and its exit receipt and harness files removed.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

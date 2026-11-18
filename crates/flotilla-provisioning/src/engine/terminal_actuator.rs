@@ -504,16 +504,16 @@ where
 
     /// Looks at each running launch once; false once the controller has stopped.
     pub async fn pass(&self) -> bool {
-        // A store read, off the async workers.
+        // A store read, off the async workers, of the launches that can still change: an awaited
+        // brief's launch has not ended (its release forgets it), and only a running one is looked at.
         let reads = Arc::clone(&self.records);
-        let records =
-            match tokio::task::spawn_blocking(carry(move || reads.at(reads.home()))).await.unwrap_or_else(|error| Err(error.to_string())) {
-                Ok(records) => records,
-                Err(error) => {
-                    warn!(%error, "terminal probe could not read this home's launches");
-                    return true;
-                }
-            };
+        let records = match tokio::task::spawn_blocking(carry(move || reads.live())).await.unwrap_or_else(|error| Err(error.to_string())) {
+            Ok(records) => records,
+            Err(error) => {
+                warn!(%error, "terminal probe could not read this home's launches");
+                return true;
+            }
+        };
         if let Some((briefs, rechecks)) = &self.briefs {
             for record in records.iter().filter(|record| briefs.awaited().contains(&record.name)) {
                 match self.provider.launch_waits_for(record).await {

@@ -363,6 +363,9 @@ pub trait TerminalRecords: Send + Sync {
     fn get(&self, name: &str, home: Option<&str>) -> Result<Option<TerminalRecord>, String>;
     /// Every launch held at `home`, ended or not.
     fn at(&self, home: &str) -> Result<Vec<TerminalRecord>, String>;
+    /// This home's launches that have not ended: requested or running. Its cost follows them,
+    /// not the ended launches retained beside them.
+    fn live(&self) -> Result<Vec<TerminalRecord>, String>;
     /// Every launch at every home this store holds.
     fn every(&self) -> Result<Vec<TerminalRecord>, String>;
     /// Every launch held for `vessel`, across homes.

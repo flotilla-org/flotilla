@@ -357,6 +357,9 @@ impl TerminalRecords for Terminals {
     fn at(&self, home: &str) -> Result<Vec<TerminalRecord>, String> {
         Ok(self.records.iter().filter(|record| record.home == home).cloned().collect())
     }
+    fn live(&self) -> Result<Vec<TerminalRecord>, String> {
+        Ok(self.records.iter().filter(|record| record.home == HERE && !record.ended()).cloned().collect())
+    }
     fn every(&self) -> Result<Vec<TerminalRecord>, String> {
         Ok(self.records.clone())
     }
