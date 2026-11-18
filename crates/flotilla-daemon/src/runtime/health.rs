@@ -24,7 +24,7 @@ use tracing::warn;
 
 use super::discovery::LocalProvisioningProfile;
 use super::seed::{canonicalize_kinds_for, ensure_host_matches};
-use super::tasks::{AGGREGATOR_CONTROLLER, CONVOY_ENSURE_CONDITION_TYPE};
+use super::tasks::{AGGREGATOR_CONTROLLER, CONVOY_ENSURE_CONDITION_TYPE, RETENTION_CONDITION_TYPE};
 use crate::{
     resource_limits::file_descriptor_pressure_condition, resource_manifest::manifest_root_name, supervisor::RestartBudgetExhausted,
 };
@@ -163,6 +163,28 @@ impl RuntimeHealth {
             }
             None => {
                 failures.remove(super::archive::ARCHIVE_CONDITION);
+            }
+        }
+    }
+
+    /// Artifact retention's condition: present while its failures are past their retry limit.
+    pub(super) fn report_retention(&self, failing: Option<String>) {
+        let mut failures = self.failures.lock().expect("runtime health lock poisoned");
+        match failing {
+            Some(message) => {
+                let condition = HostCondition::builder()
+                    .condition_type(RETENTION_CONDITION_TYPE)
+                    .value(ConditionValue::False)
+                    .reason("RetentionFailing")
+                    .message(message)
+                    .observed_at(Utc::now())
+                    .blocks_readiness(false)
+                    .blocks_forge_observation(false)
+                    .build();
+                failures.insert(RETENTION_CONDITION_TYPE.to_string(), condition);
+            }
+            None => {
+                failures.remove(RETENTION_CONDITION_TYPE);
             }
         }
     }

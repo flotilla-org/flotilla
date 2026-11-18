@@ -90,32 +90,84 @@ pub(super) async fn load_checkout_archive_roots(path: &Path) -> Result<BTreeSet<
 pub(super) const BLOB_GRACE: Duration = Duration::from_secs(24 * 60 * 60);
 /// The wait before retrying a failed collection.
 const GC_RETRY: RetryBackoff = RetryBackoff { initial: Duration::from_secs(60), maximum: Duration::from_secs(60 * 60) };
-/// Consecutive failed collections retried at [`GC_RETRY`]; past it, the next change retries.
-const GC_RETRY_LIMIT: u32 = 10;
+/// Consecutive failed collections retried at [`GC_RETRY`]; past it, the next change or expiry
+/// retries.
+pub(super) const GC_RETRY_LIMIT: u32 = 10;
+/// The host condition artifact retention reports while its failures are past [`GC_RETRY_LIMIT`].
+pub(super) const RETENTION_CONDITION_TYPE: &str = "Artifact/Retention";
+
+/// Artifact retention's consecutive failures. Each is retried at [`GC_RETRY`] up to
+/// [`GC_RETRY_LIMIT`]; the first past it is warned once with its reason and reported in the host's
+/// health, which holds it until a pass succeeds.
+pub(super) struct RetentionFailures {
+    count: u32,
+    health: RuntimeHealth,
+}
+
+impl RetentionFailures {
+    pub(super) fn new(health: RuntimeHealth) -> Self {
+        Self { count: 0, health }
+    }
+
+    /// A pass succeeded: the count and any reported failure clear.
+    pub(super) fn succeeded(&mut self) {
+        if self.count > GC_RETRY_LIMIT {
+            self.health.report_retention(None);
+        }
+        self.count = 0;
+    }
+
+    /// A pass failed with `error`: the wait before it is retried, or `None` past the limit, when
+    /// `then` says what happens instead.
+    pub(super) fn failed(&mut self, error: &str, then: &str) -> Option<Duration> {
+        self.count = self.count.saturating_add(1);
+        if self.count <= GC_RETRY_LIMIT {
+            warn!(%error, failures = self.count, "artifact retention failed; retrying");
+            return Some(GC_RETRY.delay(self.count));
+        }
+        if self.count == GC_RETRY_LIMIT + 1 {
+            warn!(%error, failures = self.count, "artifact retention keeps failing; {then}");
+            self.health.report_retention(Some(format!("artifact retention failed {} times in a row; {then}: {error}", self.count)));
+        } else {
+            debug!(%error, failures = self.count, "artifact retention failed again");
+        }
+        None
+    }
+}
 
 /// Artifact retention: reaps this home's expired artifacts and collects the blobs no artifact
 /// references any more ([`Retention`]). A convoy's retirement reaps none of its artifacts: they go
 /// at their own expiry or by an explicit delete. It lists the artifacts once, then acts at each
 /// change to one and when the next artifact expires or a blob's grace passes: nothing is listed
-/// again and no timer runs. A failure retries at a backoff a finite number of times; past it,
-/// retention stops until the daemon restarts.
-pub(super) async fn run_artifact_gc(backend: ResourceBackend, namespace: String, blobs: Arc<TieredBlobStore>, grace: Duration) {
-    let mut failures = 0_u32;
+/// again and no timer runs. A failure retries at a backoff a finite number of times; past it, a
+/// failing pass waits for the next change or expiry, and a failing listing stops retention until
+/// the daemon restarts.
+pub(super) async fn run_artifact_gc(
+    backend: ResourceBackend,
+    namespace: String,
+    blobs: Arc<TieredBlobStore>,
+    grace: Duration,
+    health: RuntimeHealth,
+) {
+    let mut failures = RetentionFailures::new(health);
     loop {
         let stopped = retain(&backend, &namespace, &blobs, grace, &mut failures).await;
-        failures = failures.saturating_add(1);
-        warn!(error = %stopped, failures, "artifact retention stopped; reading the artifacts again");
-        if failures > GC_RETRY_LIMIT {
-            error!(failures, "artifact retention keeps failing; it stops until the daemon restarts");
-            return;
+        match failures.failed(&format!("{stopped}; reading the artifacts again"), "it stops until the daemon restarts") {
+            Some(wait) => tokio::time::sleep(wait).await,
+            None => return,
         }
-        tokio::time::sleep(GC_RETRY.delay(failures)).await;
     }
 }
 
 /// Retention over one listing and the changes after it, until the artifact watch ends: why it
 /// stopped.
-async fn retain(backend: &ResourceBackend, namespace: &str, blobs: &Arc<TieredBlobStore>, grace: Duration, failures: &mut u32) -> String {
+async fn retain(
+    backend: &ResourceBackend,
+    namespace: &str,
+    blobs: &Arc<TieredBlobStore>,
+    grace: Duration,
+    failures: &mut RetentionFailures,
+) -> String {
     let mut unwritten = blobs.follow_unwritten();
     // Watched before the listing, so no change between the two is missed.
     let mut changes = match backend.including_replicas::<Artifact>(namespace).watch().await {
@@ -153,22 +205,21 @@ async fn retain(backend: &ResourceBackend, namespace: &str, blobs: &Arc<TieredBl
                 Err(error) => drop(failed.get_or_insert(error)),
             }
         }
-        // A failure waits for its retry, not for what is already due.
+        let wake = |at: chrono::DateTime<Utc>| tokio::time::Instant::now() + (at - Utc::now()).to_std().unwrap_or_default();
+        // A failure waits for its retry, not for what is already due; past its retries, for the
+        // next change, or the next expiry or grace still ahead.
         let deadline = match failed {
             None => {
-                *failures = 0;
-                let expiry =
-                    retention.next_deadline().map(|at| tokio::time::Instant::now() + (at - Utc::now()).to_std().unwrap_or_default());
-                expiry.into_iter().chain(leftovers).min()
+                failures.succeeded();
+                retention.next_deadline().map(wake).into_iter().chain(leftovers).min()
             }
-            Some(error) => {
-                *failures = failures.saturating_add(1);
-                warn!(%error, failures = *failures, "artifact garbage collection failed");
-                if *failures == GC_RETRY_LIMIT + 1 {
-                    warn!(failures = *failures, "artifact garbage collection keeps failing; the next change retries");
+            Some(error) => match failures.failed(&error, "the next change or expiry retries it") {
+                Some(wait) => Some(tokio::time::Instant::now() + wait),
+                None => {
+                    let ahead = leftovers.filter(|at| *at > tokio::time::Instant::now());
+                    retention.next_deadline_after(Utc::now()).map(wake).into_iter().chain(ahead).min()
                 }
-                (*failures <= GC_RETRY_LIMIT).then(|| tokio::time::Instant::now() + GC_RETRY.delay(*failures))
-            }
+            },
         };
         tokio::select! {
             batch = changes.next() => {

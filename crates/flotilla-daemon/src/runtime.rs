@@ -341,7 +341,13 @@ impl DaemonRuntime {
             tokio::spawn(attributed(caller("blob store sync"), Arc::clone(&blob_store).run_sync())),
             tokio::spawn(attributed(
                 caller("artifact gc"),
-                run_artifact_gc(daemon.resource_backend(), options.namespace.clone(), Arc::clone(&blob_store), tasks::BLOB_GRACE),
+                run_artifact_gc(
+                    daemon.resource_backend(),
+                    options.namespace.clone(),
+                    Arc::clone(&blob_store),
+                    tasks::BLOB_GRACE,
+                    runtime_health.clone(),
+                ),
             )),
             tokio::spawn(attributed(
                 caller("checkout archive gc"),

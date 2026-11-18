@@ -138,6 +138,13 @@ impl Retention {
         let grace = self.unreferenced.first().map(|(at, _)| *at);
         expiry.into_iter().chain(grace).min()
     }
+
+    /// [`Self::next_deadline`] still ahead of `now`: what is already due and failing is skipped.
+    pub(crate) fn next_deadline_after(&self, now: DateTime<Utc>) -> Option<DateTime<Utc>> {
+        let expiry = self.expiry.iter().map(|(at, _)| *at).find(|at| *at > now);
+        let grace = self.unreferenced.iter().map(|(at, _)| *at).find(|at| *at > now);
+        expiry.into_iter().chain(grace).min()
+    }
 }
 
 fn key(name: &str, provenance: &ResourceProvenance) -> Key {

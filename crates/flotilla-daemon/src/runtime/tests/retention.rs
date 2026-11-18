@@ -7,7 +7,10 @@ use flotilla_provisioning_testkit::EngineBackend;
 use flotilla_resources::{Artifact, ArtifactSpec};
 use flotilla_store::TypedResolver;
 
-use crate::runtime::tasks::BLOB_GRACE;
+use crate::runtime::{
+    health::RuntimeHealth,
+    tasks::{RetentionFailures, BLOB_GRACE, GC_RETRY_LIMIT, RETENTION_CONDITION_TYPE},
+};
 
 fn name(convoy: &str, kind: &str, subject: &str) -> String {
     flotilla_resources::address::record_name(
@@ -55,7 +58,7 @@ async fn an_artifact_is_reaped_at_its_expiry_without_a_timer() {
     let blobs = Arc::new(TieredBlobStore::new(state.path(), Vec::new()));
     let home = EngineBackend::open_in("home", NAMESPACE);
     let backend = home.backend.clone();
-    let task = tokio::spawn(run_artifact_gc(backend.clone(), NAMESPACE.into(), Arc::clone(&blobs), BLOB_GRACE));
+    let task = tokio::spawn(run_artifact_gc(backend.clone(), NAMESPACE.into(), Arc::clone(&blobs), BLOB_GRACE, RuntimeHealth::default()));
     let artifacts = backend.using::<Artifact>(NAMESPACE);
     let digest = blobs.put(b"review notes").await.expect("put blob");
     for (subject, pinned) in [("soon", false), ("kept", true)] {
@@ -91,7 +94,8 @@ async fn a_blob_whose_artifact_write_failed_is_collected_without_a_restart() {
     let far = Utc::now() + chrono::Duration::days(3650);
     let squatter = spec("demo", "brief", "another", &held, far, true);
     artifacts.create(&InputMeta::builder().name(name("demo", "brief", "brief")).build(), &squatter).await.expect("squatter");
-    let task = tokio::spawn(run_artifact_gc(backend.clone(), NAMESPACE.into(), Arc::clone(&blobs), Duration::ZERO));
+    let task =
+        tokio::spawn(run_artifact_gc(backend.clone(), NAMESPACE.into(), Arc::clone(&blobs), Duration::ZERO, RuntimeHealth::default()));
     // Retention has started once it has reaped a probe.
     let probe = spec("demo", "probe", "probe", &held, Utc::now() - chrono::Duration::seconds(1), false);
     artifacts.create(&InputMeta::builder().name(name("demo", "probe", "probe")).build(), &probe).await.expect("probe");
@@ -127,7 +131,7 @@ async fn retention_reads_each_artifact_change_once() {
     let artifacts = backend.using::<Artifact>(NAMESPACE);
     let task = tokio::spawn(flotilla_schema::reads::attributed(
         flotilla_schema::reads::caller(RETENTION),
-        run_artifact_gc(backend.clone(), NAMESPACE.into(), Arc::clone(&blobs), BLOB_GRACE),
+        run_artifact_gc(backend.clone(), NAMESPACE.into(), Arc::clone(&blobs), BLOB_GRACE, RuntimeHealth::default()),
     ));
     let digest = blobs.put(b"decision ledger").await.expect("put blob");
     let far = Utc::now() + chrono::Duration::days(3650);
@@ -142,4 +146,29 @@ async fn retention_reads_each_artifact_change_once() {
     let reads = flotilla_schema::reads::callers().remove(RETENTION).unwrap_or_default();
     let rows: u64 = reads.iter().filter(|(kind, _)| kind.starts_with("Artifact")).map(|(_, counts)| counts.rows).sum();
     assert!(rows <= 4 * CONVOYS as u64, "{CONVOYS} convoys' artifact writes read {rows} artifact rows in retention: {reads:?}");
+}
+
+// Behaviour (#3108): retention failing past its retries stops retrying on a backoff and shows in
+// the host's health with its reason, once, until a pass succeeds.
+#[tokio::test]
+async fn retention_failing_past_its_retries_shows_in_the_hosts_health() {
+    const THEN: &str = "the next change or expiry retries it";
+    let health = RuntimeHealth::default();
+    let reported = || async {
+        health.conditions().await.into_iter().filter(|condition| condition.condition_type == RETENTION_CONDITION_TYPE).collect::<Vec<_>>()
+    };
+    let mut failures = RetentionFailures::new(health.clone());
+    for _ in 0..GC_RETRY_LIMIT {
+        assert!(failures.failed("disk full", THEN).is_some(), "retried at a backoff");
+    }
+    assert!(reported().await.is_empty(), "within its retries it is not reported");
+
+    assert_eq!(failures.failed("disk full", THEN), None, "past its retries it waits for a change or expiry");
+    let failing = reported().await;
+    assert!(matches!(failing.as_slice(), [condition] if condition.message.contains("disk full") && condition.message.contains(THEN)));
+    assert_eq!(failures.failed("disk still full", THEN), None);
+    assert_eq!(reported().await, failing, "reported once, with the first reason past the limit");
+
+    failures.succeeded();
+    assert!(reported().await.is_empty(), "a pass that succeeds clears it");
 }
