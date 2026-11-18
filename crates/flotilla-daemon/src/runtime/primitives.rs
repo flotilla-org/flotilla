@@ -46,9 +46,9 @@ use flotilla_state_machines::{
     machines::{
         agent_session::EndReason,
         consumer::Receiver,
-        message::{Deliver, Message},
+        message::{Deliver, Message, MessageRefusal},
     },
-    Resource, Transport,
+    Resource, Transport, WriteError,
 };
 use futures::TryStreamExt;
 use tracing::{debug, info, warn, Instrument};
@@ -480,7 +480,7 @@ impl MessageDelivery {
             }
         }
         for message in self.held.expire(std::time::Instant::now()) {
-            warn!(%message, "a held turn's hold ran out unconfirmed; it may be typed again");
+            warn!(message_id = %message, "a held turn's hold ran out unconfirmed; it may be typed again");
         }
     }
 
@@ -525,19 +525,28 @@ impl MessageDelivery {
 
     /// Records a confirmed turn: each message's receipt, then its deliver. A message whose receipt
     /// is refused stays held, never retyped: the turn is kept as confirmed, so the next pass retries
-    /// only its receipt, until the hold runs out.
+    /// only its receipt, until the hold runs out. A message that ended meanwhile (superseded,
+    /// withdrawn, expired) can never take a receipt, so it is released, not retried.
     async fn record_turn(&mut self, mut turn: InFlight) {
         let inbox = self.primitives.inbox();
         let mut refused = Vec::new();
         for message in std::mem::take(&mut turn.members) {
-            if let Err(error) = inbox.receive(&turn.consumer, &message, Transport::Turn).await {
-                warn!(%message, %error, "a confirmed turn's receipt was refused; it is retried, never retyped");
-                refused.push(message);
-                continue;
+            match inbox.receive(&turn.consumer, &message, Transport::Turn).await {
+                Ok(()) => {}
+                Err(flotilla_inbox::Error::Message(WriteError::Refused(MessageRefusal::Ended))) => {
+                    info!(message_id = %message, "a confirmed turn's message ended before its receipt; nothing is recorded or retried");
+                    self.held.release(&message);
+                    continue;
+                }
+                Err(error) => {
+                    warn!(message_id = %message, %error, "a confirmed turn's receipt was refused; it is retried, never retyped");
+                    refused.push(message);
+                    continue;
+                }
             }
             self.held.release(&message);
             if let Err(error) = inbox.deliver(&message, Deliver { receiver: turn.consumer.clone(), transport: Transport::Turn }).await {
-                warn!(%message, %error, "a confirmed turn's deliver was refused; the sweep reconciles it");
+                warn!(message_id = %message, %error, "a confirmed turn's deliver was refused; the sweep reconciles it");
             }
         }
         if refused.is_empty() {
@@ -628,7 +637,7 @@ impl MessageDelivery {
         let views: Vec<_> = loaded.into_iter().zip(headers).filter_map(|((message, _), header)| Some((message, header.ok()?))).collect();
         let Some((successor, older)) = held_turns_superseded(due, &views) else { return Ok(()) };
         for message in older {
-            tracing::info!(%message, %successor, "operator turn supersedes a held system turn");
+            tracing::info!(message_id = %message, %successor, "operator turn supersedes a held system turn");
             self.primitives.supersede(message, successor, true).await;
             self.held.release(message);
         }
@@ -667,7 +676,7 @@ impl MessageDelivery {
                     // Notify and Mute record their receipts on pull; deliver them now.
                     let deliver = Deliver { receiver: holder.consumer.clone(), transport: item.mode };
                     if let Err(error) = inbox.deliver(&item.message, deliver).await {
-                        warn!(message = %item.message, %error, "a pulled notify or mute message's deliver was refused");
+                        warn!(message_id = %item.message, %error, "a pulled notify or mute message's deliver was refused");
                     }
                     continue;
                 }
@@ -701,7 +710,7 @@ impl MessageDelivery {
                     due.push((message.clone(), header));
                 }
                 Err(error) => {
-                    debug!(%message, %error, "framing an engine turn without its old spelling");
+                    debug!(message_id = %message, %error, "framing an engine turn without its old spelling");
                     texts.push(format!("[from {}]\n\n{:?}", resource.spec().sender, resource.spec().body.value()));
                 }
             }

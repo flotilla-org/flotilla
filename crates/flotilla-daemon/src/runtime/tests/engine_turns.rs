@@ -320,6 +320,8 @@ async fn typing_a_turn_loads_each_due_message_once_and_converts_none() {
 // the turn's confirmation and its receipt.
 #[tokio::test(start_paused = true)]
 async fn a_confirmed_turn_whose_receipt_is_refused_is_not_retyped() {
+    let (dispatch, logs) = json_logs();
+    let _logs = tracing::dispatcher::set_default(&dispatch);
     let pool = lossy_pool();
     let crew = engine_crew("claude-code", pool.clone()).await;
     let agents = Arc::clone(crew.primitives.sessions());
@@ -337,6 +339,53 @@ async fn a_confirmed_turn_whose_receipt_is_refused_is_not_retyped() {
     passes(&mut delivery, 20).await;
     assert!(!crew.delivered("refused-receipt").await, "the receipt is refused");
     assert_eq!(pool.deliveries.load(Ordering::SeqCst), 1, "a confirmed turn is never retyped");
+    // The daemon's jsonl keeps the WARN's sentence, and names the message in its own field.
+    let refusals = warnings_about(&logs, "refused-receipt");
+    assert!(!refusals.is_empty(), "{}", logs.text());
+    for line in refusals {
+        assert_eq!(line["fields"]["message"], "a confirmed turn's receipt was refused; it is retried, never retyped", "{line}");
+        assert!(line["fields"]["message_id"].as_str().is_some_and(|id| id.ends_with("refused-receipt")), "{line}");
+    }
+}
+
+// A held turn whose message ends before its receipt (an operator withdraws it here; on b3 a newer
+// turn superseded it) can never take the receipt: once the turn is confirmed it is released, not
+// retried on every pass until its hold runs out.
+#[tokio::test(start_paused = true)]
+async fn a_confirmed_turn_whose_message_ended_is_not_retried() {
+    let (dispatch, logs) = json_logs();
+    let _logs = tracing::dispatcher::set_default(&dispatch);
+    let pool = lossy_pool();
+    let crew = engine_crew("claude-code", pool.clone()).await;
+    crew.primitives.sessions().observe_screen(&crew.launch, Activity::Idle, EngineCrew::at(Utc::now())).expect("idle before the turn");
+    let mut delivery = crew.delivery();
+    crew.send("ended-turn", "system:turn-rules", MessageRelation::System, "wake").await;
+    passes(&mut delivery, 20).await;
+    assert_eq!(pool.deliveries.load(Ordering::SeqCst), 1, "a held turn is typed once");
+    crew.primitives.withdraw(NAMESPACE, &crew.receiver(), "ended-turn", &crew.convoy).await.expect("withdraw the held turn");
+    // This daemon saw the agent take the turn up: the turn is confirmed.
+    crew.daemon.crew_progress().prompt_submit("agent", Utc::now() + chrono::Duration::milliseconds(1));
+    passes(&mut delivery, 20).await;
+    assert_eq!(crew.phase("ended-turn").await, Some(MessagePhase::Expired), "withdrawn reads as expired");
+    assert_eq!(pool.deliveries.load(Ordering::SeqCst), 1, "a confirmed turn is never retyped");
+    assert_eq!(warnings_about(&logs, "ended-turn"), Vec::<serde_json::Value>::new(), "an ended message's receipt is not retried");
+}
+
+/// A capture of this test's logs as the daemon writes its jsonl.
+fn json_logs() -> (tracing::Dispatch, flotilla_log_testkit::Logs) {
+    let logs = flotilla_log_testkit::Logs::default();
+    let writer = logs.clone();
+    let subscriber = tracing_subscriber::fmt().json().with_ansi(false).with_writer(move || writer.clone()).finish();
+    (flotilla_log_testkit::dispatch(subscriber), logs)
+}
+
+/// The captured WARN lines whose own fields name message record `record` (not merely their span).
+fn warnings_about(logs: &flotilla_log_testkit::Logs, record: &str) -> Vec<serde_json::Value> {
+    logs.lines()
+        .iter()
+        .map(|line| serde_json::from_str::<serde_json::Value>(line).expect("a JSON log line"))
+        .filter(|line| line["level"] == "WARN" && line["fields"].to_string().contains(record))
+        .collect()
 }
 
 // #3455: an operator's turn to a session holding an unconfirmed system turn drops that turn as
