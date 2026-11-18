@@ -25,7 +25,7 @@ use flotilla_resources::{
     environment_records::LaunchFacts,
     terminal_records::{TerminalLaunchFacts, TerminalLaunchRequest, TerminalLaunchSource, TerminalRecord, TerminalRecords},
     vessel_records::VesselStep,
-    EnvironmentSpec, HostDirectEnvironmentSpec, SystemClock, TerminalOccupancy,
+    DockerEnvironmentSpec, EnvironmentSpec, HostDirectEnvironmentSpec, RetryBackoff, SystemClock, TerminalOccupancy,
 };
 use flotilla_schema_sqlite::stream::{CommitListener, Service};
 use tokio::sync::Notify;
@@ -60,6 +60,8 @@ struct Asked {
     screen_failure: Option<String>,
     /// Why the session cannot be reached to kill it, as when its environment was not adopted.
     unreachable_pool: Option<String>,
+    /// Each launch a person was told may still run, and the reason they read.
+    left_running: Vec<(String, String)>,
 }
 
 #[derive(Default)]
@@ -136,6 +138,10 @@ impl TerminalProvider for RecordingProvider {
         self.asked().cleaned.push(launch.name.clone());
         Ok(())
     }
+
+    async fn left_running(&self, launch: &TerminalRecord, reason: &str) {
+        self.asked().left_running.push((launch.name.clone(), reason.into()));
+    }
 }
 
 struct World {
@@ -157,6 +163,27 @@ fn host_direct() -> EnvironmentSpec {
     }
 }
 
+/// A container, whose teardown ends the processes run in it.
+fn docker() -> EnvironmentSpec {
+    EnvironmentSpec {
+        docker: Some(DockerEnvironmentSpec {
+            host_ref: HOME.into(),
+            image: "crew:pinned".into(),
+            image_build_ref: None,
+            declared_agent_adapters: Default::default(),
+            required_agent_adapters: Default::default(),
+            pull_policy: Default::default(),
+            mounts: vec![],
+            env: Default::default(),
+        }),
+        ..EnvironmentSpec::default()
+    }
+}
+
+/// How often a failed release is tried in these tests, and how soon again.
+const RELEASE_TRIES: u32 = 3;
+const RELEASE_BACKOFF: RetryBackoff = RetryBackoff { initial: Duration::from_millis(20), maximum: Duration::from_millis(20) };
+
 fn tool(session: &str) -> TerminalLaunchRequest {
     TerminalLaunchRequest {
         session: session.into(),
@@ -174,6 +201,16 @@ impl World {
     /// A decided store with its TerminalSession controller started over `provider`, and this
     /// host's direct environment requested, realised when `ready`.
     fn start(provider: RecordingProvider, ready: bool) -> Self {
+        Self::start_in(provider, ready, &host_direct())
+    }
+
+    /// As [`World::start`], with the environment sessions run in made from `environment`.
+    fn start_in(provider: RecordingProvider, ready: bool, environment: &EnvironmentSpec) -> Self {
+        Self::start_with(provider, ready, environment, RELEASE_TRIES)
+    }
+
+    /// As [`World::start_in`], a failed release tried at most `release_tries` times.
+    fn start_with(provider: RecordingProvider, ready: bool, environment: &EnvironmentSpec, release_tries: u32) -> Self {
         let directory = tempfile::tempdir().expect("directory");
         let service =
             Arc::new(Service::open(&directory.path().join("decided.sqlite"), HOME, decided_registry().expect("registry")).expect("store"));
@@ -184,7 +221,7 @@ impl World {
         };
         service.on_commit(Arc::downgrade(&listener));
         let vessels = EngineFixture::over(HOME, service.store());
-        vessels.environments.request(ENVIRONMENT, &host_direct(), None);
+        vessels.environments.request(ENVIRONMENT, environment, None);
         if ready {
             vessels.environments.ready(ENVIRONMENT, "/work", LaunchFacts::default());
         }
@@ -197,7 +234,8 @@ impl World {
             StoreReads::new(service.store()),
             HOME,
             terminals.staged.clone(),
-        );
+        )
+        .with_release_retry(RELEASE_BACKOFF, release_tries);
         let briefs = actuator.awaited_briefs();
         let controller =
             Controller::start(Arc::clone(&terminals.lifecycles), Arc::new(actuator), Arc::new(SystemClock), service).expect("controller");
@@ -421,11 +459,11 @@ async fn an_ended_lease_releases_its_session() {
 }
 
 // Behaviour: an ended vessel's session that cannot be reached, as when a restart did not adopt
-// its environment, is released all the same: its environment's release waits for it, and that
-// teardown removes it.
+// its environment, is released all the same when its environment is a container: its
+// environment's release waits for it, and that teardown removes it.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn an_ended_vessels_unreachable_session_is_left_to_its_environment() {
-    let world = World::start(RecordingProvider::default(), true);
+    let world = World::start_in(RecordingProvider::default(), true, &docker());
     let (launch, lease) = world.running_agent("v1").await;
     world.provider.asked().unreachable_pool = Some("provider registry unavailable".into());
     world.vessels.vessels.ready(&lease, "vessel-v1");
@@ -434,14 +472,64 @@ async fn an_ended_vessels_unreachable_session_is_left_to_its_environment() {
     assert_eq!(world.provider.asked().killed, vec![format!("pool-{launch}")], "it was asked once");
 }
 
-// Behaviour: an ended environment took its sessions with it: they are released without asking
+// Behaviour: an ended container took its sessions with it: they are released without asking
 // its gone runtime anything.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn an_ended_environment_releases_its_sessions_without_provider_work() {
-    let world = World::start(RecordingProvider::default(), true);
+    let world = World::start_in(RecordingProvider::default(), true, &docker());
     let (launch, _lease) = world.running_agent("v1").await;
     world.vessels.environments.lose(ENVIRONMENT, "container removed");
     world.until("released", |world| world.reading(&launch) == LifecycleReading::Released).await;
     let asked = world.provider.asked();
     assert!(asked.killed.is_empty() && asked.cleaned.is_empty() && asked.receipts_removed.is_empty());
+}
+
+// Behaviour (item 12): a host-direct environment's end stops none of its processes, so its
+// sessions are still killed and cleaned when they are released.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn an_ended_host_direct_environments_sessions_are_still_killed() {
+    let world = World::start(RecordingProvider::default(), true);
+    let (launch, _lease) = world.running_agent("v1").await;
+    world.vessels.environments.lose(ENVIRONMENT, "host-direct environment ended");
+    world.until("released", |world| world.reading(&launch) == LifecycleReading::Released).await;
+    let asked = world.provider.asked();
+    assert_eq!(asked.killed, vec![format!("pool-{launch}")]);
+    assert_eq!(asked.cleaned, vec![launch]);
+}
+
+// Behaviour (item 12): on a host-direct environment nothing else ends an ended vessel's session,
+// so a failed kill is not left to the environment: the release is tried again on time, and the
+// session is released once its kill succeeds, with no person told.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn an_ended_vessels_host_direct_session_whose_kill_fails_is_tried_again() {
+    // A limit this test never reaches: the release is tried again until the kill succeeds.
+    let world = World::start_with(RecordingProvider::default(), true, &host_direct(), u32::MAX);
+    let (launch, lease) = world.running_agent("v1").await;
+    world.provider.asked().unreachable_pool = Some("cleat socket refused".into());
+    world.vessels.vessels.ready(&lease, "vessel-v1");
+    world.vessels.vessels.step(&lease, VesselStep::Released);
+    world.until("tried again", |world| world.provider.asked().killed.len() >= 2).await;
+    assert_ne!(world.reading(&launch), LifecycleReading::Released, "not released while its kill fails");
+    world.provider.asked().unreachable_pool = None;
+    world.until("released", |world| world.reading(&launch) == LifecycleReading::Released).await;
+    assert!(world.provider.asked().left_running.is_empty());
+}
+
+// Behaviour (item 12): a host-direct session whose kill keeps failing is tried a bounded number of
+// times; then a person is told, once, that its process may still run, and it is released so its
+// vessel's teardown goes on.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_host_direct_session_whose_kill_keeps_failing_is_told_to_a_person_and_released() {
+    let world = World::start(RecordingProvider::default(), true);
+    let (launch, lease) = world.running_agent("v1").await;
+    world.provider.asked().unreachable_pool = Some("cleat socket refused".into());
+    world.vessels.vessels.ready(&lease, "vessel-v1");
+    world.vessels.vessels.step(&lease, VesselStep::Released);
+    world.until("released", |world| world.reading(&launch) == LifecycleReading::Released).await;
+    tokio::time::sleep(Duration::from_millis(100)).await;
+    let asked = world.provider.asked();
+    assert_eq!(asked.killed.len(), RELEASE_TRIES as usize, "tried the bounded number of times, then no more");
+    let [(told, reason)] = asked.left_running.as_slice() else { panic!("told once: {:?}", asked.left_running) };
+    assert_eq!(told, &launch);
+    assert!(reason.contains("cleat socket refused") && reason.contains("may still be running"), "{reason}");
 }

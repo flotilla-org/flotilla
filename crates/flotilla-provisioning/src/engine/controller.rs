@@ -676,9 +676,13 @@ where
             (Done::Released(Err(failure)), _) => {
                 // A realised resource has no failed-teardown edge yet, so the failure is not
                 // counted: a change of a record its release depends on, or the next start, tries
-                // the release again.
+                // the release again, and so does the time its actuator asks for, which bounds
+                // its own tries.
                 self.release_failed.insert(name.to_owned());
                 warn!(kind = K::NAME, name, cause = ?failure.cause, "release failed");
+                if let Some(retry_at) = failure.retry_at.filter(|_| failure.retryable) {
+                    self.retries.insert(name.to_owned(), retry_at);
+                }
             }
             (Done::Observed(Ok(Backing::Present { identity }), _), LifecycleState::Requested { .. }) => {
                 self.write(name, Step::Realised { identity }).await;

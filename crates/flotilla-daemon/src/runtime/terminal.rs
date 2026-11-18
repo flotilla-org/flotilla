@@ -21,6 +21,7 @@ use flotilla_provisioning::engine::terminal_actuator::{
     LaunchFailure, ScreenReading, TerminalLaunched, TerminalLiveness, TerminalProvider,
 };
 use flotilla_resources::{
+    attentions::{Attention, Fact},
     terminal_records::{AgentLaunch, TerminalLaunchFacts, TerminalRecord},
     Convoy, FulfilmentKind, ResourceObject, TerminalAttentionSource, TerminalAttentionState, TerminalOccupancy, TerminalSession,
     TerminalSessionSource, TerminalSessionTarget, Vessel, CONVOY_LABEL, CREDENTIAL_PERMISSIONS_SESSION_TAG, CREDENTIAL_REF_SESSION_TAG,
@@ -276,19 +277,24 @@ pub(super) async fn fulfilment_grants_for_terminal(
     context: &flotilla_resources::TerminalCrewContext,
 ) -> Option<BTreeSet<flotilla_resources::FulfilmentGrant>> {
     let convoy = backend.including_replicas::<Convoy>(&context.namespace).get(&context.convoy).await.ok()?.object;
-    let vessel_name = backend
-        .including_replicas::<Vessel>(&context.namespace)
-        .get(&context.vessel_ref)
-        .await
-        .ok()
-        .map(|source| source.object.spec.vessel_name)
-        .or_else(|| context.vessel_ref.strip_prefix(&format!("{}-", context.convoy)).map(str::to_string));
+    let vessel_name = vessel_name_of(backend, context).await;
     let selected_kind = vessel_name
         .as_deref()
         .and_then(|name| flotilla_resources::vessel_placement_pin(&convoy, name))
         .map(|pin| pin.decision.kind)
         .or_else(|| convoy.status.and_then(|status| status.placement_decision.map(|decision| decision.kind)))?;
     backend.including_replicas::<FulfilmentKind>(&context.namespace).get(&selected_kind).await.ok().map(|source| source.object.spec.grants)
+}
+
+/// The within-convoy name of the vessel a terminal context names by its Vessel resource.
+async fn vessel_name_of(backend: &ResourceBackend, context: &flotilla_resources::TerminalCrewContext) -> Option<String> {
+    backend
+        .including_replicas::<Vessel>(&context.namespace)
+        .get(&context.vessel_ref)
+        .await
+        .ok()
+        .map(|source| source.object.spec.vessel_name)
+        .or_else(|| context.vessel_ref.strip_prefix(&format!("{}-", context.convoy)).map(str::to_string))
 }
 
 pub(super) fn terminal_liveness_for_source(source: &TerminalSessionSource, liveness: TerminalSessionLiveness) -> TerminalLiveness {
@@ -668,7 +674,7 @@ impl TerminalControllerRuntime {
             .await
     }
 
-    async fn remove_exit_receipt(&self, spec: TerminalSessionTarget<'_>, launch_id: &str) -> Result<(), String> {
+    pub(super) async fn remove_exit_receipt(&self, spec: TerminalSessionTarget<'_>, launch_id: &str) -> Result<(), String> {
         let runner = self.runner_for_spec(spec).await?;
         flotilla_agent::process::remove_exit_receipt(&*runner, Path::new(&spec.cwd), launch_id).await
     }
@@ -1076,5 +1082,20 @@ impl TerminalProvider for TerminalControllerRuntime {
     async fn cleanup_artifacts(&self, launch: &TerminalRecord) -> Result<(), String> {
         let view = self.session_view(launch).await?;
         self.cleanup_session_artifacts((&view).into()).await
+    }
+
+    async fn left_running(&self, launch: &TerminalRecord, reason: &str) {
+        let told = async {
+            let view = self.session_view(launch).await?;
+            // Only a crew's session has a vessel to be told about; a tool's is in the log alone.
+            let TerminalSessionSource::Agent { context, .. } = &view.spec.source else { return Ok(()) };
+            let backend = self.state.daemon.resource_backend();
+            let vessel = vessel_name_of(&backend, context).await.ok_or_else(|| format!("vessel {} has no name", context.vessel_ref))?;
+            let fact = Fact::SessionLeftRunning { convoy: context.convoy.clone(), vessel, session: launch.name.clone() };
+            self.state.daemon.attentions().raise(&context.namespace, &Attention::new(fact, reason, Utc::now())).await
+        };
+        if let Err(error) = told.await {
+            warn!(launch = %launch.name, %error, %reason, "a session left running could not be told to a person");
+        }
     }
 }

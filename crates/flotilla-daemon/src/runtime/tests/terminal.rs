@@ -471,6 +471,49 @@ async fn terminal_teardown_skips_a_session_absent_from_the_pool() {
     assert!(pool.killed.lock().await.is_empty(), "teardown must not invoke the pool for an already-gone session");
 }
 
+// Item 12: a convoy's end releases its checkout and its sessions together, so the checkout, and
+// the exit receipt inside it, can be removed before the session's release reaches the receipt.
+// Removing it then has nothing left to do; it is no error.
+#[tokio::test]
+async fn an_exit_receipt_whose_checkout_is_already_removed_is_removed() {
+    let temp = TempDir::new().expect("tempdir");
+    let config_path = temp.path().join("config");
+    std::fs::create_dir_all(&config_path).expect("config dir");
+    std::fs::write(config_path.join("daemon.toml"), "machine_id = \"dinghy-test\"\n").expect("daemon config");
+    let config = Arc::new(ConfigStore::with_base(config_path));
+    let (daemon, _pool) = crew_daemon_with_process_runner(Arc::clone(&config)).await;
+    let local_registry = probe_local_provider_registry(&daemon, &config).await.expect("crew provider registry");
+    let profile = build_local_profile(&daemon, &local_registry).await.expect("local profile");
+    engine_environments(&daemon);
+    let runtime = TerminalControllerRuntime {
+        state: Arc::new(ControllerRuntimeState::new(
+            Arc::clone(&daemon),
+            config,
+            local_registry,
+            None,
+            profile.host_id.clone(),
+            profile.host_direct_environment_name(),
+        )),
+    };
+    let checkout = temp.path().join("checkout");
+    let receipt = checkout.join(flotilla_agent::process::exit_receipt("crew#1"));
+    std::fs::create_dir_all(receipt.parent().expect("receipt directory")).expect("receipt directory");
+    std::fs::write(&receipt, "0\n").expect("receipt");
+    let spec = flotilla_resources::TerminalSessionSpec {
+        env_ref: profile.host_direct_environment_name(),
+        role: "coder".to_string(),
+        source: TerminalSessionSource::Tool { command: "cargo test".to_string() },
+        cwd: checkout.display().to_string(),
+        env: Default::default(),
+        pool: "fake-terminals".to_string(),
+    };
+
+    runtime.remove_exit_receipt((&spec).into(), "crew#1").await.expect("a present receipt is removed");
+    assert!(!receipt.exists());
+    std::fs::remove_dir_all(&checkout).expect("the checkout's removal");
+    runtime.remove_exit_receipt((&spec).into(), "crew#1").await.expect("a receipt removed with its checkout is no error");
+}
+
 // #3894: teardown never strands a typed engine turn. Teardown stops a turn not
 // yet typed and waits, without blocking, while a typed one settles; the kill
 // leaves it reserved, so the engine delivery adapter still records its receipt.

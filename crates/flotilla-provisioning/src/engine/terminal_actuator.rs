@@ -24,7 +24,7 @@
 //! [`Controller`]: super::controller::Controller
 
 use std::{
-    collections::BTreeSet,
+    collections::{BTreeMap, BTreeSet},
     sync::{Arc, Mutex},
     time::Duration,
 };
@@ -34,9 +34,10 @@ use chrono::Utc;
 use flotilla_resources::{
     agent_activity::ProgressFacts,
     terminal_records::{TerminalLaunchFacts as FactsView, TerminalRecord, TerminalRecords, PROCESS_EXITED},
-    ScreenObstruction, TerminalAttention, TerminalAttentionState, TerminalOccupancy,
+    RetryBackoff, ScreenObstruction, TerminalAttention, TerminalAttentionState, TerminalOccupancy, LOCAL_RETRY_LIMIT,
+    PROVISIONING_RETRY_BACKOFF,
 };
-use flotilla_schema::{reads::carry, Identity, Kind, KindCode};
+use flotilla_schema::{reads::carry, Identity, Kind, KindCode, Timestamp};
 use flotilla_schema_sqlite::{Read, StoreError};
 use flotilla_state_machines::{
     machines::{
@@ -51,6 +52,7 @@ use tracing::{debug, warn};
 use super::{
     controller::{Actuator, Backing, BackingEvent, Holding, ProviderFailure, Usability},
     environment_actuator::state_of,
+    environments::RecipeOf,
     launch_log::StagedFacts,
     reads::StoreReads,
     terminals::{holder_vessel, stored_facts},
@@ -149,6 +151,9 @@ pub trait TerminalProvider: Send + Sync {
     async fn remove_exit_receipt(&self, launch: &TerminalRecord) -> Result<(), String>;
     /// Removes the files `launch`'s harness was prepared with.
     async fn cleanup_artifacts(&self, launch: &TerminalRecord) -> Result<(), String>;
+    /// Tells a person that `launch` is released without its process known to be stopped, and why:
+    /// its release kept failing and nothing else ends it.
+    async fn left_running(&self, launch: &TerminalRecord, reason: &str);
 }
 
 const ENVIRONMENT: KindCode = <Resource<Lifecycle<EnvironmentKind>> as Kind>::CODE;
@@ -213,6 +218,20 @@ pub struct TerminalActuator<P: ?Sized> {
     home: String,
     staged: StagedFacts<TerminalLaunchFacts>,
     briefs: AwaitedBriefs,
+    /// When a failed release is tried again, and how many tries it gets.
+    release_backoff: RetryBackoff,
+    release_limit: u32,
+    /// Each launch's failed releases in a row, in memory: a restart tries again from none.
+    release_failures: Mutex<BTreeMap<String, u32>>,
+}
+
+/// What a launch's environment does to it at teardown.
+struct EnvironmentTeardown {
+    /// The environment has ended, or no record of it is left.
+    ended: bool,
+    /// Its teardown ends the processes run in it, as a container's does; assumed when no record
+    /// is left to say.
+    ends_processes: bool,
 }
 
 impl<P: ?Sized> TerminalActuator<P> {
@@ -223,12 +242,41 @@ impl<P: ?Sized> TerminalActuator<P> {
         home: impl Into<String>,
         staged: StagedFacts<TerminalLaunchFacts>,
     ) -> Self {
-        Self { provider, records, reads, home: home.into(), staged, briefs: AwaitedBriefs::default() }
+        Self {
+            provider,
+            records,
+            reads,
+            home: home.into(),
+            staged,
+            briefs: AwaitedBriefs::default(),
+            release_backoff: PROVISIONING_RETRY_BACKOFF,
+            release_limit: LOCAL_RETRY_LIMIT,
+            release_failures: Mutex::default(),
+        }
+    }
+
+    /// Tries a failed release again after `backoff`, at most `limit` times in all.
+    pub fn with_release_retry(mut self, backoff: RetryBackoff, limit: u32) -> Self {
+        self.release_backoff = backoff;
+        self.release_limit = limit;
+        self
     }
 
     /// The launches waiting on their brief's artifact, which the probe looks for.
     pub fn awaited_briefs(&self) -> AwaitedBriefs {
         self.briefs.clone()
+    }
+
+    /// Counts a failed release of `name`: how many in a row, this one included.
+    fn release_failed(&self, name: &str) -> u32 {
+        let mut failures = self.release_failures.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        let failed = failures.entry(name.to_owned()).or_default();
+        *failed += 1;
+        *failed
+    }
+
+    fn release_done(&self, name: &str) {
+        self.release_failures.lock().unwrap_or_else(std::sync::PoisonError::into_inner).remove(name);
     }
 
     fn record(&self, name: &str) -> Result<TerminalRecord, Cause> {
@@ -238,13 +286,21 @@ impl<P: ?Sized> TerminalActuator<P> {
             .ok_or_else(|| transient(format!("terminal launch {name} is not held here")))
     }
 
-    fn environment_ended(&self, request: &TerminalSessionRequest) -> Result<bool, Cause> {
+    fn environment_teardown(&self, request: &TerminalSessionRequest) -> Result<EnvironmentTeardown, Cause> {
         let environment = &request.environment;
-        let state = self
+        let loaded = self
             .reads
-            .read(|read| Ok(state_of::<EnvironmentKind>(read, &environment.name, &environment.home)?))
+            .read(|read| {
+                let Some(id) = read.resolve(Resource::<Lifecycle<EnvironmentKind>>::CODE, &environment.name, &environment.home)? else {
+                    return Ok(None);
+                };
+                Ok(read.load::<Resource<Lifecycle<EnvironmentKind>>>(id)?.map(|loaded| loaded.value))
+            })
             .map_err(|error| transient(format!("read environment {}: {error}", environment.name)))?;
-        Ok(state.is_none_or(|state| !state.live()))
+        let Some(loaded) = loaded else { return Ok(EnvironmentTeardown { ended: true, ends_processes: true }) };
+        let recipe =
+            RecipeOf::of(loaded.spec().recipe.value()).map_err(|error| transient(format!("environment {}: {error}", environment.name)))?;
+        Ok(EnvironmentTeardown { ended: !loaded.state().live(), ends_processes: recipe.teardown_ends_processes() })
     }
 
     /// Whether the vessel `request` is held for, if any, has ended.
@@ -301,8 +357,11 @@ where
         let failed = |message: String| ProviderFailure::new(transient(message), true);
         self.records.observations().forget(name);
         self.briefs.arrived(name);
-        // An ended environment's teardown removed its sessions, pool and harness with it.
-        if self.environment_ended(request).map_err(|cause| ProviderFailure::new(cause, true))? {
+        let environment = self.environment_teardown(request).map_err(|cause| ProviderFailure::new(cause, true))?;
+        // An ended container's teardown removed its sessions, pool and harness with it; a
+        // host-direct environment's end stops nothing, so its sessions are still killed here.
+        if environment.ended && environment.ends_processes {
+            self.release_done(name);
             return Ok(());
         }
         let record = self.record(name).map_err(|cause| ProviderFailure::new(cause, true))?;
@@ -323,16 +382,35 @@ where
             errors.push(error);
         }
         if errors.is_empty() {
+            self.release_done(name);
             return Ok(());
         }
+        let errors = errors.join("; ");
         // A crew's session whose vessel ended goes with its environment, whose release waits
         // for it: one that cannot be reached here, as when its environment was not adopted after
-        // a restart, is removed by that teardown.
-        if self.vessel_ended(request).map_err(|cause| ProviderFailure::new(cause, true))? {
-            warn!(session = name, errors = %errors.join("; "), "a session of an ended vessel is left to its environment's teardown");
+        // a restart, is removed by that teardown, when the teardown ends its processes.
+        if environment.ends_processes && self.vessel_ended(request).map_err(|cause| ProviderFailure::new(cause, true))? {
+            warn!(session = name, %errors, "a session of an ended vessel is left to its environment's teardown");
+            self.release_done(name);
             return Ok(());
         }
-        Err(failed(errors.join("; ")))
+        // Nothing else ends it: tried again on time, a bounded number of times, after which a
+        // person is told its process may still run, and it is released so its holders' teardown
+        // goes on.
+        let failures = self.release_failed(name);
+        if failures >= self.release_limit {
+            let reason = format!(
+                "the session's release failed {failures} times ({errors}); its process may still be running on {}. Check it and stop it by hand.",
+                record.environment
+            );
+            warn!(session = name, %errors, failures, "a session's release gave up; it may still be running");
+            self.provider.left_running(&record, &reason).await;
+            self.release_done(name);
+            return Ok(());
+        }
+        let delay = chrono::Duration::from_std(self.release_backoff.delay(failures)).unwrap_or_else(|_| chrono::Duration::days(1));
+        let retry_at = Timestamp::from_datetime(&(Utc::now() + delay));
+        Err(ProviderFailure { retry_at: Some(retry_at), ..failed(errors) })
     }
 
     fn followed(&self) -> Vec<KindCode> {

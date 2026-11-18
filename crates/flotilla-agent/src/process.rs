@@ -39,9 +39,12 @@ pub fn with_preludes(command: &str) -> String {
     )
 }
 
-/// Remove only this launch's receipt through its execution environment.
+/// Remove only this launch's receipt through its execution environment. It runs from `/`, so a
+/// checkout already removed, and the receipt with it, leaves nothing to do.
 pub async fn remove_exit_receipt(runner: &dyn CommandRunner, cwd: &Path, launch_id: &str) -> Result<(), String> {
-    runner.run("rm", &["-f", "--", &exit_receipt(launch_id)], cwd, &ChannelLabel::Default).await?;
+    let receipt = cwd.join(exit_receipt(launch_id));
+    let receipt = receipt.to_str().ok_or_else(|| format!("exit receipt path is not valid UTF-8: {}", receipt.display()))?;
+    runner.run("rm", &["-f", "--", receipt], Path::new("/"), &ChannelLabel::Default).await?;
     Ok(())
 }
 

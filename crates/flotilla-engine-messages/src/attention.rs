@@ -34,6 +34,8 @@ pub enum Cause {
     DeliveryHeld { role: Read },
     /// A convoy role's stall reached the operator with no person named to supervise it.
     Stalled { role: Read },
+    /// A vessel's session was released though its process may still run.
+    SessionLeftRunning { vessel: Read },
 }
 
 impl Cause {
@@ -41,7 +43,7 @@ impl Cause {
     pub fn sender(&self) -> FleetRole {
         match self {
             Cause::Hold { .. } | Cause::Drift { .. } | Cause::Refused { .. } => STANDING,
-            Cause::ReclaimRefused { .. } => TEARDOWN,
+            Cause::ReclaimRefused { .. } | Cause::SessionLeftRunning { .. } => TEARDOWN,
             Cause::CredentialRefresh { .. } => CAPABILITIES,
             Cause::DeliveryHeld { .. } => TURN_RULES,
             Cause::Stalled { .. } => STALL_JUDGE,
@@ -52,7 +54,7 @@ impl Cause {
         match self {
             Cause::Hold { convoy } | Cause::ReclaimRefused { convoy } => convoy,
             Cause::Drift { role, .. } | Cause::Refused { role } => role,
-            Cause::CredentialRefresh { vessel } => vessel,
+            Cause::CredentialRefresh { vessel } | Cause::SessionLeftRunning { vessel } => vessel,
             Cause::DeliveryHeld { role } | Cause::Stalled { role } => role,
         }
     }
@@ -138,6 +140,11 @@ mod tests {
                 Cause::Stalled { role: read("project:flotilla/convoy:demo/role:coder") },
                 "fleet:lab/role:stall-judge",
                 "project:flotilla/convoy:demo/role:coder",
+            ),
+            (
+                Cause::SessionLeftRunning { vessel: read("project:flotilla/convoy:demo/vessel:work") },
+                "fleet:lab/role:teardown",
+                "project:flotilla/convoy:demo/vessel:work",
             ),
         ];
         for (cause, sender, subject) in cases {

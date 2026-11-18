@@ -48,6 +48,15 @@ impl RecipeOf {
             .or_else(|_| recipe.read::<CloudSandboxRecipe>().map(Self::Cloud))
             .map_err(|_| "the recipe is none of the Docker, host-direct and cloud sandbox recipes".to_owned())
     }
+
+    /// Whether the environment's teardown ends the processes run in it: a container or sandbox
+    /// goes with them, while a host-direct environment's processes run on the host itself.
+    pub fn teardown_ends_processes(&self) -> bool {
+        match self {
+            Self::Docker(_) | Self::Cloud(_) => true,
+            Self::HostDirect(_) => false,
+        }
+    }
 }
 
 /// The request `spec` makes, held for `vessel`. Env entries derived at launch are left out: they

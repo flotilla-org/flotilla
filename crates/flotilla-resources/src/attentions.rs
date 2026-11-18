@@ -96,13 +96,16 @@ pub enum Fact {
     DeliveryHeld { session: String, convoy: String, role: String },
     /// A convoy role's stall reached the operator with no person named to supervise it.
     Stalled { convoy: String, role: String },
+    /// A vessel's session was released though its release kept failing, and nothing else ends
+    /// its process: it may still run.
+    SessionLeftRunning { convoy: String, vessel: String, session: String },
 }
 
 impl Fact {
     pub fn sender(&self) -> Sender {
         match self {
             Fact::Hold { .. } | Fact::Drift { .. } | Fact::Refused { .. } => Sender::Standing,
-            Fact::ReclaimRefused { .. } => Sender::Teardown,
+            Fact::ReclaimRefused { .. } | Fact::SessionLeftRunning { .. } => Sender::Teardown,
             Fact::CredentialRefresh { .. } => Sender::Capabilities,
             Fact::DeliveryHeld { .. } => Sender::TurnRules,
             Fact::Stalled { .. } => Sender::StallJudge,
@@ -115,7 +118,9 @@ impl Fact {
             Fact::Drift { project, role, .. } | Fact::Refused { project, role, .. } => {
                 Subject::StandingRole { project: project.clone(), role: role.clone() }
             }
-            Fact::CredentialRefresh { convoy, vessel, .. } => Subject::Vessel { convoy: convoy.clone(), vessel: vessel.clone() },
+            Fact::CredentialRefresh { convoy, vessel, .. } | Fact::SessionLeftRunning { convoy, vessel, .. } => {
+                Subject::Vessel { convoy: convoy.clone(), vessel: vessel.clone() }
+            }
             Fact::DeliveryHeld { convoy, role, .. } | Fact::Stalled { convoy, role } => {
                 Subject::ConvoyRole { convoy: convoy.clone(), role: role.clone() }
             }
@@ -131,7 +136,8 @@ impl Fact {
             | Fact::ReclaimRefused { convoy }
             | Fact::CredentialRefresh { convoy, .. }
             | Fact::DeliveryHeld { convoy, .. }
-            | Fact::Stalled { convoy, .. } => Some(convoy),
+            | Fact::Stalled { convoy, .. }
+            | Fact::SessionLeftRunning { convoy, .. } => Some(convoy),
             Fact::Refused { .. } => None,
         }
     }

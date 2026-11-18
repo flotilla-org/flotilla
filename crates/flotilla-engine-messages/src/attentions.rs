@@ -212,15 +212,18 @@ impl MessagePrimitives {
                 Cause::Drift { role: self.standing_role(namespace, ensure, project, role).await?, convoy: held }
             }
             Fact::Refused { .. } => unreachable!("a refused admission names no convoy"),
-            Fact::CredentialRefresh { vessel, .. } => {
+            Fact::CredentialRefresh { vessel, .. } | Fact::SessionLeftRunning { vessel, .. } => {
                 // A vessel's view is versioned by its launch, so its newest launch is its revision.
                 let launch = self
                     .keyed_reads()
                     .vessel(name, &convoy.home, vessel)
                     .await?
                     .ok_or_else(|| format!("convoy `{name}` has no vessel `{vessel}`"))?;
-                let address = child(&held.address, Kind::Vessel, vessel)?;
-                Cause::CredentialRefresh { vessel: Read { address, revision: launch.name } }
+                let vessel = Read { address: child(&held.address, Kind::Vessel, vessel)?, revision: launch.name };
+                match fact {
+                    Fact::CredentialRefresh { .. } => Cause::CredentialRefresh { vessel },
+                    _ => Cause::SessionLeftRunning { vessel },
+                }
             }
             Fact::DeliveryHeld { role, .. } => {
                 Cause::DeliveryHeld { role: Read { address: child(&held.address, Kind::Role, role)?, revision: held.revision } }
