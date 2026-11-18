@@ -1279,7 +1279,11 @@ fn spawn_checkout_controller(
         engine.checkout_facts.clone(),
     )
     .with_branch_validation(Arc::new(checkouts::ForgeBranchValidation { daemon: Arc::clone(&state.daemon) }));
-    let actuator = Arc::new(actuator);
+    // A held checkout is told to a person; one they rule archived reaches the controller as a
+    // recheck carrying the ruling.
+    state.daemon.checkout_rechecks().wake_with(state.checkout_rechecks.clone());
+    let holds = checkouts::AttentionHolds { daemon: Arc::clone(&state.daemon), namespace: state.namespace.clone() };
+    let actuator = Arc::new(actuator.with_holds(Arc::new(holds)));
     // This host's checkout inspector answers gates' inspection requests through the same
     // actuator, so an inspection is recorded as the controller records it.
     match state.daemon.message_primitives() {

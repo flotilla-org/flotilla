@@ -37,6 +37,10 @@ pub enum CheckoutVerb {
         #[arg(long)]
         cr_id: Option<String>,
     },
+    /// Inspect a checkout afresh at its home, so a release held on its work is tried again
+    Recheck,
+    /// Rule a checkout archived: its release archives it and removes it
+    Archive,
 }
 
 impl CheckoutNoun {
@@ -82,6 +86,21 @@ impl CheckoutNoun {
                 host: HostResolution::SubjectHost,
             }),
             (None, Some(CheckoutVerb::Status { .. })) => Err("status requires a checkout subject".into()),
+            // The checkout's home is found by its record name where the command is executed.
+            (Some(checkout), Some(CheckoutVerb::Recheck)) => Ok(Resolved::Ready(Command {
+                node_id: None,
+                provisioning_target: None,
+                context_repo: None,
+                action: CommandAction::CheckoutRecheck { checkout },
+            })),
+            (Some(checkout), Some(CheckoutVerb::Archive)) => Ok(Resolved::Ready(Command {
+                node_id: None,
+                provisioning_target: None,
+                context_repo: None,
+                action: CommandAction::CheckoutArchive { checkout },
+            })),
+            (None, Some(CheckoutVerb::Recheck)) => Err("recheck requires a checkout subject".into()),
+            (None, Some(CheckoutVerb::Archive)) => Err("archive requires a checkout subject".into()),
             (None, None) => Ok(Resolved::Ready(Command {
                 node_id: None,
                 provisioning_target: None,
@@ -106,6 +125,8 @@ impl fmt::Display for CheckoutNoun {
                     }
                 }
                 CheckoutVerb::Remove => write!(f, " remove")?,
+                CheckoutVerb::Recheck => write!(f, " recheck")?,
+                CheckoutVerb::Archive => write!(f, " archive")?,
                 CheckoutVerb::Status { checkout_path, cr_id } => {
                     write!(f, " status")?;
                     if let Some(p) = checkout_path {
@@ -258,6 +279,21 @@ mod tests {
     fn marked_and_explicit_subjects_round_trip() {
         assert_round_trip::<CheckoutNoun>(&["checkout", "@status", "status"]);
         assert_round_trip::<CheckoutNoun>(&["checkout", "--subject", "@topic", "status"]);
+    }
+
+    #[test]
+    fn checkout_recheck_and_archive_name_the_checkout() {
+        crate::test_utils::assert_ready(
+            parse(&["checkout", "repo-feat", "recheck"]).resolve().expect("recheck"),
+            CommandAction::CheckoutRecheck { checkout: "repo-feat".into() },
+        );
+        crate::test_utils::assert_ready(
+            parse(&["checkout", "repo-feat", "archive"]).resolve().expect("archive"),
+            CommandAction::CheckoutArchive { checkout: "repo-feat".into() },
+        );
+        assert!(CheckoutNoun { subjects: SubjectArgs::default(), verb: Some(super::CheckoutVerb::Archive) }.resolve().is_err());
+        assert_round_trip::<CheckoutNoun>(&["checkout", "repo-feat", "recheck"]);
+        assert_round_trip::<CheckoutNoun>(&["checkout", "repo-feat", "archive"]);
     }
 
     #[test]

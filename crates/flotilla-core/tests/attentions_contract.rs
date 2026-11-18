@@ -130,6 +130,7 @@ fn subject_suffix(subject: &Subject) -> String {
         Subject::StandingRole { project, role } => format!("project:{project}/role:{role}"),
         Subject::Vessel { convoy, vessel } => format!("convoy:{convoy}/vessel:{vessel}"),
         Subject::ConvoyRole { convoy, role } => format!("convoy:{convoy}/role:{role}"),
+        Subject::Checkout { host, checkout } => format!("host:{host}/checkout:{checkout}"),
     }
 }
 
@@ -154,7 +155,9 @@ fn attention(fact: usize, reason: &str, began_at: DateTime<Utc>) -> Attention {
                 began_at,
             )
         }
-        _ => Attention::new(Fact::DeliveryHeld { session: "session-1".into(), convoy: convoy(), role: "coder".into() }, reason, began_at),
+        4 => Attention::new(Fact::DeliveryHeld { session: "session-1".into(), convoy: convoy(), role: "coder".into() }, reason, began_at),
+        // About a checkout at its host: told through the convoy, but not a record under it.
+        _ => Attention::new(Fact::CheckoutHeld { convoy: convoy(), host: "home-a".into(), checkout: "demo-work".into() }, reason, began_at),
     }
 }
 
@@ -169,7 +172,7 @@ async fn episode_start() -> DateTime<Utc> {
     Utc::now()
 }
 
-const FACTS: usize = 5;
+const FACTS: usize = 6;
 
 #[derive(Debug, Clone, Copy)]
 enum Step {
@@ -381,8 +384,9 @@ async fn nothing_open_is_left_within(implementation: Implementation) {
     }
     implementation.acknowledge(&attention(0, "", began_at).fact).await;
     attentions.clear_within(NAMESPACE, &Subject::convoy("demo")).await.expect("clear within");
-    let left: Vec<_> = attentions.open(NAMESPACE, None, None).await.expect("open").into_iter().map(|open| open.subject).collect();
-    assert_eq!(left, [key(2).1], "only the standing role's drift is not under the convoy");
+    let left: std::collections::BTreeSet<_> =
+        attentions.open(NAMESPACE, None, None).await.expect("open").into_iter().map(|open| open.subject).collect();
+    assert_eq!(left, [key(2).1, key(5).1].into(), "only the standing role's drift and the checkout's hold are not under the convoy");
 }
 
 // Behaviour: clearing within a convoy ends every attention about it and its records, acknowledged

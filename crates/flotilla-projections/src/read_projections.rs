@@ -26,7 +26,7 @@ use flotilla_protocol::{
     commands::{ExplainedDischarge, ExplainedEndedVessel, ExplainedSubjectFact, ExplainedSubjectObservation},
     ConvoyExplanation, DeclarationAttentionKind, DeclarationAttentionRow, DispatchQueueResponse, DispatchQueueRow, EnvironmentId,
     ExplainedArtifact, ExplainedChangeRequest, ExplainedCheckout, ExplainedClone, ExplainedCrewDelivery, ExplainedDecisionLedger,
-    ExplainedLeafFiring, ExplainedSettlement, ExplainedSubscription, ExplainedUnclaimedWork, ExplainedUnmetExpectation,
+    ExplainedHold, ExplainedLeafFiring, ExplainedSettlement, ExplainedSubscription, ExplainedUnclaimedWork, ExplainedUnmetExpectation,
     FleetHealthResponse, FleetHostRow, FleetHostStaleness, FleetListResponse, FleetListRow, FleetReplicaStatus, FleetStaleness,
     FulfilmentHarness, FulfilmentListResponse, FulfilmentModel, FulfilmentRow, HostListResponse, HostName, HostProvidersResponse,
     HostStatusResponse, HostSummary, NodeId, PeerConnectionState, ProjectListEntry, ProjectListRepository, ProjectListResponse,
@@ -1451,12 +1451,26 @@ impl ReadProjections<'_> {
             .items;
         // Evidence is aged against a clock read after every read of it: a value confirmed as it
         // is read must not appear to come from the future.
+        // A checkout's held release, as teardown's open attention about it at its home tells it.
+        let holds: BTreeMap<(String, String), ExplainedHold> = self
+            .attentions
+            .open(namespace, Some(Sender::Teardown), None)
+            .await?
+            .into_iter()
+            .filter_map(|open| match open.subject {
+                attentions::Subject::Checkout { host, checkout } => {
+                    Some(((host, checkout), ExplainedHold { reason: open.reason, since: open.raised_at }))
+                }
+                _ => None,
+            })
+            .collect();
         let now = self.clock.now();
         let checkouts = expected
             .iter()
             .zip(checkout_clones)
             .map(|(checkout_name, clone)| {
                 let selected = selected_checkouts.get(checkout_name);
+                let held = selected.and_then(|checkout| holds.get(&(checkout.home.clone(), checkout_name.clone())).cloned());
                 let integration = selected.and_then(|checkout| checkout.integration.as_ref());
                 let explain = |value: fn(&flotilla_resources::checkout_records::Inspection) -> (Option<bool>, &Vec<String>)| {
                     integration.map(|integration| {
@@ -1473,6 +1487,7 @@ impl ReadProjections<'_> {
                     landed: explain(|inspection| (inspection.landed, &inspection.landed_details)),
                     lifecycle: selected.map(|checkout| checkout.reading.clone()),
                     clone,
+                    held,
                 }
             })
             .collect::<Vec<_>>();

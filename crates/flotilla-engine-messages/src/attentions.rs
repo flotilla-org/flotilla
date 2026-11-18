@@ -78,6 +78,7 @@ fn subject_of(address: &Address, records: &BTreeMap<Address, String>) -> Option<
         (Kind::Vessel, Some(_)) => Some(Subject::Vessel { convoy: convoy()?, vessel: name }),
         (Kind::Role, Some(_)) => Some(Subject::ConvoyRole { convoy: convoy()?, role: name }),
         (Kind::Role, None) => Some(Subject::StandingRole { project: address.get(Kind::Project)?.to_owned(), role: name }),
+        (Kind::Checkout, _) => Some(Subject::Checkout { host: address.get(Kind::Host)?.to_owned(), checkout: name }),
         _ => None,
     }
 }
@@ -290,6 +291,12 @@ impl MessagePrimitives {
             }
             Fact::Stalled { role, .. } => {
                 Cause::Stalled { role: Read { address: child(&held.address, Kind::Role, role)?, revision: held.revision } }
+            }
+            Fact::CheckoutHeld { host, checkout, .. } => {
+                // The checkout's address names it at its host, read at the convoy's revision that
+                // finished it, as a convoy role's is.
+                let at = Address::root(Kind::Host, host).map_err(|error| format!("host `{host}`: {error}"))?;
+                Cause::CheckoutHeld { checkout: Read { address: child(&at, Kind::Checkout, checkout)?, revision: held.revision } }
             }
         };
         Ok((cause, inbox))

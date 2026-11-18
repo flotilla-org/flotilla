@@ -255,6 +255,16 @@ pub struct ExplainedCheckout {
     /// The clone launch a worktree checkout is made from, as the engine reads it (#3108).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub clone: Option<ExplainedClone>,
+    /// Its release held on its work, as the open attention telling a person says.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub held: Option<ExplainedHold>,
+}
+
+/// A checkout's release held until a person acts: why, and since when.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ExplainedHold {
+    pub reason: String,
+    pub since: chrono::DateTime<chrono::Utc>,
 }
 
 /// One clone launch (`<clone>#<n>`) and the engine's reading of it.
@@ -972,6 +982,16 @@ pub enum CommandAction {
         checkout_path: Option<PathBuf>,
         change_request_id: Option<String>,
     },
+    /// Inspect checkout `checkout` (its record name) afresh at its home, so a release held on its
+    /// work is tried again (`flotilla checkout <name> recheck`).
+    CheckoutRecheck {
+        checkout: String,
+    },
+    /// Rule checkout `checkout` archived at its home: its release archives it and removes it,
+    /// whatever its integration says (`flotilla checkout <name> archive`).
+    CheckoutArchive {
+        checkout: String,
+    },
     OpenChangeRequest {
         id: String,
     },
@@ -1390,6 +1410,8 @@ impl Command {
             },
             CommandAction::RemoveCheckout { .. } => "Removing checkout...",
             CommandAction::FetchCheckoutStatus { .. } => "Fetching checkout status...",
+            CommandAction::CheckoutRecheck { .. } => "Rechecking checkout...",
+            CommandAction::CheckoutArchive { .. } => "Ruling checkout archived...",
             CommandAction::OpenChangeRequest { .. } => "Opening in browser...",
             CommandAction::CloseChangeRequest { .. } => "Closing PR...",
             CommandAction::MergeChangeRequest { .. } => "Merging change request...",
@@ -1812,6 +1834,8 @@ mod tests {
                 })
                 .context_repo(RepoSelector::Path(PathBuf::from("/repo")))
                 .build(),
+            Command::builder().action(CommandAction::CheckoutRecheck { checkout: "repo-feat-x".into() }).build(),
+            Command::builder().action(CommandAction::CheckoutArchive { checkout: "repo-feat-x".into() }).build(),
             Command::builder()
                 .action(CommandAction::Attach { reference: "convoy-a".into(), host: None, mode: AttachMode::Default })
                 .build(),
@@ -2355,6 +2379,8 @@ mod tests {
             Command::builder()
                 .action(CommandAction::FetchCheckoutStatus { branch: "b".into(), checkout_path: None, change_request_id: None })
                 .build(),
+            Command::builder().action(CommandAction::CheckoutRecheck { checkout: "b".into() }).build(),
+            Command::builder().action(CommandAction::CheckoutArchive { checkout: "b".into() }).build(),
             Command::builder()
                 .action(CommandAction::OpenChangeRequest { id: "1".into() })
                 .context_repo(RepoSelector::Path(PathBuf::from("/tmp")))

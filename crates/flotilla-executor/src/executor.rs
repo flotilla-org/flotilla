@@ -147,6 +147,8 @@ pub async fn build_plan(
         | CommandAction::PersonInbox { .. }
         | CommandAction::PersonAcknowledge { .. }
         | CommandAction::PersonAnswer { .. }
+        | CommandAction::CheckoutRecheck { .. }
+        | CommandAction::CheckoutArchive { .. }
         | CommandAction::ResourceStatusPatch { .. }
         | CommandAction::ResourceDelete { .. }
         | CommandAction::ResourceWatch { .. } => {

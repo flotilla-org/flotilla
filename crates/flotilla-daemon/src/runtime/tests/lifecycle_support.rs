@@ -8,12 +8,24 @@ pub(super) enum CompletionAction {
     DeleteLive,
     /// The work commits on its branch, pushes it when `pushed`, leaves an untracked file when
     /// `untracked`, and completes naming change request 884, which the forge observer then reads in
-    /// `state` at the checkout's head.
+    /// `state` at the checkout's head. Once a person is told its release is held, `then` acts.
     ChangeRequest {
         state: flotilla_resources::ObservedChangeRequestState,
         pushed: bool,
         untracked: bool,
+        then: OnHold,
     },
+}
+
+/// What a person does about a checkout whose release is held.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(super) enum OnHold {
+    /// Nothing is held, or nothing is done.
+    Nothing,
+    /// Removes the untracked file and runs `checkout <name> recheck`.
+    CleanAndRecheck,
+    /// Runs `checkout <name> archive`.
+    Archive,
 }
 
 /// What became of a convoy's checkout once its change request was read.
@@ -34,6 +46,12 @@ pub(super) struct ReleaseSeen {
     pub(super) archives: usize,
     /// The convoy's phase, last read.
     pub(super) convoy: Option<ConvoyPhase>,
+    /// What teardown told a person while the release was held, if it was; and what the explanation
+    /// showed of the hold then.
+    pub(super) told: Option<String>,
+    pub(super) explained: Option<String>,
+    /// Teardown's attentions about the checkout still open, last read.
+    pub(super) still_told: usize,
 }
 
 pub(super) struct NoPrProcessRunner;
@@ -274,8 +292,8 @@ pub(super) async fn run_stage4a_flow_reaches_running_and_completes_convoy(
         tokio::time::sleep(Duration::from_millis(200)).await;
     }
 
-    if let CompletionAction::ChangeRequest { state: request_state, pushed, untracked } = completion_action {
-        let seen = release_after_change_request(&daemon, &convoy_name, &launch, &repo_default_dir, request_state, pushed, untracked).await;
+    if matches!(completion_action, CompletionAction::ChangeRequest { .. }) {
+        let seen = release_after_change_request(&daemon, &convoy_name, &launch, &repo_default_dir, completion_action).await;
         for handle in controller_handles {
             handle.abort();
             let _ = handle.await;
@@ -461,10 +479,11 @@ async fn release_after_change_request(
     convoy_name: &str,
     vessel: &str,
     repo_default_dir: &Path,
-    state: flotilla_resources::ObservedChangeRequestState,
-    pushed: bool,
-    untracked: bool,
+    completion: CompletionAction,
 ) -> ReleaseSeen {
+    let CompletionAction::ChangeRequest { state, pushed, untracked, then } = completion else {
+        panic!("a change request completion");
+    };
     let backend = daemon.resource_backend();
     let convoys = backend.clone().using::<Convoy>(NAMESPACE);
     // The checkout is held for the convoy's launch, `<name>#<n>`, as the holder names it.
@@ -552,6 +571,53 @@ async fn release_after_change_request(
         engine.verdict(&current, "template/pr", false, "operator", "closed unmerged; retraction accepted").await.expect("retract");
     }
 
+    // A held release is told to a person, as teardown's attention about the checkout at its home,
+    // and the convoy's explanation shows it; then the person acts.
+    let attentions = daemon.attentions();
+    let subject =
+        flotilla_resources::attentions::Subject::Checkout { host: checkout.home.clone(), checkout: checkout.checkout_name().to_owned() };
+    let told_about = || {
+        let (attentions, subject) = (Arc::clone(&attentions), subject.clone());
+        async move {
+            attentions
+                .open(NAMESPACE, Some(flotilla_resources::attentions::Sender::Teardown), Some(&subject))
+                .await
+                .expect("open attentions")
+                .into_iter()
+                .map(|open| open.reason)
+                .collect::<Vec<_>>()
+        }
+    };
+    let (mut told, mut explained) = (None, None);
+    if untracked {
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(20);
+        while tokio::time::Instant::now() < deadline && told.is_none() {
+            told = told_about().await.into_iter().next();
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+        let explanation = daemon.explain_convoy_internal(Some(NAMESPACE), convoy_name).await.expect("explain the convoy");
+        explained = explanation
+            .checkouts
+            .iter()
+            .find(|explained| explained.name == checkout.checkout_name())
+            .and_then(|explained| explained.held.as_ref())
+            .map(|held| held.reason.clone());
+    }
+    let act = |action: CommandAction| async move {
+        let mut rx = daemon.subscribe();
+        let id = daemon.execute(Command::builder().action(action).build()).await.expect("run the command");
+        assert_eq!(wait_for_command_result(&mut rx, id).await, CommandValue::Ok);
+    };
+    let name = checkout.checkout_name().to_owned();
+    match then {
+        OnHold::Nothing => {}
+        OnHold::CleanAndRecheck => {
+            fs::remove_file(Path::new(&checkout_path).join("left-over.pyc")).expect("remove the untracked file");
+            act(CommandAction::CheckoutRecheck { checkout: name }).await;
+        }
+        OnHold::Archive => act(CommandAction::CheckoutArchive { checkout: name }).await,
+    }
+
     // The release ends the launch; one the removal refuses is given the same time to end.
     let deadline = tokio::time::Instant::now() + Duration::from_secs(20);
     while tokio::time::Instant::now() < deadline && !held().iter().any(|checkout| checkout.name == launch && checkout.ended()) {
@@ -575,6 +641,9 @@ async fn release_after_change_request(
         // repositories' directory rather than in it.
         archives: saved_archives(repo_default_dir.parent().unwrap_or(repo_default_dir)),
         convoy: convoys.get(convoy_name).await.ok().and_then(|convoy| convoy.status).map(|status| status.phase),
+        told,
+        explained,
+        still_told: told_about().await.len(),
     }
 }
 

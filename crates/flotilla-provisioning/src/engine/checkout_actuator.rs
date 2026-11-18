@@ -41,7 +41,7 @@ use tracing::warn;
 use super::{
     checkouts::spec_of,
     clone_actuator::{classify, environment_host, CloneFailure},
-    controller::{Actuator, Backing, Holding, ProviderFailure, Usability},
+    controller::{Actuator, Backing, Holding, ProviderFailure, Recheck, Usability},
     environment_actuator::state_of,
     launch_log::StagedFacts,
     reads::StoreReads,
@@ -355,6 +355,62 @@ fn materialisation_failure(error: CheckoutMaterialisationError) -> ProviderFailu
     }
 }
 
+/// Who is told when a finished convoy's checkout is held: its landed removal refuses work that is
+/// not clean, and the checkout waits until it is cleaned up and rechecked, or ruled archived.
+#[async_trait]
+pub trait CheckoutHolds: Send + Sync {
+    /// Checkout `checkout` at `home`, held for convoy `convoy`, is not released, for `reason`.
+    async fn held(&self, convoy: &str, home: &str, checkout: &str, reason: &str);
+    /// Checkout `checkout` at `home` is released: a hold on it, if one was told, has ended.
+    async fn released(&self, home: &str, checkout: &str);
+}
+
+/// Tells no one.
+pub struct NoCheckoutHolds;
+
+#[async_trait]
+impl CheckoutHolds for NoCheckoutHolds {
+    async fn held(&self, _: &str, _: &str, _: &str, _: &str) {}
+    async fn released(&self, _: &str, _: &str) {}
+}
+
+/// The running Checkout controller's rechecks at this home, by which a person's archive ruling
+/// reaches it: the ruling travels in the recheck and is acted on in that pass only. A restarted
+/// controller's channel replaces the last.
+#[derive(Default)]
+pub struct CheckoutRechecks(std::sync::Mutex<Option<tokio::sync::mpsc::Sender<Recheck>>>);
+
+impl CheckoutRechecks {
+    pub fn wake_with(&self, rechecks: tokio::sync::mpsc::Sender<Recheck>) {
+        *self.0.lock().unwrap_or_else(std::sync::PoisonError::into_inner) = Some(rechecks);
+    }
+
+    /// Checkout launch `launch` is rechecked with its release ruled archived: a release held on
+    /// its work is tried again, archiving it and removing it.
+    pub async fn archive(&self, launch: &str) -> Result<(), String> {
+        let rechecks = self.0.lock().unwrap_or_else(std::sync::PoisonError::into_inner).clone();
+        let rechecks = rechecks.ok_or("no Checkout controller runs at this home")?;
+        rechecks
+            .send(Recheck { name: launch.to_owned(), ruled_release: true })
+            .await
+            .map_err(|_| "the Checkout controller has stopped".to_owned())
+    }
+}
+
+/// Why a landed checkout's removal is held: the work its inspection found not clean.
+fn held_reason(launch: &str, inspection: &Inspection) -> String {
+    let mut reason = format!("checkout {launch} landed, but its removal is held: the checkout is not clean");
+    for detail in &inspection.clean_details {
+        reason.push_str("\n  ");
+        reason.push_str(detail);
+    }
+    let checkout = launched(launch);
+    reason.push_str(&format!(
+        "\nclean it up and run `flotilla checkout {checkout} recheck`, or rule it archived with `flotilla checkout {checkout} archive`"
+    ));
+    reason
+}
+
 /// The Checkout kind's [`Actuator`] over the host's checkout provider.
 pub struct CheckoutActuator<P> {
     provider: Arc<P>,
@@ -364,6 +420,7 @@ pub struct CheckoutActuator<P> {
     home: String,
     staged: StagedFacts<CheckoutFacts>,
     validation: Arc<dyn BranchValidation>,
+    holds: Arc<dyn CheckoutHolds>,
 }
 
 impl<P> CheckoutActuator<P> {
@@ -375,12 +432,27 @@ impl<P> CheckoutActuator<P> {
         home: impl Into<String>,
         staged: StagedFacts<CheckoutFacts>,
     ) -> Self {
-        Self { provider, inputs, records, reads, home: home.into(), staged, validation: Arc::new(NoBranchValidation) }
+        Self {
+            provider,
+            inputs,
+            records,
+            reads,
+            home: home.into(),
+            staged,
+            validation: Arc::new(NoBranchValidation),
+            holds: Arc::new(NoCheckoutHolds),
+        }
     }
 
     /// New branches are validated by `validation` before they are made.
     pub fn with_branch_validation(mut self, validation: Arc<dyn BranchValidation>) -> Self {
         self.validation = validation;
+        self
+    }
+
+    /// A held checkout is told to `holds`.
+    pub fn with_holds(mut self, holds: Arc<dyn CheckoutHolds>) -> Self {
+        self.holds = holds;
         self
     }
 }
@@ -512,6 +584,69 @@ impl<P: CheckoutProvider> CheckoutActuator<P> {
         let inputs = self.inputs.inputs(holder.as_ref(), &spec_of(&view.request)).await?;
         self.record_inspection(&view.name, &view.request, &inputs, remote).await?;
         Ok(Some(view.name))
+    }
+
+    /// Checkout `checkout` is released here: its ruling is spent and its hold has ended.
+    async fn released(&self, checkout: &str) {
+        self.holds.released(&self.home, checkout).await;
+    }
+
+    /// Releases launch `name`: inspects it afresh, records the inspection, and removes it as its
+    /// integration says, or, when a person ruled it so, archives it and removes it whatever that
+    /// says.
+    async fn release_as(&self, name: &str, request: &CheckoutRequest, archive: bool) -> Result<(), ProviderFailure> {
+        let environment = &request.environment.name;
+        if request.source == Source::Adopted {
+            // Adopted where it was found: releasing it leaves it on disk.
+            return Ok(());
+        }
+        let checkout = launched(name);
+        match self.provider.path_exists(environment, &request.path).await {
+            // Nothing was made, or it is already gone.
+            Ok(Some(false)) => {
+                self.released(checkout).await;
+                return Ok(());
+            }
+            Ok(_) => {}
+            Err(error) => return Err(transient(error)),
+        }
+        let holder = request.holder.as_ref().and_then(super::checkouts::checkout_holder);
+        let inputs = self.inputs.inputs(holder.as_ref(), &spec_of(request)).await.unwrap_or_else(|error| {
+            warn!(checkout = name, %error, "a released checkout's inputs could not be read; it is inspected with none");
+            CheckoutInputs::default()
+        });
+        let integration = self.inspected(name, request, &inputs).await;
+        let clone_path = match &request.source {
+            Source::Worktree => match self.clone_path(request) {
+                Ok(path) => path,
+                // The clone has ended or was never held: the worktree is released by its own path.
+                Err(failure) if failure.retryable => None,
+                Err(failure) => return Err(failure),
+            },
+            _ => None,
+        };
+        // A person's ruling archives it, as integration that could not be judged is.
+        let judged = if archive { None } else { integration.as_ref() };
+        let Some(removal) = removal_for(request, clone_path, judged) else { return Ok(()) };
+        match self.provider.remove(environment, &removal).await {
+            Ok(outcome) => {
+                removal_events(checkout, &self.home, environment, &outcome);
+                self.released(checkout).await;
+                Ok(())
+            }
+            Err(error) => {
+                // A landed checkout whose work is not clean is refused its removal: a person is
+                // told, and it waits for its integration to be written again.
+                if let (CheckoutRemoval::LandedWorktree { .. }, Some(inspection), Some(CheckoutHolder::Convoy(convoy))) =
+                    (&removal, judged, &holder)
+                {
+                    if inspection.clean == Some(false) {
+                        self.holds.held(convoy, &self.home, checkout, &held_reason(name, inspection)).await;
+                    }
+                }
+                Err(transient(error))
+            }
+        }
     }
 
     /// Inspects launch `name` afresh and records it; the integration its removal is decided from.
@@ -678,36 +813,12 @@ where
     }
 
     async fn release(&self, name: &str, request: &CheckoutRequest, _: Option<&str>) -> Result<(), ProviderFailure> {
-        let environment = &request.environment.name;
-        if request.source == Source::Adopted {
-            // Adopted where it was found: releasing it leaves it on disk.
-            return Ok(());
-        }
-        match self.provider.path_exists(environment, &request.path).await {
-            // Nothing was made, or it is already gone.
-            Ok(Some(false)) => return Ok(()),
-            Ok(_) => {}
-            Err(error) => return Err(transient(error)),
-        }
-        let holder = request.holder.as_ref().and_then(super::checkouts::checkout_holder);
-        let inputs = self.inputs.inputs(holder.as_ref(), &spec_of(request)).await.unwrap_or_else(|error| {
-            warn!(checkout = name, %error, "a released checkout's inputs could not be read; it is inspected with none");
-            CheckoutInputs::default()
-        });
-        let integration = self.inspected(name, request, &inputs).await;
-        let clone_path = match &request.source {
-            Source::Worktree => match self.clone_path(request) {
-                Ok(path) => path,
-                // The clone has ended or was never held: the worktree is released by its own path.
-                Err(failure) if failure.retryable => None,
-                Err(failure) => return Err(failure),
-            },
-            _ => None,
-        };
-        let Some(removal) = removal_for(request, clone_path, integration.as_ref()) else { return Ok(()) };
-        let outcome = self.provider.remove(environment, &removal).await.map_err(transient)?;
-        removal_events(launched(name), &self.home, environment, &outcome);
-        Ok(())
+        self.release_as(name, request, false).await
+    }
+
+    /// A person ruled it archived: it is archived and removed, whatever its integration says.
+    async fn release_ruled(&self, name: &str, request: &CheckoutRequest, _: Option<&str>) -> Result<(), ProviderFailure> {
+        self.release_as(name, request, true).await
     }
 
     fn followed(&self) -> Vec<KindCode> {

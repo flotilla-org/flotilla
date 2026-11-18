@@ -36,6 +36,8 @@ pub enum Cause {
     Stalled { role: Read },
     /// A vessel's session was released though its process may still run.
     SessionLeftRunning { vessel: Read },
+    /// A finished convoy's checkout is not released: its work is not clean.
+    CheckoutHeld { checkout: Read },
 }
 
 impl Cause {
@@ -43,7 +45,7 @@ impl Cause {
     pub fn sender(&self) -> FleetRole {
         match self {
             Cause::Hold { .. } | Cause::Drift { .. } | Cause::Refused { .. } => STANDING,
-            Cause::ReclaimRefused { .. } | Cause::SessionLeftRunning { .. } => TEARDOWN,
+            Cause::ReclaimRefused { .. } | Cause::SessionLeftRunning { .. } | Cause::CheckoutHeld { .. } => TEARDOWN,
             Cause::CredentialRefresh { .. } => CAPABILITIES,
             Cause::DeliveryHeld { .. } => TURN_RULES,
             Cause::Stalled { .. } => STALL_JUDGE,
@@ -56,6 +58,7 @@ impl Cause {
             Cause::Drift { role, .. } | Cause::Refused { role } => role,
             Cause::CredentialRefresh { vessel } | Cause::SessionLeftRunning { vessel } => vessel,
             Cause::DeliveryHeld { role } | Cause::Stalled { role } => role,
+            Cause::CheckoutHeld { checkout } => checkout,
         }
     }
 
@@ -145,6 +148,11 @@ mod tests {
                 Cause::SessionLeftRunning { vessel: read("project:flotilla/convoy:demo/vessel:work") },
                 "fleet:lab/role:teardown",
                 "project:flotilla/convoy:demo/vessel:work",
+            ),
+            (
+                Cause::CheckoutHeld { checkout: read("host:kiwi/checkout:demo-work") },
+                "fleet:lab/role:teardown",
+                "host:kiwi/checkout:demo-work",
             ),
         ];
         for (cause, sender, subject) in cases {

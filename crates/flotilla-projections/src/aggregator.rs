@@ -2587,6 +2587,12 @@ impl Aggregator {
             AttentionSubject::StandingRole { project, .. } => {
                 ResourceRef::new(api_version(Project::API_PATHS), Project::API_PATHS.kind, &self.attention_namespace, project)
             }
+            AttentionSubject::Checkout { checkout, .. } => ResourceRef::new(
+                api_version(flotilla_resources::Checkout::API_PATHS),
+                flotilla_resources::Checkout::API_PATHS.kind,
+                &self.attention_namespace,
+                checkout,
+            ),
         }
     }
 

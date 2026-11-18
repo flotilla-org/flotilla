@@ -88,6 +88,8 @@ impl InProcessDaemon {
             A::ImageCheck { .. } => (TargetReason::LocalMutation, RemoteDelivery::Command),
             // A build's launches are written only at its builder's home.
             A::ImageBuildRetry { .. } => (TargetReason::RecordHome, RemoteDelivery::Command),
+            // A checkout is inspected, and a ruling on it held, only at its home.
+            A::CheckoutRecheck { .. } | A::CheckoutArchive { .. } => (TargetReason::RecordHome, RemoteDelivery::Command),
             A::ConvoyStart { .. } | A::ConvoyCreate { .. } => (TargetReason::Admission, RemoteDelivery::Command),
             A::ConvoyDelete { .. }
             | A::ConvoyLink { .. }
@@ -226,6 +228,14 @@ impl InProcessDaemon {
                     TargetHost::Local
                 } else {
                     TargetHost::Node(NodeId::new(builder))
+                }
+            }
+            A::CheckoutRecheck { checkout } | A::CheckoutArchive { checkout } => {
+                let home = off_frame(|| self.checkout_home(checkout)).await.map_err(TargetError::RecordHome)?;
+                if home == self.node_id().as_str() {
+                    TargetHost::Local
+                } else {
+                    TargetHost::Node(NodeId::new(home))
                 }
             }
             // A person's receipt is written at the message's home (#3938).

@@ -62,6 +62,11 @@ pub enum Subject {
         convoy: String,
         role: String,
     },
+    /// A checkout, by its record name at the host that holds it.
+    Checkout {
+        host: String,
+        checkout: String,
+    },
 }
 
 impl Subject {
@@ -99,13 +104,16 @@ pub enum Fact {
     /// A vessel's session was released though its release kept failing, and nothing else ends
     /// its process: it may still run.
     SessionLeftRunning { convoy: String, vessel: String, session: String },
+    /// A finished convoy's checkout at `host` is not released: its work is not clean, so its
+    /// removal is refused until it is cleaned up and rechecked, or a person rules it archived.
+    CheckoutHeld { convoy: String, host: String, checkout: String },
 }
 
 impl Fact {
     pub fn sender(&self) -> Sender {
         match self {
             Fact::Hold { .. } | Fact::Drift { .. } | Fact::Refused { .. } => Sender::Standing,
-            Fact::ReclaimRefused { .. } | Fact::SessionLeftRunning { .. } => Sender::Teardown,
+            Fact::ReclaimRefused { .. } | Fact::SessionLeftRunning { .. } | Fact::CheckoutHeld { .. } => Sender::Teardown,
             Fact::CredentialRefresh { .. } => Sender::Capabilities,
             Fact::DeliveryHeld { .. } => Sender::TurnRules,
             Fact::Stalled { .. } => Sender::StallJudge,
@@ -124,6 +132,7 @@ impl Fact {
             Fact::DeliveryHeld { convoy, role, .. } | Fact::Stalled { convoy, role } => {
                 Subject::ConvoyRole { convoy: convoy.clone(), role: role.clone() }
             }
+            Fact::CheckoutHeld { host, checkout, .. } => Subject::Checkout { host: host.clone(), checkout: checkout.clone() },
         }
     }
 
@@ -137,7 +146,8 @@ impl Fact {
             | Fact::CredentialRefresh { convoy, .. }
             | Fact::DeliveryHeld { convoy, .. }
             | Fact::Stalled { convoy, .. }
-            | Fact::SessionLeftRunning { convoy, .. } => Some(convoy),
+            | Fact::SessionLeftRunning { convoy, .. }
+            | Fact::CheckoutHeld { convoy, .. } => Some(convoy),
             Fact::Refused { .. } => None,
         }
     }

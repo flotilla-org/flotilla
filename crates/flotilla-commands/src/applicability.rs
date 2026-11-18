@@ -45,6 +45,9 @@ pub fn tui_actionable_action(action: &CommandAction) -> bool {
         // A check's report is a CLI wait loop with no TUI effect.
         | CommandAction::ImageCheck { .. }
         | CommandAction::ImageBuildRetry { .. }
+        // A held checkout's recheck or archive ruling is a CLI action; its effect is the release.
+        | CommandAction::CheckoutRecheck { .. }
+        | CommandAction::CheckoutArchive { .. }
         | CommandAction::QueryFleetList { .. }
         | CommandAction::QueryCrewStalls { .. }
         | CommandAction::QueryCrewCapabilities { .. }

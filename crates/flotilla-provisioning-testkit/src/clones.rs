@@ -208,7 +208,7 @@ impl RunningClones {
         )
         .expect("checkout controller");
         let (backing, backings) = tokio::sync::mpsc::channel(1);
-        let (rechecks, recheck_receiver) = tokio::sync::mpsc::channel(1);
+        let (rechecks, recheck_receiver) = tokio::sync::mpsc::channel::<String>(1);
         // The senders are kept by the controller's task: nothing is pushed to it.
         running.controllers.push(tokio::spawn(async move {
             let _senders = (backing, rechecks);

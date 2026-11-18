@@ -774,6 +774,7 @@ async fn checkout_release_after_change_request(
     state: flotilla_resources::ObservedChangeRequestState,
     pushed: bool,
     untracked: bool,
+    then: OnHold,
 ) -> ReleaseSeen {
     let temp = TempDir::new().expect("tempdir");
     let repo_default_dir = temp.path().join("flotilla-repos");
@@ -797,7 +798,7 @@ async fn checkout_release_after_change_request(
         daemon,
         config,
         repo_default_dir,
-        CompletionAction::ChangeRequest { state, pushed, untracked },
+        CompletionAction::ChangeRequest { state, pushed, untracked, then },
     )
     .await
     .expect("what became of the checkout")
@@ -808,7 +809,8 @@ async fn checkout_release_after_change_request(
 // so without the change request it would be archived as forced removal.
 #[tokio::test]
 async fn a_merged_change_request_releases_its_checkout_as_landed() {
-    let seen = checkout_release_after_change_request(flotilla_resources::ObservedChangeRequestState::Merged, false, false).await;
+    let seen =
+        checkout_release_after_change_request(flotilla_resources::ObservedChangeRequestState::Merged, false, false, OnHold::Nothing).await;
     assert_eq!(seen.convoy, Some(ConvoyPhase::Landed), "{seen:?}");
     assert_eq!(seen.landed, Some(true), "{seen:?}");
     assert!(matches!(seen.reading, LifecycleReading::Released), "{seen:?}");
@@ -820,7 +822,8 @@ async fn a_merged_change_request_releases_its_checkout_as_landed() {
 // never removed as landed.
 #[tokio::test]
 async fn a_change_request_closed_unmerged_archives_its_checkout() {
-    let seen = checkout_release_after_change_request(flotilla_resources::ObservedChangeRequestState::Closed, false, false).await;
+    let seen =
+        checkout_release_after_change_request(flotilla_resources::ObservedChangeRequestState::Closed, false, false, OnHold::Nothing).await;
     assert_eq!(seen.convoy, Some(ConvoyPhase::Landed), "{seen:?}");
     assert_eq!(seen.landed, Some(false), "{seen:?}");
     assert!(seen.landed_details.iter().any(|detail| detail.contains("#884")), "the change request was read: {seen:?}");
@@ -835,7 +838,8 @@ async fn a_change_request_closed_unmerged_archives_its_checkout() {
 // branch, and nothing is archived.
 #[tokio::test]
 async fn an_unmerged_pushed_clean_branch_is_removed_as_pushed_not_archived() {
-    let seen = checkout_release_after_change_request(flotilla_resources::ObservedChangeRequestState::Closed, true, false).await;
+    let seen =
+        checkout_release_after_change_request(flotilla_resources::ObservedChangeRequestState::Closed, true, false, OnHold::Nothing).await;
     assert_eq!(seen.convoy, Some(ConvoyPhase::Landed), "{seen:?}");
     assert_eq!(seen.landed, Some(false), "{seen:?}");
     assert_eq!(seen.pushed, Some(true), "{seen:?}");
@@ -845,18 +849,38 @@ async fn an_unmerged_pushed_clean_branch_is_removed_as_pushed_not_archived() {
     assert_eq!(seen.archives, 0, "a pushed checkout is not archived: {seen:?}");
 }
 
-// CURRENT BEHAVIOUR, pending Robert's ruling (run 3's trial-a): a merged change request's
-// checkout left with an untracked file is landed, but its landed removal refuses a dirty checkout.
-// The one release attempt fails (DirtyCheckout) and then waits on the checkout's integration or its
-// host's observation changing: the launch stays Ready and on disk, with nothing archived.
-#[tokio::test]
-async fn a_landed_checkout_with_an_untracked_file_stays_unreleased() {
-    let seen = checkout_release_after_change_request(flotilla_resources::ObservedChangeRequestState::Merged, false, true).await;
+/// A merged change request's checkout left with an untracked file is landed, but its landed
+/// removal refuses a checkout that is not clean: a person is told, naming the file, and the
+/// convoy's explanation shows the hold. Then `then` acts.
+async fn held_landed_checkout(then: OnHold) -> ReleaseSeen {
+    let seen = checkout_release_after_change_request(flotilla_resources::ObservedChangeRequestState::Merged, false, true, then).await;
     assert_eq!(seen.convoy, Some(ConvoyPhase::Landed), "{seen:?}");
     assert_eq!(seen.landed, Some(true), "{seen:?}");
-    assert!(matches!(seen.reading, LifecycleReading::Ready { .. }), "{seen:?}");
-    assert!(seen.on_disk, "{seen:?}");
+    let told = seen.told.as_deref().unwrap_or_else(|| panic!("a person is told the release is held: {seen:?}"));
+    assert!(told.contains("left-over.pyc"), "the reason names the file: {seen:?}");
+    assert_eq!(seen.explained.as_deref(), Some(told), "the explanation shows the hold: {seen:?}");
+    seen
+}
+
+// Cleaned up and rechecked, the held checkout is released as landed: removed, nothing archived,
+// and the person's attention withdrawn.
+#[tokio::test]
+async fn a_held_landed_checkout_cleaned_and_rechecked_is_released() {
+    let seen = held_landed_checkout(OnHold::CleanAndRecheck).await;
+    assert!(matches!(seen.reading, LifecycleReading::Released), "{seen:?}");
+    assert!(!seen.on_disk, "{seen:?}");
     assert_eq!(seen.archives, 0, "{seen:?}");
+    assert_eq!(seen.still_told, 0, "the attention is withdrawn: {seen:?}");
+}
+
+// Ruled archived, the held checkout is archived and removed, and the person's attention withdrawn.
+#[tokio::test]
+async fn a_held_landed_checkout_ruled_archived_is_archived_and_released() {
+    let seen = held_landed_checkout(OnHold::Archive).await;
+    assert!(matches!(seen.reading, LifecycleReading::Released), "{seen:?}");
+    assert!(!seen.on_disk, "{seen:?}");
+    assert_eq!(seen.archives, 1, "{seen:?}");
+    assert_eq!(seen.still_told, 0, "the attention is withdrawn: {seen:?}");
 }
 
 #[test]

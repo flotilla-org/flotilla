@@ -15,9 +15,12 @@ use flotilla_projections::ports::LifecycleReads;
 use flotilla_protocol::RepositoryKey;
 use flotilla_provisioning::{
     checkout_runtime::{CheckoutRemoval, CheckoutRemovalOutcome, PreparedCheckout},
-    engine::checkout_actuator::{Against, BranchValidation, CheckoutActuator, CheckoutInputs, CheckoutProvider, FreshClone, HolderInputs},
+    engine::checkout_actuator::{
+        Against, BranchValidation, CheckoutActuator, CheckoutHolds, CheckoutInputs, CheckoutProvider, FreshClone, HolderInputs,
+    },
 };
 use flotilla_resources::{
+    attentions::{Attention, Fact, Sender, Subject},
     checkout_integration::convoy_change_request_id,
     checkout_records::{CheckoutHolder, Inspection},
     CheckoutSpec, CloneCredentials, Convoy, Forge, LandedEvidence, ResourceError, ResourceObject, Vessel,
@@ -274,11 +277,35 @@ async fn recheck_launches(state: &super::state::ControllerRuntimeState, path: Op
         .filter(|checkout| checkout.is_ready() && path.is_none_or(|path| checkout.ready_path() == Some(path)))
         .map(|checkout| checkout.name);
     for launch in launches {
-        if state.checkout_rechecks.send(launch).await.is_err() {
+        if state.checkout_rechecks.send(launch.into()).await.is_err() {
             return false;
         }
     }
     true
+}
+
+/// A held checkout told to a person as teardown's attention about it, on the convoy it was held
+/// for, and withdrawn once it is released.
+pub(super) struct AttentionHolds {
+    pub(super) daemon: Arc<InProcessDaemon>,
+    pub(super) namespace: String,
+}
+
+#[async_trait]
+impl CheckoutHolds for AttentionHolds {
+    async fn held(&self, convoy: &str, home: &str, checkout: &str, reason: &str) {
+        let fact = Fact::CheckoutHeld { convoy: convoy.to_owned(), host: home.to_owned(), checkout: checkout.to_owned() };
+        if let Err(error) = self.daemon.attentions().raise(&self.namespace, &Attention::new(fact, reason, chrono::Utc::now())).await {
+            warn!(%checkout, %error, "a held checkout could not be told to a person");
+        }
+    }
+
+    async fn released(&self, home: &str, checkout: &str) {
+        let subject = Subject::Checkout { host: home.to_owned(), checkout: checkout.to_owned() };
+        if let Err(error) = self.daemon.attentions().clear(&self.namespace, Sender::Teardown, &subject).await {
+            warn!(%checkout, %error, "a released checkout's hold could not be withdrawn");
+        }
+    }
 }
 
 /// What a gate's inspection request asks of this host: checkout `checkout` inspected afresh, its

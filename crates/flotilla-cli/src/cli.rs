@@ -1275,6 +1275,12 @@ pub(crate) fn format_convoy_explanation_human(explanation: &flotilla_protocol::C
                 let _ = writeln!(output, "  {} clone {}: {} ({reason})", checkout.name, clone.name, clone.reading.label());
             }
         }
+        // A checkout whose release is held on its work says why, and since when.
+        for checkout in &explanation.checkouts {
+            let Some(held) = &checkout.held else { continue };
+            let reason = held.reason.replace('\n', "\n    ");
+            let _ = writeln!(output, "  {}: Held: {reason} since {}", checkout.name, held.since.to_rfc3339());
+        }
     }
 
     output.push_str("\nSubjects:\n");

@@ -94,9 +94,10 @@ pub(super) struct ControllerRuntimeState {
     pub(super) environment_backings: tokio::sync::mpsc::UnboundedSender<BackingEvent>,
     pub(super) environment_backing_events: StdMutex<Option<tokio::sync::mpsc::UnboundedReceiver<BackingEvent>>>,
     /// The checkout launches a host probe saw change, for the Checkout controller to observe
-    /// again: the sender the probe uses, and the receiver its controller takes once.
-    pub(super) checkout_rechecks: tokio::sync::mpsc::Sender<String>,
-    pub(super) checkout_recheck_events: StdMutex<Option<tokio::sync::mpsc::Receiver<String>>>,
+    /// again, or a person's archive ruling: the sender the probe and the ruling use, and the
+    /// receiver its controller takes once.
+    pub(super) checkout_rechecks: tokio::sync::mpsc::Sender<flotilla_provisioning::engine::controller::Recheck>,
+    pub(super) checkout_recheck_events: StdMutex<Option<tokio::sync::mpsc::Receiver<flotilla_provisioning::engine::controller::Recheck>>>,
     /// The vessel launches to plan again, as their convoys, crews' bindings or seats change: the
     /// sender the wakes and seats use, and the receiver the Vessel controller takes once.
     pub(super) vessel_rechecks: tokio::sync::mpsc::Sender<String>,

@@ -818,6 +818,8 @@ pub struct InProcessDaemon {
     surfaces: Surfaces,
     /// The checkouts this host's refresh discovered: local facts, in memory.
     discovered_checkouts: DiscoveredCheckouts,
+    /// This home's Checkout controller's rechecks, which carry a person's archive ruling to it.
+    checkout_rechecks: Arc<flotilla_provisioning::engine::checkout_actuator::CheckoutRechecks>,
     /// Serializes observed Checkout publication with repository removal so a
     /// refresh captured before untracking cannot recreate deleted resources.
     /// Admission cleanup and resource deletion share this lock with adoption.
@@ -1508,6 +1510,7 @@ impl InProcessDaemon {
             issue_observer,
             resource_backend: resource_backend.clone(),
             discovered_checkouts: discovered_checkouts.clone(),
+            checkout_rechecks: Default::default(),
             observed_checkout_reconciliation: Arc::clone(&observed_checkout_reconciliation),
             aggregator_projection_state: aggregator_projection_state.clone(),
             image_layer_refresh: Default::default(),
@@ -2710,6 +2713,11 @@ impl InProcessDaemon {
     /// The checkouts this host's refresh discovered.
     pub fn discovered_checkouts(&self) -> DiscoveredCheckouts {
         self.discovered_checkouts.clone()
+    }
+
+    /// This home's Checkout controller's rechecks, which its runtime installs as it starts it.
+    pub fn checkout_rechecks(&self) -> Arc<flotilla_provisioning::engine::checkout_actuator::CheckoutRechecks> {
+        Arc::clone(&self.checkout_rechecks)
     }
 
     /// Returns the current connection status for a peer host.
@@ -5727,6 +5735,9 @@ impl InProcessDaemon {
             CommandAction::PersonInbox { .. } | CommandAction::PersonAcknowledge { .. } | CommandAction::PersonAnswer { .. } => {
                 return boxed_action!(self.execute_action_person(id, &command))
             }
+            CommandAction::CheckoutRecheck { .. } | CommandAction::CheckoutArchive { .. } => {
+                return boxed_action!(self.execute_action_checkout_hold(id, &command))
+            }
             CommandAction::FleetPostInstall { .. } => return boxed_action!(executor.execute_action_fleet_post_install(id, &command)),
             CommandAction::ResourceStatusPatch { .. } => return boxed_action!(executor.execute_action_resource_status_patch(id, &command)),
             CommandAction::ResourceDelete { .. } => return boxed_action!(executor.execute_action_resource_delete(id, &command)),
@@ -6132,6 +6143,7 @@ impl InProcessDaemon {
         &self.environment_manager
     }
 }
+mod checkout_holds;
 mod person_inbox;
 
 #[async_trait]

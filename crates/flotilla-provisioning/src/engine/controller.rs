@@ -160,6 +160,15 @@ pub trait Actuator<K: LifecycleKind>: Send + Sync + 'static {
     /// Tears `name`'s backing down; an absent backing is done. `identity` is the one it was
     /// realised under, if it was.
     async fn release(&self, name: &str, request: &K::Request, identity: Option<&str>) -> Result<(), ProviderFailure>;
+    /// Tears `name`'s backing down as [`Actuator::release`] does, under a person's ruling that it
+    /// may discard what a release would otherwise keep; a kind with no such choice releases it
+    /// plainly.
+    async fn release_ruled(&self, name: &str, request: &K::Request, identity: Option<&str>) -> Result<(), ProviderFailure>
+    where
+        K::Request: Sync,
+    {
+        self.release(name, request, identity).await
+    }
     /// The kinds of the records [`Actuator::dependencies`], [`Actuator::usability`] and
     /// [`Actuator::release_blockers`] name.
     fn followed(&self) -> Vec<KindCode>;
@@ -208,8 +217,8 @@ enum Trigger {
     Retry,
     /// The controller started: the backing is observed.
     Start,
-    /// A host probe saw the backing change: a realised one is observed again, and a failed attempt
-    /// runs again, what it lacked having arrived.
+    /// A host probe saw the backing change, or a person ruled on it: a realised one is observed
+    /// again, and a failed attempt, a failed release among them, runs again.
     Recheck,
 }
 
@@ -265,10 +274,11 @@ impl Found {
 }
 
 /// The decision for one resource, from its state and what was read for it. A release that failed
-/// (`release_failed`) is tried again only when a record it depends on changed.
+/// (`release_failed`) is tried again only when a record it depends on changed, its time came, or a
+/// host probe or a person's ruling rechecks it.
 fn act(state: &LifecycleState, judgement: &Judgement, found: &Found, trigger: Trigger, usable_again: bool, release_failed: bool) -> Action {
     let usable = found.usable();
-    let release_again = !release_failed || matches!(trigger, Trigger::Dependency | Trigger::Retry);
+    let release_again = !release_failed || matches!(trigger, Trigger::Dependency | Trigger::Retry | Trigger::Recheck);
     match state {
         LifecycleState::Requested { .. } if found.release() && release_again => Action::Release { identity: None },
         LifecycleState::Realised { identity } if found.release() && release_again => Action::Release { identity: Some(identity.clone()) },
@@ -330,6 +340,24 @@ pub struct Controller<K: LifecycleKind, A: Actuator<K>> {
     /// meanwhile: what that read finds may be stale, so it is read again.
     holding: BTreeSet<String>,
     stale_holdings: BTreeSet<String>,
+    /// The resource a recheck carrying a person's release ruling is evaluating, for that pass only.
+    ruled: Option<String>,
+}
+
+/// A recheck of one resource: by a host probe that saw its backing change, or by a person, whose
+/// recheck may carry a ruling on its release. The ruling is acted on in that recheck's pass and
+/// kept nowhere: one not acted on then is given again.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Recheck {
+    pub name: String,
+    /// A person ruled that its release may discard what a release would otherwise keep.
+    pub ruled_release: bool,
+}
+
+impl From<String> for Recheck {
+    fn from(name: String) -> Self {
+        Recheck { name, ruled_release: false }
+    }
 }
 
 impl<K, A> Controller<K, A>
@@ -366,19 +394,20 @@ where
             holdings: BTreeMap::new(),
             holding: BTreeSet::new(),
             stale_holdings: BTreeSet::new(),
+            ruled: None,
         })
     }
 
     /// Runs until `backing` closes.
     pub async fn run(self, backing: mpsc::Receiver<BackingEvent>) {
-        let (_none, rechecks) = mpsc::channel(1);
+        let (_none, rechecks) = mpsc::channel::<Recheck>(1);
         self.run_with(backing, rechecks).await
     }
 
     /// Runs until `backing` closes, observing again each realised resource named on `rechecks`, and
     /// trying again each retrying one: a host probe that saw its backing change without knowing
     /// what it now is, or saw what a failed attempt lacked arrive.
-    pub async fn run_with(mut self, mut backing: mpsc::Receiver<BackingEvent>, mut rechecks: mpsc::Receiver<String>) {
+    pub async fn run_with<R: Into<Recheck> + Send>(mut self, mut backing: mpsc::Receiver<BackingEvent>, mut rechecks: mpsc::Receiver<R>) {
         let mut rechecking = true;
         let start = self.lifecycles.live().iter().map(|resource| (resource.name().to_owned(), Trigger::Start)).collect();
         self.evaluate(start).await;
@@ -442,8 +471,12 @@ where
                     }
                     None => return,
                 },
-                name = rechecks.recv(), if rechecking => match name {
-                    Some(name) => self.evaluate(BTreeMap::from([(name, Trigger::Recheck)])).await,
+                recheck = rechecks.recv(), if rechecking => match recheck.map(Into::into) {
+                    Some(Recheck { name, ruled_release }) => {
+                        self.ruled = ruled_release.then(|| name.clone());
+                        self.evaluate(BTreeMap::from([(name, Trigger::Recheck)])).await;
+                        self.ruled = None;
+                    }
                     None => rechecking = false,
                 },
             }
@@ -624,9 +657,14 @@ where
             }
             Action::Release { identity } => {
                 self.releasing.insert(owned.clone());
+                let ruled = self.ruled.as_deref() == Some(name);
                 self.flights.spawn(inherit(async move {
-                    let done = Done::Released(actuator.release(&owned, &request, identity.as_deref()).await);
-                    (owned, done)
+                    let released = if ruled {
+                        actuator.release_ruled(&owned, &request, identity.as_deref()).await
+                    } else {
+                        actuator.release(&owned, &request, identity.as_deref()).await
+                    };
+                    (owned, Done::Released(released))
                 }));
             }
         }
