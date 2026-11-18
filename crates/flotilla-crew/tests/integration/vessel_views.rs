@@ -70,7 +70,7 @@ async fn a_watcher_is_told_a_released_launch_is_gone() {
             WatchEvent::DeletedByName(tombstone) => break tombstone.name,
             // The request itself, followed from the log after the watch began.
             WatchEvent::Added(object) | WatchEvent::Modified(object) => {
-                assert_ne!(object.status.map(|status| status.phase), Some(VesselPhase::Lost), "a released launch told as changed")
+                assert_ne!(object.status.map(|status| status.phase), Some(VesselPhase::Released), "a released launch told as changed")
             }
         }
     };
