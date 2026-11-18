@@ -527,6 +527,11 @@ fn evaluate_observed_digest_anchor(
                 Some((integration.inspection.remote_digest.as_ref()?, integration))
             })
             .collect::<Vec<_>>();
+        // Staleness here is replication freshness, not inspection freshness: `confirmed_at` is now
+        // for this home's checkouts and the replication watermark for another home's, so the ref
+        // goes stale only while its home's records lag. It does not say when the checkout was last
+        // inspected (`inspected_at`). Judging by inspection time waits on a way to see other homes'
+        // inspections that changed nothing, and on something to re-inspect a stale ref.
         let Some((digest, integration)) = observations.into_iter().max_by_key(|(_, integration)| integration.confirmed_at) else {
             unmet.push(UnmetSettlementExpectation::MissingObservedRef { reference: claim.refs.head.clone() });
             continue;
