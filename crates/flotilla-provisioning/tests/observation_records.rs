@@ -237,6 +237,37 @@ async fn a_failing_observer_ages_its_values_from_the_first_failure() {
     observations.failing("ChangeRequest", "absent").await.expect("an absent record is done");
 }
 
+// Behaviour (#3108 observed_at, option B): this home's values are confirmed by its observer's
+// last read, not by the time they are read: they age while the observer is silent, a read that
+// changes nothing confirms them again without writing, and after a restart, until the observer
+// reads again, they are confirmed when the record was last written.
+#[tokio::test]
+async fn this_homes_values_are_confirmed_by_the_observers_last_read() {
+    let directory = tempfile::tempdir().expect("temp dir");
+    let clock = ManualClock::at(1_800_000_000);
+    let (service, observations) = open(&directory, "alpha", clock.clone());
+    let records = cr_port(&observations);
+    let created = records.apply(&cr_1(), None, &BTreeMap::new(), &BTreeMap::new(), &cr_spec(1, "alpha")).await.expect("create");
+    let open = cr_status(ObservedChangeRequestState::Open, ObservedChecks::Pass, epoch(0));
+    clock.set(1_800_000_010);
+    let written = records.set_status(&cr_1(), created.version, &open).await.expect("publish");
+    async fn read(records: &dyn KindRecords<ChangeRequest>) -> DateTime<Utc> {
+        status_of(&records.get(&cr_1()).await.expect("get").expect("held")).state.observed_at
+    }
+
+    clock.set(1_800_000_500);
+    assert_eq!(read(records).await, epoch(1_800_000_010), "values age while the observer is silent");
+
+    let again = records.set_status(&cr_1(), written.version, &open).await.expect("an unchanged read");
+    assert_eq!(again.version, written.version, "an unchanged read writes nothing");
+    clock.set(1_800_000_900);
+    assert_eq!(read(records).await, epoch(1_800_000_500), "an unchanged read confirms the values");
+
+    drop(observations);
+    let restarted = Arc::new(EngineObservations::open(service, clock.clone() as Arc<dyn Clock>).expect("reopen"));
+    assert_eq!(read(cr_port(&restarted)).await, epoch(1_800_000_010), "after a restart, the last write confirms them");
+}
+
 /// One round of `from`'s stream applied at `to`, served at `at`; a reset round when `cursor` is none.
 fn pump(from: &Service, from_home: &str, to: &Service, cursor: Option<u64>, at: DateTime<Utc>) -> u64 {
     let mut frames = Vec::new();

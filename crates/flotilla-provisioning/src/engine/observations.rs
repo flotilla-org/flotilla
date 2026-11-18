@@ -4,8 +4,10 @@
 //! source's observer writes its record at its own home, only when an observed value changes; every
 //! home's are read from a resident map kept current by following the log. A value's age is a
 //! judgement made when it is read: a record holds no observation times, so its values were last
-//! confirmed when its home was last heard (now, at this home), unless its reads are failing, in
-//! which case they were last confirmed when they started to fail.
+//! confirmed when its home was last heard, unless its reads are failing, in which case they were
+//! last confirmed when they started to fail. At its own home, the observer's last read confirms
+//! them; that is held in memory only, so after a restart, until the observer reads again, the
+//! record's last write stands in for it.
 //!
 //! A source's observer is the single writer of its records: once the observers are installed
 //! ([`EngineObservations::observed_by`]), a write of a record whose source this home does
@@ -52,30 +54,26 @@ const BRANCH_PAGE: u32 = 64;
 /// The writer the plain-kind port records for the observer's writes.
 const WRITER: &str = "forge-observer";
 
-/// One home's record of either kind, at its version, with when it was created.
+/// One home's record of either kind, at its version, with when it was created and last written.
 #[derive(Clone)]
-enum Held {
-    ChangeRequest(u64, DateTime<Utc>, ChangeRequestRecord),
-    Issue(u64, DateTime<Utc>, IssueRecord),
+struct Held {
+    version: u64,
+    created: DateTime<Utc>,
+    written: Timestamp,
+    record: HeldRecord,
+}
+
+#[derive(Clone)]
+enum HeldRecord {
+    ChangeRequest(ChangeRequestRecord),
+    Issue(IssueRecord),
 }
 
 impl Held {
     fn failing_since(&self) -> Option<Timestamp> {
-        match self {
-            Self::ChangeRequest(_, _, record) => record.failing_since,
-            Self::Issue(_, _, record) => record.failing_since,
-        }
-    }
-
-    fn version(&self) -> u64 {
-        match self {
-            Self::ChangeRequest(version, _, _) | Self::Issue(version, _, _) => *version,
-        }
-    }
-
-    fn created(&self) -> DateTime<Utc> {
-        match self {
-            Self::ChangeRequest(_, created, _) | Self::Issue(_, created, _) => *created,
+        match &self.record {
+            HeldRecord::ChangeRequest(record) => record.failing_since,
+            HeldRecord::Issue(record) => record.failing_since,
         }
     }
 }
@@ -117,9 +115,9 @@ impl Observed for ChangeRequestRecord {
     const NAME: &'static str = CHANGE_REQUEST;
 
     fn of_held(held: &Held) -> Option<&Self> {
-        match held {
-            Held::ChangeRequest(_, _, record) => Some(record),
-            Held::Issue(..) => None,
+        match &held.record {
+            HeldRecord::ChangeRequest(record) => Some(record),
+            HeldRecord::Issue(..) => None,
         }
     }
 
@@ -178,9 +176,9 @@ impl Observed for IssueRecord {
     const NAME: &'static str = ISSUE;
 
     fn of_held(held: &Held) -> Option<&Self> {
-        match held {
-            Held::Issue(_, _, record) => Some(record),
-            Held::ChangeRequest(..) => None,
+        match &held.record {
+            HeldRecord::Issue(record) => Some(record),
+            HeldRecord::ChangeRequest(..) => None,
         }
     }
 
@@ -265,16 +263,16 @@ fn kind_of(kind: &str) -> Result<&'static str, String> {
 }
 
 fn load(read: &mut Read<'_>, kind: &'static str, id: ResourceId) -> Result<Option<(String, String, Held)>, StoreError> {
-    match kind {
-        CHANGE_REQUEST => match read.load::<ChangeRequestRecord>(id)? {
-            Some(loaded) => Ok(Some((loaded.name, loaded.home, Held::ChangeRequest(loaded.version, created_at(read, id)?, loaded.value)))),
-            None => Ok(None),
-        },
-        _ => match read.load::<IssueRecord>(id)? {
-            Some(loaded) => Ok(Some((loaded.name, loaded.home, Held::Issue(loaded.version, created_at(read, id)?, loaded.value)))),
-            None => Ok(None),
-        },
-    }
+    let loaded = match kind {
+        CHANGE_REQUEST => read
+            .load::<ChangeRequestRecord>(id)?
+            .map(|loaded| (loaded.name, loaded.home, loaded.version, HeldRecord::ChangeRequest(loaded.value))),
+        _ => read.load::<IssueRecord>(id)?.map(|loaded| (loaded.name, loaded.home, loaded.version, HeldRecord::Issue(loaded.value))),
+    };
+    let Some((name, home, version, record)) = loaded else { return Ok(None) };
+    let created = created_at(read, id)?;
+    let written = read.last_change(id)?.map_or_else(|| Timestamp::from_datetime(&created), |change| change.at);
+    Ok(Some((name, home, Held { version, created, written, record })))
 }
 
 fn code_kind(code: KindCode) -> Option<&'static str> {
@@ -333,6 +331,9 @@ pub struct EngineObservations {
     clock: Arc<dyn flotilla_resources::Clock>,
     /// Which sources this home observes; a port with none, standing alone, observes all.
     observers: Option<Arc<dyn SourceObservers>>,
+    /// When the observer last read each of this home's records, by kind and name: a read that
+    /// changes nothing writes nothing, so this is the observer's own fact and is never stored.
+    observed: Mutex<BTreeMap<(&'static str, String), Timestamp>>,
 }
 
 impl std::fmt::Debug for EngineObservations {
@@ -357,6 +358,7 @@ impl EngineObservations {
             resident: Mutex::new(resident),
             clock,
             observers: None,
+            observed: Mutex::default(),
         };
         let homes = opened.service.homes();
         {
@@ -461,12 +463,14 @@ impl EngineObservations {
         PendingChange::new(NewChange::new(WRITER, self.now()))
     }
 
-    /// When a record's values were last confirmed: since its reads started failing, else when its
-    /// home was last heard, which for this home is now.
-    fn confirmed_at(&self, home: &str, failing_since: Option<Timestamp>) -> DateTime<Utc> {
-        let at = match failing_since {
+    /// When `K`'s record `name` at `home` had its values last confirmed: since its reads started
+    /// failing; else, at this home, when its observer last read it, or when it was last written
+    /// when the observer has not read it since this daemon started; else when its home was last
+    /// heard.
+    fn confirmed_at<K: Observed>(&self, name: &str, home: &str, held: &Held) -> DateTime<Utc> {
+        let at = match held.failing_since() {
             Some(since) => since,
-            None if home == self.home => self.now(),
+            None if home == self.home => locked(&self.observed).get(&(K::NAME, name.to_owned())).copied().unwrap_or(held.written),
             None => self.service.watermark(home).map(|watermark| watermark.applied_through).unwrap_or(Timestamp::ZERO),
         };
         at.to_datetime().unwrap_or(DateTime::UNIX_EPOCH)
@@ -475,13 +479,13 @@ impl EngineObservations {
     /// `held` as the resource, and when its values were last confirmed.
     fn object<K: Observed>(&self, name: &str, home: &str, held: &Held) -> Result<Confirmed<K::Resource>, String> {
         let record = K::of_held(held).ok_or_else(|| format!("{name} at {home} is not a {}", K::NAME))?;
-        let confirmed = self.confirmed_at(home, held.failing_since());
+        let confirmed = self.confirmed_at::<K>(name, home, held);
         let status = record.status_at(confirmed).map_err(|error| format!("{name} at {home}: {error}"))?;
         let object = Record {
             name: name.to_owned(),
             home: home.to_owned(),
-            version: held.version(),
-            created_at: held.created(),
+            version: held.version,
+            created_at: held.created,
             labels: BTreeMap::new(),
             annotations: BTreeMap::new(),
             spec: record.spec_at(home),
@@ -517,7 +521,7 @@ impl EngineObservations {
             match self.object::<K>(name, home, held) {
                 Ok(copy) => copies.push(copy),
                 Err(error) => {
-                    if warned.insert((kind, name.clone(), home.clone(), held.version())) {
+                    if warned.insert((kind, name.clone(), home.clone(), held.version)) {
                         tracing::warn!(%error, "an observation record does not encode; it is not read");
                     }
                 }
@@ -578,13 +582,17 @@ impl EngineObservations {
             return Err(WriteError::Stale);
         }
         match self.log.edit(name, version, &current.spec.observed(&self.home, status), &self.change()) {
-            Ok(_) => Ok(self.written::<K>(name)?),
+            Ok(_) => {
+                locked(&self.observed).insert((K::NAME, name.to_owned()), self.now());
+                Ok(self.written::<K>(name)?)
+            }
             Err(PlainError::Conflict { .. }) => Err(WriteError::Stale),
             Err(error) => Err(format!("write {} {name}: {error}", K::KIND).into()),
         }
     }
 
     fn delete_as<K: Observed>(&self, name: &str) -> Result<(), String> {
+        locked(&self.observed).remove(&(K::NAME, name.to_owned()));
         let Some(current) = self.log.get::<K>(name, &self.home).map_err(|error| error.to_string())? else { return Ok(()) };
         match self.log.delete::<K>(name, current.version, &self.change()) {
             Ok(()) | Err(PlainError::Missing { .. }) => Ok(()),
