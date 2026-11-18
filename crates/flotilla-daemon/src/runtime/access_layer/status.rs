@@ -221,7 +221,9 @@ impl AccessStatusReconciler {
                 }
             };
         // A convoy that ended is gone too: a launch is ended, never deleted, and holds no access.
-        // One not found here is no record that it ended: its requester state stays.
+        // One not found here is no record that it ended: its requester state stays. Imported
+        // ended convoys rely on this pass at start-up (#3108 ruling (x)): one held only by an
+        // access delivery the old fleet had not yet removed retires once this removes it.
         let convoy_gone = match record.metadata.labels.get(CONVOY_LABEL) {
             Some(convoy) => match backend.including_replicas::<Convoy>(&self.namespace).get(convoy).await {
                 Ok(read) => read.object.status.is_some_and(|status| status.phase.is_terminal()),

@@ -348,36 +348,70 @@ async fn held_role(host: &Host, role: &str, failures: u64, reason: &str) {
 }
 
 // #3108 import (ruling (a)): imported history sets nothing off. A daemon started over an old store
-// holding ended convoys, two held by a pending message to their crew (one delivered, one
-// abandoned) and two held by nothing, imports the held two ended and the others retired; with its
-// controllers running, and a convoy reconciler pass over each, none fails and nothing but the
-// import has written any of them.
+// holding ended convoys, two with a pending message to their crew (one delivered, one abandoned)
+// and two with nothing, imports all four retired: the import withdraws what their end would have
+// (ruling 2), so nothing holds them. None is listed, and with the daemon's controllers running and
+// a convoy reconciler pass over each, nothing but the import has written any of them.
+//
+// The one exception (ruling (x)): an ended convoy held only by an access delivery imports ended,
+// and is retired once the access layer's start-up pass removes the delivery, as the old fleet's
+// own teardown would have finished; its retirement is the convoy home's write.
 #[tokio::test]
 async fn imported_ended_convoys_pass_the_convoy_reconciler_and_write_nothing() {
+    use flotilla_daemon_testkit::import_fixture::access_delivery;
+    use flotilla_engine_store::watch::EngineWatch;
     use flotilla_state_machines::machines::convoy::Convoy as EngineConvoy;
     use flotilla_store::controller::Reconciler as _;
 
     let host = Host::new("ended").await;
     own::<FleetDesignation>(&host.backend, designation()).await;
     let ended = [
-        ("delivered-held", "Landed", json!({"disposition": "merged"})),
-        ("abandoned-held", "Abandoned", json!({"message": "stopped by an operator"})),
+        ("delivered-waited", "Landed", json!({"disposition": "merged"})),
+        ("abandoned-waited", "Abandoned", json!({"message": "stopped by an operator"})),
         ("delivered", "Landed", json!({"disposition": "merged"})),
         ("failed", "Failed", json!({"message": "vessel failed"})),
+        ("accessed", "Abandoned", json!({"message": "stopped by an operator"})),
     ];
     for (name, phase, fields) in &ended {
         let convoy = ended_convoy(name, phase, "2026-10-19T01:00:00Z", fields.clone());
         host.own::<Convoy>(name, convoy["spec"].clone(), convoy["status"].clone()).await;
     }
-    for held in ["delivered-held", "abandoned-held"] {
-        let mut waiting = message(&format!("for-{held}"));
-        waiting["spec"]["receiver"] = json!(format!("flotilla/{held}/implement/coder"));
+    for waited in ["delivered-waited", "abandoned-waited"] {
+        let mut waiting = message(&format!("for-{waited}"));
+        waiting["spec"]["receiver"] = json!(format!("flotilla/{waited}/implement/coder"));
         own::<Message>(&host.backend, waiting).await;
     }
+    let mut delivery = access_delivery("access-accessed", false);
+    delivery["spec"]["access"] = json!("flotilla/accessed/implement/coder");
+    own::<flotilla_resources::AccessDelivery>(&host.backend, delivery).await;
     // The running daemon's controllers act on what it imported as they would on their own.
     let _runtime = host.start().await.expect("runtime");
     let daemon = host.daemon();
     let home = host.home();
+    let service = daemon.decided_store().expect("engine store");
+    let mut convoy_writes =
+        EngineWatch::start(Arc::clone(&service), [<flotilla_state_machines::Resource<EngineConvoy> as Kind>::CODE]).expect("watch");
+    let writer_of = |launch: &str| {
+        service
+            .with_store(|store| {
+                let mut read = store.read()?;
+                let id = read.resolve(<flotilla_state_machines::Resource<EngineConvoy> as Kind>::CODE, launch, &home)?.expect("the launch");
+                Ok(read.last_change(id)?.expect("its last change").writer)
+            })
+            .expect("read")
+    };
+    let accessed = tokio::time::timeout(Duration::from_secs(30), async {
+        loop {
+            let writer = writer_of("accessed#1");
+            if writer != flotilla_engine_store::IMPORT_WRITER {
+                return writer;
+            }
+            convoy_writes.next(|_, _| Ok(())).await.expect("a convoy write");
+        }
+    })
+    .await
+    .expect("the access-held convoy retires once its delivery is removed");
+    assert_eq!(accessed, home, "the convoy's home retires it");
 
     let backend = daemon.resource_backend();
     let reconciler = flotilla_crew::convoy::ConvoyReconciler::new(daemon.lifecycle_reads())
@@ -386,33 +420,19 @@ async fn imported_ended_convoys_pass_the_convoy_reconciler_and_write_nothing() {
         .with_vessels(backend.including_replicas::<flotilla_resources::Vessel>(NS))
         .with_prepared_snapshot_gc(flotilla_store::PreparedSnapshotGarbageCollector::new(backend.clone(), NS));
     let convoys = backend.using::<Convoy>(NS);
-    let mut listed: Vec<String> = convoys.list().await.expect("list").items.into_iter().map(|convoy| convoy.metadata.name).collect();
-    listed.sort();
-    assert_eq!(listed.len(), 2, "the held two are listed and the others retired: {listed:?}");
+    let listed: Vec<String> = convoys.list().await.expect("list").items.into_iter().map(|convoy| convoy.metadata.name).collect();
+    // The import's four never reach the views. The exception retired just now, and the views
+    // drop a retired launch once its watchers have read it, so it may still be listed.
+    assert!(listed.iter().all(|launch| launch == "accessed#1"), "all retired: {listed:?}");
     for (name, _, _) in &ended {
-        // Each is one of this home's first launches, read by name whether retired or not.
-        let mut found = None;
-        for n in 1..=ended.len() {
-            if let Ok(convoy) = convoys.get(&format!("{name}#{n}")).await {
-                found = Some(convoy);
-            }
-        }
-        let convoy = found.unwrap_or_else(|| panic!("{name} imports as a launch"));
-        let launch = convoy.metadata.name.clone();
-        assert_eq!(listed.contains(&launch), name.ends_with("-held"), "{launch}: listed while held");
+        // Each is this home's first launch of its name, read by name though retired.
+        let launch = format!("{name}#1");
+        let convoy = convoys.get(&launch).await.unwrap_or_else(|error| panic!("{launch}: {error}"));
+        let before = writer_of(&launch);
         reconciler.prepare(&convoy).await.unwrap_or_else(|error| panic!("{launch}: {error}"));
-        // Nothing but the import has written the launch: no pass has ended, failed or changed it.
-        let writer = daemon
-            .decided_store()
-            .expect("engine store")
-            .with_store(|store| {
-                let mut read = store.read()?;
-                let id =
-                    read.resolve(<flotilla_state_machines::Resource<EngineConvoy> as Kind>::CODE, &launch, &home)?.expect("the launch");
-                Ok(read.last_change(id)?.expect("its last change").writer)
-            })
-            .expect("read");
-        assert_eq!(writer, flotilla_engine_store::IMPORT_WRITER, "{launch}");
+        // Nothing but the import, or for the exception its home's retirement, has written it.
+        let expected = if *name == "accessed" { accessed.clone() } else { flotilla_engine_store::IMPORT_WRITER.to_owned() };
+        assert_eq!((before, writer_of(&launch)), (expected.clone(), expected), "{launch}");
     }
 }
 
