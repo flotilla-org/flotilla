@@ -56,11 +56,16 @@ pub struct CommandCompletions {
 impl CommandCompletions {
     /// The `CommandFinished` of `command_id`, or `None` once the sink is gone.
     pub async fn finished(&mut self, command_id: u64) -> Option<DaemonEvent> {
-        while let Some(event) = self.receiver.recv().await {
+        while let Some(event) = self.next().await {
             if matches!(event, DaemonEvent::CommandFinished { command_id: finished, .. } if finished == command_id) {
                 return Some(event);
             }
         }
         None
+    }
+
+    /// The next captured `CommandFinished`, of any command, or `None` once the sink is gone.
+    pub async fn next(&mut self) -> Option<DaemonEvent> {
+        self.receiver.recv().await
     }
 }
