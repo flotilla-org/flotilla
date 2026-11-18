@@ -1304,10 +1304,11 @@ pub(crate) fn format_convoy_explanation_human(explanation: &flotilla_protocol::C
                     let observation = explanation.subject_observations.iter().find(|observation| observation.subject == subject.subject);
                     let _ = writeln!(
                         output,
-                        "    {} state={} checks={} review={} actionable_at_head={} readiness={}",
+                        "    {} state={} checks={} mergeable={} review={} actionable_at_head={} readiness={}",
                         subject.short,
                         format_subject_fact(observation.map(|o| &o.state)),
                         format_subject_fact(observation.map(|o| &o.checks)),
+                        format_subject_fact(observation.map(|o| &o.mergeable)),
                         format_subject_fact(observation.map(|o| &o.review)),
                         format_subject_fact(observation.map(|o| &o.review_actionable_at_head)),
                         format_subject_fact(observation.map(|o| &o.readiness))

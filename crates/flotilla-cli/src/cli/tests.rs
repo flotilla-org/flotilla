@@ -852,8 +852,10 @@ fn convoy_explanation_subject_observations_snapshot() {
     for (number, state, checks, review, readiness, freshness) in [
         (1, Some("open"), Some("pass"), Some("approved"), "ready_to_merge", EvidenceFreshness::Fresh),
         (2, Some("merged"), Some("pending"), Some("none"), "merged_not_landed", EvidenceFreshness::Stale),
-        (3, None, None, None, "awaiting_review_response", EvidenceFreshness::Missing),
-        (4, None, None, None, "awaiting_review_response", EvidenceFreshness::Fresh),
+        (3, None, None, None, "unknown", EvidenceFreshness::Missing),
+        (4, None, None, None, "unknown", EvidenceFreshness::Fresh),
+        // Run 4 R4-4: checks running and mergeability unknown say so, naming no review.
+        (5, Some("open"), Some("pending"), Some("none"), "checks_pending", EvidenceFreshness::Fresh),
     ] {
         let subject = Subject {
             kind: SubjectKind::ChangeRequest,
@@ -872,6 +874,7 @@ fn convoy_explanation_subject_observations_snapshot() {
             subject,
             state: fact(state, freshness),
             checks: fact(checks, freshness),
+            mergeable: fact((number == 1).then_some("mergeable"), freshness),
             review: fact(review, freshness),
             review_actionable_at_head: fact(state.map(|_| "false"), freshness),
             readiness: fact(Some(readiness), freshness),
@@ -884,15 +887,17 @@ fn convoy_explanation_subject_observations_snapshot() {
     let output = format_convoy_explanation_human(&explanation);
     let subjects = output.split("Subjects:\n").nth(1).expect("subjects").split("\nChange requests:").next().expect("section");
     insta::assert_snapshot!(subjects, @r###"
-      produces !1, !2, !3, !4
-        !1 state=open checks=pass review=approved actionable_at_head=false readiness=ready_to_merge
+      produces !1, !2, !3, !4, !5
+        !1 state=open checks=pass mergeable=mergeable review=approved actionable_at_head=false readiness=ready_to_merge
         !1 https://github.com/owner/repo/pull/1
-        !2 state=merged (stale) checks=pending (stale) review=none (stale) actionable_at_head=false (stale) readiness=merged_not_landed (stale)
+        !2 state=merged (stale) checks=pending (stale) mergeable=unknown (stale) review=none (stale) actionable_at_head=false (stale) readiness=merged_not_landed (stale)
         !2 https://github.com/owner/repo/pull/2
-        !3 state=unknown (missing) checks=unknown (missing) review=unknown (missing) actionable_at_head=unknown (missing) readiness=awaiting_review_response (missing)
+        !3 state=unknown (missing) checks=unknown (missing) mergeable=unknown (missing) review=unknown (missing) actionable_at_head=unknown (missing) readiness=unknown (missing)
         !3 https://github.com/owner/repo/pull/3
-        !4 state=unknown checks=unknown review=unknown actionable_at_head=unknown readiness=awaiting_review_response
+        !4 state=unknown checks=unknown mergeable=unknown review=unknown actionable_at_head=unknown readiness=unknown
         !4 https://github.com/owner/repo/pull/4
+        !5 state=open checks=pending mergeable=unknown review=none actionable_at_head=false readiness=checks_pending
+        !5 https://github.com/owner/repo/pull/5
     "###);
 }
 

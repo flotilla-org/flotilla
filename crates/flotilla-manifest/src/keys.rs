@@ -183,14 +183,15 @@ pub const SEGMENT_ISSUE: &str = "flotilla.issue";
 // and actionable-at-head are Bool. CR state: open|draft|merged|closed;
 // issue state: open|closed; checks: pass|fail|pending; mergeable:
 // mergeable|conflicting; review_decision: approved|changes_requested|required|none.
-// Readiness: ready_to_merge|awaiting_review_response|ci_failing|conflicting|
-// draft|merged_not_landed|closed. All observed_at companions are Text.
+// Readiness: ready_to_merge|awaiting_review_response|checks_pending|
+// review_required|unknown|ci_failing|conflicting|draft|merged_not_landed|closed.
+// All observed_at companions are Text.
 // Subject entities are scoped to live convoys and strictly less than 24 hours
 // after landed finished_at; failed/cancelled/abandoned links are excluded.
-// Missing status and incomplete observations use awaiting_review_response,
-// matching the existing readiness function and closed ADR vocabulary. This
-// means waiting for evidence; absence of raw fields distinguishes unknown.
-// Readiness is the ADR 0051 closed vocabulary. Orphans are deferred to the
+// Missing status, and incomplete observations with no known blocker, use
+// unknown (run 4 R4-4): the absent raw fields say which input is unknown.
+// Readiness is the ADR 0051 closed vocabulary, widened by checks_pending,
+// review_required and unknown so it names no blocker that does not exist. Orphans are deferred to the
 // producer provenance/retention follow-up; unmatched observations are excluded.
 // Attempts are ordered by generation, oldest first. The current attempt is
 // the live generation; it is absent between admissions. desired_state is

@@ -104,7 +104,16 @@ pub fn subject_forge<'a>(forges: &'a [ResourceObject<Forge>], service: &str) -> 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ChangeRequestReadiness {
     ReadyToMerge,
+    /// A review asks something of the author: changes requested, or an actionable review at
+    /// the head.
     AwaitingReviewResponse,
+    /// Checks are still running.
+    ChecksPending,
+    /// The forge requires a review that has not been given.
+    ReviewRequired,
+    /// Nothing known blocks it, but an input it needs is not yet observed (mergeability, most
+    /// often); the raw fields say which.
+    Unknown,
     CiFailing,
     Conflicting,
     Draft,
@@ -117,6 +126,9 @@ impl ChangeRequestReadiness {
         match self {
             Self::ReadyToMerge => "ready_to_merge",
             Self::AwaitingReviewResponse => "awaiting_review_response",
+            Self::ChecksPending => "checks_pending",
+            Self::ReviewRequired => "review_required",
+            Self::Unknown => "unknown",
             Self::CiFailing => "ci_failing",
             Self::Conflicting => "conflicting",
             Self::Draft => "draft",
@@ -128,11 +140,12 @@ impl ChangeRequestReadiness {
 
 /// Derive the single readiness fact published on a change-request entity.
 ///
-/// Precedence is closed or merged, draft, conflict, failed checks, then
-/// waiting for review or incomplete evidence. `ready_to_merge` requires every
-/// positive observation to be known. Pending checks and unknown observations
-/// use the waiting state because the wire vocabulary has no pending/unknown
-/// readiness variant; consumers can distinguish them through the raw fields.
+/// Precedence is closed or merged, draft, conflict, failed checks, a review
+/// asking for a response, pending checks, a required review, then ready.
+/// `ready_to_merge` requires every positive observation to be known; when
+/// nothing known blocks it but an input is unobserved (mergeability unknown,
+/// say), readiness is `unknown` rather than naming a blocker that does not
+/// exist (run 4 R4-4). The raw fields say which input is unknown.
 /// A merged change request whose linked convoy has landed maps to `closed`:
 /// there is no separate landed value. `landed` means a linked convoy has
 /// reached its terminal landed phase.
@@ -195,13 +208,23 @@ impl ReadinessInputs<'_> {
         if self.checks.value == Some(ObservedChecks::Fail) {
             return Readiness::CiFailing;
         }
+        // Known blockers, most actionable first, before anything unobserved.
+        if self.actionable_at_head.value == Some(true) || self.review_decision.value == Some(ObservedReviewDecision::ChangesRequested) {
+            return Readiness::AwaitingReviewResponse;
+        }
+        if self.checks.value == Some(ObservedChecks::Pending) {
+            return Readiness::ChecksPending;
+        }
+        if self.review_decision.value == Some(ObservedReviewDecision::Required) {
+            return Readiness::ReviewRequired;
+        }
         if self.state.value != Some(ObservedChangeRequestState::Open)
             || self.checks.value != Some(ObservedChecks::Pass)
             || self.mergeable.value != Some(ObservedMergeability::Mergeable)
             || self.actionable_at_head.value != Some(false)
             || !matches!(self.review_decision.value, Some(ObservedReviewDecision::Approved | ObservedReviewDecision::None))
         {
-            return Readiness::AwaitingReviewResponse;
+            return Readiness::Unknown;
         }
         Readiness::ReadyToMerge
     }

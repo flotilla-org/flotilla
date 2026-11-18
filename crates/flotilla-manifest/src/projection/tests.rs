@@ -169,7 +169,7 @@ fn change_request_readiness_precedence_and_unknown_evidence() {
             .review_decision(Review::Required)
             .actionable(false)
             .landed(false)
-            .expected(Readiness::AwaitingReviewResponse)
+            .expected(Readiness::ReviewRequired)
             .build(),
         ReadinessCase::builder()
             .name("approved")
@@ -199,7 +199,38 @@ fn change_request_readiness_precedence_and_unknown_evidence() {
             .review_decision(Review::Approved)
             .actionable(false)
             .landed(false)
+            .expected(Readiness::ChecksPending)
+            .build(),
+        // Run 4 R4-4: Forgejo's unknown mergeability while checks run names no review.
+        ReadinessCase::builder()
+            .name("pending checks, unknown mergeability, no review")
+            .state(State::Open)
+            .checks(Checks::Pending)
+            .maybe_mergeable(None)
+            .review_decision(Review::None)
+            .actionable(false)
+            .landed(false)
+            .expected(Readiness::ChecksPending)
+            .build(),
+        ReadinessCase::builder()
+            .name("a review response beats pending checks")
+            .state(State::Open)
+            .checks(Checks::Pending)
+            .maybe_mergeable(None)
+            .review_decision(Review::Approved)
+            .actionable(true)
+            .landed(false)
             .expected(Readiness::AwaitingReviewResponse)
+            .build(),
+        ReadinessCase::builder()
+            .name("pending checks beat a required review")
+            .state(State::Open)
+            .checks(Checks::Pending)
+            .mergeable(Mergeability::Mergeable)
+            .review_decision(Review::Required)
+            .actionable(false)
+            .landed(false)
+            .expected(Readiness::ChecksPending)
             .build(),
         ReadinessCase::builder()
             .name("unknown checks")
@@ -209,7 +240,7 @@ fn change_request_readiness_precedence_and_unknown_evidence() {
             .review_decision(Review::Approved)
             .actionable(false)
             .landed(false)
-            .expected(Readiness::AwaitingReviewResponse)
+            .expected(Readiness::Unknown)
             .build(),
         ReadinessCase::builder()
             .name("unknown mergeability")
@@ -219,7 +250,7 @@ fn change_request_readiness_precedence_and_unknown_evidence() {
             .review_decision(Review::Approved)
             .actionable(false)
             .landed(false)
-            .expected(Readiness::AwaitingReviewResponse)
+            .expected(Readiness::Unknown)
             .build(),
         ReadinessCase::builder()
             .name("unknown review decision")
@@ -229,7 +260,7 @@ fn change_request_readiness_precedence_and_unknown_evidence() {
             .maybe_review_decision(None)
             .actionable(false)
             .landed(false)
-            .expected(Readiness::AwaitingReviewResponse)
+            .expected(Readiness::Unknown)
             .build(),
         ReadinessCase::builder()
             .name("unknown feedback")
@@ -239,7 +270,7 @@ fn change_request_readiness_precedence_and_unknown_evidence() {
             .review_decision(Review::Approved)
             .maybe_actionable(None)
             .landed(false)
-            .expected(Readiness::AwaitingReviewResponse)
+            .expected(Readiness::Unknown)
             .build(),
         ReadinessCase::builder()
             .name("unknown state")
@@ -249,7 +280,7 @@ fn change_request_readiness_precedence_and_unknown_evidence() {
             .review_decision(Review::Approved)
             .actionable(false)
             .landed(false)
-            .expected(Readiness::AwaitingReviewResponse)
+            .expected(Readiness::Unknown)
             .build(),
     ];
     for case in cases {
@@ -275,6 +306,9 @@ fn change_request_readiness_uses_adr_wire_values() {
     for (readiness, expected) in [
         (Readiness::ReadyToMerge, "ready_to_merge"),
         (Readiness::AwaitingReviewResponse, "awaiting_review_response"),
+        (Readiness::ChecksPending, "checks_pending"),
+        (Readiness::ReviewRequired, "review_required"),
+        (Readiness::Unknown, "unknown"),
         (Readiness::CiFailing, "ci_failing"),
         (Readiness::Conflicting, "conflicting"),
         (Readiness::Draft, "draft"),
@@ -1605,7 +1639,7 @@ fn replicated_subjects_publish_entities_edges_and_reference_labels() {
     assert!(!patch.set.contains_key("flotilla.change_request.state"));
     assert_eq!(text(patch, KEY_DISPLAY_LABEL), "f!42");
     assert_eq!(text(patch, KEY_DISPLAY_LABEL_SHORT), "f!42");
-    assert_eq!(text(patch, "flotilla.change_request.readiness"), "awaiting_review_response");
+    assert_eq!(text(patch, "flotilla.change_request.readiness"), "unknown");
     let convoy = find_entity(&patches, &entity::convoy("flotilla", "ship-it", "kiwi"));
     assert_eq!(text(convoy, KEY_DISPLAY_LABEL), "ship-it");
     assert_eq!(convoy.set["flotilla.subject.produces"].value, MetadataValue::EntityRefs(vec![cr]));

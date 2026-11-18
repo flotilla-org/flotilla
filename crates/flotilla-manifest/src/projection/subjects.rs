@@ -363,7 +363,7 @@ pub fn change_request_facts(status: Option<&flotilla_resources::ChangeRequestSta
     let mut facts = vec![(
         KEY_CHANGE_REQUEST_READINESS,
         MetadataValue::text(
-            status.map(|status| super::change_request_readiness(status, landed).as_str()).unwrap_or("awaiting_review_response"),
+            status.map(|status| super::change_request_readiness(status, landed)).unwrap_or(super::ChangeRequestReadiness::Unknown).as_str(),
         ),
     )];
     if let Some(status) = status {

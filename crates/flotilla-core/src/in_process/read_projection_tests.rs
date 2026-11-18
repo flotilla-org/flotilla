@@ -1079,11 +1079,7 @@ mod tests {
             assert_eq!(observation.readiness.freshness, aged);
             assert_eq!(
                 observation.readiness.value.as_deref(),
-                Some(if missing {
-                    "awaiting_review_response"
-                } else {
-                    ["ready_to_merge", "draft", "merged_not_landed", "closed", "awaiting_review_response"][state_index]
-                })
+                Some(if missing { "unknown" } else { ["ready_to_merge", "draft", "merged_not_landed", "closed", "unknown"][state_index] })
             );
             assert_eq!(observation.checks.value.as_deref(), if missing { None } else { Some("pass") });
             assert_eq!(observation.review.value.as_deref(), if missing { None } else { Some("approved") });
@@ -1149,6 +1145,68 @@ mod tests {
         assert_eq!(observation.state.value.as_deref(), Some("open"));
         assert_eq!(observation.state.freshness, EvidenceFreshness::Fresh);
         assert_eq!(observation.readiness.freshness, EvidenceFreshness::Fresh);
+    }
+
+    // Run 4 R4-4: a change request whose checks are running and whose mergeability the forge has
+    // not told explains as exactly that, naming no review that does not exist.
+    #[tokio::test]
+    async fn convoy_explanation_names_pending_checks_and_unknown_mergeability_not_a_review() {
+        let fixture = ProjectionFixture::with_clock(Arc::new(TickingClock(Default::default())));
+        let subject = Subject {
+            kind: SubjectKind::ChangeRequest,
+            source: IssueSource { service: "github.com".into(), scope: "owner/one".into() },
+            id: "16".into(),
+        };
+        let launch = fixture
+            .admit(
+                "pending",
+                ConvoySpec::builder()
+                    .workflow_ref("review".to_string())
+                    .project_ref("flotilla".to_string())
+                    .subjects(vec![DeclaredSubject {
+                        subject: subject.clone(),
+                        relationship: Relationship::Produces,
+                        issue: None,
+                        change_request: None,
+                    }])
+                    .build(),
+                flotilla_engine_convoys_testkit::single_agent("coder"),
+            )
+            .await;
+        let requests = fixture.backend.using::<ChangeRequest>("flotilla");
+        let record = requests
+            .create(
+                &InputMeta::builder().name(cr_name("github.com", "owner/one", 16)).build(),
+                &ChangeRequestSpec::builder()
+                    .service("github.com".into())
+                    .scope("owner/one".into())
+                    .number(16)
+                    .observing_authority("local".into())
+                    .build(),
+            )
+            .await
+            .expect("request");
+        let now = fixture.clock.now();
+        let mut status = subject_status(now);
+        status.checks = Observation::known(ObservedChecks::Pending, now);
+        status.mergeable = Observation::unknown(now);
+        status.review_decision = Observation::known(ObservedReviewDecision::None, now);
+        requests.update_status(&record.metadata.name, &record.metadata.resource_version, &status).await.expect("status");
+        let explanation = fixture.projections().explain_convoy("flotilla", &launch).await.expect("explain");
+        let observation = explanation.subject_observations.iter().find(|row| row.subject == subject).expect("subject row");
+        assert_eq!(observation.checks.value.as_deref(), Some("pending"));
+        assert_eq!(observation.mergeable.value, None, "mergeability unknown");
+        assert_eq!(observation.review.value.as_deref(), Some("none"));
+        assert_eq!(observation.readiness.value.as_deref(), Some("checks_pending"));
+
+        // Checks pass while the forge still says nothing of mergeability: unknown, not a review.
+        status.checks = Observation::known(ObservedChecks::Pass, now);
+        let record = requests.get(&record.metadata.name).await.expect("request");
+        requests.update_status(&record.metadata.name, &record.metadata.resource_version, &status).await.expect("status");
+        let explanation = fixture.projections().explain_convoy("flotilla", &launch).await.expect("explain");
+        let observation = explanation.subject_observations.iter().find(|row| row.subject == subject).expect("subject row");
+        assert_eq!(observation.readiness.value.as_deref(), Some("unknown"));
+        assert_eq!(observation.mergeable.value, None);
     }
 
     // Behaviour: subjects alone determine explain identities, even across repositories;

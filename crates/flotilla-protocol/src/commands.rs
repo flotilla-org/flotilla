@@ -303,6 +303,8 @@ pub struct ExplainedSubjectObservation {
     pub subject: crate::Subject,
     pub state: ExplainedSubjectFact,
     pub checks: ExplainedSubjectFact,
+    /// Whether it merges cleanly: absent while the forge has not said (run 4 R4-4).
+    pub mergeable: ExplainedSubjectFact,
     pub review: ExplainedSubjectFact,
     pub review_actionable_at_head: ExplainedSubjectFact,
     pub readiness: ExplainedSubjectFact,
