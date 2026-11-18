@@ -9382,6 +9382,11 @@ struct StartupForgeRunner;
 #[async_trait]
 impl CommandRunner for StartupForgeRunner {
     async fn run(&self, cmd: &str, args: &[&str], cwd: &Path, _label: &ChannelLabel) -> Result<String, String> {
+        // The daemon's forge identities ride ahead of every local Git call as `-c` options.
+        let mut args = args;
+        while let ["-c", _, rest @ ..] = args {
+            args = rest;
+        }
         if cmd == "pwd" || (cmd == "git" && args == ["rev-parse", "--show-toplevel"]) {
             return Ok(cwd.to_string_lossy().into_owned());
         }

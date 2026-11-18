@@ -490,7 +490,7 @@ async fn a_released_vessel_leaves_the_convoys_checkout() {
             async move {
                 matches!(
                     workspaces.get(&launch).await.ok().and_then(|workspace| workspace.status).map(|status| status.phase),
-                    Some(VesselPhase::Lost)
+                    Some(VesselPhase::Released)
                 )
             }
         })

@@ -160,7 +160,12 @@ impl GitHttpCredentials for DaemonForgeCredentials {
                 Err(ResourceError::NotFound { .. }) => continue,
                 Err(error) => return Err(format!("Forge {forge_id}: {error}")),
             };
-            identities.extend(daemon_forgejo_identity(&self.resource_backend, &daemon, &namespace, &forge).await?);
+            // A bad mapping costs only its own forge's Git the identity; that forge's repositories
+            // report the error from discovery, and Git elsewhere goes on.
+            match daemon_forgejo_identity(&self.resource_backend, &daemon, &namespace, &forge).await {
+                Ok(identity) => identities.extend(identity),
+                Err(error) => tracing::warn!(forge = %forge_id, %error, "daemon forge identity unusable; its Git runs without it"),
+            }
         }
         Ok(identities)
     }
