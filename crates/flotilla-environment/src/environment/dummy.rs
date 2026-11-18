@@ -29,6 +29,7 @@
 
 use std::{
     collections::{BTreeMap, BTreeSet, HashMap},
+    net::SocketAddr,
     path::{Path, PathBuf},
     sync::{
         atomic::{AtomicBool, AtomicU64, AtomicU8, Ordering},
@@ -235,6 +236,7 @@ impl DummyEnvironmentProvider {
             mounts,
             environment,
             runner: Arc::new(DummyCommandRunner { journal, ..DummyCommandRunner::default() }),
+            agent: Arc::default(),
             id,
             destroyed: AtomicBool::new(false),
             vendor: AtomicU8::new(RUNNING),
@@ -319,6 +321,12 @@ impl DummyEnvironmentProvider {
             .iter()
             .find(|(id, handle)| (id.as_str() == environment || handle.container_name == environment) && handle.held())
             .map(|(_, handle)| Arc::clone(handle))
+    }
+
+    /// The controller socket the agent of `environment` (environment ID or backing name)
+    /// forwards the vessel's daemon endpoint to, once the daemon has asked for the forward.
+    pub fn forward_target(&self, environment: &str) -> Option<PathBuf> {
+        self.backing(environment)?.agent.controller_forward.lock().unwrap_or_else(std::sync::PoisonError::into_inner).clone()
     }
 
     /// The vendor deletes `environment`'s backing, as a sandbox vendor evicts
@@ -541,6 +549,110 @@ struct DummyEnvironment {
     mounts: Vec<ProvisionedMount>,
     environment: HashMap<String, String>,
     runner: Arc<DummyCommandRunner>,
+    agent: Arc<DummyAgentState>,
+}
+
+/// What a dummy vessel's resident agent holds beyond its file tree. A real agent's forward
+/// lives as long as the controller process that asked for it, so none is journalled: the next
+/// daemon asks again when it adopts the vessel.
+#[derive(Default)]
+struct DummyAgentState {
+    /// The controller socket the vessel's daemon forward carries connections to.
+    controller_forward: Mutex<Option<PathBuf>>,
+    /// What [`VesselAgent::extend_environment`] added for the vessel's commands.
+    environment: Mutex<BTreeMap<String, String>>,
+}
+
+/// The resident agent of a dummy vessel: its file operations are the in-memory file tree's,
+/// its command runner the dummy's, and it serves the controller's forward by recording its host
+/// target, where a dummy crew in the vessel connects. Tools pushed to it are present in the tree
+/// at their vessel paths, holding the host path they came from rather than their bytes.
+struct DummyVesselAgent {
+    runner: Arc<DummyCommandRunner>,
+    state: Arc<DummyAgentState>,
+}
+
+#[async_trait]
+impl super::VesselAgent for DummyVesselAgent {
+    async fn ready(&self) -> Result<(), String> {
+        Ok(())
+    }
+    async fn forward_socket(&self, guest: &Path) -> Result<PathBuf, String> {
+        Err(format!("nothing serves {} inside a dummy vessel", guest.display()))
+    }
+    async fn push_tools(&self, tools: &[super::EnvironmentTool]) -> Result<(), String> {
+        for tool in tools {
+            for asset in &tool.assets {
+                let source = format!("dummy vessel copy of {}\n", asset.host_path.as_path().display());
+                self.runner.write_file(asset.environment_path.as_path(), &source).await?;
+            }
+            if !self.runner.has_path(tool.executable.as_path()) {
+                self.runner.write_file(tool.executable.as_path(), &format!("dummy vessel tool {}\n", tool.name)).await?;
+            }
+        }
+        Ok(())
+    }
+    async fn forward_controller_socket(&self, _guest: &Path, _tcp: Option<SocketAddr>, controller: &Path) -> Result<(), String> {
+        *self.state.controller_forward.lock().unwrap_or_else(std::sync::PoisonError::into_inner) = Some(controller.to_path_buf());
+        Ok(())
+    }
+    async fn extend_environment(&self, environment: BTreeMap<String, String>) -> Result<(), String> {
+        self.state.environment.lock().unwrap_or_else(std::sync::PoisonError::into_inner).extend(environment);
+        Ok(())
+    }
+    fn commands(&self) -> Arc<dyn CommandRunner> {
+        Arc::clone(&self.runner) as Arc<dyn CommandRunner>
+    }
+    async fn writable_base(&self) -> Result<PathBuf, String> {
+        self.runner.writable_config_base(None, Path::new(super::runner::CONTAINED_WRITABLE_CONFIG_BASE)).await
+    }
+    async fn stat(&self, path: &Path) -> Result<Option<super::EntryKind>, String> {
+        Ok(if self.runner.files().contains_key(path) {
+            Some(super::EntryKind::File)
+        } else if self.runner.directories().contains(path) {
+            Some(super::EntryKind::Directory)
+        } else {
+            None
+        })
+    }
+    async fn create_dir(&self, path: &Path, _mode: u32) -> Result<(), String> {
+        if self.runner.files().contains_key(path) {
+            return Err(format!("{} is not a directory", path.display()));
+        }
+        self.runner.change(DummyFileChange::Made {
+            paths: path.ancestors().filter(|p| !p.as_os_str().is_empty()).map(Path::to_path_buf).collect(),
+        });
+        Ok(())
+    }
+    async fn read(&self, path: &Path, limit: u64) -> Result<Option<Vec<u8>>, String> {
+        match self.runner.files().get(path) {
+            Some(content) if content.len() as u64 > limit => Err(format!("{} is larger than {limit} bytes", path.display())),
+            Some(content) => Ok(Some(content.clone().into_bytes())),
+            None => Ok(None),
+        }
+    }
+    async fn write(&self, path: &Path, bytes: Vec<u8>, mode: u32) -> Result<(), String> {
+        let text = String::from_utf8(bytes).map_err(|_| format!("{} must be UTF-8 in a dummy vessel", path.display()))?;
+        self.runner.write_file_with_mode(path, &text, mode).await
+    }
+    async fn symlink(&self, path: &Path, target: &Path) -> Result<(), String> {
+        // The tree holds no links: the path reads as what it points at, as following one does.
+        let content = self.runner.files().get(target).cloned().unwrap_or_default();
+        self.runner.write_file(path, &content).await
+    }
+    async fn rename(&self, from: &Path, to: &Path) -> Result<(), String> {
+        if self.runner.has_path(to) {
+            return Err(format!("{} already exists", to.display()));
+        }
+        if !self.runner.files().contains_key(from) {
+            return Err(format!("{} is absent in the dummy vessel", from.display()));
+        }
+        self.runner.change(DummyFileChange::Moved { from: from.into(), to: to.into() });
+        Ok(())
+    }
+    async fn architecture(&self) -> Result<String, String> {
+        Ok("amd64".into())
+    }
 }
 
 impl DummyEnvironment {
@@ -599,9 +711,8 @@ impl ProvisionedEnvironment for DummyEnvironment {
     fn runner(&self) -> Arc<dyn CommandRunner> {
         Arc::clone(&self.runner) as Arc<dyn CommandRunner>
     }
-    /// The dummy's scripted runner stands for its vessel, agent included.
     fn agent(&self) -> Arc<dyn super::VesselAgent> {
-        Arc::new(super::vessel_ops::RunnerVesselAgent(self.runner()))
+        Arc::new(DummyVesselAgent { runner: Arc::clone(&self.runner), state: Arc::clone(&self.agent) })
     }
     async fn destroy(&self) -> Result<(), String> {
         if !self.destroyed.swap(true, Ordering::AcqRel) && self.vendor.load(Ordering::Acquire) != VANISHED {
@@ -907,7 +1018,10 @@ impl DummyEnvironmentProvider {
 mod tests {
     use flotilla_resources::{DockerEnvironmentSpec, EnvironmentSpec};
 
-    use super::*;
+    use super::{
+        super::{EntryKind, EnvironmentTool},
+        *,
+    };
 
     fn docker_spec(image: &str) -> EnvironmentSpec {
         EnvironmentSpec {
@@ -1124,6 +1238,43 @@ mod tests {
         use flotilla_discovery_api::detectors::resolve_binary_path;
         assert_eq!(resolve_binary_path(&runner, "claude").await, None);
         assert_eq!(resolve_binary_path(&runner, DUMMY_CREW_BINARY).await, Some(PathBuf::from("/usr/local/bin/flotilla-dummy-crew")));
+    }
+
+    // A dummy vessel's agent answers as a resident agent does: it is ready, serves the
+    // controller's daemon forward (whose host target a crew in the vessel reads back), keeps
+    // what is written, made, moved and pushed to it in memory, and refuses what a filesystem
+    // refuses.
+    #[tokio::test]
+    async fn the_vessel_agent_serves_the_forward_and_keeps_delivered_files() {
+        let provider = DummyEnvironmentProvider::new(DummyEnvironmentBehaviour::default());
+        let handle = provision(&provider, "one").await.expect("one");
+        let agent = handle.agent();
+        agent.ready().await.expect("ready");
+        assert_eq!(provider.forward_target("one"), None, "no forward before the daemon asks");
+        let controller = Path::new("/run/flotilla/environments/one.sock");
+        agent.forward_controller_socket(Path::new("/run/flotilla/daemon.sock"), None, controller).await.expect("forward");
+        assert_eq!(provider.forward_target("flotilla-dummy-one"), Some(controller.to_path_buf()), "by backing name too");
+
+        let home = Path::new("/home/crew/.claude");
+        agent.create_dir(home, 0o700).await.expect("directory");
+        assert_eq!(agent.stat(home).await.expect("stat"), Some(EntryKind::Directory));
+        agent.write(&home.join("settings.json.new"), b"{}".to_vec(), 0o600).await.expect("write");
+        agent.rename(&home.join("settings.json.new"), &home.join("settings.json")).await.expect("rename");
+        assert_eq!(agent.read(&home.join("settings.json"), 1024).await.expect("read"), Some(b"{}".to_vec()));
+        assert_eq!(agent.stat(&home.join("settings.json.new")).await.expect("stat"), None);
+        assert!(agent.read(&home.join("settings.json"), 1).await.is_err(), "over the limit");
+        assert!(agent.create_dir(&home.join("settings.json"), 0o700).await.is_err(), "a file is not a directory");
+        agent.write(&home.join("other"), b"x".to_vec(), 0o600).await.expect("write");
+        assert!(agent.rename(&home.join("other"), &home.join("settings.json")).await.is_err(), "the target exists");
+
+        let tool = EnvironmentTool::new("flotilla", "/opt/flotilla/bin/flotilla");
+        agent.push_tools(&[tool]).await.expect("push");
+        assert_eq!(agent.stat(Path::new("/opt/flotilla/bin/flotilla")).await.expect("stat"), Some(EntryKind::File));
+        agent
+            .extend_environment(BTreeMap::from([("FLOTILLA_DAEMON_SOCKET".into(), "/run/flotilla/daemon.sock".into())]))
+            .await
+            .expect("env");
+        assert_eq!(agent.architecture().await.as_deref(), Ok("amd64"));
     }
 
     // The vendor's journal, as the fleet writes it to disk, holds no secret: provisioning tokens

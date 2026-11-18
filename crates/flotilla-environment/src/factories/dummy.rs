@@ -1,7 +1,7 @@
 //! Dummy environment factory (#3206). The composition root installs it only
 //! when the daemon's `[dummy_fleet]` settings enable the dummy fleet.
 
-use std::sync::Arc;
+use std::{path::PathBuf, sync::Arc};
 
 use async_trait::async_trait;
 use flotilla_discovery_api::provider_config::ProviderConfigView;
@@ -52,6 +52,11 @@ impl DummyEnvironmentFactory {
     /// See [`DummyEnvironmentProvider::snapshot`].
     pub fn snapshot(&self) -> Vec<DummyVendorChange> {
         self.provider.snapshot()
+    }
+
+    /// See [`DummyEnvironmentProvider::forward_target`].
+    pub fn forward_target(&self, environment: &str) -> Option<PathBuf> {
+        self.provider.forward_target(environment)
     }
 
     /// Act as the vendor: see [`DummyEnvironmentProvider::vanish`].
