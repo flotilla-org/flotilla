@@ -737,6 +737,11 @@ async fn refresh_record_card(
             .await
             .map_err(|error| format!("read convoy {}: {error}", vessel.convoy))?
             .object;
+        // An ended convoy's crew is torn down: its teardown closes the bindings the card names, and
+        // a card sent then waits at a seat no one will consume (#3108).
+        if convoy.status.as_ref().is_some_and(|status| status.phase.is_terminal()) {
+            return Ok(());
+        }
         let work = vessel.work();
         let credential_refs = convoy
             .status

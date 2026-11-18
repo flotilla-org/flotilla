@@ -277,6 +277,49 @@ async fn failing_source_never_publishes_an_empty_card() {
     assert!(messages.is_empty());
 }
 
+// Behaviour (#3108): a convoy's end sends its crew no card. Its teardown closes the bindings a card
+// names while its sessions still run, and a card sent then would wait at a seat no one consumes.
+#[tokio::test]
+async fn an_ended_convoys_crew_is_sent_no_card() {
+    use crate::crew_capabilities::{refresh_cards, CapabilityCardTracker, CardScope};
+    use flotilla_capability_contract::{CredentialCapability, SessionCapabilitySource};
+    use flotilla_resources::{EnvironmentSpec, HostDirectEnvironmentSpec, Message};
+    // Credential/endpoint delivery is the runtime I/O boundary; resources use the real memory backend.
+    struct Delivery(RwLock<BTreeMap<String, String>>);
+    #[async_trait]
+    impl SessionCapabilitySource for Delivery {
+        async fn credentials(&self, _: &str, _: &BTreeSet<String>) -> Result<Vec<CredentialCapability>, String> {
+            Ok(vec![])
+        }
+        async fn endpoints(&self, _: &str, _: &str) -> Result<BTreeMap<String, String>, String> {
+            Ok(self.0.read().await.clone())
+        }
+    }
+    let (crew, backend, _, held) = fixture(CrewWorkPhase::Working).await;
+    held.engine.engine.environments.request(
+        "resume-env",
+        &EnvironmentSpec {
+            host_direct: Some(HostDirectEnvironmentSpec { host_ref: "host".into(), repo_default_dir: "/repo".into() }),
+            ..Default::default()
+        },
+        None,
+    );
+    let source = Delivery(RwLock::new(BTreeMap::new()));
+    let tracker = CapabilityCardTracker::with_message_path(crew.message_path.clone());
+    let accounts = flotilla_store_testkit::OldStoreAccounts::new(backend.clone());
+    let every = CardScope::every();
+    let refresh = || refresh_cards(&backend, "flotilla", &source, &tracker, held.engine.reads(), &accounts, &every);
+    refresh().await.expect("baseline");
+    source.0.write().await.insert("pinned service".into(), "127.0.0.1:7423".into());
+    let convoy = held.convoy(&backend).await;
+    held.engine.engine().abandon(&convoy, "operator", "torn down").await.expect("abandon");
+    let session = backend.using::<ResourceTerminalSession>("flotilla").get("session").await.expect("session");
+    assert_eq!(session.status.map(|status| status.phase), Some(ResourceTerminalSessionPhase::Running), "its crew still runs");
+    refresh().await.expect("refresh");
+    let messages = backend.using::<Message>("flotilla").list().await.expect("messages").items;
+    assert!(messages.is_empty(), "no card is sent to an ended convoy's crew: {messages:?}");
+}
+
 // Capability cards verify tools only once the engine has built the referenced image.
 #[tokio::test]
 async fn image_capabilities_follow_engine_builds() {
