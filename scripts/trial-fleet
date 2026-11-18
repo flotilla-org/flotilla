@@ -105,11 +105,12 @@ def cargo_target_dir():
 
 
 def drydock_pin():
-    text = (REPO / 'Cargo.toml').read_text()
-    pins = set(re.findall(r'^drydock[a-z-]* = \{ git = "([^"]+)", rev = "([0-9a-f]{40})" \}', text, re.M))
-    if len(pins) != 1:
-        raise TrialFailure(f'Cargo.toml must pin every drydock crate to one git rev; found {sorted(pins)}')
-    return pins.pop()
+    # Cargo.toml declares drydock by branch; the lockfile holds the one commit.
+    text = (REPO / 'Cargo.lock').read_text()
+    pin = re.search(r'^name = "drydock-host"\nversion = "[^"]+"\nsource = "git\+([^?#"]+)\?[^#"]*#([0-9a-f]{40})"$', text, re.M)
+    if not pin:
+        raise TrialFailure('Cargo.lock must lock drydock-host to one git commit')
+    return pin.groups()
 
 
 def build(target, log, guest):
@@ -124,8 +125,8 @@ def build(target, log, guest):
         *(guest_steps if guest else []),
         ['cargo', 'build', '--locked', '-p', 'flotilla-fake-forge', '--bin', 'flotilla-fake-forge'],
         # drydock-host is only a dev-dependency here, which cargo cannot build as a
-        # package; install it from the pinned rev. Each rev builds apart: cargo
-        # takes a git package built at another rev as fresh.
+        # package; install it from the locked commit. Each commit builds apart: cargo
+        # takes a git package built at another commit as fresh.
         ['cargo', 'install', '--locked', '--debug', '--git', git, '--rev', rev, '--root', str(target / f'trial-fleet/drydock-host/{rev}'),
          '--target-dir', str(target / f'trial-fleet/drydock-host/{rev}/build'), '--bin', 'drydock-host', 'drydock-host'],
     ]

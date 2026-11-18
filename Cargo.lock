@@ -267,7 +267,7 @@ checksum = "2af50177e190e07a26ab74f8b1efbfe2ef87da2116221318cb1c2e82baf7de06"
 [[package]]
 name = "binnacle-cli"
 version = "0.1.0"
-source = "git+https://github.com/flotilla-org/binnacle?rev=0eb2af53542b0fdcea843165bd6a71fa6a6c66c3#0eb2af53542b0fdcea843165bd6a71fa6a6c66c3"
+source = "git+https://github.com/flotilla-org/binnacle?branch=main#319ecf2fa2c4f0d12927ff4388f8cd3f16d4cda6"
 dependencies = [
  "binnacle-core",
  "binnacle-described",
@@ -284,12 +284,12 @@ dependencies = [
 [[package]]
 name = "binnacle-core"
 version = "0.1.0"
-source = "git+https://github.com/flotilla-org/binnacle?rev=0eb2af53542b0fdcea843165bd6a71fa6a6c66c3#0eb2af53542b0fdcea843165bd6a71fa6a6c66c3"
+source = "git+https://github.com/flotilla-org/binnacle?branch=main#319ecf2fa2c4f0d12927ff4388f8cd3f16d4cda6"
 
 [[package]]
 name = "binnacle-described"
 version = "0.1.0"
-source = "git+https://github.com/flotilla-org/binnacle?rev=0eb2af53542b0fdcea843165bd6a71fa6a6c66c3#0eb2af53542b0fdcea843165bd6a71fa6a6c66c3"
+source = "git+https://github.com/flotilla-org/binnacle?branch=main#319ecf2fa2c4f0d12927ff4388f8cd3f16d4cda6"
 dependencies = [
  "binnacle-core",
  "binnacle-format",
@@ -305,7 +305,7 @@ dependencies = [
 [[package]]
 name = "binnacle-described-http"
 version = "0.1.0"
-source = "git+https://github.com/flotilla-org/binnacle?rev=0eb2af53542b0fdcea843165bd6a71fa6a6c66c3#0eb2af53542b0fdcea843165bd6a71fa6a6c66c3"
+source = "git+https://github.com/flotilla-org/binnacle?branch=main#319ecf2fa2c4f0d12927ff4388f8cd3f16d4cda6"
 dependencies = [
  "binnacle-described",
  "bytes",
@@ -318,7 +318,7 @@ dependencies = [
 [[package]]
 name = "binnacle-format"
 version = "0.1.0"
-source = "git+https://github.com/flotilla-org/binnacle?rev=0eb2af53542b0fdcea843165bd6a71fa6a6c66c3#0eb2af53542b0fdcea843165bd6a71fa6a6c66c3"
+source = "git+https://github.com/flotilla-org/binnacle?branch=main#319ecf2fa2c4f0d12927ff4388f8cd3f16d4cda6"
 dependencies = [
  "serde_json",
  "unicode-segmentation",
@@ -327,7 +327,7 @@ dependencies = [
 [[package]]
 name = "binnacle-group"
 version = "0.1.0"
-source = "git+https://github.com/flotilla-org/binnacle?rev=0eb2af53542b0fdcea843165bd6a71fa6a6c66c3#0eb2af53542b0fdcea843165bd6a71fa6a6c66c3"
+source = "git+https://github.com/flotilla-org/binnacle?branch=main#319ecf2fa2c4f0d12927ff4388f8cd3f16d4cda6"
 dependencies = [
  "binnacle-core",
  "binnacle-memory",
@@ -336,7 +336,7 @@ dependencies = [
 [[package]]
 name = "binnacle-layout"
 version = "0.1.0"
-source = "git+https://github.com/flotilla-org/binnacle?rev=0eb2af53542b0fdcea843165bd6a71fa6a6c66c3#0eb2af53542b0fdcea843165bd6a71fa6a6c66c3"
+source = "git+https://github.com/flotilla-org/binnacle?branch=main#319ecf2fa2c4f0d12927ff4388f8cd3f16d4cda6"
 dependencies = [
  "binnacle-core",
  "ciborium",
@@ -348,7 +348,7 @@ dependencies = [
 [[package]]
 name = "binnacle-memory"
 version = "0.1.0"
-source = "git+https://github.com/flotilla-org/binnacle?rev=0eb2af53542b0fdcea843165bd6a71fa6a6c66c3#0eb2af53542b0fdcea843165bd6a71fa6a6c66c3"
+source = "git+https://github.com/flotilla-org/binnacle?branch=main#319ecf2fa2c4f0d12927ff4388f8cd3f16d4cda6"
 dependencies = [
  "binnacle-core",
  "regex",
@@ -357,7 +357,7 @@ dependencies = [
 [[package]]
 name = "binnacle-ratatui"
 version = "0.1.0"
-source = "git+https://github.com/flotilla-org/binnacle?rev=0eb2af53542b0fdcea843165bd6a71fa6a6c66c3#0eb2af53542b0fdcea843165bd6a71fa6a6c66c3"
+source = "git+https://github.com/flotilla-org/binnacle?branch=main#319ecf2fa2c4f0d12927ff4388f8cd3f16d4cda6"
 dependencies = [
  "binnacle-cli",
  "binnacle-core",
@@ -1055,7 +1055,7 @@ dependencies = [
  "libc",
  "option-ext",
  "redox_users",
- "windows-sys 0.61.2",
+ "windows-sys 0.59.0",
 ]
 
 [[package]]
@@ -1081,7 +1081,7 @@ dependencies = [
 [[package]]
 name = "drydock"
 version = "0.1.0"
-source = "git+https://github.com/flotilla-org/drydock?rev=30282004caf2b82d903bfbb8e1dfce0ba49b8bdc#30282004caf2b82d903bfbb8e1dfce0ba49b8bdc"
+source = "git+https://github.com/flotilla-org/drydock?branch=main#dac0802e8f809ad74aca88ad6527ecf91a0f5948"
 dependencies = [
  "async-stream",
  "async-trait",
@@ -1124,7 +1124,7 @@ dependencies = [
 [[package]]
 name = "drydock-agent"
 version = "0.1.0"
-source = "git+https://github.com/flotilla-org/drydock?rev=30282004caf2b82d903bfbb8e1dfce0ba49b8bdc#30282004caf2b82d903bfbb8e1dfce0ba49b8bdc"
+source = "git+https://github.com/flotilla-org/drydock?branch=main#dac0802e8f809ad74aca88ad6527ecf91a0f5948"
 dependencies = [
  "async-trait",
  "axum",
@@ -1168,7 +1168,7 @@ dependencies = [
 [[package]]
 name = "drydock-client"
 version = "0.1.0"
-source = "git+https://github.com/flotilla-org/drydock?rev=30282004caf2b82d903bfbb8e1dfce0ba49b8bdc#30282004caf2b82d903bfbb8e1dfce0ba49b8bdc"
+source = "git+https://github.com/flotilla-org/drydock?branch=main#dac0802e8f809ad74aca88ad6527ecf91a0f5948"
 dependencies = [
  "async-stream",
  "async-trait",
@@ -1197,7 +1197,7 @@ dependencies = [
 [[package]]
 name = "drydock-host"
 version = "0.1.0"
-source = "git+https://github.com/flotilla-org/drydock?rev=30282004caf2b82d903bfbb8e1dfce0ba49b8bdc#30282004caf2b82d903bfbb8e1dfce0ba49b8bdc"
+source = "git+https://github.com/flotilla-org/drydock?branch=main#dac0802e8f809ad74aca88ad6527ecf91a0f5948"
 dependencies = [
  "async-trait",
  "axum",
@@ -1238,7 +1238,7 @@ dependencies = [
 [[package]]
 name = "drydock-oci"
 version = "0.1.0"
-source = "git+https://github.com/flotilla-org/drydock?rev=30282004caf2b82d903bfbb8e1dfce0ba49b8bdc#30282004caf2b82d903bfbb8e1dfce0ba49b8bdc"
+source = "git+https://github.com/flotilla-org/drydock?branch=main#dac0802e8f809ad74aca88ad6527ecf91a0f5948"
 dependencies = [
  "base64 0.22.1",
  "bytes",
@@ -1254,7 +1254,7 @@ dependencies = [
 [[package]]
 name = "drydock-protocol"
 version = "0.1.0"
-source = "git+https://github.com/flotilla-org/drydock?rev=30282004caf2b82d903bfbb8e1dfce0ba49b8bdc#30282004caf2b82d903bfbb8e1dfce0ba49b8bdc"
+source = "git+https://github.com/flotilla-org/drydock?branch=main#dac0802e8f809ad74aca88ad6527ecf91a0f5948"
 dependencies = [
  "base64 0.23.1",
  "chrono",
@@ -1268,7 +1268,7 @@ dependencies = [
 [[package]]
 name = "drydock-provider"
 version = "0.1.0"
-source = "git+https://github.com/flotilla-org/drydock?rev=30282004caf2b82d903bfbb8e1dfce0ba49b8bdc#30282004caf2b82d903bfbb8e1dfce0ba49b8bdc"
+source = "git+https://github.com/flotilla-org/drydock?branch=main#dac0802e8f809ad74aca88ad6527ecf91a0f5948"
 dependencies = [
  "async-trait",
  "axum",
@@ -1289,7 +1289,7 @@ dependencies = [
 [[package]]
 name = "drydock-transport"
 version = "0.1.0"
-source = "git+https://github.com/flotilla-org/drydock?rev=30282004caf2b82d903bfbb8e1dfce0ba49b8bdc#30282004caf2b82d903bfbb8e1dfce0ba49b8bdc"
+source = "git+https://github.com/flotilla-org/drydock?branch=main#dac0802e8f809ad74aca88ad6527ecf91a0f5948"
 dependencies = [
  "async-trait",
  "axum",
@@ -1428,7 +1428,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "39cab71617ae0d63f51a36d69f866391735b51691dbda63cf6f96d042b63efeb"
 dependencies = [
  "libc",
- "windows-sys 0.61.2",
+ "windows-sys 0.59.0",
 ]
 
 [[package]]
@@ -2628,6 +2628,7 @@ dependencies = [
  "rigging-process",
  "rigging-relay-protocol",
  "rigging-replay-testkit",
+ "rigging-ssh",
  "rigging-tls",
  "rusqlite",
  "serde",
@@ -2637,7 +2638,6 @@ dependencies = [
  "subtle",
  "tar",
  "tempfile",
- "tender",
  "tokio",
  "tokio-tungstenite 0.29.0",
  "tokio-util",
@@ -5367,7 +5367,7 @@ version = "0.50.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "7957b9740744892f114936ab4a57b3f487491bbeafaf8083688b16841a4240e5"
 dependencies = [
- "windows-sys 0.61.2",
+ "windows-sys 0.59.0",
 ]
 
 [[package]]
@@ -5936,7 +5936,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "b570b25f7617e43d59005d0990ccb79e950a423952cea19671b7a876da390adf"
 dependencies = [
  "anyhow",
- "itertools 0.14.0",
+ "itertools 0.12.1",
  "proc-macro2",
  "quote",
  "syn 2.0.117",
@@ -6005,7 +6005,7 @@ dependencies = [
  "once_cell",
  "socket2",
  "tracing",
- "windows-sys 0.61.2",
+ "windows-sys 0.59.0",
 ]
 
 [[package]]
@@ -6373,7 +6373,7 @@ dependencies = [
 [[package]]
 name = "rigging-condition"
 version = "0.1.0"
-source = "git+https://github.com/flotilla-org/rigging?rev=1e28bbbbb8c64a7ab9b4fe59c29331075440bdbd#1e28bbbbb8c64a7ab9b4fe59c29331075440bdbd"
+source = "git+https://github.com/flotilla-org/rigging?branch=main#261a4460166fc79e1b6442a693f62d4e41bef8d4"
 dependencies = [
  "serde",
  "thiserror 2.0.18",
@@ -6382,7 +6382,7 @@ dependencies = [
 [[package]]
 name = "rigging-http-client"
 version = "0.1.0"
-source = "git+https://github.com/flotilla-org/rigging?rev=1e28bbbbb8c64a7ab9b4fe59c29331075440bdbd#1e28bbbbb8c64a7ab9b4fe59c29331075440bdbd"
+source = "git+https://github.com/flotilla-org/rigging?branch=main#261a4460166fc79e1b6442a693f62d4e41bef8d4"
 dependencies = [
  "async-trait",
  "bytes",
@@ -6396,7 +6396,7 @@ dependencies = [
 [[package]]
 name = "rigging-http-serve"
 version = "0.1.0"
-source = "git+https://github.com/flotilla-org/rigging?rev=1e28bbbbb8c64a7ab9b4fe59c29331075440bdbd#1e28bbbbb8c64a7ab9b4fe59c29331075440bdbd"
+source = "git+https://github.com/flotilla-org/rigging?branch=main#261a4460166fc79e1b6442a693f62d4e41bef8d4"
 dependencies = [
  "axum",
  "getrandom 0.3.4",
@@ -6412,7 +6412,7 @@ dependencies = [
 [[package]]
 name = "rigging-http-wire"
 version = "0.1.0"
-source = "git+https://github.com/flotilla-org/rigging?rev=1e28bbbbb8c64a7ab9b4fe59c29331075440bdbd#1e28bbbbb8c64a7ab9b4fe59c29331075440bdbd"
+source = "git+https://github.com/flotilla-org/rigging?branch=main#261a4460166fc79e1b6442a693f62d4e41bef8d4"
 dependencies = [
  "axum",
  "flotilla-cbor",
@@ -6423,7 +6423,7 @@ dependencies = [
 [[package]]
 name = "rigging-paths"
 version = "0.1.0"
-source = "git+https://github.com/flotilla-org/rigging?rev=1e28bbbbb8c64a7ab9b4fe59c29331075440bdbd#1e28bbbbb8c64a7ab9b4fe59c29331075440bdbd"
+source = "git+https://github.com/flotilla-org/rigging?branch=main#261a4460166fc79e1b6442a693f62d4e41bef8d4"
 dependencies = [
  "rigging-process",
 ]
@@ -6431,7 +6431,7 @@ dependencies = [
 [[package]]
 name = "rigging-process"
 version = "0.1.0"
-source = "git+https://github.com/flotilla-org/rigging?rev=1e28bbbbb8c64a7ab9b4fe59c29331075440bdbd#1e28bbbbb8c64a7ab9b4fe59c29331075440bdbd"
+source = "git+https://github.com/flotilla-org/rigging?branch=main#261a4460166fc79e1b6442a693f62d4e41bef8d4"
 dependencies = [
  "async-trait",
  "libc",
@@ -6444,7 +6444,7 @@ dependencies = [
 [[package]]
 name = "rigging-relay-protocol"
 version = "0.1.0"
-source = "git+https://github.com/flotilla-org/rigging?rev=1e28bbbbb8c64a7ab9b4fe59c29331075440bdbd#1e28bbbbb8c64a7ab9b4fe59c29331075440bdbd"
+source = "git+https://github.com/flotilla-org/rigging?branch=main#261a4460166fc79e1b6442a693f62d4e41bef8d4"
 dependencies = [
  "serde",
  "serde_json",
@@ -6453,7 +6453,7 @@ dependencies = [
 [[package]]
 name = "rigging-replay-testkit"
 version = "0.1.0"
-source = "git+https://github.com/flotilla-org/rigging?rev=1e28bbbbb8c64a7ab9b4fe59c29331075440bdbd#1e28bbbbb8c64a7ab9b4fe59c29331075440bdbd"
+source = "git+https://github.com/flotilla-org/rigging?branch=main#261a4460166fc79e1b6442a693f62d4e41bef8d4"
 dependencies = [
  "async-trait",
  "axum",
@@ -6474,7 +6474,7 @@ dependencies = [
 [[package]]
 name = "rigging-ssh"
 version = "0.1.0"
-source = "git+https://github.com/flotilla-org/rigging?rev=1e28bbbbb8c64a7ab9b4fe59c29331075440bdbd#1e28bbbbb8c64a7ab9b4fe59c29331075440bdbd"
+source = "git+https://github.com/flotilla-org/rigging?branch=main#261a4460166fc79e1b6442a693f62d4e41bef8d4"
 dependencies = [
  "async-trait",
  "rigging-stream",
@@ -6485,7 +6485,7 @@ dependencies = [
 [[package]]
 name = "rigging-stream"
 version = "0.1.0"
-source = "git+https://github.com/flotilla-org/rigging?rev=1e28bbbbb8c64a7ab9b4fe59c29331075440bdbd#1e28bbbbb8c64a7ab9b4fe59c29331075440bdbd"
+source = "git+https://github.com/flotilla-org/rigging?branch=main#261a4460166fc79e1b6442a693f62d4e41bef8d4"
 dependencies = [
  "tokio",
 ]
@@ -6493,7 +6493,7 @@ dependencies = [
 [[package]]
 name = "rigging-tls"
 version = "0.1.0"
-source = "git+https://github.com/flotilla-org/rigging?rev=1e28bbbbb8c64a7ab9b4fe59c29331075440bdbd#1e28bbbbb8c64a7ab9b4fe59c29331075440bdbd"
+source = "git+https://github.com/flotilla-org/rigging?branch=main#261a4460166fc79e1b6442a693f62d4e41bef8d4"
 dependencies = [
  "reqwest 0.13.2",
  "rustls",
@@ -6608,7 +6608,7 @@ dependencies = [
  "errno",
  "libc",
  "linux-raw-sys",
- "windows-sys 0.61.2",
+ "windows-sys 0.59.0",
 ]
 
 [[package]]
@@ -6666,7 +6666,7 @@ dependencies = [
  "security-framework",
  "security-framework-sys",
  "webpki-root-certs",
- "windows-sys 0.61.2",
+ "windows-sys 0.59.0",
 ]
 
 [[package]]
@@ -6687,7 +6687,7 @@ dependencies = [
  "security-framework",
  "security-framework-sys",
  "webpki-root-certs",
- "windows-sys 0.52.0",
+ "windows-sys 0.59.0",
 ]
 
 [[package]]
@@ -7300,30 +7300,7 @@ dependencies = [
  "getrandom 0.4.2",
  "once_cell",
  "rustix",
- "windows-sys 0.61.2",
-]
-
-[[package]]
-name = "tender"
-version = "0.1.0"
-dependencies = [
- "async-trait",
- "ed25519-dalek",
- "flotilla-build-features",
- "flotilla-build-features-async",
- "flotilla-build-features-base",
- "flotilla-build-features-os",
- "flotilla-build-features-signing",
- "flotilla-build-features-tracing",
- "hegeltest",
- "libc",
- "rand_core 0.6.4",
- "serde",
- "serde_json",
- "sha2",
- "tempfile",
- "tokio",
- "tracing",
+ "windows-sys 0.59.0",
 ]
 
 [[package]]
@@ -8415,7 +8392,7 @@ version = "0.1.11"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "c2a7b1c03c876122aa43f3020e6c3c3ee5c05081c9a00739faf7503aeba10d22"
 dependencies = [
- "windows-sys 0.61.2",
+ "windows-sys 0.59.0",
 ]
 
 [[package]]

@@ -44,18 +44,17 @@ class RunnerTests(unittest.TestCase):
         # Contract: the checked-in list is accepted for every job without freezing its contents.
         # A frozen argv golden would require editing tests whenever a selector changes (#2838).
         selectors = (ROOT / "ci/platform-tests/selectors.txt").read_text()
-        for job in ["windows", "macos", "tender-ssh"]:
+        for job in ["windows", "macos"]:
             with self.subTest(job=job):
                 self.log.unlink(missing_ok=True)
                 result, _ = self.run_job(job, selectors)
                 self.assertEqual(result.returncode, 0, result.stderr)
 
     def test_shared_and_os_specific_rows(self):
-        # Contract: all runs once on each OS, never in the deliberately isolated SSH job.
-        for job, expected in [("windows", ["shared", "win"]), ("macos", ["shared", "mac"]),
-                              ("tender-ssh", ["ssh"])]:
+        # Contract: all runs once on each OS.
+        for job, expected in [("windows", ["shared", "win"]), ("macos", ["shared", "mac"])]:
             self.log.unlink(missing_ok=True)
-            result, commands = self.run_job(job, "# comment\n\nall|shared\nwindows|win\nmacos|mac\ntender-ssh|ssh")
+            result, commands = self.run_job(job, "# comment\n\nall|shared\nwindows|win\nmacos|mac")
             self.assertEqual(result.returncode, 0, result.stderr)
             self.assertEqual([c[-1] for c in commands], expected)
 

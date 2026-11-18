@@ -78,7 +78,7 @@ Core and daemon unit tests compile shared adapter sources only under `cfg(test)`
 integration tests import the testkit crates directly. Native libraries share `flotilla-build-features`' feature-only dependency
 selections on stable Cargo; `ci/build-graph/check.py` checks build and test selections separately for every workspace package,
 rejects production testkit dependencies and production `test-util`, and runs in workspace CI. Keep its anchors aligned when
-adding dependencies. The build-graph check resolves the full Cargo graph to enforce the boundary on external Rigging crates; its first run may fetch the pinned Git sources. Optional TLS providers and sandbox skips remain opt-in.
+adding dependencies. The build-graph check resolves the full Cargo graph to enforce the boundary on external Rigging crates; its first run may fetch the locked Git sources. Optional TLS providers and sandbox skips remain opt-in.
 Workspace tests require Python 3.9+ and Cargo on PATH (`python` on Windows, `python3` elsewhere) for this guard.
 
 `flotilla-store-testkit`, `flotilla-crew` and `flotilla-controllers` collect their integration tests in `tests/integration/main.rs`.
@@ -134,7 +134,7 @@ User actions flow: **TableIntent/UI action → Command → daemon executor → p
 | `flotilla-provider-runtime` | Flotilla Git guard, scratch namespace, helper scripts, SSH runner and neutral observation errors; re-exports Rigging process, probe and HTTP interfaces |
 | `flotilla-forge-github` | GitHub client, invocation macros, rate-limit classification, polling, telemetry, host budget accounting and discovery-time repository resolution |
 | `flotilla-environment` | Environment and image capability traits, Docker and host-direct adapters, factories and transport hop resolution; the drydock adapter, written against flotilla's own provider-API and vessel-agent client traits, with no drydock dependency |
-| `flotilla-drydock` | Drydock behind those traits: its provider API, vessel agent client and link, and SSH host vessel agents. Only `flotilla-daemon` depends on it, so a drydock repin rebuilds nothing below the composition root (`ci/build-graph/check.py`) |
+| `flotilla-drydock` | Drydock behind those traits: its provider API, vessel agent client and link, and SSH host vessel agents. Only `flotilla-daemon` depends on it, so moving drydock's locked commit rebuilds nothing below the composition root (`ci/build-graph/check.py`) |
 | `flotilla-vcs` | Checkout-scoped VCS traits, Git strategies, factory and Git discovery probes |
 | `flotilla-ai-utility` | AI utility trait, Claude API/CLI implementations and factories |
 | `flotilla-cloud-agent` | Cloud session provider trait, Claude/Codex/Cursor implementations, factories and detectors |
@@ -188,16 +188,16 @@ User actions flow: **TableIntent/UI action → Command → daemon executor → p
 | `flotilla-schema-sqlite` | SQLite DDL rendering (`DdlMode`), SQL extension traits and the Rusqlite runtime for derived kinds: shared tables (`strings`, `resource_identity`, `objects`, `home_sequence`, `log`), per-kind statements, interning, owner-checked writes (creation, spec edits, `apply_edge`, delete and expunge), the per-home event log with one lowering for local writes and `apply` of other homes' events, snapshot restore, reads of entries about a master, keyset-paged index queries and the startup scan |
 | `flotilla-replication` | Store-to-store replication over `dyn Store`: list/watch/resume, origin filtering, digest scheduling; host ports for stores, identity, health and peer sources |
 | `flotilla-review-bundle-object-store` | Object-store/S3 byte adapter for the review-bundle port |
-| `rigging-tls` (external) | TLS provider selection and reqwest builders from the pinned Rigging revision |
+| `rigging-tls` (external) | TLS provider selection and reqwest builders from the locked Rigging commit |
 | `rigging-process` (external) | Command supervision, invocation macros, environment variables, filesystem/space probes, scan cache and binary/version detection |
 | `rigging-http-serve` (external) | Axum serving over Unix sockets, accepted connections and loopback TCP: typed caller identity, the token file, and the Host/Origin/cookie-Origin TCP policy around consumer authentication |
 | `rigging-http-client` (external) | Injectable HTTP execution and the reqwest implementation |
+| `rigging-ssh` (external) | OpenSSH argument builders and the forwarded-socket waiter for the peer transport, from the locked Rigging commit |
 | `rigging-replay-testkit` (external, dev-only) | Replay sessions, recording, masks, mock runners and HTTP stand-ins |
 | `flotilla-replay-testkit` | GitHub replay channel over `rigging-replay-testkit` scheduling, masks and test helpers |
 | `flotilla-controllers` | Cross-capability reconciler tests and the `provisioned_mount` helper, pending retirement |
 | `flotilla-commands` | Resource-oriented command preparation and execution |
 | `flotilla-transport` | Framed message sessions over Unix sockets or in-memory channels for daemon client and peer connections |
-| `tender` | Publication, discovery, pinned-exposure, and raw-stream contracts with an in-memory adapter and shared behavior tests |
 | `flotilla` (root) | Thin `src/main.rs` entry point |
 
 ### Key Modules

@@ -11,6 +11,7 @@ use flotilla_provider_runtime::ChannelLabel;
 use flotilla_provider_runtime::CommandOutput;
 use flotilla_provider_runtime::CommandProcess;
 use flotilla_provider_runtime::CommandRunner;
+use rigging_ssh::args;
 use tokio::{
     io::{AsyncBufReadExt, BufReader},
     net::UnixStream,
@@ -216,12 +217,12 @@ impl SshTransport {
             "spawning SSH tunnel"
         );
 
-        let args = tender::ssh::forwarding_arguments(
+        let args = args::forwarding_arguments(
             &destination,
             &self.local_socket_path,
             self.remote_daemon_socket_path()?,
             Some((self.remote_resource_socket_path()?, &self.local_daemon_socket_path)),
-            tender::ssh::ExistingSocket::Unlink,
+            args::ExistingSocket::Unlink,
         );
         let binary = self.ssh_binary.to_string_lossy();
         let arg_refs: Vec<&str> = args.iter().map(String::as_str).collect();
@@ -303,8 +304,8 @@ impl SshTransport {
         let remote_daemon_socket = self.remote_daemon_socket_path().expect("remote daemon socket path is resolved before forwarding");
         let remote_resource_socket = self.remote_resource_socket_path().expect("remote resource socket path is resolved before forwarding");
         (
-            tender::ssh::forward_spec(&self.local_socket_path, remote_daemon_socket),
-            tender::ssh::forward_spec(remote_resource_socket, &self.local_daemon_socket_path),
+            args::forward_spec(&self.local_socket_path, remote_daemon_socket),
+            args::forward_spec(remote_resource_socket, &self.local_daemon_socket_path),
         )
     }
 
@@ -322,7 +323,7 @@ impl SshTransport {
     /// unreachable host, etc.) to fail fast instead of waiting the
     /// full timeout.
     async fn wait_for_socket(&mut self) -> Result<(), String> {
-        tender::ssh::wait_for_socket(&self.local_socket_path, FORWARDED_SOCKET_TIMEOUT, || match self.ssh_process.as_mut() {
+        args::wait_for_socket(&self.local_socket_path, FORWARDED_SOCKET_TIMEOUT, || match self.ssh_process.as_mut() {
             Some(child) => child.try_wait(),
             None => Ok(None),
         })
