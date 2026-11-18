@@ -428,6 +428,10 @@ pub const SETTLEMENT_MODE_STANDING: &str = "standing";
 pub struct ExplainedSettlement {
     pub mode: String,
     pub satisfied: bool,
+    /// The exit the convoy was delivered by (`merged`, `closed-unmerged`, a workflow's own),
+    /// once it was.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub disposition: Option<String>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub unmet: Vec<ExplainedUnmetExpectation>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]

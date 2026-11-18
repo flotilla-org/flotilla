@@ -1329,8 +1329,12 @@ mod tests {
         // Its crew submits the change request it opened to its pr promise.
         let engine = fixture.convoy_engine.get().expect("the Convoy path");
         let convoy = fixture.home.convoy(&launch).await;
-        let submission =
-            Submission { reference: "cr/github.com/owner/one/42".into(), metadata: Default::default(), submitted_at: now, verdict: None };
+        let submission = Submission {
+            reference: "cr/github.com/owner/one/42".into(),
+            metadata: Default::default(),
+            submitted_at: Some(now),
+            verdict: None,
+        };
         let submit = PromiseOperation::Submit { id: "pr".into(), kind: PromiseKind::Pr, source: PromiseSource::Crew, submission };
         engine.promise(&convoy, "work", "coder", &submit, Actor::Crew).await.expect("submitted");
         let (explained, name) = (&fixture, launch.as_str());

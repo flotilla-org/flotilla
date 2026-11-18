@@ -909,7 +909,7 @@ async fn merged_unclaimed_scenario(repeats: usize, unknown_head: bool, stalled: 
                 submission: Submission {
                     reference: "cr/github.com/flotilla-org/flotilla/2596".into(),
                     metadata: BTreeMap::new(),
-                    submitted_at: base,
+                    submitted_at: Some(base),
                     verdict: None,
                 },
             },
@@ -1322,7 +1322,7 @@ async fn submit_ledger(home: &EngineHome, backend: &ResourceBackend, launch: &st
         id: ledger.id,
         kind: PromiseKind::DecisionLedger,
         source: ledger.source,
-        submission: Submission { reference: reference.into(), metadata: BTreeMap::new(), submitted_at: at, verdict: None },
+        submission: Submission { reference: reference.into(), metadata: BTreeMap::new(), submitted_at: Some(at), verdict: None },
     };
     let crew = flotilla_resources::convoy::engine::Actor::Crew;
     home.engine().promise(&convoy, "work", "coder", &operation, crew).await.expect("the coder submits its ledger");

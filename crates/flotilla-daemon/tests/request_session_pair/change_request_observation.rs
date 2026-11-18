@@ -101,7 +101,7 @@ async fn produce(requester: &InProcessDaemon, name: &str) -> String {
         submission: Submission {
             reference: "cr/github.com/org/shared/330".into(),
             metadata: BTreeMap::new(),
-            submitted_at: Utc::now(),
+            submitted_at: Some(Utc::now()),
             verdict: None,
         },
     };

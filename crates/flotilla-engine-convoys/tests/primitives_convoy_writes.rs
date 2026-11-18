@@ -112,7 +112,7 @@ fn submit(id: &str, reference: &str) -> PromiseOperation {
         id: id.into(),
         kind: PromiseKind::Pr,
         source: OldSource::Crew,
-        submission: Submission { reference: reference.into(), metadata: BTreeMap::new(), submitted_at: Utc::now(), verdict: None },
+        submission: Submission { reference: reference.into(), metadata: BTreeMap::new(), submitted_at: Some(Utc::now()), verdict: None },
     }
 }
 
@@ -120,7 +120,7 @@ fn merged(id: &str) -> PromiseOperation {
     PromiseOperation::Verdict {
         id: id.into(),
         reference: PR.into(),
-        submitted_at: Utc::now(),
+        submitted_at: Some(Utc::now()),
         verdict: SubmissionVerdict { accepted: true, who: "forge".into(), at: Utc::now(), why: "PR merged".into() },
     }
 }
@@ -187,6 +187,43 @@ async fn a_submitted_pr_is_kept_by_its_merge_and_the_convoy_delivers() {
     // The delivery records the exit entry it was given; delivering again changes nothing.
     fixture.engine.deliver(&convoy, "closed-unmerged").await.expect("delivering again is no error");
     assert_eq!(fixture.engine.delivered(&convoy).as_deref(), Some("merged"));
+}
+
+// Behaviour (run 3 F7): a keyed read of one convoy carries what its log records of a promise:
+// when its submission was written, the closed PR's rejection (whose edge records no reason) and
+// the operator's own retraction reason. The record-only read that listings take leaves each of
+// these absent rather than inventing them.
+#[tokio::test]
+async fn a_keyed_read_carries_the_logged_submission_rejection_and_retraction() {
+    let fixture = fixture();
+    let convoy = admitted(&fixture, "c", bootstrapped(vec![("work", vec![crew("coder", true)])])).await;
+    let before = Utc::now() - chrono::Duration::milliseconds(1);
+    fixture.engine.promise(&convoy, "work", "coder", &submit("template/pr", PR), Actor::Crew).await.expect("submitted");
+    let after = Utc::now() + chrono::Duration::milliseconds(1);
+    let closed = PromiseOperation::Verdict {
+        id: "template/pr".into(),
+        reference: PR.into(),
+        submitted_at: None,
+        verdict: SubmissionVerdict { accepted: false, who: "forge".into(), at: Utc::now(), why: "PR closed without merging".into() },
+    };
+    fixture.engine.promise(&convoy, "work", "coder", &closed, Actor::Observer).await.expect("rejected");
+    fixture.engine.verdict(&convoy, "template/coder/pr", false, "alice", "closed unmerged; retraction accepted").await.expect("retracted");
+    let stored = fixture.backend.clone().using::<Convoy>(NAMESPACE).get("c").await.expect("convoy");
+
+    let recorded = fixture.engine.recorded_promises(&stored, None).expect("read").expect("held");
+    let promise = recorded["work"]["coder"].iter().find(|promise| promise.id == "template/pr").expect("promise");
+    assert_eq!(promise.state, PromiseState::Retracted);
+    assert_eq!(promise.retraction_reason.as_deref(), Some("closed unmerged; retraction accepted"));
+    let [submission] = promise.submissions.as_slice() else { panic!("one submission: {:?}", promise.submissions) };
+    let at = submission.submitted_at.expect("the Submit entry's time");
+    assert!(before <= at && at <= after, "{before} <= {at} <= {after}");
+    let verdict = submission.verdict.as_ref().expect("the rejection");
+    assert!(!verdict.accepted && verdict.why == "rejected" && verdict.at >= at, "{verdict:?}");
+
+    let listed = fixture.engine.promises(&stored, None).expect("read").expect("held");
+    let promise = listed["work"]["coder"].iter().find(|promise| promise.id == "template/pr").expect("promise");
+    assert_eq!(promise.retraction_reason, None, "the record holds no reason");
+    assert_eq!((promise.submissions[0].submitted_at, &promise.submissions[0].verdict), (None, &None), "nor a time or a rejection");
 }
 
 // Behaviour: the engine's refusals reach the caller and write nothing: a crew may not retract a
@@ -375,13 +412,18 @@ async fn a_taken_label_is_refused_at_declaration() {
         id: id.into(),
         kind: PromiseKind::DecisionLedger,
         source: OldSource::Crew,
-        submission: Submission { reference: format!("{by}-ledger"), metadata: BTreeMap::new(), submitted_at: Utc::now(), verdict: None },
+        submission: Submission {
+            reference: format!("{by}-ledger"),
+            metadata: BTreeMap::new(),
+            submitted_at: Some(Utc::now()),
+            verdict: None,
+        },
     };
     fixture.engine.promise(&convoy, "work", "coder", &ledger("script-ledger", "coder"), Actor::Crew).await.expect("coder's ledger");
     let kept = PromiseOperation::Verdict {
         id: "script-ledger".into(),
         reference: String::new(),
-        submitted_at: Utc::now(),
+        submitted_at: Some(Utc::now()),
         verdict: SubmissionVerdict { accepted: true, who: "artifact".into(), at: Utc::now(), why: "exists".into() },
     };
     fixture.engine.promise(&convoy, "work", "coder", &kept, Actor::Observer).await.expect("kept");

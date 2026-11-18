@@ -9,6 +9,7 @@ use std::{
 use chrono::{DateTime, Utc};
 use flotilla_protocol::{Leaf, LeafAddress, LeafOperator, LifecycleReading};
 use flotilla_resources::checkout_integration::remote_ref_for_branch;
+use flotilla_resources::convoy::engine::OldPromises;
 use flotilla_resources::{
     actor_obligation,
     address::{leaf_address, leaf_for, record_name, subject_address},
@@ -579,6 +580,18 @@ impl ReconcilerWake {
         schedule.changed(Some(&judged));
     }
 
+    /// This home's `convoy` with its promises as its log records them: a keyed read of one
+    /// convoy, made only for a seat that has submitted every open promise.
+    async fn recorded_promises(&self, convoy: &ResourceObject<Convoy>) -> Result<OldPromises, String> {
+        let engine = self.subscriptions.inner.convoy_engine.get().cloned().ok_or(flotilla_resources::convoy::engine::NO_ENGINE)?;
+        let convoy = convoy.clone();
+        let name = convoy.metadata.name.clone();
+        tokio::task::spawn_blocking(carry(move || engine.recorded_promises(&convoy, None)))
+            .await
+            .map_err(|error| format!("recorded promises: {error}"))??
+            .ok_or_else(|| format!("the engine does not hold convoy `{name}`"))
+    }
+
     pub(super) async fn sync_rows(&self, namespace: &str, convoys: &HashMap<String, impl ConvoyRead>) -> Result<(), String> {
         self.sync_rows_selected(namespace, convoys, None).await
     }
@@ -788,6 +801,9 @@ impl ReconcilerWake {
                 // roles never owe settlement claims, even after assignment.
                 // A missing workflow snapshot likewise declares no exit.
                 if status.workflow_snapshot.as_ref().and_then(|snapshot| snapshot.exit.as_ref()).is_some() {
+                    // The convoy's promises with their logged submission times, read once and
+                    // only for a seat that has submitted every open promise.
+                    let mut recorded: Option<Result<OldPromises, String>> = None;
                     for (vessel, crew) in &status.crew_work {
                         for (role, work) in crew {
                             let owes_promise = !flotilla_resources::promises::pending(status, vessel, role).is_empty();
@@ -825,9 +841,26 @@ impl ReconcilerWake {
                             if declared_stall(status, vessel, role).is_none()
                                 && !open.is_empty()
                                 && open.iter().all(|promise| promise.state == flotilla_resources::promises::PromiseState::Submitted)
-                                && !turn_delivered_since_submission(status, vessel, role, &open)
                             {
-                                continue;
+                                if recorded.is_none() {
+                                    recorded = Some(self.recorded_promises(convoy).await);
+                                }
+                                let latest = match recorded.as_ref().expect("read above") {
+                                    Ok(promises) => latest_submission(promises, vessel, role, &open),
+                                    Err(error) => Err(error.clone()),
+                                };
+                                match latest {
+                                    Ok(latest) if !turn_delivered_since(status, vessel, role, latest) => continue,
+                                    Ok(_) => {}
+                                    // Unread, the seat stays armed for this pass.
+                                    Err(error) => tracing::debug!(
+                                        convoy = %convoy.metadata.name,
+                                        vessel = %vessel,
+                                        role = %role,
+                                        %error,
+                                        "a submitted seat's submission times are unread; it stays armed this pass"
+                                    ),
+                                }
                             }
                             if status.stalls.iter().any(|stalled| {
                                 stalled.supervisor.is_some()
@@ -1222,19 +1255,32 @@ impl ReconcilerWake {
     }
 }
 
-/// Whether a turn rule targeting seat `vessel`/`role` admitted a new turn to it after the latest
-/// submission of its `submitted` promises. Stall nudges and hand-offs record no turn delivery, so
-/// they never count.
-fn turn_delivered_since_submission(
-    status: &flotilla_resources::ConvoyStatus,
+/// The latest submission time of seat `vessel`/`role`'s `submitted` promises, as `recorded` (the
+/// convoy's promises read with their log) holds them. `Err` when a promise or its latest
+/// submission's time is not there: the record alone does not carry it (run 3 F7).
+fn latest_submission(
+    recorded: &OldPromises,
     vessel: &str,
     role: &str,
     submitted: &[&flotilla_resources::promises::Promise],
-) -> bool {
-    let Some(latest) = submitted.iter().filter_map(|promise| promise.submissions.last()).map(|submission| submission.submitted_at).max()
-    else {
-        return false;
-    };
+) -> Result<DateTime<Utc>, String> {
+    let seat = recorded.get(vessel).and_then(|roles| roles.get(role)).map(Vec::as_slice).unwrap_or_default();
+    let mut latest = None;
+    for promise in submitted {
+        let at = seat
+            .iter()
+            .find(|logged| logged.id == promise.id)
+            .and_then(|logged| logged.submissions.last())
+            .and_then(|submission| submission.submitted_at)
+            .ok_or_else(|| format!("promise `{}` has no logged submission time", promise.id))?;
+        latest = latest.max(Some(at));
+    }
+    latest.ok_or_else(|| "no submitted promise".to_string())
+}
+
+/// Whether a turn rule targeting seat `vessel`/`role` admitted a new turn to it after `latest`,
+/// its latest submission. Stall nudges and hand-offs record no turn delivery, so they never count.
+fn turn_delivered_since(status: &flotilla_resources::ConvoyStatus, vessel: &str, role: &str, latest: DateTime<Utc>) -> bool {
     let Some(snapshot) = &status.workflow_snapshot else { return false };
     snapshot
         .turn_delivery

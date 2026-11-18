@@ -143,6 +143,14 @@ pub trait EngineConvoys: Send + Sync {
     /// never fail; another home's is its replica in the decided store.
     fn promises(&self, convoy: &ResourceObject<Convoy>, home: Option<&str>) -> Result<Option<OldPromises>, String>;
 
+    /// [`Self::promises`], with what the convoy's log records beyond its record: each
+    /// submission's time, the verdict that settled it and a retraction's reason (run 3 F7). It
+    /// reads the convoy's log entries, so it serves keyed reads of one convoy (explain), never
+    /// listings. An engine that keeps no log gives the record's promises.
+    fn recorded_promises(&self, convoy: &ResourceObject<Convoy>, home: Option<&str>) -> Result<Option<OldPromises>, String> {
+        self.promises(convoy, home)
+    }
+
     /// The names of this home's convoys as their engine records change. No
     /// old record is written for an engine edge, so the convoy reconciler
     /// follows these to run again (#3587 layer 8).
@@ -204,11 +212,22 @@ pub fn deciding<'a>(path: &'a EngineConvoyPath, convoy: &ResourceObject<Convoy>)
 /// the path is installed, is an error, never the stored record: an engine-held
 /// convoy's stored promises were handed over, and would read as none.
 pub fn viewed_read(path: &EngineConvoyPath, read: &ReadResourceObject<Convoy>) -> Result<ResourceObject<Convoy>, String> {
+    viewed(path, read, false)
+}
+
+/// [`viewed_read`] for a keyed read of one convoy: its promises carry what the log records of
+/// them ([`EngineConvoys::recorded_promises`]).
+pub fn recorded_read(path: &EngineConvoyPath, read: &ReadResourceObject<Convoy>) -> Result<ResourceObject<Convoy>, String> {
+    viewed(path, read, true)
+}
+
+fn viewed(path: &EngineConvoyPath, read: &ReadResourceObject<Convoy>, recorded: bool) -> Result<ResourceObject<Convoy>, String> {
     let home = match &read.provenance {
         ResourceProvenance::Replica { origin_root, .. } => Some(origin_root.as_str()),
         _ => None,
     };
-    let held = path.get().ok_or(NO_ENGINE)?.promises(&read.object, home)?;
+    let engine = path.get().ok_or(NO_ENGINE)?;
+    let held = if recorded { engine.recorded_promises(&read.object, home)? } else { engine.promises(&read.object, home)? };
     Ok(match held {
         Some(promises) => with_promises(&read.object, promises),
         None => read.object.clone(),

@@ -1020,7 +1020,7 @@ impl CrewService {
                     metadata.insert("subject".into(), submission_subject_text(&subject_address(subject, &forges)?)?);
                     produced = Some(subject.clone());
                 }
-                let submission = Submission { reference, metadata, submitted_at: self.clock.now(), verdict: None };
+                let submission = Submission { reference, metadata, submitted_at: Some(self.clock.now()), verdict: None };
                 let reference = &submission.reference;
                 // Earlier submissions may spell the same subject differently.
                 let id = match promise {

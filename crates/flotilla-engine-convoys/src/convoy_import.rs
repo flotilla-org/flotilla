@@ -368,7 +368,7 @@ pub fn import_convoy(
         if progress == Progress::Submitted && submissions.is_empty() {
             return Err(refuse(format!("promise `{}` is Submitted with no submission", old.id)));
         }
-        let mut at = old.submissions.last().map(|submission| timestamp(&submission.submitted_at)).unwrap_or(since);
+        let mut at = old.submissions.last().and_then(|submission| submission.submitted_at.as_ref()).map(timestamp).unwrap_or(since);
         // An operator's forced completion of the work is a verdict keeping its open promises
         // (owner ruling, #3108): completion is promises only.
         let forced = status.work.get(vessel.as_str()).filter(|work| work.completion_authority == WorkCompletionAuthority::HumanOverride);

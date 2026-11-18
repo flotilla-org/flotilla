@@ -283,7 +283,13 @@ fn convoy_explanation_renders_linked_and_missing_decision_ledgers() {
                 superseded: false,
             },
         ],
-        settlement: ExplainedSettlement { mode: "world_terminal".into(), satisfied: false, unmet: Vec::new(), discharged: Vec::new() },
+        settlement: ExplainedSettlement {
+            mode: "world_terminal".into(),
+            satisfied: false,
+            disposition: None,
+            unmet: Vec::new(),
+            discharged: Vec::new(),
+        },
         account_bindings: Vec::new(),
         access_deliveries: Vec::new(),
         held_by: None,
@@ -546,6 +552,7 @@ fn convoy_explanation_shows_reserved_platform_fallback_without_escalation() {
         settlement: ExplainedSettlement {
             mode: "world_terminal".into(),
             satisfied: true,
+            disposition: Some("closed-unmerged".into()),
             unmet: Vec::new(),
             discharged: vec![ExplainedDischarge {
                 expectation: ExplainedUnmetExpectation {
@@ -578,6 +585,8 @@ fn convoy_explanation_shows_reserved_platform_fallback_without_escalation() {
     assert!(output.contains("Discharged unread (no vessel left to read them):"), "{output}");
     assert!(output.contains("  - missing_status: checkout/checkout-dead — no inspection of the checkout has been read"), "{output}");
     assert!(output.contains("      triage-label-work#1 Released (released) at 2026-11-12T00:00:00+00:00"), "{output}");
+    // A delivered convoy's settlement names the exit it was delivered by (run 3 F7).
+    assert!(output.contains("Settlement: SATISFIED (world_terminal, closed-unmerged)\n"), "{output}");
     // Glue: both human surfaces print the admission diagnostic verbatim.
     assert!(output.contains(&format!("Warning: {}", explanation.warnings[0])));
     let started = super::format_command_result(&flotilla_protocol::CommandValue::ConvoyStarted {

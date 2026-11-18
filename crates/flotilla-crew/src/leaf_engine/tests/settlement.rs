@@ -292,7 +292,7 @@ fn retracted_unlinked_submission_does_not_recreate_observation(tc: hegel::TestCa
                 submission: Submission {
                     reference: "cr/github.com/flotilla-org/rigging/70".into(),
                     metadata: BTreeMap::new(),
-                    submitted_at: Utc::now(),
+                    submitted_at: Some(Utc::now()),
                     verdict: None,
                 },
             }),

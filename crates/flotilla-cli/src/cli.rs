@@ -1097,7 +1097,14 @@ pub(crate) fn format_convoy_explanation_human(explanation: &flotilla_protocol::C
     if standing {
         output.push_str("Settlement: STANDING (no exit table)\n");
     } else {
-        let _ = writeln!(output, "Settlement: {verdict} ({})", explanation.settlement.mode);
+        match &explanation.settlement.disposition {
+            Some(disposition) => {
+                let _ = writeln!(output, "Settlement: {verdict} ({}, {disposition})", explanation.settlement.mode);
+            }
+            None => {
+                let _ = writeln!(output, "Settlement: {verdict} ({})", explanation.settlement.mode);
+            }
+        }
     }
     let _ = writeln!(
         output,

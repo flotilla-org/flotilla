@@ -650,7 +650,12 @@ fn rejected_promise_arms_owner_turn(tc: hegel::TestCase) {
             id: "implementation".into(),
             kind: PromiseKind::Pr,
             source: PromiseSource::Crew,
-            submission: Submission { reference: address.to_string(), metadata: BTreeMap::new(), submitted_at: started_at, verdict: None },
+            submission: Submission {
+                reference: address.to_string(),
+                metadata: BTreeMap::new(),
+                submitted_at: Some(started_at),
+                verdict: None,
+            },
         };
         let convoy = convoys.get(launch).await.unwrap();
         home.engine().promise(&convoy, "work", "coder", &submit, Actor::Crew).await.expect("the coder submits its PR");

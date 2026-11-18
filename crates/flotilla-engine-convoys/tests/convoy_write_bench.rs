@@ -135,7 +135,7 @@ async fn convoy_write_path_at_the_ceiling() {
         submission: Submission {
             reference: format!("cr/github.com/org/repo/{number}"),
             metadata: BTreeMap::new(),
-            submitted_at: Utc::now(),
+            submitted_at: Some(Utc::now()),
             verdict: None,
         },
     };
@@ -148,7 +148,7 @@ async fn convoy_write_path_at_the_ceiling() {
     let merged = PromiseOperation::Verdict {
         id: "template/pr".into(),
         reference: String::new(),
-        submitted_at: Utc::now(),
+        submitted_at: Some(Utc::now()),
         verdict: SubmissionVerdict { accepted: true, who: "forge".into(), at: Utc::now(), why: "PR merged".into() },
     };
     let started = Instant::now();

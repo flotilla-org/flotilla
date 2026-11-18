@@ -23,7 +23,7 @@ use flotilla_resources::{
     promises::{PromiseKind as OldKind, PromiseOperation, PromiseSource as OldSource},
     Convoy as OldConvoy, Forge, ForgeSpec, ResourceObject, SubjectDiscoverySource,
 };
-use flotilla_schema::{reads::carry, Timestamp};
+use flotilla_schema::{reads::carry, Kind, Timestamp};
 use flotilla_state_machines::{
     machines::convoy::{
         AbandonCause, AddSeat, Authority, Convoy, ConvoyEdge, ConvoyLabel, ConvoyState, Declare, Deliver, FailSeat, Keep, Link, LinkSource,
@@ -57,6 +57,22 @@ const CHANGES: usize = 1024;
 impl ConvoyEngine {
     pub fn new(convoys: Arc<Convoys>, backend: ResourceBackend, clock: Arc<dyn flotilla_resources::Clock>) -> Self {
         Self { convoys, backend, clock, changes: tokio::sync::broadcast::channel(CHANGES).0 }
+    }
+
+    /// The engine record of `convoy` at `home` (`None` for this one): one keyed read.
+    fn engine_record(&self, convoy: &ResourceObject<OldConvoy>, home: Option<&str>) -> Result<Option<Resource<Convoy>>, String> {
+        // This home named as the convoy's home is deliberately the local read: the in-memory
+        // engine is current, and its own records are never replicas here.
+        Ok(match home.filter(|home| *home != self.convoys.home()) {
+            None => match self.convoys.launch(&convoy.metadata.name) {
+                Some(launch) => Some(launch),
+                None => self.convoys.get(&map::engine_name(convoy)?),
+            },
+            Some(home) => self
+                .convoys
+                .replica(&map::engine_name(convoy)?, &map::project(convoy)?, home)
+                .map_err(|error| format!("convoy `{}` at {home}: the engine replica did not read: {error}", convoy.metadata.name))?,
+        })
     }
 
     fn changed(&self, name: &str) {
@@ -538,18 +554,23 @@ impl EngineConvoys for ConvoyEngine {
     }
 
     fn promises(&self, convoy: &ResourceObject<OldConvoy>, home: Option<&str>) -> Result<Option<OldPromises>, String> {
-        // This home named as the convoy's home is deliberately the local read: the in-memory
-        // engine is current, and its own records are never replicas here.
-        let engine = match home.filter(|home| *home != self.convoys.home()) {
-            None => match self.convoys.launch(&convoy.metadata.name) {
-                Some(launch) => Some(launch),
-                None => self.convoys.get(&map::engine_name(convoy)?),
-            },
-            Some(home) => self
-                .convoys
-                .replica(&map::engine_name(convoy)?, &map::project(convoy)?, home)
-                .map_err(|error| format!("convoy `{}` at {home}: the engine replica did not read: {error}", convoy.metadata.name))?,
-        };
-        Ok(engine.map(|engine| map::old_promises(&engine, &crews(convoy))))
+        Ok(self.engine_record(convoy, home)?.map(|engine| map::old_promises(&engine, &crews(convoy), None)))
+    }
+
+    fn recorded_promises(&self, convoy: &ResourceObject<OldConvoy>, home: Option<&str>) -> Result<Option<OldPromises>, String> {
+        let Some(engine) = self.engine_record(convoy, home)? else { return Ok(None) };
+        let at = home.unwrap_or(self.convoys.home()).to_owned();
+        let history = self
+            .convoys
+            .service()
+            .with_store(|store| {
+                let mut read = store.read()?;
+                match read.resolve(<Resource<Convoy> as Kind>::CODE, engine.name(), &at)? {
+                    Some(id) => crate::convoy_records::promise_history(&mut read, id, &at, &engine).map(Some),
+                    None => Ok(None),
+                }
+            })
+            .map_err(|error| format!("convoy `{}` at {at}: its promises' log entries did not read: {error}", convoy.metadata.name))?;
+        Ok(Some(map::old_promises(&engine, &crews(convoy), history.as_ref())))
     }
 }

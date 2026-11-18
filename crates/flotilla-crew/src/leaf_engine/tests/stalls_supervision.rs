@@ -89,12 +89,13 @@ async fn coder_promise(case: &Case, number: u64, state: PromiseState) {
             engine.promise(&case.convoy().await, "work", "coder", &retract, Actor::Crew).await.expect("the coder retracts");
         }
         PromiseState::Submitted | PromiseState::Kept => {
-            let submission = Submission { reference: reference.clone(), metadata: BTreeMap::new(), submitted_at, verdict: None };
+            let submission =
+                Submission { reference: reference.clone(), metadata: BTreeMap::new(), submitted_at: Some(submitted_at), verdict: None };
             let submit = PromiseOperation::Submit { id: id.into(), kind: PromiseKind::Pr, source: PromiseSource::Crew, submission };
             engine.promise(&case.convoy().await, "work", "coder", &submit, Actor::Crew).await.expect("the coder submits");
             if state == PromiseState::Kept {
                 let verdict = SubmissionVerdict { accepted: true, who: "forge".into(), at: submitted_at, why: "PR merged".into() };
-                let verdict = PromiseOperation::Verdict { id: id.into(), reference, submitted_at, verdict };
+                let verdict = PromiseOperation::Verdict { id: id.into(), reference, submitted_at: Some(submitted_at), verdict };
                 engine.promise(&case.convoy().await, "work", "coder", &verdict, Actor::Observer).await.expect("the forge accepts");
             }
         }

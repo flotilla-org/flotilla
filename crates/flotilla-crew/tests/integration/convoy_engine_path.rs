@@ -249,7 +249,7 @@ async fn pr_pass_reads(others: usize) -> (ReadSnapshot, Vec<(bool, String, Strin
         submission: Submission {
             reference: "cr/github.com/org/repo/1".into(),
             metadata: BTreeMap::new(),
-            submitted_at: chrono::Utc::now(),
+            submitted_at: Some(chrono::Utc::now()),
             verdict: None,
         },
     };
@@ -875,7 +875,7 @@ fn submit_pr(convoy: &mut ResourceObject<Convoy>, number: u64) {
         submission: Submission {
             reference: format!("cr/github.com/org/repo/{number}"),
             metadata: BTreeMap::new(),
-            submitted_at: chrono::Utc::now(),
+            submitted_at: Some(chrono::Utc::now()),
             verdict: None,
         },
     };

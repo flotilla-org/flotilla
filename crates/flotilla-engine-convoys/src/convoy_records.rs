@@ -21,6 +21,7 @@ use flotilla_resources::{
         ConvoyChange, ConvoyEnd, ConvoyListing, ConvoyMemory, ConvoyRecord, ConvoyRecords, LaunchHolds, SeatRecord, UnreadableLaunch,
     },
     lifecycle_reads::{ChangeCursor, CursorSince},
+    promises::SubmissionVerdict,
     ConvoyStatus, DiscoveredSubject, SubjectDiscovery, SubjectDiscoverySource,
 };
 use flotilla_schema::{Code, CodeEnum, Event, Kind, KindCode, Timestamp};
@@ -29,7 +30,8 @@ use flotilla_state_machines::{
     machines::{
         awaiting_reply::{AwaitingReply, AwaitingReplySpec},
         convoy::{
-            AbandonCause, Convoy, ConvoyEdge, ConvoyEdgeKind, ConvoyLabel, ConvoySpec, ConvoyState, LinkSource, Progress, PromiseSource,
+            AbandonCause, Convoy, ConvoyEdge, ConvoyEdgeKind, ConvoyLabel, ConvoySpec, ConvoyState, Keep, LinkSource, Progress, PromiseId,
+            PromiseSource,
         },
     },
     Resource,
@@ -340,6 +342,70 @@ fn written_at(
     Ok(read.change(home, event.change)?.map(|change| change.at))
 }
 
+/// What the log at `home` records of launch `convoy`'s (resource `id`) promises beyond its
+/// record: each submission's write time, the Reject or Keep that settled a submission, and each
+/// Retract's reason. Entries this store does not hold (a replica restored from a later snapshot)
+/// leave their values absent.
+pub(crate) fn promise_history(
+    read: &mut Read<'_>,
+    id: ResourceId,
+    home: &str,
+    convoy: &Resource<Convoy>,
+) -> Result<map::PromiseHistory, StoreError> {
+    let mut history = map::PromiseHistory::default();
+    // Each promise's submission rows, by the home sequence that wrote them.
+    let mut written: BTreeMap<PromiseId, Vec<u64>> = BTreeMap::new();
+    for row in convoy.spec().promises.iter() {
+        let promise = &row.record;
+        let mut times = Vec::new();
+        for submission in promise.submissions.iter() {
+            written.entry(promise.id).or_default().push(submission.version);
+            times.push(written_at(read, id, home, submission.version)?.map(time));
+        }
+        history.submitted.insert(promise.id, times);
+    }
+    // The submission a verdict at `seq` settled: the promise's newest written before it.
+    let settled =
+        |promise: PromiseId, seq: u64| written.get(&promise).and_then(|versions| versions.iter().rposition(|version| *version < seq));
+    // The launch's own log, paged by the version each entry left.
+    let mut entries = Vec::new();
+    loop {
+        let page = read.changes(id, entries.last().map_or(0, |entry: &Event| entry.home_seq), 64)?;
+        if page.is_empty() {
+            break;
+        }
+        entries.extend(page);
+    }
+    for entry in entries {
+        let Some(edge) = entry.arguments::<ConvoyEdge>().transpose()? else { continue };
+        let Some(change) = read.change(home, entry.change)? else { continue };
+        let verdict = |accepted: bool, who: String, why: String| SubmissionVerdict { accepted, who, at: time(change.at), why };
+        match edge {
+            ConvoyEdge::Reject(reject) => {
+                if let Some(position) = settled(reject.promise, entry.home_seq) {
+                    // The Reject edge records no reason.
+                    history.verdicts.insert((reject.promise, position), verdict(false, change.writer.clone(), "rejected".into()));
+                }
+            }
+            ConvoyEdge::Keep(Keep::Observed { promise, submission }) => {
+                if let Some(position) = usize::try_from(submission).ok().and_then(|number| number.checked_sub(1)) {
+                    history.verdicts.insert((promise, position), verdict(true, change.writer.clone(), "observed".into()));
+                }
+            }
+            ConvoyEdge::Keep(Keep::Verdict { promise, by, reason, .. }) => {
+                if let Some(position) = settled(promise, entry.home_seq) {
+                    history.verdicts.insert((promise, position), verdict(true, by.role, reason));
+                }
+            }
+            ConvoyEdge::Retract(retract) => {
+                history.retractions.insert(retract.promise, retract.reason);
+            }
+            _ => {}
+        }
+    }
+    Ok(history)
+}
+
 /// How an abandoned launch ended, by its cause.
 fn end_of(cause: AbandonCause, reason: String) -> ConvoyEnd {
     match cause {
@@ -513,7 +579,7 @@ fn entry(
         ended,
         retired: is_retired,
         seats,
-        promises: map::old_promises(&convoy, &crews),
+        promises: map::old_promises(&convoy, &crews, None),
         subjects,
         unlinked,
         admission,

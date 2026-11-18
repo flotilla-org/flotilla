@@ -1,5 +1,5 @@
 use flotilla_store_memory::engine_home_backend;
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 use std::sync::Arc;
 
 use chrono::Utc;
@@ -325,16 +325,85 @@ async fn an_idle_seat_whose_open_promises_are_all_submitted_is_not_nudged() {
 async fn an_idle_seat_given_a_turn_after_its_submission_is_nudged() {
     use flotilla_resources::{
         promises::{owned, PromiseState},
-        Clock, StallRung, TurnDeliveryEpisode, TurnDeliveryOutcome,
+        StallRung,
     };
 
     let coder = coder().await;
     let pr = submit_pr(&coder).await;
+    deliver_review_fix(&coder).await;
     let Coder { daemon, backend, probe, clock, launch, .. } = coder;
     let convoys = backend.clone().using::<ResourceConvoy>("flotilla");
+    let status = convoys.get(&probe.convoy).await.expect("convoy").status.expect("status");
+    assert_eq!(
+        owned(&status, "work", "coder").iter().find(|promise| promise.id == pr.id).expect("the PR promise").state,
+        PromiseState::Submitted
+    );
 
-    // The review rule fires while the PR waits on the forge, as turn delivery does it: the turn is
-    // delivered through the crew's actuator, then its episode is noted on the convoy.
+    clock.advance(chrono::Duration::seconds(1));
+    idle_coder(&daemon, &probe, &clock, &launch);
+    daemon.reconcile_crew_stalls_once("flotilla").await.expect("stall judgement");
+    let status = convoys.get(&probe.convoy).await.expect("convoy").status.expect("status");
+    let stalled = status.stalls.about(Some(("work", "coder"))).expect("the seat is stalled");
+    assert_eq!(stalled.rung, StallRung::Nudge);
+    assert!(crew_messages(&daemon, "flotilla")
+        .await
+        .iter()
+        .any(|message| message.spec.body.contains("You owe deliverables for work/coder")));
+}
+
+// F4 with F7 (run 3): the turn that keeps a submitted seat armed is one after its latest
+// submission, by the time the convoy's log records. A coder handed a review fix that pushes it
+// and submits its PR again has handed over all it owes, and is not nudged when it goes idle. The
+// promise was Submitted throughout, so its record's state time is the first submission's.
+#[tokio::test]
+async fn a_seat_that_resubmits_after_a_review_fix_is_not_nudged() {
+    let coder = coder().await;
+    let pr = submit_pr(&coder).await;
+    deliver_review_fix(&coder).await;
+    coder.clock.advance(chrono::Duration::seconds(1));
+    coder
+        .daemon
+        .crew
+        .promise(
+            &coder.context,
+            flotilla_protocol::commands::CrewPromiseOperation::Submit {
+                promise: Some(pr.id.clone()),
+                kind: "pr".into(),
+                reference: "https://github.com/flotilla-org/flotilla/pull/2200".into(),
+                metadata: BTreeMap::from([("commit".to_string(), "head-2".to_string())]),
+            },
+        )
+        .await
+        .expect("submit the fixed PR again");
+    let Coder { daemon, backend, probe, clock, launch, .. } = coder;
+    let convoys = backend.clone().using::<ResourceConvoy>("flotilla");
+    let convoy = convoys.get(&probe.convoy).await.expect("convoy");
+    let recorded = daemon.convoy_engine_path().get().expect("engine").recorded_promises(&convoy, None).expect("recorded read");
+    let resubmitted = recorded.expect("held")["work"]["coder"].iter().find(|promise| promise.id == pr.id).expect("the PR promise").clone();
+    assert_eq!(resubmitted.submissions.len(), 2, "the fix is a second submission");
+    assert!(resubmitted.submissions.iter().all(|submission| submission.submitted_at.is_some()), "{resubmitted:?}");
+    let nudges = crew_messages(&daemon, "flotilla").await.len();
+
+    clock.advance(chrono::Duration::seconds(1));
+    idle_coder(&daemon, &probe, &clock, &launch);
+    daemon.reconcile_crew_stalls_once("flotilla").await.expect("stall judgement");
+    let status = convoys.get(&probe.convoy).await.expect("convoy").status.expect("status");
+    assert!(
+        !status.stalls.iter().any(|stalled| matches!(stalled.maker, Some(flotilla_resources::LeafMaker::Actor { .. }))),
+        "{:?}",
+        status.stalls
+    );
+    assert_eq!(crew_messages(&daemon, "flotilla").await.len(), nudges, "no nudge after the resubmission");
+}
+
+/// The review rule fires while the coder's PR waits on the forge, as turn delivery does it: the
+/// turn is delivered through the crew's actuator, its episode noted on the convoy, and the coder
+/// receives it.
+async fn deliver_review_fix(coder: &Coder) {
+    use flotilla_resources::{Clock, TurnDeliveryEpisode, TurnDeliveryOutcome};
+
+    let Coder { daemon, backend, probe, clock, .. } = coder;
+    let convoys = backend.clone().using::<ResourceConvoy>("flotilla");
     clock.advance(chrono::Duration::seconds(1));
     let review = flotilla_crew::leaf_engine::CrewTurnIntent::builder()
         .namespace("flotilla".into())
@@ -372,24 +441,8 @@ async fn an_idle_seat_given_a_turn_after_its_submission_is_nudged() {
     )
     .await
     .expect("note the delivery");
-    let turn = crew_messages(&daemon, "flotilla").await.remove(0);
-    receive_turn(&daemon, &turn.spec.receiver, &turn.metadata.name, "resume-staging-session", clock.now()).await;
-    let status = convoys.get(&probe.convoy).await.expect("convoy").status.expect("status");
-    assert_eq!(
-        owned(&status, "work", "coder").iter().find(|promise| promise.id == pr.id).expect("the PR promise").state,
-        PromiseState::Submitted
-    );
-
-    clock.advance(chrono::Duration::seconds(1));
-    idle_coder(&daemon, &probe, &clock, &launch);
-    daemon.reconcile_crew_stalls_once("flotilla").await.expect("stall judgement");
-    let status = convoys.get(&probe.convoy).await.expect("convoy").status.expect("status");
-    let stalled = status.stalls.about(Some(("work", "coder"))).expect("the seat is stalled");
-    assert_eq!(stalled.rung, StallRung::Nudge);
-    assert!(crew_messages(&daemon, "flotilla")
-        .await
-        .iter()
-        .any(|message| message.spec.body.contains("You owe deliverables for work/coder")));
+    let turn = crew_messages(daemon, "flotilla").await.remove(0);
+    receive_turn(daemon, &turn.spec.receiver, &turn.metadata.name, "resume-staging-session", clock.now()).await;
 }
 
 // F4 (run 3): a nudge is not a turn the seat owes after its submission. A coder nudged while its

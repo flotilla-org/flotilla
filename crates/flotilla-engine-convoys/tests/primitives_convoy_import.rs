@@ -102,7 +102,7 @@ fn submit(id: &str, kind: PromiseKind, reference: &str) -> PromiseOperation {
         id: id.into(),
         kind,
         source: PromiseSource::Crew,
-        submission: Submission { reference: reference.into(), metadata: BTreeMap::new(), submitted_at: Utc::now(), verdict: None },
+        submission: Submission { reference: reference.into(), metadata: BTreeMap::new(), submitted_at: Some(Utc::now()), verdict: None },
     }
 }
 

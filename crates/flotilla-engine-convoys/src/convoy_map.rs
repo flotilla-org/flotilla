@@ -448,8 +448,13 @@ pub fn submission(
     }
 }
 
-/// An engine submission in the old shape, at `at`.
-fn old_submission(address: &Address, revision: &str, at: DateTime<Utc>, verdict: Option<old::SubmissionVerdict>) -> old::Submission {
+/// An engine submission in the old shape, submitted at `at` where that is known.
+fn old_submission(
+    address: &Address,
+    revision: &str,
+    at: Option<DateTime<Utc>>,
+    verdict: Option<old::SubmissionVerdict>,
+) -> old::Submission {
     let mut metadata = BTreeMap::new();
     let reference = match address.kind() {
         AddressKind::ChangeRequest => {
@@ -473,12 +478,32 @@ fn time(timestamp: Timestamp) -> DateTime<Utc> {
     timestamp.to_datetime().unwrap_or(DateTime::<Utc>::UNIX_EPOCH)
 }
 
+/// What a convoy's log records of its promises that its record does not hold (run 3 F7): when
+/// each submission was written, the verdict that settled it, and a retraction's reason. A keyed
+/// read of one convoy reads it; a listing maps the record alone.
+#[derive(Clone, Debug, Default, PartialEq)]
+pub struct PromiseHistory {
+    /// Each promise's submissions' write times, by position; `None` where the entry is not held.
+    pub submitted: BTreeMap<PromiseId, Vec<Option<DateTime<Utc>>>>,
+    /// The verdict that settled a promise's submission at a position: a Reject (whose edge
+    /// carries no reason), an observed keep or a keeping verdict.
+    pub verdicts: BTreeMap<(PromiseId, usize), old::SubmissionVerdict>,
+    /// A retracted promise's retraction reason, as its Retract edge recorded it.
+    pub retractions: BTreeMap<PromiseId, String>,
+}
+
 /// The engine's promises in the old status's shape, for the one-way copy.
 /// Each promise sits under its owner seat's crew, with its old id; a kind
-/// the old status cannot spell (`results`) is left out. Submissions before
-/// the current one carry a rejection; a kept promise's current submission
-/// carries the acceptance.
-pub fn old_promises(convoy: &Resource<Convoy>, crews: &Crews) -> BTreeMap<String, BTreeMap<String, Vec<old::Promise>>> {
+/// the old status cannot spell (`results`) is left out.
+///
+/// The record alone gives a kept promise's current submission its acceptance, at the keep; a
+/// submission's time, any other verdict and a retraction's reason are only in the log, so they
+/// are absent unless `history` carries them.
+pub fn old_promises(
+    convoy: &Resource<Convoy>,
+    crews: &Crews,
+    history: Option<&PromiseHistory>,
+) -> BTreeMap<String, BTreeMap<String, Vec<old::Promise>>> {
     let ids = old_ids(convoy);
     let mut out: BTreeMap<String, BTreeMap<String, Vec<old::Promise>>> = BTreeMap::new();
     for row in convoy.spec().promises.iter() {
@@ -501,20 +526,15 @@ pub fn old_promises(convoy: &Resource<Convoy>, crews: &Crews) -> BTreeMap<String
             .iter()
             .enumerate()
             .map(|(index, submitted)| {
-                let current = index + 1 == count;
-                let verdict = match (current, promise.progress.value) {
-                    (true, Progress::Submitted | Progress::Retracted) => None,
-                    (true, Progress::Kept) => {
-                        Some(old::SubmissionVerdict { accepted: true, who: "engine".into(), at: since, why: "kept".into() })
-                    }
-                    _ => Some(old::SubmissionVerdict {
-                        accepted: false,
-                        who: "engine".into(),
-                        at: since,
-                        why: "rejected or replaced".into(),
-                    }),
+                let recorded = history.and_then(|history| history.verdicts.get(&(promise.id, index))).cloned();
+                let verdict = match (index + 1 == count, promise.progress.value) {
+                    (true, Progress::Kept) => recorded
+                        .or_else(|| Some(old::SubmissionVerdict { accepted: true, who: "engine".into(), at: since, why: "kept".into() })),
+                    _ => recorded,
                 };
-                old_submission(&submitted.record.address, &submitted.record.revision, since, verdict)
+                let at =
+                    history.and_then(|history| history.submitted.get(&promise.id)).and_then(|times| times.get(index)).copied().flatten();
+                old_submission(&submitted.record.address, &submitted.record.revision, at, verdict)
             })
             .collect();
         out.entry(vessel.clone()).or_default().entry(role.clone()).or_default().push(old::Promise {
@@ -524,7 +544,10 @@ pub fn old_promises(convoy: &Resource<Convoy>, crews: &Crews) -> BTreeMap<String
             source: old_source(promise.source),
             kind,
             state,
-            retraction_reason: (promise.progress.value == Progress::Retracted).then(|| "retracted on the engine".to_owned()),
+            retraction_reason: history
+                .filter(|_| promise.progress.value == Progress::Retracted)
+                .and_then(|history| history.retractions.get(&promise.id))
+                .cloned(),
             submissions,
         });
     }

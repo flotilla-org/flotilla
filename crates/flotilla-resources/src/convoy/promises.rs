@@ -88,7 +88,11 @@ pub struct Submission {
     /// ADR 0047: one-roll decoder shim for optional submission evidence.
     #[serde(default)]
     pub metadata: BTreeMap<String, String>,
-    pub submitted_at: DateTime<Utc>,
+    /// When it was submitted; absent where the reader holds only the engine's record, which does
+    /// not carry the time (its log entry does). Widened from required (run 3 F7): every stored
+    /// value still decodes.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub submitted_at: Option<DateTime<Utc>>,
     #[serde(default)]
     pub verdict: Option<SubmissionVerdict>,
 }
@@ -194,7 +198,7 @@ pub enum PromiseOperation {
     Declare { id: String, kind: PromiseKind, source: PromiseSource },
     Submit { id: String, kind: PromiseKind, source: PromiseSource, submission: Submission },
     Retract { id: String, reason: String },
-    Verdict { id: String, reference: String, submitted_at: DateTime<Utc>, verdict: SubmissionVerdict },
+    Verdict { id: String, reference: String, submitted_at: Option<DateTime<Utc>>, verdict: SubmissionVerdict },
 }
 
 pub fn owned<'a>(status: &'a ConvoyStatus, vessel: &str, role: &str) -> &'a [Promise] {
@@ -331,14 +335,12 @@ pub fn apply(status: &mut ConvoyStatus, vessel: &str, role: &str, operation: &Pr
         // Status patches apply without a Forge list: a forge-id or public
         // GitHub spelling resolves, and an existing subject in another
         // spelling of the same request is not discovered twice.
-        if let Ok(subject) = submission.subject_address(&[]).and_then(|address| crate::address::subject_for(&address)) {
+        // A submission applied here is always timed; one without a time is discovered by nothing.
+        if let (Ok(subject), Some(at)) =
+            (submission.subject_address(&[]).and_then(|address| crate::address::subject_for(&address)), submission.submitted_at)
+        {
             if !status.produces_any(|produced| crate::address::same_subject(produced, &subject, &[])) {
-                status.discover_subject(
-                    subject,
-                    flotilla_protocol::Relationship::Produces,
-                    super::SubjectDiscoverySource::Claim,
-                    submission.submitted_at,
-                );
+                status.discover_subject(subject, flotilla_protocol::Relationship::Produces, super::SubjectDiscoverySource::Claim, at);
             }
         }
     }
@@ -650,7 +652,7 @@ pub fn discovered_submission(
         id,
         kind: PromiseKind::Pr,
         source: PromiseSource::Crew,
-        submission: Submission { reference, metadata: BTreeMap::new(), submitted_at: now, verdict: None },
+        submission: Submission { reference, metadata: BTreeMap::new(), submitted_at: Some(now), verdict: None },
     })
 }
 
@@ -763,7 +765,7 @@ fn ledger_submission(
         submission: Submission {
             reference: name,
             metadata: BTreeMap::from([("digest".into(), artifact.spec.digest.clone())]),
-            submitted_at: now,
+            submitted_at: Some(now),
             verdict: None,
         },
     })
@@ -1086,7 +1088,7 @@ mod tests {
             submission: Submission {
                 reference: format!("cr/github.com/org/repo/{attempt}"),
                 metadata: BTreeMap::new(),
-                submitted_at: DateTime::from_timestamp(attempt, 0).unwrap(),
+                submitted_at: DateTime::from_timestamp(attempt, 0),
                 verdict: None,
             },
         }
@@ -1095,7 +1097,7 @@ mod tests {
         PromiseOperation::Verdict {
             id: id.into(),
             reference: format!("cr/github.com/org/repo/{attempt}"),
-            submitted_at: DateTime::from_timestamp(attempt, 0).unwrap(),
+            submitted_at: DateTime::from_timestamp(attempt, 0),
             verdict: SubmissionVerdict {
                 accepted,
                 who: "forge".into(),
@@ -1105,12 +1107,7 @@ mod tests {
         }
     }
     fn submission(reference: &str) -> Submission {
-        Submission {
-            reference: reference.into(),
-            metadata: BTreeMap::new(),
-            submitted_at: DateTime::from_timestamp(1, 0).unwrap(),
-            verdict: None,
-        }
+        Submission { reference: reference.into(), metadata: BTreeMap::new(), submitted_at: DateTime::from_timestamp(1, 0), verdict: None }
     }
 
     // ADR 0066 §3: a submission names its PR whatever text recorded it: the
@@ -1166,7 +1163,7 @@ mod tests {
             submission: Submission {
                 reference: reference.into(),
                 metadata: BTreeMap::from([(key.to_string(), "yes".to_string())]),
-                submitted_at: DateTime::from_timestamp(1, 0).unwrap(),
+                submitted_at: DateTime::from_timestamp(1, 0),
                 verdict: None,
             },
         };

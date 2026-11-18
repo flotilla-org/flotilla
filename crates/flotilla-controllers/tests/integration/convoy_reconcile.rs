@@ -1396,7 +1396,7 @@ async fn three_pr_promises_hold_completion_and_landing() {
                             submission: Submission {
                                 reference: address.to_string(),
                                 metadata: BTreeMap::new(),
-                                submitted_at: timestamp(30),
+                                submitted_at: Some(timestamp(30)),
                                 verdict: None,
                             },
                         },

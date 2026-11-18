@@ -67,7 +67,7 @@ fn old(n: usize) -> ResourceObject<Convoy> {
         submission: Submission {
             reference: format!("cr/github.com/org/repo/{number}"),
             metadata: BTreeMap::new(),
-            submitted_at: Utc::now(),
+            submitted_at: Some(Utc::now()),
             verdict: None,
         },
     };

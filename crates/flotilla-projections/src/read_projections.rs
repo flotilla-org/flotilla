@@ -1321,8 +1321,9 @@ impl ReadProjections<'_> {
             convoy_sources.items.extend(convoy_name.newest_launch(self.backend, namespace).await?);
         }
         let convoy_source = convoy_name.select(&convoy_sources.items)?.ok_or_else(|| format!("no convoy matches `{convoy_name}`"))?;
-        // With the engine holding the convoy, the promises explained are the engine's (#3587 layer 8).
-        let convoy = flotilla_resources::convoy::engine::viewed_read(self.convoy_engine, convoy_source)?;
+        // With the engine holding the convoy, the promises explained are the engine's (#3587 layer 8),
+        // with what its log records of them.
+        let convoy = flotilla_resources::convoy::engine::recorded_read(self.convoy_engine, convoy_source)?;
         // What holds the launch from retiring, read at its home where the engine holds it (#3108).
         let held_by = match convoy.status.as_ref().and_then(|status| status.engine_launch.as_ref()) {
             Some(launch) => {
@@ -1584,6 +1585,7 @@ impl ReadProjections<'_> {
             }
             .to_string(),
             satisfied: evaluation.satisfied,
+            disposition: convoy.status.as_ref().and_then(|status| status.disposition.clone()),
             unmet,
             discharged,
         };

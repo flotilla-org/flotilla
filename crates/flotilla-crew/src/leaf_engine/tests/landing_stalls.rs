@@ -392,12 +392,14 @@ fn merged_submission_entering_landing_owes_settlement_or_names_no_exit(tc: hegel
                 .expect("the promise the coder owes")
                 .clone();
             let submitted_at = merged_at - chrono::Duration::seconds(10);
-            let submission = Submission { reference: reference.into(), metadata: BTreeMap::new(), submitted_at, verdict: None };
+            let submission =
+                Submission { reference: reference.into(), metadata: BTreeMap::new(), submitted_at: Some(submitted_at), verdict: None };
             let submit = PromiseOperation::Submit { id: promise.id.clone(), kind, source: promise.source, submission };
             engine.promise(&convoy, "work", "coder", &submit, Actor::Crew).await.expect("the coder submits");
             let convoy = home.view(&backend, &launch).await;
             let verdict = SubmissionVerdict { accepted: true, who: "forge".into(), at: merged_at, why: "PR merged".into() };
-            let verdict = PromiseOperation::Verdict { id: promise.id, reference: reference.into(), submitted_at, verdict };
+            let verdict =
+                PromiseOperation::Verdict { id: promise.id, reference: reference.into(), submitted_at: Some(submitted_at), verdict };
             engine.promise(&convoy, "work", "coder", &verdict, Actor::Observer).await.expect("the forge accepts");
         }
         let status = status_of(&backend, &home, &launch).await;

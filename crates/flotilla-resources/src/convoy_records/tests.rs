@@ -250,7 +250,7 @@ fn submitted(reference: &str, kept_at: Option<DateTime<Utc>>) -> Submission {
     Submission {
         reference: reference.into(),
         metadata: BTreeMap::new(),
-        submitted_at: at(140),
+        submitted_at: Some(at(140)),
         verdict: kept_at.map(|at| SubmissionVerdict { accepted: true, who: "engine".into(), at, why: "kept".into() }),
     }
 }
