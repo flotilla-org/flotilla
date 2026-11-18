@@ -47,7 +47,8 @@ fn namespace_attentions(source: &Source, namespace: &str, target: &mut Import, c
     let ensures = source.context::<ConvoyEnsure>("convoyensures", Some(namespace));
     let vessels = source.context::<Vessel>("vessels", Some(namespace));
     let terminals = source.context::<TerminalSession>("terminalsessions", Some(namespace));
-    let records = old_store_records(source, namespace, terminals.iter().map(|terminal| terminal.object.clone()).collect());
+    let records =
+        old_store_records(source, namespace, terminals.iter().map(|terminal| terminal.object.clone()).collect(), &carried.convoy_launches);
     let launched = AtLaunches { records: &records, launches: &carried.convoy_launches, namespace };
     let conversion = Conversion { roles: &roles, forges: &records.forges, records: &launched };
     let named = DemandRecords {

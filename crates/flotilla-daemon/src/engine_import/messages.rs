@@ -11,7 +11,10 @@ use flotilla_core::primitives::{
 use flotilla_engine_messages::{roles::FleetRoles, OldStoreRecords};
 use flotilla_engine_store::{Import, ImportTarget};
 use flotilla_provisioning::engine::import::{ImportRefusal, ImportReport, RowOutcome};
-use flotilla_resources::{Artifact, Convoy, FleetDesignation, Forge, Message, Project, Repository, ResourceObject, TerminalSession};
+use flotilla_resources::{
+    convoy::engine::ImportedLaunches, Artifact, Convoy, FleetDesignation, Forge, Message, Project, Repository, ResourceObject,
+    TerminalSession,
+};
 use flotilla_state_machines::machines::message::MessageRef;
 
 use super::{Carried, Source};
@@ -56,7 +59,8 @@ fn namespace_messages(source: &Source, namespace: &str, target: &mut Import, car
             Some(((status.crew.as_ref()?.id.clone(), status.session_id.clone()?), (launch, terminal.home.clone())))
         })
         .collect();
-    let records = old_store_records(source, namespace, terminals.into_iter().map(|terminal| terminal.object).collect());
+    let records =
+        old_store_records(source, namespace, terminals.into_iter().map(|terminal| terminal.object).collect(), &carried.convoy_launches);
     let launched = AtLaunches { records: &records, launches: &carried.convoy_launches, namespace };
     let conversion = Conversion { roles: &roles, forges: &records.forges, records: &launched };
     let world = ReadRecords {
@@ -117,8 +121,19 @@ pub(super) fn fleet_roles(source: &Source, namespace: &str) -> Result<FleetRoles
     }
 }
 
-/// The records of `namespace` a message's addresses are read from.
-pub(super) fn old_store_records(source: &Source, namespace: &str, terminals: Vec<ResourceObject<TerminalSession>>) -> OldStoreRecords {
+/// The records of `namespace` a message's addresses are read from, with the convoys the old store
+/// lost spelled under the projects of the tombstones `launches` makes of them.
+pub(super) fn old_store_records(
+    source: &Source,
+    namespace: &str,
+    terminals: Vec<ResourceObject<TerminalSession>>,
+    launches: &ImportedLaunches,
+) -> OldStoreRecords {
+    let lost = launches
+        .tombstones()
+        .iter()
+        .filter(|((tombstoned, _), _)| tombstoned == namespace)
+        .map(|((_, record), tombstone)| (record.clone(), tombstone.launch.project.clone()));
     OldStoreRecords::from_records(
         namespace,
         source.context::<Forge>("forges", Some(namespace)).into_iter().map(|forge| forge.object.spec).collect(),
@@ -128,4 +143,5 @@ pub(super) fn old_store_records(source: &Source, namespace: &str, terminals: Vec
         source.context::<Repository>("repositories", Some(namespace)).into_iter().map(|repository| repository.object).collect(),
         source.context::<Project>("projects", Some(namespace)).into_iter().map(|project| project.object).collect(),
     )
+    .with_lost_convoys(lost)
 }

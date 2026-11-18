@@ -679,7 +679,7 @@ fn a_checkout_held_for_a_convoy_with_no_launch_is_refused() {
         held["metadata"]["labels"] = json!({"flotilla.work/convoy": convoy});
         held
     };
-    let unbooted = document("Convoy", "unbooted", json!({"workflow_ref": "w", "inputs": {}}), Value::Null);
+    let unbooted = document("Convoy", "unbooted", json!({"workflow_ref": "w", "project_ref": "flotilla", "inputs": {}}), Value::Null);
     // Held here for a convoy another home holds, which ended there: left on disk as one held for
     // an ended convoy here is.
     let mut held_there = held_for("held-for-landed-there", "landed-there");
@@ -1340,8 +1340,9 @@ fn open_demands_import_as_the_attentions_their_writers_send() {
         assert_eq!(message.since(), Timestamp::from_datetime(&"2026-10-20T00:00:00Z".parse().expect("time")), "{name}");
     }
     // One about a convoy the source no longer holds is about its tombstone, and the import
-    // settles it: nobody can act on a convoy gone before the import (#3108 ruling (a)).
-    let gone = load("fleet:lab/role:operator/message:reclaim-refusal-gone");
+    // settles it: nobody can act on a convoy gone before the import (#3108 ruling (a)). It goes to
+    // the operator of the tombstone's project, as one about a held convoy does.
+    let gone = load("project:flotilla/role:operator/message:reclaim-refusal-gone");
     assert_eq!(gone.spec().subject().map(|reference| reference.address.as_str()), Some("project:flotilla/convoy:gone%231"));
     assert!(matches!(gone.state(), MessageState::Dropped { reason: DropReason::Withdrawn { .. }, .. }), "{:?}", gone.state());
     assert_eq!(imported.tallies["Demand"].get("withdrawn: its convoy was gone before import"), Some(&1), "{imported:?}");

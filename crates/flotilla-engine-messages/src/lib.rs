@@ -35,7 +35,7 @@ use flotilla_address::{Address, Kind as AddressKind};
 use flotilla_engine_store::StoreLog;
 use flotilla_inbox::{sqlite::SqliteInbox, ConsumerLog, ConsumerPort, InboxBackend, Observations, ReceiptScope, Supervision};
 use flotilla_messaging::MessageResolution;
-use flotilla_resources::convoy::engine::convoy_reference_address;
+use flotilla_resources::convoy::engine::{convoy_reference_address, NoLaunch};
 use flotilla_resources::{
     address::{artifact_address, record_name as address_record_name, repository_address},
     Artifact, Convoy, ForgeSpec, Message as OldMessage, MessageReference as OldReference, Project, ReadResourceObject, Repository,
@@ -2278,6 +2278,9 @@ pub struct OldStoreRecords {
     artifacts: BTreeMap<String, ResourceObject<Artifact>>,
     repositories: BTreeMap<String, ResourceObject<Repository>>,
     projects: BTreeMap<String, ResourceObject<Project>>,
+    /// The project of each convoy the old store lost that the import makes a tombstone of
+    /// (#3108 import ruling (a)), by record name: what references to it are spelled under.
+    lost_convoys: BTreeMap<String, String>,
     /// What has been read, found or not: a lookup asks only for what is beyond it.
     read: Wanted,
     /// What lookups asked for since the last read.
@@ -2379,6 +2382,7 @@ impl OldStoreRecords {
             artifacts: by_name(artifacts),
             repositories: by_name(repositories),
             projects: by_name(projects),
+            lost_convoys: BTreeMap::new(),
             read: Wanted::default(),
             asked: Mutex::default(),
         }
@@ -2393,13 +2397,26 @@ impl OldStoreRecords {
         })
     }
 
-    /// The project a convoy belongs to; `None` when the convoy is not held.
-    pub fn convoy_project(&self, name: &str) -> Option<String> {
-        Some(self.convoy(name)?.spec.project_ref.clone())
+    /// These records, with the convoys the old store lost that the import makes tombstones of,
+    /// each under its tombstone's project (#3108 import ruling (a)).
+    pub fn with_lost_convoys(mut self, lost: impl IntoIterator<Item = (String, String)>) -> Self {
+        self.lost_convoys.extend(lost);
+        self
     }
 
+    /// The project a convoy belongs to, or its tombstone's when the old store lost it; `None`
+    /// when it is neither held nor a tombstone.
+    pub fn convoy_project(&self, name: &str) -> Option<String> {
+        match self.convoy(name) {
+            Some(convoy) => Some(convoy.spec.project_ref.clone()),
+            None => self.lost_convoys.get(name).cloned(),
+        }
+    }
+
+    /// [`Self::convoy_project`], or a refusal naming the convoy as one this host does not hold, in
+    /// the form the import reads to make a tombstone of it.
     fn held_convoy_project(&self, name: &str) -> Result<String, String> {
-        self.convoy_project(name).ok_or_else(|| format!("convoy `{name}` was not read"))
+        self.convoy_project(name).ok_or_else(|| format!("`convoy:{name}` {} (`{name}`)", NoLaunch::NotHeld.class()))
     }
 
     fn convoy_address(&self, name: &str) -> Result<Address, String> {
