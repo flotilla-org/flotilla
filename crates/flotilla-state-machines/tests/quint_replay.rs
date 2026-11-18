@@ -895,20 +895,48 @@ fn probe_convoys(home: &mut Home<Convoy>, state: &Value, now: Timestamp, step: &
             reason: "decision".into(),
         };
         if !convoy_open(&model) {
-            let probes: Vec<ConvoyEdge> = vec![
+            let mut probes: Vec<ConvoyEdge> = vec![
                 verdict(PromiseId(0)).into(),
                 retract(PromiseId(0)).into(),
                 delivered().into(),
                 abandon("decision").into(),
                 convoy::Readmit { quota: current, by: by(), authority: owner() }.into(),
             ];
+            for pair in pairs(&model["promises"]) {
+                let (promise, owner_seat) = (PromiseId(small(&pair[0])), seat(&pair[1]["owner"]));
+                let submit = convoy::Submit {
+                    promise,
+                    by: owner_seat.clone(),
+                    address: reference(),
+                    revision: "r".into(),
+                    durable: Ref::new(reference().as_str()),
+                };
+                probes.push(submit.into());
+                let reassign = convoy::Reassign { promise, to: owner_seat, by: operator.clone(), authority: convoy::Authority::Operator };
+                probes.push(reassign.into());
+            }
             if tag(&model["phase"]) == "Retired" {
                 assert_end_refuses(home, &name, probes, &world, now, step, tally);
             } else {
-                // Delivered or abandoned, it waits to retire and takes no work edge.
+                // Delivered or abandoned, it waits to retire and takes no decision edge.
                 for edge in probes {
                     let kind = edge.kind();
                     assert!(!would_accept(home, &name, edge, &world, now, tally), "{step}: ended convoy {id} accepted {kind:?}");
+                }
+            }
+            // Abandoned, its Submitted promise still resolves by the world (#3108 ruling 1):
+            // evidence of the current submission keeps it, and a rejection returns it to Pending.
+            if tag(&model["phase"]) == "Abandoned" {
+                for pair in pairs(&model["promises"]).iter().filter(|pair| tag(&pair[1]["state"]) == "Submitted") {
+                    let promise = PromiseId(small(&pair[0]));
+                    let submission = u32::try_from(pair[1]["submissions"].as_array().expect("submissions").len()).expect("small");
+                    let kept = convoy::Keep::Observed { promise, submission };
+                    assert!(
+                        would_accept(home, &name, kept, &world, now, tally),
+                        "{step}: abandoned convoy {id} keeps {promise:?} as observed"
+                    );
+                    let rejected = convoy::Reject { promise };
+                    assert!(would_accept(home, &name, rejected, &world, now, tally), "{step}: abandoned convoy {id} rejects {promise:?}");
                 }
             }
             continue;

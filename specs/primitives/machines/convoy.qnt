@@ -249,14 +249,22 @@ module convoy {
     else if (a.quota.keys() != q.keys() or not(a.quota.keys().forall(c => a.quota.get(c) >= q.get(c)))) Refused(QuotaNotIncrease)
     else Accepted
   }
-  // An ended convoy takes only Retire, and a retired one nothing.
+  // An ended convoy takes Retire, and a retired one nothing. An abandoned
+  // convoy's submitted promise still resolves by the world (#3108 ruling 1): a
+  // rejection or an observed keep, writing only the promise, so a submission
+  // holding it is released when its PR closes or merges. No decision edge
+  // (verdict, retraction, submission, reassignment) runs once it ended.
   def ended(id: int, e: Event): Outcome = match e {
     | Retire(h) => if (phase.get(id) == Retired) Refused(NotOpen) else match h {
         | Unread => Refused(HoldsUnread)
         | Read(held) => if (held.size() > 0) Refused(Held(held)) else Accepted
       }
+    | Reject(a) => if (isAbandoned(id)) rejected(id, a.promise) else Refused(NotOpen)
+    | Keep(k) => if (isAbandoned(id) and observed(k)) kept(id, k) else Refused(NotOpen)
     | _ => Refused(NotOpen)
   }
+  def isAbandoned(id: int): bool = match phase.get(id) { | Abandoned(_) => true | _ => false }
+  pure def observed(k: Keeping): bool = match k { | Observed(_) => true | Verdict(_) => false }
   // What convoy `id` does with `e`. Only an open convoy takes a work edge.
   def outcome(id: int, e: Event): Outcome = if (not(isOpen(id))) ended(id, e) else match e {
     | Declare(d) => declared(id, d)

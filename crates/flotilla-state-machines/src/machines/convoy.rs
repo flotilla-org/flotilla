@@ -1083,20 +1083,22 @@ impl Machine for Convoy {
                     .gate("the owner submits a durable reference to an open promise", gate_submit)
                     .effect(submit),
             )
+            // An abandoned convoy's submitted promise still resolves by the world (#3108
+            // ruling 1): a rejection or an observed keep, its phase unchanged.
             .edge(
                 EdgeDef::<Self, Reject>::new()
-                    .from([Open])
-                    .to([Open])
+                    .from([Open, Abandoned])
+                    .stays()
                     .writes(["promises"])
                     .gate("the promise is Submitted", gate_reject)
                     .effect(|h, state, reject| progress(h, state, reject.promise, Progress::Pending)),
             )
             .edge(
                 EdgeDef::<Self, Keep>::new()
-                    .from([Open])
-                    .to([Open])
+                    .from([Open, Abandoned])
+                    .stays()
                     .writes(["promises"])
-                    .gate("evidence of the current submission, or an authorised verdict with a reason", gate_keep)
+                    .gate("evidence of the current submission, or an authorised verdict with a reason while Open", gate_keep)
                     .effect(|h, state, keep| {
                         let promise = match keep {
                             Keep::Observed { promise, .. } | Keep::Verdict { promise, .. } => *promise,
@@ -1410,6 +1412,10 @@ fn gate_keep(h: &mut Handle<'_, Convoy>, keep: &Keep) -> Result<(), ConvoyRefusa
             Ok(())
         }
         Keep::Verdict { promise, authority, reason, .. } => {
+            // A verdict is a decision, and no decision runs once the convoy ended.
+            if !matches!(h.state(), ConvoyState::Open { .. }) {
+                return Err(ConvoyRefusal::NotOpen);
+            }
             if !may_keep(open_promise(h, *promise)?, *authority) || reason.is_empty() {
                 return Err(ConvoyRefusal::Unauthorised);
             }

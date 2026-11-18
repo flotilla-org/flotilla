@@ -86,7 +86,10 @@ authorised `RetireDuty`; a duty while some promises are open has no edges and
 ends with them, and a breach of terms is a message, not an edge. `Deliver` is
 refused while any promise is Pending or Submitted, or while a lifetime duty
 holds. Delivered and Abandoned retain the work record so delivery and finality
-remain state properties, and take no work edge. Retired is the only end:
+remain state properties, and take no work edge, except that an abandoned
+convoy's Submitted promise still takes an observed `Keep` or a `Reject`, its
+phase unchanged (#3108 ruling 1): the world resolves a submission that holds
+the convoy, and no decision edge runs once it ended. Retired is the only end:
 `Retire` moves a delivered or abandoned convoy there once nothing holds it. Its
 holds are read from its dependents' own records, each named by kind and
 record; a non-empty set refuses (`Held`), and holds not read refuse too

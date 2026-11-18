@@ -186,10 +186,13 @@ fn the_diagram_is_pinned() {
         "  Open --> Open: readmit [quota]\n",
         "  Delivered --> Retired: retire\n",
         "  Abandoned --> Retired: retire\n",
+        "  Abandoned --> Abandoned: reject writes promises\n",
+        "  Abandoned --> Abandoned: keep writes promises\n",
         "  note right of Retired: the convoy ended and nothing holds it\n",
     ] {
         assert!(full.contains(line), "missing {line:?} in\n{full}");
     }
+    assert!(!full.contains("Open --> Abandoned: reject") && !full.contains("Abandoned --> Open: keep"), "{full}");
     let labels = Convoy::definition().mermaid(Diagram::Labels);
     assert!(!labels.contains("Open --> Open"), "{labels}");
 }
@@ -455,6 +458,50 @@ fn an_ended_convoy_retires_once_nothing_holds_it() {
     assert_eq!(home.newest_launch("c", None).expect("exists").state(), &ConvoyState::Retired);
     assert_eq!(retire(&mut home, "free"), refused(ConvoyRefusal::NotOpen));
     assert_eq!(apply(&mut home, merged()), refused(ConvoyRefusal::NotOpen));
+}
+
+// An abandoned convoy's submitted promise still resolves by the world (#3108
+// ruling 1): a rejection returns it to Pending and evidence of its current
+// submission keeps it, the convoy staying Abandoned. No decision runs once it
+// ended: a verdict, a retraction, a submission or a reassignment is NotOpen.
+// A delivered convoy has nothing open and takes neither.
+#[test]
+fn an_abandoned_convoys_submission_resolves_by_the_world_alone() {
+    let mut home = convoy(request(&[(0, PromiseSource::Template), (1, PromiseSource::Template)]));
+    apply(&mut home, submit(0, "coder", YES)).expect("submitted");
+    apply(&mut home, submit(1, "coder", YES)).expect("submitted");
+    let abandon = Abandon { by: seat("lead"), cause: AbandonCause::Operator, reason: "stop".into(), authority: Ref::new(YES) };
+    apply(&mut home, abandon).expect("abandoned");
+    // Refused edges write nothing, so each is tried on the convoy itself.
+    let decides_nothing = |home: &mut Home<Convoy>| {
+        for promise in [0, 1] {
+            let reassign = Reassign { promise: PromiseId(promise), to: seat("coder"), by: seat("lead"), authority: Authority::Operator };
+            let decisions: [(&str, Result<(), WriteError<Convoy>>); 4] = [
+                ("verdict", apply(home, verdict(promise, Authority::Operator))),
+                ("retract", apply(home, retract(promise, "lead", Authority::Operator))),
+                ("submit", apply(home, submit(promise, "coder", YES))),
+                ("reassign", apply(home, reassign)),
+            ];
+            for (edge, result) in decisions {
+                assert_eq!(result, refused(ConvoyRefusal::NotOpen), "{edge} of promise {promise}");
+            }
+        }
+    };
+    decides_nothing(&mut home);
+    assert_eq!(apply(&mut home, Keep::Observed { promise: PromiseId(0), submission: 0 }), refused(ConvoyRefusal::StaleEvidence));
+    apply(&mut home, Keep::Observed { promise: PromiseId(0), submission: 1 }).expect("merged");
+    apply(&mut home, Reject { promise: PromiseId(1) }).expect("closed");
+    assert_eq!((progress(&home, 0), progress(&home, 1)), (Progress::Kept, Progress::Pending));
+    let state = home.newest_launch("c", None).expect("exists").state().clone();
+    assert_eq!((state.label(), state.reason()), (ConvoyLabel::Abandoned, Some("stop")));
+    assert_eq!(apply(&mut home, Reject { promise: PromiseId(1) }), refused(ConvoyRefusal::NotSubmitted));
+    decides_nothing(&mut home);
+
+    let mut delivered = convoy(request(&[(0, PromiseSource::Template)]));
+    apply(&mut delivered, verdict(0, Authority::Operator)).expect("kept");
+    apply(&mut delivered, merged()).expect("delivered");
+    assert_eq!(apply(&mut delivered, Reject { promise: PromiseId(0) }), refused(ConvoyRefusal::NotOpen));
+    assert_eq!(apply(&mut delivered, Keep::Observed { promise: PromiseId(0), submission: 0 }), refused(ConvoyRefusal::NotOpen));
 }
 
 // A Fail verdict is authorised, has a reason, names a known seat and is

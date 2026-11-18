@@ -310,8 +310,14 @@ async fn remote_change_request_scenario(late_watcher: bool) {
     };
     eventually(Duration::from_secs(5), Duration::from_millis(10), "first consumer's end replicated", || ended(producer.clone())).await;
     assert_eq!(owner_observer.demanded_owned().await.expect("remaining owner demand"), vec![subject]);
+    // An abandoned consumer's submitted PR is still observed until its promise resolves (#3108
+    // ruling 1): the producer's ended pass keeps it on the merged observation, and that releases
+    // the last demand.
     end(second.clone()).await;
     eventually(Duration::from_secs(5), Duration::from_millis(10), "last consumer releases demand", || async {
+        use flotilla_store::controller::Reconciler;
+        let current = convoys.get(&second).await.expect("second producer");
+        reconciler.prepare(&current).await.expect("the ended pass observes the second producer's promise");
         owner_observer.demanded_owned().await.is_ok_and(|subjects| subjects.is_empty())
     })
     .await;

@@ -98,6 +98,20 @@ module convoy_deliver {
     Set(C::Retire(C::Read(Set())), C::Deliver({ disposition: "merged" }), C::Abandon({ authorised: true, cause: C::OperatorDecision, reason: "decision" }))
       .forall(e => not(C::accepts(id, e))),
   })
+  // An ended convoy takes no decision on a promise, and only an abandoned one
+  // takes the world's resolution of a submission (#3108 ruling 1), which
+  // writes only the promise.
+  val endedDecidesNothing = everyConvoy(id => C::isOpen(id) or C::promises.get(id).keys().forall(p => {
+    val r = C::promiseRecord(id, p)
+    Set(
+      C::Submit({ promise: p, by: r.owner, reference: "ref", durable: true }),
+      C::Keep(C::Verdict({ promise: p, by: "operator", authority: C::Operator, reason: "decision" })),
+      C::Retract({ promise: p, by: "operator", authority: C::Operator, reason: "decision" }),
+      C::Reassign({ promise: p, to: r.owner, by: "operator", authority: C::Operator })
+    ).forall(e => not(C::accepts(id, e))) and (C::isAbandoned(id) or
+      Set(C::Reject({ promise: p }), C::Keep(C::Observed({ promise: p, submission: r.submissions.length() })))
+        .forall(e => not(C::accepts(id, e))))
+  }))
   // A Submitted promise has a current submission.
   val submittedHasSubmission = everyConvoy(id => C::promises.get(id).keys().forall(p =>
     C::promiseRecord(id, p).state != C::Submitted or C::promiseRecord(id, p).submissions.length() > 0))
@@ -124,7 +138,7 @@ module convoy_deliver {
   // Replacement counts stay within the limit, and seat "a" carries every replacement granted to it.
   val replacementsWithinLimit = everyConvoy(id => C::seats.get(id).keys().forall(seat => C::seatRecord(id, seat).replacements <= C::REPLACEMENT_LIMIT))
   val replacementsCarried = everyConvoy(id => not(C::known(id, "a")) or C::seatRecord(id, "a").replacements == replacedA)
-  val safety = replacementsWithinLimit and replacementsCarried and seatsWithinLimit and retiredSeatsHoldNothing and ownersAreSeats and seatTreeClosed and seatTreeAcyclic and everyConvoyObliged and deliveredSettled and settledPromisesFinal and retiredFinal and submittedHasSubmission and ownerRetractsOnlyUnsubmitted
+  val safety = replacementsWithinLimit and replacementsCarried and seatsWithinLimit and retiredSeatsHoldNothing and ownersAreSeats and seatTreeClosed and seatTreeAcyclic and everyConvoyObliged and deliveredSettled and settledPromisesFinal and retiredFinal and endedDecidesNothing and submittedHasSubmission and ownerRetractsOnlyUnsubmitted
   // No inductive invariant: a universe of every owned-promise shape is beyond
   // Apalache in a crew's memory, and the fast tier exhausts this scenario's
   // complete finite graph, which covers every depth at its bounds.

@@ -199,6 +199,65 @@ fn a_target_outside_the_declaration_is_a_fault() {
     );
 }
 
+// A machine whose `load` keeps its label, from Armed or Fired, yet always
+// arms the latch, for the staying-edge tests.
+struct Drifter;
+
+impl Machine for Drifter {
+    const NAME: &'static str = "Drifter";
+    type Request = ();
+    type Spec = ();
+    type State = Latch;
+    type Edge = LatchEdge;
+    type Write = flotilla_state_machines::NoRecords;
+    type Refusal = LatchRefusal;
+    type World = Table<Signal>;
+    fn definition() -> MachineDef<Self> {
+        MachineDef::new(LatchLabel::Armed).edge(
+            EdgeDef::<Self, Load>::new()
+                .from([LatchLabel::Armed, LatchLabel::Fired])
+                .stays()
+                .changes(["shots", "failures", "last_failure"])
+                .ungated("a test fixture")
+                .effect(|_, state, load| armed(shots(&state) + load.shots)),
+        )
+    }
+    fn admit(_: &mut flotilla_state_machines::Admission<'_, Self>, _: ()) -> Result<((), Latch), LatchRefusal> {
+        Ok(((), armed(0)))
+    }
+}
+
+// An edge that keeps its label reaches from each label it leaves that label
+// alone: the diagram draws no edge between its labels, a move to another is a
+// declaration fault, and naming targets of its own besides is refused.
+#[test]
+fn a_staying_edge_keeps_its_label() {
+    let full = Drifter::definition().mermaid(Diagram::Full);
+    assert!(full.contains("  Armed --> Armed: load") && full.contains("  Fired --> Fired: load"), "{full}");
+    assert!(!full.contains("Fired --> Armed") && !full.contains("Armed --> Fired"), "{full}");
+    let world = Table::new();
+    let load: LatchEdge = Load { shots: 1 }.into();
+    let state = armed(1);
+    let mut handle = Handle::<Drifter>::new(&(), &state, &world, Timestamp::ZERO);
+    assert_eq!(Drifter::definition().step(&mut handle, &load).map(|next| shots(&next)), Ok(2));
+    let state = Latch::Fired { shots: 1, by: "s".into() };
+    let mut handle = Handle::<Drifter>::new(&(), &state, &world, Timestamp::ZERO);
+    assert_eq!(
+        Drifter::definition().step(&mut handle, &load),
+        Err(StepError::Fault(Fault::Target { edge: LatchEdgeKind::Load, target: LatchLabel::Armed }))
+    );
+    let named = MachineDef::<Drifter>::new(LatchLabel::Armed).edge(
+        EdgeDef::<Drifter, Load>::new()
+            .from([LatchLabel::Armed])
+            .stays()
+            .to([LatchLabel::Spent])
+            .changes(["shots"])
+            .ungated("a test fixture")
+            .effect(|_, state, _| state),
+    );
+    assert!(named.validate().expect_err("refused").contains(&DefError::StayingEdgeWithTargets("load")));
+}
+
 // Changing data the edge does not declare is a declaration fault, so a
 // declaration's list of changed data is exactly what the engine allows. An
 // effect that leaves the data as it was changes nothing.

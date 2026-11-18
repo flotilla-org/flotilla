@@ -60,7 +60,7 @@ use flotilla_state_machines::{
         awaiting_reply::{Awaited, AwaitingReplySpec},
         convoy::{
             Abandon, AbandonCause, AdmissionBytes, AdmittedPromise, Authority, Convoy, ConvoyId, ConvoyLabel, ConvoyRequest, Deliver, Keep,
-            Link, LinkSource, Priority, PromiseId, PromiseSource, Reject, Seat, SeatName, Submit, VesselClass,
+            Link, LinkSource, Priority, Progress, PromiseId, PromiseSource, Reject, Seat, SeatName, Submit, VesselClass,
         },
         message::{DropReason, MessageRef, MessageState},
         vessel::{VesselKind, VesselSpec},
@@ -530,6 +530,41 @@ async fn a_convoy_retires_after_its_merge_once_its_change_request_record_is_coll
     };
     tokio::time::timeout(std::time::Duration::from_secs(30), retired).await.expect("retired once its checkout released");
     follower.abort();
+}
+
+// Behaviour (#3108 ruling 1): an abandoned convoy's Submitted pr promise holds it while its PR is
+// open. The world still resolves the promise once the convoy ended, a close rejecting it and a
+// merge keeping it with the convoy left Abandoned, and the convoy's home then retires it.
+#[tokio::test]
+async fn an_abandoned_convoys_submitted_pr_holds_it_until_the_pr_closes_or_merges() {
+    for (state, resolved) in [(ObservedChangeRequestState::Closed, Progress::Pending), (ObservedChangeRequestState::Merged, Progress::Kept)]
+    {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let fixture = Fixture::new(&dir);
+        let change = fixture.submit(PRS[0], 7);
+        fixture.abandon();
+        let mut convoy_writes = EngineWatch::start(Arc::clone(&fixture.service), [<Resource<Convoy> as Kind>::CODE]).expect("watch");
+        let follower = retire::follow(Arc::clone(&fixture.convoys), Arc::new(SystemClock)).expect("follow");
+        assert_eq!(fixture.holds(), BTreeSet::from([format!("change-request:{change}")]), "{state:?}");
+        assert_eq!(fixture.label(), ConvoyLabel::Abandoned);
+
+        fixture.observe(&change, state).await;
+        let promise = PromiseId(PRS[0]);
+        let applied = match state {
+            ObservedChangeRequestState::Closed => fixture.convoys.apply("fix-it", Reject { promise }, Timestamp(5_000_000)),
+            _ => fixture.convoys.apply("fix-it", Keep::Observed { promise, submission: 1 }, Timestamp(5_000_000)),
+        };
+        applied.expect("the world resolves the abandoned convoy's submission");
+        let retired = async {
+            while fixture.label() != ConvoyLabel::Retired {
+                convoy_writes.next(|_, _| Ok(())).await.expect("a convoy write");
+            }
+        };
+        tokio::time::timeout(std::time::Duration::from_secs(30), retired).await.expect("retired once its PR resolved");
+        let launch = fixture.convoys.launch(&fixture.launch).expect("launch");
+        assert_eq!(launch.spec().promise(promise).expect("pr promise").1.progress.value, resolved, "{state:?}");
+        follower.abort();
+    }
 }
 
 // Behaviour (#3108 ruling 2): a convoy's end withdraws every message still pending to its own seats,
