@@ -12,10 +12,8 @@ use flotilla_protocol::DaemonEvent;
 use flotilla_protocol::PlacementDecision;
 use flotilla_protocol::PrincipalRef;
 use flotilla_resources::normalize_project_spec;
-use flotilla_resources::ConvoyRepositorySpec;
 use flotilla_resources::InputMeta;
 use flotilla_resources::Project;
-use flotilla_resources::Repository;
 use flotilla_resources::ResourceError;
 use flotilla_resources::WorkflowTemplate;
 use flotilla_resources::WriterIdentity;
@@ -151,16 +149,8 @@ impl AdmissionActions<'_> {
         dispatching_principal_ref: &Option<PrincipalRef>,
     ) -> Result<u64, String> {
         let dispatching_principal_ref = dispatching_principal_ref.clone();
-        if let CommandAction::ConvoyCreate {
-            name,
-            workflow_ref,
-            inputs,
-            repository_url,
-            r#ref,
-            project_ref,
-            placement_policy,
-            adopted_checkout,
-        } = &command.action
+        if let CommandAction::ConvoyCreate { name, workflow_ref, inputs, r#ref, project_ref, placement_policy, adopted_checkout } =
+            &command.action
         {
             let empty_identity = empty_repo_identity();
             self.events.sink.emit(DaemonEvent::CommandStarted {
@@ -172,7 +162,13 @@ impl AdmissionActions<'_> {
             });
             let namespace = self.provisioning_namespace().await;
             let role = name.clone();
-            let project_identity = project_ref.as_deref();
+            // A convoy belongs to the project it names; its repositories come from that project.
+            if project_ref.trim().is_empty() {
+                let message = format!("convoy `{role}` names no project: pass --project <name>");
+                self.finish_admission(id, empty_identity, CommandValue::Error { message });
+                return Ok(id);
+            }
+            let project_identity = Some(project_ref.as_str());
             if let Err(message) = validate_convoy_name(&role) {
                 let result = CommandValue::Error { message };
                 self.finish_admission(id, empty_identity, result);
@@ -220,36 +216,26 @@ impl AdmissionActions<'_> {
                     return Ok(id);
                 }
             };
-            let project_repositories = if let Some(project_ref) = project_ref {
+            let repositories =
                 match super::project_ops::snapshot_project_repositories_with_backend(self.resource_backend, &namespace, project_ref, None)
                     .await
                 {
-                    Ok(repositories) => Some(repositories),
+                    Ok(repositories) => repositories,
                     Err(message) => {
                         self.finish_admission(id, empty_identity, CommandValue::Error { message });
                         return Ok(id);
                     }
-                }
-            } else {
-                None
-            };
-            if project_repositories.is_some() && repository_url.is_some() {
-                let message = "convoy repository selection is not allowed when a project is supplied".to_string();
-                self.finish_admission(id, empty_identity, CommandValue::Error { message });
-                return Ok(id);
-            }
-            let mut direct_repository_url = repository_url.clone();
+                };
             let mut r#ref = r#ref.clone();
             let adopted_checkout = match adopted_checkout {
                 Some(path) => {
                     let adopted_result = async {
-                        let inspection =
-                            self.port.inspect_adopted_checkout(path.as_ref(), direct_repository_url.as_deref(), r#ref.as_deref()).await?;
+                        let inspection = self.port.inspect_repository_path(path.as_ref(), None).await?;
                         let repo_ref = inspection.spec.key();
-                        let transport_url = inspection
-                            .transport_url
-                            .as_deref()
-                            .ok_or_else(|| "an adopted checkout requires a repository transport URL".to_string())?;
+                        // Refused before the checkout's record is written: a refused create leaves nothing behind.
+                        if !repositories.iter().any(|repository| repository.repo_ref == repo_ref) {
+                            return Err(format!("adopted checkout repository {repo_ref} is not part of project {project_ref}"));
+                        }
                         let git_ref = r#ref.as_deref().unwrap_or(&inspection.checkout.git_ref);
                         let (checkout_ref, spec) = adopted_checkout_spec(
                             self.resource_backend,
@@ -263,14 +249,11 @@ impl AdmissionActions<'_> {
                                 .build(),
                         )
                         .await?;
-                        Ok::<_, String>((repo_ref, checkout_ref, spec, transport_url.to_string(), git_ref.to_string()))
+                        Ok::<_, String>((repo_ref, checkout_ref, spec, git_ref.to_string()))
                     }
                     .await;
                     match adopted_result {
-                        Ok((repo_ref, checkout_ref, spec, inferred_repository_url, inferred_ref)) => {
-                            if project_repositories.is_none() {
-                                direct_repository_url.get_or_insert(inferred_repository_url);
-                            }
+                        Ok((repo_ref, checkout_ref, spec, inferred_ref)) => {
                             r#ref.get_or_insert(inferred_ref);
                             Some((repo_ref, checkout_ref, spec))
                         }
@@ -283,72 +266,15 @@ impl AdmissionActions<'_> {
                 }
                 None => None,
             };
-            let repositories = if let Some(repositories) = project_repositories {
-                repositories
-            } else if let Some(url) = direct_repository_url {
-                let resolved = async {
-                    let repository_spec = self.port.resolve_repository_remote(&url).await?;
-                    let canonical_url =
-                        super::project_ops::repository_transport_url_with_backend(self.resource_backend, &namespace, &repository_spec)
-                            .await?;
-                    let repo_ref = repository_spec.key();
-                    let repository = flotilla_store::ensure_repository(
-                        &self.resource_backend.clone().using::<Repository>(&namespace),
-                        &repo_ref,
-                        &repository_spec,
-                    )
-                    .await
-                    .map_err(|error| error.to_string())?;
-                    let default_ref = repository
-                        .status
-                        .as_ref()
-                        .and_then(|status| status.default_branch.clone())
-                        .or_else(|| if adopted_checkout.is_some() { r#ref.clone() } else { None })
-                        .ok_or_else(|| format!("repository {repo_ref} has no resolved default branch"))?;
-                    let workspace_slug = flotilla_resources::repository_workspace_slugs([(&repo_ref, &repository_spec)])
-                        .remove(&repo_ref)
-                        .expect("repository slug should resolve");
-                    Ok::<_, String>(vec![ConvoyRepositorySpec {
-                        url: canonical_url,
-                        repo_ref,
-                        source_ref: default_ref.clone(),
-                        target_ref: default_ref,
-                        workspace_slug,
-                        subpaths: Vec::new(),
-                    }])
-                }
-                .await;
-                match resolved {
-                    Ok(repositories) => repositories,
-                    Err(message) => {
-                        self.finish_admission(id, empty_identity, CommandValue::Error { message });
-                        return Ok(id);
-                    }
-                }
-            } else {
-                Vec::new()
-            };
             let mut adopted_checkout_refs = BTreeMap::new();
             let mut adopted_checkout_spec = None;
             if let Some((repo_ref, checkout_ref, spec)) = adopted_checkout {
-                if !repositories.iter().any(|repository| repository.repo_ref == repo_ref) {
-                    let message =
-                        format!("adopted checkout repository {repo_ref} is not part of project {}", project_ref.as_deref().unwrap_or(""));
-                    self.finish_admission(id, empty_identity, CommandValue::Error { message });
-                    return Ok(id);
-                }
                 adopted_checkout_refs.insert(repo_ref, checkout_ref);
                 adopted_checkout_spec = Some(spec);
             }
             let mut placement = match self
                 .admission
-                .resolve_created_convoy_placement(
-                    &namespace,
-                    project_ref.as_deref(),
-                    &repositories,
-                    &workflow.spec,
-                    placement_policy.as_deref(),
-                )
+                .resolve_created_convoy_placement(&namespace, project_identity, &repositories, &workflow.spec, placement_policy.as_deref())
                 .await
             {
                 Ok(placement) => placement,
@@ -360,7 +286,7 @@ impl AdmissionActions<'_> {
             let credential_result = resolve_and_validate_workflow_credentials(
                 self.resource_backend,
                 &namespace,
-                project_ref.as_deref(),
+                project_identity,
                 &repositories,
                 placement.selected.as_ref(),
                 &mut workflow.spec,
@@ -412,13 +338,7 @@ impl AdmissionActions<'_> {
             }
             let (vessel_placements, image_builds) = match self
                 .admission
-                .join_convoy_placement_builds(
-                    &namespace,
-                    project_ref.as_deref(),
-                    &workflow.spec,
-                    &mut placement,
-                    placement_decision.as_ref(),
-                )
+                .join_convoy_placement_builds(&namespace, project_identity, &workflow.spec, &mut placement, placement_decision.as_ref())
                 .await
             {
                 Ok(vessel_placements) => vessel_placements,
@@ -441,7 +361,7 @@ impl AdmissionActions<'_> {
                         .inputs(inputs)
                         .repositories(repositories)
                         .maybe_source_ref(r#ref)
-                        .maybe_project_ref(project_ref.clone())
+                        .project_ref(project_ref.clone())
                         .adopted_checkout_refs(adopted_checkout_refs)
                         .maybe_adopted_checkout(adopted_checkout_spec)
                         .maybe_dispatching_principal_ref(dispatching_principal_ref)

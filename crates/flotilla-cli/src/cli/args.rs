@@ -307,7 +307,7 @@ pub enum DomainCommand {
     /// Inspect proposed dispatch work
     Dispatch(flotilla_commands::commands::dispatch::DispatchNoun),
     /// Communicate with crew members
-    Crew(flotilla_commands::commands::crew::CrewNoun),
+    Crew(Box<flotilla_commands::commands::crew::CrewNoun>),
     /// Inspect live message relationships
     Message(MessageNoun),
     /// Code review (alias on CrNoun itself, not duplicated here)
@@ -1651,8 +1651,19 @@ mod tests {
 
     #[test]
     fn cli_parses_convoy_create() {
-        let cli = Cli::try_parse_from(["flotilla", "convoy", "my-convoy", "create", "--template", "scratch", "--input", "topic=hi"])
-            .expect("convoy create cli should parse");
+        let cli = Cli::try_parse_from([
+            "flotilla",
+            "convoy",
+            "my-convoy",
+            "create",
+            "--template",
+            "scratch",
+            "--project",
+            "flotilla",
+            "--input",
+            "topic=hi",
+        ])
+        .expect("convoy create cli should parse");
         assert!(matches!(cli.command, Some(SubCommand::Domain(DomainCommand::Convoy(_)))));
     }
 

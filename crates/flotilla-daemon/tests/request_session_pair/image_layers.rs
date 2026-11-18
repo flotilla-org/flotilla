@@ -225,9 +225,8 @@ async fn composed_image_routing_row(issuer: usize, satisfiable: bool) {
         name: "created-composed-work".into(),
         workflow_ref: "display-workflow".into(),
         inputs: Vec::new(),
-        repository_url: None,
         r#ref: Some("test/created-composed-work".into()),
-        project_ref: Some("flotilla".into()),
+        project_ref: "flotilla".into(),
         placement_policy: Some("composed-docker".into()),
         adopted_checkout: None,
     };

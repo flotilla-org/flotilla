@@ -17,9 +17,12 @@ use flotilla_resources::{
 };
 use flotilla_store::ResourceBackend;
 
-/// What creation reports for `launch` in the namespace's own project: the launch's address.
+/// The project every convoy here is created in; scratch work needs no repository.
+const PROJECT: &str = "flotilla";
+
+/// What creation reports for `launch` in [`PROJECT`]: the launch's address.
 fn created(launch: &str) -> CommandValue {
-    let project = "project:flotilla".parse().expect("project address");
+    let project = flotilla_address::Address::project(PROJECT).expect("project address");
     CommandValue::ConvoyCreated {
         name: flotilla_resources::convoy::engine::launch_address(&project, launch).expect("launch address").to_string(),
     }
@@ -71,6 +74,7 @@ async fn start_daemon_with_backend(
         ..RuntimeOptions::default()
     };
     let runtime = DaemonRuntime::start_with_options(Arc::clone(&daemon), Arc::clone(&config), None, options).await.expect("runtime start");
+    flotilla_store_testkit::fixtures::project(&backend, "flotilla", PROJECT).await;
     (daemon, backend, config, runtime, tmp)
 }
 
@@ -98,6 +102,7 @@ async fn start_sqlite_daemon(
         ..RuntimeOptions::default()
     };
     let runtime = DaemonRuntime::start_with_options(Arc::clone(&daemon), Arc::clone(&config), None, options).await.expect("runtime start");
+    flotilla_store_testkit::fixtures::project(&backend, "flotilla", PROJECT).await;
     (daemon, backend, config, runtime, tmp)
 }
 
@@ -179,9 +184,8 @@ async fn builtin_template_is_the_code_spec_at_dispatch() {
                     name: "explicit-host-direct".into(),
                     workflow_ref: "single-agent".into(),
                     inputs: Vec::new(),
-                    repository_url: None,
                     r#ref: None,
-                    project_ref: None,
+                    project_ref: PROJECT.into(),
                     placement_policy: Some(host_direct_kind.clone()),
                     adopted_checkout: None,
                 })
@@ -207,9 +211,8 @@ async fn convoy_create_command_creates_convoy_resource() {
                     name: "my-scratch".into(),
                     workflow_ref: "scratch".into(),
                     inputs: vec![("topic".into(), "first-convoy".into())],
-                    repository_url: None,
                     r#ref: None,
-                    project_ref: None,
+                    project_ref: PROJECT.into(),
                     placement_policy: None,
                     adopted_checkout: None,
                 })
@@ -240,9 +243,8 @@ async fn convoy_create_command_creates_convoy_resource() {
                     name: "bad@role".into(),
                     workflow_ref: "scratch".into(),
                     inputs: Vec::new(),
-                    repository_url: None,
                     r#ref: None,
-                    project_ref: None,
+                    project_ref: PROJECT.into(),
                     placement_policy: None,
                     adopted_checkout: None,
                 })
@@ -270,9 +272,8 @@ async fn a_refused_launch_releases_its_placement_snapshot() {
                     name: "no-topic".into(),
                     workflow_ref: "scratch".into(),
                     inputs: Vec::new(),
-                    repository_url: None,
                     r#ref: None,
-                    project_ref: None,
+                    project_ref: PROJECT.into(),
                     placement_policy: None,
                     adopted_checkout: None,
                 })
@@ -404,9 +405,8 @@ async fn sqlite_backed_runtime_reconciles_convoy_create_into_namespace_view() {
                     name: "sqlite-scratch".into(),
                     workflow_ref: "scratch".into(),
                     inputs: vec![("topic".into(), "embedded".into())],
-                    repository_url: None,
                     r#ref: None,
-                    project_ref: None,
+                    project_ref: PROJECT.into(),
                     placement_policy: None,
                     adopted_checkout: None,
                 })

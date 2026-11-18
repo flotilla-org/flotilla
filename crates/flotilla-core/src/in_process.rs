@@ -2113,33 +2113,6 @@ impl InProcessDaemon {
         }
     }
 
-    async fn inspect_adopted_checkout(
-        &self,
-        path: &Path,
-        repository_url: Option<&str>,
-        git_ref: Option<&str>,
-    ) -> Result<RepositoryInspection, String> {
-        if let (Some(repository_url), Some(git_ref)) = (repository_url, git_ref) {
-            if let Ok(spec) = RepositorySpec::remote(repository_url) {
-                let path = self.discovery.blocking_probe.canonicalize(path).await?;
-                let (spec, replaces_prior_repository) = self.configure_inspected_repository(&path, spec).await?;
-                let host_ref = self.local_host_id().ok_or_else(|| "local Host identity is unavailable".to_string())?.to_string();
-                return Ok(RepositoryInspection {
-                    spec,
-                    checkout: flotilla_admission::repository_inspection::LocalCheckoutInspection {
-                        path,
-                        host_ref,
-                        git_ref: git_ref.to_string(),
-                        is_main: matches!(git_ref, "main" | "master" | "trunk"),
-                    },
-                    transport_url: Some(repository_url.to_string()),
-                    replaces_prior_repository,
-                });
-            }
-        }
-        self.inspect_repository_path(path, repository_url).await
-    }
-
     pub fn local_environment_bag(&self) -> Option<EnvironmentBag> {
         self.environment_manager.environment_bag(&self.local_environment_id)
     }
@@ -6398,14 +6371,6 @@ impl ProjectOperations for InProcessDaemon {
         InProcessDaemon::reap_ensured_convoy(self, namespace, ensure_name, convoy_name, force).await
     }
 
-    async fn inspect_adopted_checkout(
-        &self,
-        path: &Path,
-        repository_url: Option<&str>,
-        git_ref: Option<&str>,
-    ) -> Result<RepositoryInspection, String> {
-        InProcessDaemon::inspect_adopted_checkout(self, path, repository_url, git_ref).await
-    }
     async fn project_add(
         &self,
         target: &str,

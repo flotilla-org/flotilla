@@ -1074,7 +1074,11 @@ impl flotilla_admission::repository_inspection::RepositoryInspector for Conflict
         use flotilla_admission::repository_inspection::LocalCheckoutInspection;
         use flotilla_admission::repository_inspection::RepositoryInspection;
         let daemon = self.daemon.upgrade().expect("daemon remains alive");
-        let rival = ConvoySpec::builder().role("cleanup".to_string()).workflow_ref("cleanup-workflow".to_string()).build();
+        let rival = ConvoySpec::builder()
+            .role("cleanup".to_string())
+            .workflow_ref("cleanup-workflow".to_string())
+            .project_ref("widgets".to_string())
+            .build();
         admit_convoy(&daemon, engine_convoy("rival", rival)).await;
         Ok(RepositoryInspection {
             spec: RepositorySpec::remote("https://github.com/widgets/api.git")?,
@@ -1087,16 +1091,6 @@ impl flotilla_admission::repository_inspection::RepositoryInspector for Conflict
             transport_url: Some("https://github.com/widgets/api.git".to_string()),
             replaces_prior_repository: false,
         })
-    }
-
-    async fn resolve_remote(&self, remote: &str) -> Result<RepositorySpec, String> {
-        // Admission resolves the remote before it commits. The adopted checkout is recorded on
-        // the convoy for its vessel to request on the engine (#3108), so nothing adopted is
-        // published, nor shown by the real Aggregator, before then.
-        let daemon = self.daemon.upgrade().expect("daemon remains alive");
-        let rows = cleanup_checkout_rows(&daemon).await;
-        assert!(!rows.iter().any(|row| row.authority == LifecycleAuthority::Adopted), "nothing adopted before admission commits: {rows:?}");
-        RepositorySpec::remote(remote)
     }
 }
 
@@ -1193,6 +1187,7 @@ async fn assert_adopted_checkout_cleanup(admission_conflict: bool) {
             )
             .await
             .expect("workflow");
+        flotilla_store_testkit::fixtures::project_on_repository(&backend, "flotilla", "widgets", &repository, "main").await;
         daemon.set_repository_inspector(Arc::new(ConflictCheckoutInspector { daemon: Arc::downgrade(&daemon) })).await;
         let result = cleanup_command_result(
             &daemon,
@@ -1200,9 +1195,8 @@ async fn assert_adopted_checkout_cleanup(admission_conflict: bool) {
                 name: "cleanup".to_string(),
                 workflow_ref: "cleanup-workflow".to_string(),
                 inputs: vec![],
-                repository_url: None,
                 r#ref: None,
-                project_ref: None,
+                project_ref: "widgets".to_string(),
                 placement_policy: None,
                 adopted_checkout: Some(Box::new(tmp.path().join("checkout"))),
             },

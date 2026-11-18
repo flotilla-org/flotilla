@@ -1534,9 +1534,8 @@ async fn retracking_path_after_remote_appears_does_not_materialize_a_project() {
                     workflow_ref: "scratch".into(),
                     // Admission freezes the workflow, so its declared input is given up front.
                     inputs: vec![("topic".into(), "identity-migrated".into())],
-                    repository_url: None,
                     r#ref: None,
-                    project_ref: Some("github-com-flotilla-org-andamento".into()),
+                    project_ref: "github-com-flotilla-org-andamento".into(),
                     placement_policy: None,
                     adopted_checkout: None,
                 })
@@ -2348,9 +2347,8 @@ async fn convoy_create_carries_project_ref() {
                     workflow_ref: "scratch".into(),
                     // Admission freezes the workflow, so its declared input is given up front.
                     inputs: vec![("topic".into(), "linked".into())],
-                    repository_url: None,
                     r#ref: None,
-                    project_ref: Some("my-project".into()),
+                    project_ref: "my-project".into(),
                     placement_policy: None,
                     adopted_checkout: None,
                 })
@@ -2404,9 +2402,8 @@ async fn unresolved_replicated_project_refs_store_but_block_convoy_admission() {
                     name: "blocked".into(),
                     workflow_ref: "scratch".into(),
                     inputs: Vec::new(),
-                    repository_url: None,
                     r#ref: None,
-                    project_ref: Some("waiting".into()),
+                    project_ref: "waiting".into(),
                     placement_policy: None,
                     adopted_checkout: None,
                 })

@@ -7,8 +7,9 @@ use std::{collections::BTreeMap, future::Future, time::Duration};
 use chrono::{DateTime, TimeZone, Utc};
 use flotilla_resources::{
     ApiPaths, Convoy as RealConvoy, ConvoySpec as RealConvoySpec, ConvoyStatus as RealConvoyStatus, CrewSource, CrewSpec, CrewWorkPhase,
-    CrewWorkState, ExitDeclaration, InputDefinition, InputMeta, ObjectMeta, OwnerReference, Resource, ResourceObject, Selector,
-    StatusPatch, VesselRequirement, WorkCompletionAuthority, WorkPhase, WorkState, WorkflowTemplate, WorkflowTemplateSpec,
+    CrewWorkState, ExitDeclaration, InputDefinition, InputMeta, ObjectMeta, OwnerReference, Project, ProjectRepositorySpec, ProjectSpec,
+    Repository, RepositoryKey, RepositorySpec, Resource, ResourceObject, Selector, StatusPatch, VesselRequirement, WorkCompletionAuthority,
+    WorkPhase, WorkState, WorkflowTemplate, WorkflowTemplateSpec,
 };
 use serde::{Deserialize, Serialize};
 use tokio::{
@@ -73,6 +74,42 @@ pub fn input_meta(name: &str) -> InputMeta {
         .labels([("app".to_string(), "flotilla".to_string())].into_iter().collect())
         .annotations([("note".to_string(), "test".to_string())].into_iter().collect())
         .call()
+}
+
+/// The project `project` with no repositories, for a convoy whose work needs none.
+pub async fn project(backend: &flotilla_store::ResourceBackend, namespace: &str, project: &str) {
+    let spec = ProjectSpec::builder().display_name(project.to_string()).build();
+    backend
+        .clone()
+        .using::<Project>(namespace)
+        .create(&InputMeta::builder().name(project.to_string()).build(), &spec)
+        .await
+        .expect("project");
+}
+
+/// The project `project` on `repository` alone, whose default branch is
+/// `default_branch`: the project a created convoy names, and takes its
+/// repositories from.
+pub async fn project_on_repository(
+    backend: &flotilla_store::ResourceBackend,
+    namespace: &str,
+    project: &str,
+    repository: &RepositorySpec,
+    default_branch: &str,
+) -> RepositoryKey {
+    let key = repository.key();
+    flotilla_store::ensure_repository(&backend.clone().using::<Repository>(namespace), &key, repository).await.expect("project repository");
+    let spec = ProjectSpec::builder()
+        .display_name(project.to_string())
+        .repositories(vec![ProjectRepositorySpec::builder().repo(key.clone()).default_branch(default_branch.to_string()).build()])
+        .build();
+    backend
+        .clone()
+        .using::<Project>(namespace)
+        .create(&InputMeta::builder().name(project.to_string()).build(), &spec)
+        .await
+        .expect("project");
+    key
 }
 
 pub fn spec(template: &str) -> ConvoySpec {

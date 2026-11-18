@@ -1109,12 +1109,9 @@ pub enum CommandAction {
         workflow_ref: String,
         #[serde(default, skip_serializing_if = "Vec::is_empty")]
         inputs: Vec<(String, String)>,
-        #[serde(default, skip_serializing_if = "Option::is_none")]
-        repository_url: Option<String>,
         #[serde(default, rename = "ref", skip_serializing_if = "Option::is_none")]
         r#ref: Option<String>,
-        #[serde(default, skip_serializing_if = "Option::is_none")]
-        project_ref: Option<String>,
+        project_ref: String,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         placement_policy: Option<String>,
         #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -1911,9 +1908,8 @@ mod tests {
                     name: "my-convoy".into(),
                     workflow_ref: "scratch".into(),
                     inputs: vec![("topic".into(), "convoy-create-cli".into())],
-                    repository_url: Some("https://github.com/flotilla-org/flotilla.git".into()),
                     r#ref: Some("main".into()),
-                    project_ref: Some("my-project".into()),
+                    project_ref: "my-project".into(),
                     placement_policy: Some("host-direct-local".into()),
                     adopted_checkout: None,
                 })

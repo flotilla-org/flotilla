@@ -269,13 +269,6 @@ pub trait ProjectOperations: Send + Sync {
     async fn resolve_repository_remote(&self, remote: &str) -> Result<RepositorySpec, String>;
     async fn resolve_forge_identity_in(&self, namespace: &str, spec: RepositorySpec) -> Result<RepositorySpec, String>;
     async fn reap_ensured_convoy(&self, namespace: &str, ensure_name: &str, convoy_name: &str, force: bool) -> Result<(), String>;
-
-    async fn inspect_adopted_checkout(
-        &self,
-        path: &Path,
-        repository_url: Option<&str>,
-        git_ref: Option<&str>,
-    ) -> Result<RepositoryInspection, String>;
     async fn project_add(
         &self,
         target: &str,

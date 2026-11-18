@@ -1175,6 +1175,7 @@ async fn router_duplicate_create_scenarios_admit_one_generation_at_the_requested
             .create(&InputMeta::builder().name("empty".to_string()).build(), &flotilla_resources::single_agent_workflow_spec())
             .await
             .expect("workflow at create host");
+        flotilla_store_testkit::fixtures::project(&home.resource_backend(), "flotilla", "flotilla").await;
         if !remote {
             seed_local_host_direct_kind(home).await;
         }
@@ -1196,9 +1197,8 @@ async fn router_duplicate_create_scenarios_admit_one_generation_at_the_requested
                 name: name.to_string(),
                 workflow_ref: "empty".to_string(),
                 inputs: Vec::new(),
-                repository_url: None,
                 r#ref: None,
-                project_ref: None,
+                project_ref: "flotilla".to_string(),
                 placement_policy,
                 adopted_checkout: None,
             })
@@ -1449,6 +1449,7 @@ async fn convoy_creation_attribution_scenario() {
         .create(&InputMeta::builder().name("empty".to_string()).build(), &flotilla_resources::single_agent_workflow_spec())
         .await
         .expect("create workflow");
+    flotilla_store_testkit::fixtures::project(&leader.resource_backend(), "flotilla", "flotilla").await;
     let follower = empty_daemon_named("follower").await;
     seed_host_capacity(&follower, 2 * 1024 * 1024 * 1024, 1024 * 1024 * 1024).await;
     let follower_host_id = follower.local_host_id().expect("follower host identity").to_string();
@@ -1471,9 +1472,8 @@ async fn convoy_creation_attribution_scenario() {
                     name: "alice-dispatch".to_string(),
                     workflow_ref: "empty".to_string(),
                     inputs: Vec::new(),
-                    repository_url: None,
                     r#ref: None,
-                    project_ref: None,
+                    project_ref: "flotilla".to_string(),
                     placement_policy: None,
                     adopted_checkout: None,
                 })
@@ -3553,9 +3553,8 @@ async fn remote_docker_admission_refusal_scenario(provider_case: Option<usize>, 
                     name: "legacy-remote-docker-work".to_string(),
                     workflow_ref: "remote-workflow".to_string(),
                     inputs: Vec::new(),
-                    repository_url: None,
                     r#ref: None,
-                    project_ref: None,
+                    project_ref: "flotilla".to_string(),
                     placement_policy: Some("remote-docker".to_string()),
                     adopted_checkout: None,
                 })

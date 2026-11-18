@@ -3699,9 +3699,8 @@ async fn convoy_start_rejects_agent_adapter_missing_from_docker_placement() {
                     name: "missing-adapter-legacy".into(),
                     workflow_ref: "single-agent".into(),
                     inputs: Vec::new(),
-                    repository_url: None,
                     r#ref: Some("fix/missing-adapter-legacy".into()),
-                    project_ref: Some("flotilla".into()),
+                    project_ref: "flotilla".into(),
                     placement_policy: Some("docker-test".into()),
                     adopted_checkout: None,
                 })

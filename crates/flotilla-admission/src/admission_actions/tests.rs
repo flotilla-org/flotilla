@@ -20,18 +20,7 @@ fn handlers<'a>(
     AdmissionActions { port: worker, admission: owner, resource_backend: backend, namespace, events }
 }
 
-// #2975: admission emits Started before Finished, freezes inputs and principal,
-// and serializes competing admissions so the duplicate creates no resources.
-#[tokio::test]
-async fn direct_admission_contract_success_and_duplicate() {
-    let HandlerContractFixture { owner, backend, namespace, temp, engine: _engine } =
-        super::super::convoy_admission::handler_contract_fixture().await;
-    super::super::convoy_admission::register_host_direct_kind(&backend, "host").await;
-    let worker = Worker::default();
-    let recording = Arc::new(RecordingEventSink::default());
-    let sink: Arc<dyn EventSink> = recording.clone();
-    let node = NodeId::new("handler");
-    let actions = handlers(&worker, &owner, &backend, ActionEvents { sink: &sink, node_id: &node }, &namespace);
+async fn create_work_template(backend: &ResourceBackend) {
     let workflow = WorkflowTemplateSpec::builder()
         .vessels(vec![VesselRequirement::builder()
             .name("work".into())
@@ -44,14 +33,31 @@ async fn direct_admission_contract_success_and_duplicate() {
             .build()])
         .build();
     backend.using::<WorkflowTemplate>("flotilla").create(&InputMeta::builder().name("work".into()).build(), &workflow).await.unwrap();
+}
+
+// #2975: admission emits Started before Finished, freezes inputs and principal,
+// and serializes competing admissions so the duplicate creates no resources.
+#[tokio::test]
+async fn direct_admission_contract_success_and_duplicate() {
+    let HandlerContractFixture { owner, backend, namespace, temp, engine: _engine } =
+        super::super::convoy_admission::handler_contract_fixture().await;
+    super::super::convoy_admission::register_host_direct_kind(&backend, "host").await;
+    let remote = "https://github.com/example/project";
+    let repository = flotilla_resources::RepositorySpec::remote(remote).unwrap();
+    flotilla_store_testkit::fixtures::project_on_repository(&backend, "flotilla", "contract-project", &repository, "main").await;
+    let worker = Worker { checkout_remote: Some(remote.into()), ..Worker::default() };
+    let recording = Arc::new(RecordingEventSink::default());
+    let sink: Arc<dyn EventSink> = recording.clone();
+    let node = NodeId::new("handler");
+    let actions = handlers(&worker, &owner, &backend, ActionEvents { sink: &sink, node_id: &node }, &namespace);
+    create_work_template(&backend).await;
     let command = Command::builder()
         .action(CommandAction::ConvoyCreate {
             name: "contract".into(),
             workflow_ref: "work".into(),
             inputs: vec![("task".into(), "preserve me".into())],
-            repository_url: Some("https://github.com/example/project".into()),
             r#ref: Some("feature/contract".into()),
-            project_ref: None,
+            project_ref: "contract-project".into(),
             placement_policy: None,
             adopted_checkout: Some(Box::new(temp.path().to_path_buf())),
         })
@@ -86,6 +92,74 @@ async fn direct_admission_contract_success_and_duplicate() {
     let flotilla_resources::CheckoutSpec::Observed(adopted) = adopted else { panic!("adopted checkout is observed") };
     assert_eq!(adopted.r#ref, "feature/contract");
     assert_eq!(convoys[0].spec.adopted_checkout_refs.len(), 1);
+}
+
+// #3108: a convoy names its project. Admission infers none and writes nothing.
+#[tokio::test]
+async fn convoy_create_naming_no_project_is_refused_and_writes_nothing() {
+    let HandlerContractFixture { owner, backend, namespace, temp, engine: _engine } =
+        super::super::convoy_admission::handler_contract_fixture().await;
+    let worker = Worker { checkout_remote: Some("https://github.com/example/project".into()), ..Worker::default() };
+    let recording = Arc::new(RecordingEventSink::default());
+    let sink: Arc<dyn EventSink> = recording.clone();
+    let node = NodeId::new("handler");
+    let actions = handlers(&worker, &owner, &backend, ActionEvents { sink: &sink, node_id: &node }, &namespace);
+    let command = Command::builder()
+        .action(CommandAction::ConvoyCreate {
+            name: "unhomed".into(),
+            workflow_ref: "work".into(),
+            inputs: Vec::new(),
+            r#ref: Some("feature/unhomed".into()),
+            project_ref: " ".into(),
+            placement_policy: None,
+            adopted_checkout: Some(Box::new(temp.path().to_path_buf())),
+        })
+        .build();
+    actions.execute_action_convoy_create(1, &command, &None).await.unwrap();
+    let events = recording.events();
+    assert!(
+        matches!(events.last(), Some(DaemonEvent::CommandFinished { command_id: 1, result: CommandValue::Error { message }, .. }) if message == "convoy `unhomed` names no project: pass --project <name>"),
+        "{events:?}"
+    );
+    assert!(backend.using::<Convoy>("flotilla").list().await.unwrap().items.is_empty());
+    assert_eq!(worker.inspections.load(Ordering::SeqCst), 0, "a refused create inspects no checkout");
+}
+
+// #3108: an adopted checkout of a repository outside the project is refused
+// before its repository is recorded.
+#[tokio::test]
+async fn adopting_a_checkout_outside_the_project_is_refused_and_writes_nothing() {
+    let HandlerContractFixture { owner, backend, namespace, temp, engine: _engine } =
+        super::super::convoy_admission::handler_contract_fixture().await;
+    let repository = flotilla_resources::RepositorySpec::remote("https://github.com/example/project").unwrap();
+    flotilla_store_testkit::fixtures::project_on_repository(&backend, "flotilla", "contract-project", &repository, "main").await;
+    let outsider = "https://github.com/example/elsewhere";
+    let worker = Worker { checkout_remote: Some(outsider.into()), ..Worker::default() };
+    let recording = Arc::new(RecordingEventSink::default());
+    let sink: Arc<dyn EventSink> = recording.clone();
+    let node = NodeId::new("handler");
+    let actions = handlers(&worker, &owner, &backend, ActionEvents { sink: &sink, node_id: &node }, &namespace);
+    create_work_template(&backend).await;
+    let command = Command::builder()
+        .action(CommandAction::ConvoyCreate {
+            name: "stray".into(),
+            workflow_ref: "work".into(),
+            inputs: Vec::new(),
+            r#ref: None,
+            project_ref: "contract-project".into(),
+            placement_policy: None,
+            adopted_checkout: Some(Box::new(temp.path().to_path_buf())),
+        })
+        .build();
+    actions.execute_action_convoy_create(1, &command, &None).await.unwrap();
+    let events = recording.events();
+    let outsider_key = flotilla_resources::RepositorySpec::remote(outsider).unwrap().key();
+    assert!(
+        matches!(events.last(), Some(DaemonEvent::CommandFinished { command_id: 1, result: CommandValue::Error { message }, .. }) if message == &format!("adopted checkout repository {outsider_key} is not part of project contract-project")),
+        "{events:?}"
+    );
+    assert!(backend.using::<Convoy>("flotilla").list().await.unwrap().items.is_empty());
+    assert!(backend.using::<flotilla_resources::Repository>("flotilla").get(&outsider_key.to_string()).await.is_err());
 }
 
 // #2975: failed worker submission clears the pending key; a queued duplicate

@@ -210,9 +210,8 @@ pub(super) async fn remote_shared_clone_placement_reaches_running(docker: bool) 
                     name: "remote-placement".to_string(),
                     workflow_ref: workflow_name.to_string(),
                     inputs: Vec::new(),
-                    repository_url: None,
                     r#ref: Some("remote-placement".to_string()),
-                    project_ref: Some("remote-placement".to_string()),
+                    project_ref: "remote-placement".to_string(),
                     placement_policy: Some(policy_name.to_string()),
                     adopted_checkout: None,
                 })

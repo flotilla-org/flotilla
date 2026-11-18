@@ -1,5 +1,29 @@
 use super::*;
 use crate::testkits::engine::runtime_checkouts;
+use flotilla_admission::repository_inspection::{LocalCheckoutInspection, RepositoryInspection, RepositoryInspector};
+
+/// Every inspected path is a checkout of `repository` on `main`, on host `host_ref`.
+struct CheckoutOf {
+    repository: RepositorySpec,
+    host_ref: String,
+}
+
+#[async_trait::async_trait]
+impl RepositoryInspector for CheckoutOf {
+    async fn inspect_path(&self, path: &std::path::Path, _remote: Option<&str>) -> Result<RepositoryInspection, String> {
+        Ok(RepositoryInspection {
+            spec: self.repository.clone(),
+            checkout: LocalCheckoutInspection::builder()
+                .path(path.to_path_buf())
+                .host_ref(self.host_ref.clone())
+                .git_ref("main".to_string())
+                .is_main(true)
+                .build(),
+            transport_url: self.repository.live_remote().map(str::to_string),
+            replaces_prior_repository: false,
+        })
+    }
+}
 
 pub(super) async fn crew_provisioning_recovery_scenario() {
     async fn promise(daemon: &InProcessDaemon, context: CrewCommandContext, operation: flotilla_protocol::commands::CrewPromiseOperation) {
@@ -78,6 +102,12 @@ pub(super) async fn crew_provisioning_recovery_scenario() {
         )
         .await
         .expect("crew workflow");
+    // This daemon's runner answers agent probes only, so the checkout's inspection is stood in.
+    let repository = RepositorySpec::remote("https://github.com/flotilla-org/flotilla.git").expect("repository spec");
+    let host_ref = daemon.local_host_id().expect("local host id").to_string();
+    daemon.set_repository_inspector(Arc::new(CheckoutOf { repository: repository.clone(), host_ref })).await;
+    // The project is on the repository the checkout is of.
+    flotilla_store_testkit::fixtures::project_on_repository(&backend, NAMESPACE, NAMESPACE, &repository, "main").await;
 
     let mut rx = daemon.subscribe();
     let create_id = daemon
@@ -87,9 +117,8 @@ pub(super) async fn crew_provisioning_recovery_scenario() {
                     name: "crew-convoy".to_string(),
                     workflow_ref: "crew-workflow".to_string(),
                     inputs: Vec::new(),
-                    repository_url: Some("https://github.com/flotilla-org/flotilla.git".to_string()),
                     r#ref: Some("main".to_string()),
-                    project_ref: None,
+                    project_ref: NAMESPACE.to_string(),
                     placement_policy: Some(profile.host_direct_policy_name()),
                     adopted_checkout: Some(Box::new(repo.clone())),
                 })
@@ -405,6 +434,8 @@ pub(super) async fn crew_provisioning_recovery_scenario() {
     })
     .await;
     let (daemon, pool) = crew_daemon_with_backend(Arc::clone(&config), backend.clone()).await;
+    let host_ref = daemon.local_host_id().expect("local host id after restart").to_string();
+    daemon.set_repository_inspector(Arc::new(CheckoutOf { repository: repository.clone(), host_ref })).await;
     let local_registry = probe_local_provider_registry(&daemon, &config).await.expect("crew provider registry after restart");
     let profile = build_local_profile(&daemon, &local_registry).await.expect("local profile after restart");
     let surviving_sessions = terminals
@@ -608,9 +639,8 @@ pub(super) async fn crew_provisioning_recovery_scenario() {
                     name: "unknown-convoy".to_string(),
                     workflow_ref: "unknown-capability".to_string(),
                     inputs: Vec::new(),
-                    repository_url: Some("https://github.com/flotilla-org/flotilla.git".to_string()),
                     r#ref: Some("main".to_string()),
-                    project_ref: None,
+                    project_ref: NAMESPACE.to_string(),
                     placement_policy: Some(profile.host_direct_policy_name()),
                     adopted_checkout: Some(Box::new(repo)),
                 })

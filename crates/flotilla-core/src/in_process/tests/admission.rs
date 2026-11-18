@@ -294,14 +294,15 @@ async fn concurrent_duplicate_adopted_convoy_creates_leave_only_the_winning_chec
         )
         .await
         .expect("workflow");
+    let repository = RepositorySpec::remote("https://github.com/owner/repo").expect("repository");
+    flotilla_store_testkit::fixtures::project_on_repository(&backend, "flotilla", "owner-repo", &repository, "main").await;
     let command = Command::builder()
         .action(CommandAction::ConvoyCreate {
             name: "duplicate".to_string(),
             workflow_ref: "work".to_string(),
             inputs: Vec::new(),
-            repository_url: None,
             r#ref: None,
-            project_ref: None,
+            project_ref: "owner-repo".to_string(),
             placement_policy: None,
             adopted_checkout: Some(Box::new(repo)),
         })

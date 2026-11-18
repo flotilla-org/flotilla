@@ -159,10 +159,7 @@ pub(super) async fn run_stage4a_flow_reaches_running_and_completes_convoy(
         .await
         .expect("workflow template create should succeed");
     let repository_spec = RepositorySpec::remote("https://github.com/flotilla-org/flotilla.git").expect("repository spec");
-    let repository_key = repository_spec.key();
-    flotilla_store::ensure_repository(&backend.clone().using::<Repository>(NAMESPACE), &repository_key, &repository_spec)
-        .await
-        .expect("repository create should succeed");
+    flotilla_store_testkit::fixtures::project_on_repository(&backend, NAMESPACE, NAMESPACE, &repository_spec, "main").await;
     let mut rx = daemon.subscribe();
     let create_id = daemon
         .execute(
@@ -171,9 +168,8 @@ pub(super) async fn run_stage4a_flow_reaches_running_and_completes_convoy(
                     name: "convoy-a".to_string(),
                     workflow_ref: "wf-a".to_string(),
                     inputs: Vec::new(),
-                    repository_url: Some("https://github.com/flotilla-org/flotilla.git".to_string()),
                     r#ref: Some("stage4a-work".to_string()),
-                    project_ref: None,
+                    project_ref: NAMESPACE.to_string(),
                     placement_policy: Some(format!("host-direct-{host_id}")),
                     adopted_checkout: None,
                 })

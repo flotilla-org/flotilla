@@ -76,31 +76,30 @@ async fn a_lone_coder_keeps_its_change_request_promise_and_lands() {
 }
 
 // A convoy dispatched into the Fleet project has its project, so explain scores its dispatch, and
-// both it and one created on a bare repository record that their operator named them.
+// both it and one created from a template that authors its vessels record that their operator
+// named them.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_named_convoy_records_its_naming_and_has_its_project() {
     let fleet = TestDaemon::builder().start().await;
     let dispatched = fleet.dispatch(CrewMix::Coder, DUMMY_FULFILMENT_KIND).await;
-    // `create --repo` does not allocate, so its template authors its vessel.
+    // A create does not allocate, so its template authors its vessel.
     let mut authored = CrewMix::Coder.workflow(LONG_RUNNER_TURNS);
     let crew = std::mem::take(&mut authored.roles);
     authored.vessels = vec![flotilla_resources::VesselRequirement::builder().name("implement".into()).crew(crew).build()];
     fleet.apply::<WorkflowTemplate>("authored-coder", authored).await;
-    let forge = catalog::forge(&catalog_forge_url(&fleet).await);
     let created = fleet
         .execute(CommandAction::ConvoyCreate {
-            name: "created-on-a-repository".into(),
+            name: "created-from-a-template".into(),
             workflow_ref: "authored-coder".into(),
             inputs: Vec::new(),
-            repository_url: Some(catalog::repository_url(&forge)),
             r#ref: Some("main".into()),
-            project_ref: None,
+            project_ref: catalog::FLEET_PROJECT.into(),
             placement_policy: Some(DUMMY_FULFILMENT_KIND.into()),
             adopted_checkout: None,
         })
         .await;
     assert!(matches!(created, CommandValue::ConvoyCreated { .. }), "{created:?}");
-    let created = convoy_named(&fleet, "created-on-a-repository").await;
+    let created = convoy_named(&fleet, "created-from-a-template").await;
     let explain = |name: &str| CommandAction::QueryExplainConvoy { namespace: Some(NAMESPACE.into()), name: name.into() };
     let CommandValue::ConvoyExplanation(explained) = fleet.execute(explain(&dispatched)).await else { panic!("an explanation") };
     assert_eq!(explained.naming, Some(ConvoyNaming::Explicit));
