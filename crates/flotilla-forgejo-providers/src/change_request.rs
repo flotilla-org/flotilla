@@ -77,6 +77,37 @@ fn review_decision(reviews: &[serde_json::Value]) -> Option<ObservedReviewDecisi
     }
 }
 
+/// Whether the reviews hold feedback the crew has still to act on at commit `head`: a reviewer
+/// other than the author and the crew whose latest decisive review requests changes, at any
+/// commit, or who commented with a body on `head` itself. None when the list cannot be read.
+fn actionable_at_head(reviews: &[serde_json::Value], author: Option<&str>, head: Option<&str>, crew: &[String]) -> Option<bool> {
+    let outsider = |login: &str| {
+        !author.is_some_and(|author| author.eq_ignore_ascii_case(login)) && !crew.iter().any(|member| member.eq_ignore_ascii_case(login))
+    };
+    let mut latest_by_reviewer = HashMap::<String, (i64, bool)>::new();
+    let mut commented_at_head = false;
+    for review in reviews {
+        let (Some(state), Some(id)) = (review["state"].as_str(), review["id"].as_i64()) else { return None };
+        if !matches!(state, "APPROVED" | "REQUEST_CHANGES" | "REQUEST_REVIEW" | "COMMENT" | "PENDING") {
+            return None;
+        }
+        // The author's and the crew's own reviews, and a team's review request, are not feedback.
+        let Some(login) = review["user"]["login"].as_str().filter(|login| outsider(login)) else { continue };
+        let active = review["dismissed"] != true;
+        if state == "COMMENT" {
+            let body = review["body"].as_str().is_some_and(|body| !body.trim().is_empty());
+            commented_at_head |= active && body && head.is_some_and(|head| review["commit_id"].as_str() == Some(head));
+        } else if state != "PENDING" {
+            let requests = active && state == "REQUEST_CHANGES";
+            let entry = latest_by_reviewer.entry(login.to_ascii_lowercase()).or_insert((id, requests));
+            if id > entry.0 {
+                *entry = (id, requests);
+            }
+        }
+    }
+    Some(commented_at_head || latest_by_reviewer.values().any(|(_, requests)| *requests))
+}
+
 impl ForgejoChangeRequestProvider {
     pub fn new(http: Arc<dyn HttpClient>, runner: Arc<dyn CommandRunner>, config: ForgejoIssueProviderConfig, repo_slug: String) -> Self {
         Self { forge: ForgejoClient::new(http, config), runner, repo_slug, operator_login: None }
@@ -121,12 +152,14 @@ impl ForgejoChangeRequestProvider {
             head_sha: Observation { value: value["head"]["sha"].as_str().map(str::to_string), observed_at },
             // The commit status endpoint supplies this during bound observation.
             checks: Observation::unknown(observed_at),
+            // The review list supplies this during bound observation.
             review: ChangeRequestReviewObservation { actionable_at_head: Observation::unknown(observed_at) },
             mergeable: Observation { value: mergeable, observed_at },
         }
     }
 
-    async fn read_review_decision(&self, number: u64) -> Result<Option<ObservedReviewDecision>, ObservationError> {
+    /// Every review of pull request `number`, every page of them.
+    async fn read_reviews(&self, number: u64) -> Result<Vec<serde_json::Value>, ObservationError> {
         const PAGE_SIZE: usize = 50;
         const MAX_PAGES: usize = 100;
         let mut reviews = Vec::new();
@@ -148,11 +181,11 @@ impl ForgejoChangeRequestProvider {
             let batch: Vec<serde_json::Value> =
                 serde_json::from_slice(response.body()).map_err(|error| format!("Forgejo review response was not an array: {error}"))?;
             if batch.is_empty() {
-                return Ok(review_decision(&reviews));
+                return Ok(reviews);
             }
             reviews.extend(batch);
             if total.is_some_and(|total| reviews.len() >= total) {
-                return Ok(review_decision(&reviews));
+                return Ok(reviews);
             }
         }
         Err(format!("Forgejo review page limit ({MAX_PAGES}) reached for pull request {number}").into())
@@ -257,11 +290,12 @@ impl ForgejoChangeRequestProvider {
 impl ChangeRequestTracker for ForgejoChangeRequestProvider {
     /// The trait default converts only the presentation snapshot. Read the
     /// pull endpoint once per bound number for its author and reviewer facts,
-    /// then read the review list to derive the aggregate decision.
+    /// then read the review list to derive the aggregate decision and whether
+    /// any review is feedback to act on at the head.
     async fn observe_bound(
         &self,
         numbers: &[u64],
-        _crew_logins: &flotilla_change_request::CrewGithubLoginsByRequest,
+        crew_logins: &flotilla_change_request::CrewGithubLoginsByRequest,
     ) -> Result<flotilla_change_request::BoundObservations, ObservationError> {
         let mut statuses = std::collections::HashMap::new();
         for number in numbers {
@@ -269,17 +303,23 @@ impl ChangeRequestTracker for ForgejoChangeRequestProvider {
                 Ok(value) => {
                     let mut status = self.observed_status(&value);
                     let observed_at = Utc::now();
-                    status.review_decision = match self.read_review_decision(*number).await {
-                        Ok(value) => Observation { value, observed_at },
+                    match self.read_reviews(*number).await {
+                        Ok(reviews) => {
+                            let crew = crew_logins.get(number).map(Vec::as_slice).unwrap_or(&[]);
+                            let actionable =
+                                actionable_at_head(&reviews, status.author.value.as_deref(), status.head_sha.value.as_deref(), crew);
+                            status.review_decision = Observation { value: review_decision(&reviews), observed_at };
+                            status.review.actionable_at_head = Observation { value: actionable, observed_at };
+                        }
                         Err(error @ ObservationError::RateLimited { .. }) => {
                             statuses.insert(*number, Err(error));
                             continue;
                         }
                         Err(error) => {
-                            tracing::warn!(number, %error, "Forgejo review decision unavailable");
-                            Observation::unknown(observed_at)
+                            tracing::warn!(number, %error, "Forgejo reviews unavailable");
+                            status.review_decision = Observation::unknown(observed_at);
                         }
-                    };
+                    }
                     if let Some(head) = status.head_sha.value.clone() {
                         status.checks = match self.read_checks(&head).await {
                             Ok(value) => Observation { value, observed_at: Utc::now() },
@@ -702,7 +742,7 @@ mod tests {
             responses: Mutex::new(VecDeque::from([json_response(&serde_json::json!({"invalid": true}))])),
             urls: Mutex::new(Vec::new()),
         });
-        assert!(provider(http).read_review_decision(7).await.expect_err("malformed reviews").to_string().contains("not an array"));
+        assert!(provider(http).read_reviews(7).await.expect_err("malformed reviews").to_string().contains("not an array"));
     }
 
     #[tokio::test]
@@ -718,7 +758,7 @@ mod tests {
             urls: Mutex::new(Vec::new()),
         });
         let provider = provider(http.clone());
-        assert_eq!(provider.read_review_decision(7).await.expect("reviews"), Some(ObservedReviewDecision::Approved));
+        assert_eq!(review_decision(&provider.read_reviews(7).await.expect("reviews")), Some(ObservedReviewDecision::Approved));
         let urls = http.urls.lock().expect("urls");
         assert_eq!(urls.len(), 2);
         assert!(urls[0].contains("page=1"));
@@ -736,7 +776,7 @@ mod tests {
             urls: Mutex::new(Vec::new()),
         });
         let provider = provider(http.clone());
-        assert_eq!(provider.read_review_decision(7).await.expect("reviews"), Some(ObservedReviewDecision::ChangesRequested));
+        assert_eq!(review_decision(&provider.read_reviews(7).await.expect("reviews")), Some(ObservedReviewDecision::ChangesRequested));
         assert_eq!(http.urls.lock().expect("urls").len(), 3);
     }
 
@@ -746,7 +786,7 @@ mod tests {
         let http =
             Arc::new(MockHttp { responses: Mutex::new((0..101).map(|_| json_response(&page)).collect()), urls: Mutex::new(Vec::new()) });
         let provider = provider(http.clone());
-        assert!(provider.read_review_decision(7).await.expect_err("page limit").to_string().contains("page limit"));
+        assert!(provider.read_reviews(7).await.expect_err("page limit").to_string().contains("page limit"));
         assert_eq!(http.urls.lock().expect("urls").len(), 100);
     }
 
@@ -1291,6 +1331,51 @@ mod tests {
         assert_eq!(observe(&provider, 1).await.checks.value, Some(ObservedChecks::Pass), "the new head has no status");
         fake.set_draft(&repo, 1, true).expect("draft");
         assert_eq!(observe(&provider, 1).await.mergeable.value, None);
+        assert_no_refusals(&fake);
+    }
+
+    // Behaviour (#3108 Q2 ruling (a)): a Forgejo change request has review feedback to act on at
+    // its head when a reviewer other than its author and crew last decided to request changes, at
+    // any commit, until a later decision or a dismissal, or commented with a body on the head
+    // commit itself; a comment on an earlier head, an empty comment and the author's and crew's
+    // own reviews are not feedback.
+    #[tokio::test]
+    async fn bound_observation_reads_review_feedback_at_the_head() {
+        let (fake, _clock, provider) = empty_fake();
+        let repo = team_repo();
+        fake.create_pull(
+            &repo,
+            NewPull { title: "Work".into(), head: "work".into(), base: "main".into(), body: String::new(), user: None, draft: false },
+        )
+        .expect("pull");
+        let crew = flotilla_change_request::CrewGithubLoginsByRequest::from([(1, vec!["Crew-Coder".to_owned()])]);
+        let actionable = || async {
+            let mut observed = provider.observe_bound(&[1], &crew).await.expect("observe bound");
+            observed.remove(&1).expect("observed").expect("status").review.actionable_at_head.value
+        };
+        let review = |user: &str, state, body: &str| {
+            fake.add_review(&repo, 1, NewReview { user: user.into(), state, body: body.into() }).expect("review").id
+        };
+        assert_eq!(actionable().await, Some(false), "no reviews");
+
+        review("crew-coder", ReviewState::Comment, "Addressed in the next push.");
+        review("flotilla-bot", ReviewState::Comment, "Author's note.");
+        review("alice", ReviewState::Comment, "  ");
+        assert_eq!(actionable().await, Some(false), "the crew's, the author's and empty comments");
+        review("alice", ReviewState::Comment, "This drops the error.");
+        assert_eq!(actionable().await, Some(true), "a comment on the head");
+        fake.push_head(&repo, 1).expect("push");
+        assert_eq!(actionable().await, Some(false), "a comment on an earlier head");
+
+        review("bob", ReviewState::RequestChanges, "Please split this.");
+        fake.push_head(&repo, 1).expect("push");
+        assert_eq!(actionable().await, Some(true), "a change request stands across heads");
+        review("bob", ReviewState::Approved, "");
+        assert_eq!(actionable().await, Some(false), "a later approval answers it");
+        let dismissed = review("carol", ReviewState::RequestChanges, "No.");
+        assert_eq!(actionable().await, Some(true));
+        fake.dismiss_review(&repo, 1, dismissed).expect("dismiss");
+        assert_eq!(actionable().await, Some(false), "a dismissed change request");
         assert_no_refusals(&fake);
     }
 
