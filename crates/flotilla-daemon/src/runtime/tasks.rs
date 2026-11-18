@@ -38,7 +38,7 @@ use tokio::{
     sync::{broadcast, oneshot, watch, Mutex},
     task::JoinHandle,
 };
-use tracing::{debug, error, info, warn};
+use tracing::{debug, error, info, warn, Instrument};
 
 use super::discovery::{
     observe_fulfilment_facts, BagEnvVars, FulfilmentProbeContext, LocalProvisioningProfile, ProbeListings, SshHostProfile,
@@ -1239,7 +1239,8 @@ where
         ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
         loop {
             ticker.tick().await;
-            operation().await;
+            // One span per pass, named by its task: what the pass logs carries its trace.
+            operation().instrument(tracing::info_span!("periodic", task = name)).await;
         }
     }))
 }

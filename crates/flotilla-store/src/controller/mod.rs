@@ -16,7 +16,7 @@ use tokio::{
     task::JoinHandle,
     time::Instant,
 };
-use tracing::{error, warn};
+use tracing::{error, warn, Instrument};
 
 use crate::{
     apply_status_patch,
@@ -865,6 +865,8 @@ impl<R: Reconciler> ControllerLoop<R> {
                 }
                 let mut attempted_reconcile = false;
                 let mut attempted_finalizer = false;
+                // One span per reconcile, named by kind: what it logs carries its trace.
+                let span = tracing::info_span!("reconcile", kind = R::Resource::API_PATHS.kind);
                 let result = async {
                     let lifecycle_owned = is_lifecycle_owned(object.metadata.lifecycle_authority()?);
                     if !lifecycle_owned
@@ -968,6 +970,7 @@ impl<R: Reconciler> ControllerLoop<R> {
                     }
                     Ok(())
                 }
+                .instrument(span.clone())
                 .await;
                 if attempted_reconcile {
                     metrics.reconcile.record(woke_at.elapsed());
@@ -990,7 +993,9 @@ impl<R: Reconciler> ControllerLoop<R> {
                     Err(err) => {
                         if attempted_reconcile {
                             // Counted with the kind's controller failures (#3206); told here, not stored.
-                            warn!(resource_kind = R::Resource::API_PATHS.kind, resource = %name, error = %err, "reconcile failed");
+                            span.in_scope(
+                                || warn!(resource_kind = R::Resource::API_PATHS.kind, resource = %name, error = %err, "reconcile failed"),
+                            );
                         }
                         let mut terminal = false;
                         // A finalizer or its removal write may fail without
@@ -1072,13 +1077,15 @@ impl<R: Reconciler> ControllerLoop<R> {
                                 },
                             );
                         }
-                        warn!(
-                            resource_kind = R::Resource::API_PATHS.kind,
-                            resource = %name,
-                            %err,
-                            terminal,
-                            "controller failed to reconcile object; other objects will continue",
-                        );
+                        span.in_scope(|| {
+                            warn!(
+                                resource_kind = R::Resource::API_PATHS.kind,
+                                resource = %name,
+                                %err,
+                                terminal,
+                                "controller failed to reconcile object; other objects will continue",
+                            )
+                        });
                         if let Some(delay) = retry_after {
                             Self::requeue_after(&scheduled_requeues, &sender, &name, delay).await;
                         }
