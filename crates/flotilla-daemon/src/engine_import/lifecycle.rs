@@ -139,6 +139,11 @@ fn namespace_lifecycles(source: &Source, namespace: &str, target: &mut Import, c
                 report.drop_rows("Checkout", "an orphaned worktree left on disk: held for an ended convoy", 1);
                 continue;
             }
+            // A convoy gone before the import ended too, as its tombstone did (#3108 ruling (a)).
+            if carried.convoy_launches.is_tombstone(&record.0.metadata.namespace, convoy) {
+                report.drop_rows("Checkout", "an orphaned worktree left on disk: held for a convoy gone before import", 1);
+                continue;
+            }
             let why = match carried.convoy_launches.launch(&record.0.metadata.namespace, convoy) {
                 Err(reason) => reason.to_string(),
                 Ok(launch) => format!("names a convoy imported as `{launch}`, not open at `{convoy_home}`"),

@@ -204,6 +204,9 @@ struct Carried {
     convoy_launches: ImportedLaunches,
     /// Each imported message's engine reference and inbox, by namespace and old record name.
     messages: BTreeMap<(String, String), (flotilla_state_machines::machines::message::MessageRef, flotilla_address::Address)>,
+    /// Each attention imported from a demand, by its engine reference, with the record it is
+    /// about: one about a tombstone is settled with it.
+    attentions: Vec<(flotilla_state_machines::machines::message::MessageRef, flotilla_address::Address)>,
     /// The last admission sequence the imported messages took, by home.
     admitted: BTreeMap<String, u64>,
     /// The launch each imported live old Convoy became, and its version as written, by home and
@@ -261,6 +264,8 @@ pub const STEPS: &[Step] = &[
     Step { name: "fulfilment kinds", kinds: &records::PLACEMENT_KINDS, run: records::placement },
     Step { name: "access deliveries", kinds: &["accessdeliveries"], run: records::access_deliveries },
     Step { name: "lifecycles", kinds: &lifecycle::KINDS, run: lifecycle::lifecycles },
+    // After every dependent: a convoy records name that the old store no longer holds.
+    Step { name: "tombstones", kinds: &[], run: convoys::tombstones },
     // Last: an ended convoy retires once every record that could hold it is imported.
     Step { name: "retirements", kinds: &[], run: convoys::retirements },
     // After every write: a launch made here next numbers above every imported one.
@@ -445,14 +450,60 @@ pub fn import(source: &Source, target: &mut Import) -> Summary {
     plan_rows(source, target, &mut summary);
     let convoys = source.context::<flotilla_resources::Convoy>("convoys", None);
     let launches = ImportedLaunches::number(convoys.iter().map(|convoy| (convoy.home.as_str(), &convoy.object)));
+    let launches = tombstoned(source, launches);
+    steps(source, target, launches, &mut summary);
+    summary.account(source, target);
+    summary
+}
+
+/// Runs every importer over `source` into `target`, with each convoy record naming `launches`.
+fn steps(source: &Source, target: &mut Import, launches: ImportedLaunches, summary: &mut Summary) {
     let mut carried = Carried { convoy_launches: launches, ..Carried::default() };
     for step in STEPS {
         let mut report = ImportReport::default();
         (step.run)(source, target, &mut carried, &mut report);
         summary.absorb(report);
     }
-    summary.account(source, target);
-    summary
+}
+
+/// `launches`, with a tombstone for each convoy that records name and the old store no longer
+/// holds, its garbage collection having removed it (#3108 import ruling (a)): every record naming
+/// it then imports against the tombstone rather than being refused. Every host must make the same
+/// tombstones, though each imports only its own home's records, so each home's records are
+/// imported first into a scratch store of that home, and each record that would be refused for
+/// naming a convoy the old store does not hold names one. A tombstone is homed at the lowest home
+/// whose records name it, and made at the earliest of their creation times.
+fn tombstoned(source: &Source, launches: ImportedLaunches) -> ImportedLaunches {
+    let Ok(registry) = crate::runtime::decided_registry() else { return launches };
+    let created: BTreeMap<(&str, &str, String), chrono::DateTime<chrono::Utc>> = source
+        .rows
+        .iter()
+        .filter_map(|row| {
+            let kind = plan::plan(&row.plural).map(|(kind, _)| kind)?;
+            let at = row.document.pointer("/metadata/creationTimestamp").cloned()?;
+            Some(((kind, row.home.as_str(), record_name(&row.document)), serde_json::from_value(at).ok()?))
+        })
+        .collect();
+    let homes: BTreeSet<&str> = source.rows.iter().map(|row| row.home.as_str()).collect();
+    let mut named = BTreeMap::<String, (BTreeSet<&str>, Option<chrono::DateTime<chrono::Utc>>)>::new();
+    for home in homes {
+        let Ok(mut scratch) = Import::in_memory(home, registry.clone()) else { continue };
+        let mut summary = Summary::default();
+        steps(source, &mut scratch, launches.clone(), &mut summary);
+        for refusal in &summary.refusals {
+            let Some(record) = NoLaunch::not_held_in(&refusal.reason) else { continue };
+            let (homes, earliest) = named.entry(record.to_owned()).or_default();
+            homes.insert(home);
+            if let Some(at) = created.get(&(refusal.kind.as_str(), home, refusal.name.clone())) {
+                *earliest = Some(earliest.map_or(*at, |earliest| earliest.min(*at)));
+            }
+        }
+    }
+    named.into_iter().fold(launches, |launches, (record, (homes, earliest))| match (homes.first(), earliest) {
+        (Some(home), Some(earliest)) => launches.with_tombstone(DEFAULT_PROVISIONING_NAMESPACE, &record, home, earliest),
+        // With no dependent's time it is not made, and its dependents are refused as before.
+        _ => launches,
+    })
 }
 
 /// [`import`] into a store in memory homed at `home`: what an import there would write.

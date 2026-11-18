@@ -6,13 +6,17 @@ use std::collections::{BTreeMap, BTreeSet};
 
 use flotilla_address::Address;
 use flotilla_admission::{reconcilers::convoy_ensure::generation_end, standing::fold};
-use flotilla_engine_convoys::convoy_import::{end_into, import_all, retire_into, withdraw_into, write_into, ConvoyImportWorld};
+use flotilla_engine_convoys::convoy_import::{
+    end_into, import_all, retire_into, settle_into, tombstone_into, withdraw_into, write_into, ConvoyImportWorld,
+};
 use flotilla_engine_store::{Import, ImportTarget, IMPORT_WRITER};
 use flotilla_provisioning::engine::{
     import::{created, ImportRefusal, ImportReport},
     standing_roles::record,
 };
-use flotilla_resources::{standing_roles::RunningValues, Convoy, Forge, ResourceObject, ENSURED_FROM_ANNOTATION};
+use flotilla_resources::{
+    convoy::engine::launch_address, standing_roles::RunningValues, Convoy, Forge, ResourceObject, ENSURED_FROM_ANNOTATION,
+};
 use flotilla_schema::{NewChange, Timestamp};
 use flotilla_state_machines::machines::message::MessageRef;
 
@@ -118,6 +122,65 @@ pub(super) fn convoys(source: &Source, target: &mut Import, carried: &mut Carrie
     }
     carried.convoys.extend(written_convoys);
     carried.ended.extend(ended_convoys);
+}
+
+/// Writes each tombstone homed here, ended, and retires it unless something imported holds it
+/// (#3108 import ruling (a)); first withdraws this home's messages pending to any tombstone's
+/// seats, wherever it is homed: its convoy was gone before the import. The step after every
+/// importer of a dependent, as [`retirements`] is.
+pub(super) fn tombstones(_: &Source, target: &mut Import, carried: &mut Carried, report: &mut ImportReport) {
+    let home = target.store().home().to_owned();
+    for ((_, record), tombstone) in carried.convoy_launches.tombstones() {
+        let launch = &tombstone.launch;
+        let refused = |reason: String| ImportRefusal { kind: KIND, record: record.clone(), reason };
+        let address = match Address::project(&launch.project)
+            .map_err(|error| error.to_string())
+            .and_then(|project| launch_address(&project, &launch.name()))
+        {
+            Ok(address) => address,
+            Err(reason) => {
+                report.refused.push(refused(reason));
+                continue;
+            }
+        };
+        let at = Timestamp::from_datetime(&tombstone.earliest_dependent);
+        let to_seats = carried.messages.values().filter(|(_, inbox)| inbox.is_under(&address)).map(|(message, _)| message);
+        let about = carried.attentions.iter().filter(|(_, subject)| subject.is_under(&address)).map(|(message, _)| message);
+        for (kind, messages) in [("Message", to_seats.collect::<Vec<_>>()), ("Demand", about.collect())] {
+            match settle_into(target, &address, messages, at) {
+                Ok(settled) => {
+                    for _ in 0..settled {
+                        report.tally(kind, "withdrawn: its convoy was gone before import");
+                    }
+                }
+                Err(reason) => report.refused.push(refused(reason)),
+            }
+        }
+        if launch.home != home {
+            continue;
+        }
+        let ended = match tombstone_into(target, tombstone) {
+            Ok((ended, _)) => ended,
+            Err(reason) => {
+                report.refused.push(refused(reason));
+                continue;
+            }
+        };
+        report.tally(KIND, "tombstone: its convoy was gone before import");
+        match retire_into(target, &ended, at) {
+            Ok(held) if held.is_empty() => {
+                report.tally(KIND, "tombstone retired");
+                carried.retired.insert((home.clone(), record.clone()));
+            }
+            Ok(held) => {
+                let kinds: BTreeSet<&str> = held.iter().map(|hold| hold.split(':').next().unwrap_or_default()).collect();
+                for kind in kinds {
+                    report.tally(KIND, format!("tombstone held by {kind}"));
+                }
+            }
+            Err(reason) => report.refused.push(refused(reason)),
+        }
+    }
 }
 
 /// Retires each imported convoy that ended and that nothing imported holds, at its end's time:

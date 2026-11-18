@@ -183,6 +183,7 @@ fn every_generated_demand_is_converted_dropped_or_refused_once(tc: TestCase) {
         ensures: ensures.iter().map(|ensure| (ensure.metadata.name.clone(), ensure)).collect(),
         vessels: vessels.iter().collect(),
         terminals: terminals.iter().map(|terminal| (terminal.metadata.name.clone(), terminal)).collect(),
+        tombstones: Default::default(),
     };
     let old: Vec<_> = demands.iter().map(|record| OldDemand { record, home: HOME.into() }).collect();
     let results = import_demands(&old, &|_| 1, &conversion, &records);

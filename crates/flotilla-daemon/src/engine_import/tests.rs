@@ -424,16 +424,14 @@ fn messages_import_by_state_drop_what_nobody_can_act_on_and_name_each_refusal() 
         json!({"kind": "Message", "metadata": {"name": "broken"}, "spec": 7}),
     ];
     let summary = rehearse(&rows(documents.clone()), HERE);
-    assert_eq!(summary.kinds["Message"], Counts { imported: 2, dropped: 2, refused: 4 }, "{summary:?}");
+    assert_eq!(summary.kinds["Message"], Counts { imported: 2, dropped: 3, refused: 3 }, "{summary:?}");
     let messages: Vec<_> = refused(&summary).into_iter().filter(|(kind, _)| *kind == "Message").collect();
-    assert_eq!(
-        messages,
-        [("Message", "broken"), ("Message", "awaiting-in-gone"), ("Message", "awaiting-in-live"), ("Message", "orphan-reply")],
-        "{summary:?}"
-    );
+    assert_eq!(messages, [("Message", "broken"), ("Message", "awaiting-in-live"), ("Message", "orphan-reply")], "{summary:?}");
     assert!(summary.refusals[0].reason.starts_with("does not decode"), "{:?}", summary.refusals[0]);
-    // A record naming a convoy with no launch is refused, and counted by why.
-    assert_eq!(summary.tallies["Message"].get("refused: names a convoy not in this host's replica"), Some(&1), "{summary:?}");
+    // A record naming a convoy the old store no longer holds names its tombstone (#3108 ruling
+    // (a)): awaiting a crew whose session is gone, it is dropped as the one in a landed convoy is.
+    assert_eq!(summary.rows["Message"].drops.get("its delivered session is gone"), Some(&3), "{summary:?}");
+    assert_eq!(summary.tallies["Convoy"].get("tombstone: its convoy was gone before import"), Some(&1), "{summary:?}");
 
     let mut unnamed = documents;
     unnamed[0]["spec"].as_object_mut().expect("spec").remove("fleet");
@@ -665,21 +663,29 @@ fn lifecycle_records_import_by_state_and_name_what_they_cannot_map() {
     }
 }
 
-// Behaviour (#3108, R2): a checkout held for a convoy that imports as no launch is refused by name
-// and counted by why: nothing is dropped.
+// Behaviour (#3108, R2): a checkout held for a convoy that never bootstrapped, so imports as no
+// launch, is refused by name and counted by why. One held for a convoy the old store no longer
+// holds names its tombstone (#3108 ruling (a)), ended, so it is left on disk as an orphaned
+// worktree, as one held for an ended convoy is.
 #[test]
 fn a_checkout_held_for_a_convoy_with_no_launch_is_refused() {
-    let mut held = document(
-        "Checkout",
-        "held-for-gone",
-        json!({"kind": "worktree", "repo_ref": "repo", "env_ref": "env-a", "ref": "feature", "target_path": "/w", "clone_ref": "clone-a"}),
-        json!({"phase": "Ready"}),
-    );
-    held["metadata"]["labels"] = json!({"flotilla.work/convoy": "gone"});
-    let summary = rehearse(&rows(vec![clone("clone-a"), held]), HERE);
-    assert_eq!(refused(&summary), [("Checkout", "held-for-gone")], "{summary:?}");
-    assert_eq!(summary.kinds["Checkout"].dropped, 0, "{summary:?}");
-    assert_eq!(summary.tallies["Checkout"].get("refused: names a convoy not in this host's replica"), Some(&1), "{summary:?}");
+    let held_for = |name: &str, convoy: &str| {
+        let mut held = document(
+            "Checkout",
+            name,
+            json!({"kind": "worktree", "repo_ref": "repo", "env_ref": "env-a", "ref": "feature", "target_path": "/w", "clone_ref": "clone-a"}),
+            json!({"phase": "Ready"}),
+        );
+        held["metadata"]["labels"] = json!({"flotilla.work/convoy": convoy});
+        held
+    };
+    let unbooted = document("Convoy", "unbooted", json!({"workflow_ref": "w", "inputs": {}}), Value::Null);
+    let documents = vec![clone("clone-a"), unbooted, held_for("held-for-unbooted", "unbooted"), held_for("held-for-gone", "gone")];
+    let summary = rehearse(&rows(documents), HERE);
+    assert_eq!(refused(&summary), [("Checkout", "held-for-unbooted")], "{summary:?}");
+    assert_eq!(summary.tallies["Checkout"].get("refused: names a convoy that never bootstrapped"), Some(&1), "{summary:?}");
+    let drops = &summary.rows["Checkout"].drops;
+    assert_eq!(drops.get("an orphaned worktree left on disk: held for a convoy gone before import"), Some(&1), "{summary:?}");
 }
 
 #[test]
@@ -930,6 +936,83 @@ fn ended_convoys_import_with_their_end_and_retire_unless_held() {
             assert_eq!((change.writer.as_str(), change.at), ("import", at(finished)), "{of} retires when it ended");
         }
     }
+}
+
+// Behaviour (#3108 import ruling (a)): records naming a convoy the old store's garbage collection
+// removed import against a tombstone, not as refusals. The tombstone is launch 1 of the name,
+// homed at the lowest home whose records name it and made at the earliest of their times, ended
+// with its end time marked unknown and retired by the import. A message pending to it is settled
+// by the import. A convoy only another home's records name is that home's to write.
+#[test]
+fn records_naming_a_convoy_the_old_store_lost_import_against_a_retired_tombstone() {
+    use flotilla_engine_convoys::convoy_import::TOMBSTONE_REASON;
+    use flotilla_provisioning::stored::artifact::ArtifactRecord;
+    use flotilla_schema::CodeEnum as _;
+    use flotilla_state_machines::machines::convoy::{ConvoyEdge, ConvoyEdgeKind, ConvoyLabel};
+    use flotilla_state_machines::machines::message::{DropReason, MessageState};
+
+    let named = |name: &str, convoy: &str, created: &str| {
+        let mut named = artifact(name);
+        named["spec"]["convoy"] = json!(convoy);
+        named["spec"]["subject"] = json!(convoy);
+        named["metadata"]["creationTimestamp"] = json!(created);
+        named
+    };
+    let mut waiting = message("for-gone");
+    waiting["spec"]["receiver"] = json!("flotilla/gone/implement/coder");
+    let documents = vec![
+        designation(),
+        named("brief-gone", "gone", "2026-10-18T00:00:00Z"),
+        homed(THERE, named("brief-gone-there", "gone", "2026-10-17T00:00:00Z")),
+        homed(THERE, named("brief-lost", "lost", "2026-10-17T00:00:00Z")),
+        waiting,
+    ];
+    let dir = tempfile::tempdir().expect("tempdir");
+    let mut target =
+        Import::create(&dir.path().join(ENGINE_STORE), HERE, crate::runtime::decided_registry().expect("registry")).expect("target");
+    let summary = import(&rows(documents), &mut target);
+    drop(target);
+    assert!(summary.refusals.is_empty(), "{summary:?}");
+    let tallies: Vec<(&str, usize)> = summary.tallies["Convoy"].iter().map(|(what, count)| (what.as_str(), *count)).collect();
+    assert_eq!(
+        tallies,
+        [("launch numbers raised to 1", 1), ("tombstone retired", 1), ("tombstone: its convoy was gone before import", 1)],
+        "{summary:?}"
+    );
+    assert_eq!(summary.tallies["Message"].get("withdrawn: its convoy was gone before import"), Some(&1), "{summary:?}");
+
+    let at = |time: &str| Timestamp::from_datetime(&time.parse().expect("time"));
+    let mut store = engine(dir.path());
+    let mut read = store.read().expect("read");
+    let (id, tombstone) = convoy_launch(&mut read, "gone");
+    assert_eq!((tombstone.name(), tombstone.label()), ("gone#1", ConvoyLabel::Retired));
+    // Made, ended and retired by the import at its earliest dependent's time, every home's.
+    let earliest = at("2026-10-17T00:00:00Z");
+    for edge in [ConvoyEdgeKind::Abandon, ConvoyEdgeKind::Retire] {
+        let entry = read.last_edge(id, &edge.code()).expect("entry").unwrap_or_else(|| panic!("{edge:?}"));
+        let change = read.change(HERE, entry.change).expect("change").expect("its change");
+        assert_eq!((change.writer.as_str(), change.at), ("import", earliest), "{edge:?}");
+        if let ConvoyEdge::Abandon(abandon) = entry.arguments::<ConvoyEdge>().expect("an edge").expect("its arguments decode") {
+            assert_eq!(abandon.reason, TOMBSTONE_REASON);
+        }
+    }
+    let page = read.scan::<EngineConvoyResource>(HERE, None, 64).expect("scan");
+    assert_eq!(page.ids.len(), 1, "`lost` is only another home's records' to name, so that home writes it");
+
+    let record = "project:flotilla/convoy:gone%231/role:coder/message:for-gone";
+    let id = read.resolve(<MessageResource as Kind>::CODE, record, HERE).expect("resolve").expect("the message");
+    let message = read.load::<MessageResource>(id).expect("load").expect("held").value;
+    assert!(matches!(message.state(), MessageState::Dropped { reason: DropReason::Withdrawn { .. }, .. }), "{:?}", message.state());
+    assert_eq!(read.last_change(id).expect("entry").expect("its change").writer, "import");
+
+    let artifacts = read.scan::<ArtifactRecord>(HERE, None, 64).expect("scan");
+    let convoys: Vec<String> = artifacts
+        .ids
+        .into_iter()
+        .filter_map(|id| read.load::<ArtifactRecord>(id).expect("load"))
+        .map(|loaded| loaded.value.convoy)
+        .collect();
+    assert_eq!(convoys, ["gone#1"]);
 }
 
 #[test]
@@ -1185,21 +1268,17 @@ fn attention_records() -> Vec<Value> {
 
 #[test]
 fn open_demands_import_as_the_attentions_their_writers_send() {
+    use flotilla_state_machines::machines::message::{DropReason, MessageState};
+
     let source = rows(attention_records());
     let summary = rehearse(&source, HERE);
-    // A demand about a convoy the source does not hold is refused (#3108 R2), counted by why.
-    assert_eq!(summary.kinds["Demand"], Counts { imported: 5, dropped: 4, refused: 4 }, "{summary:?}");
+    // A demand about a convoy the source no longer holds reads its tombstone (#3108 ruling (a)).
+    assert_eq!(summary.kinds["Demand"], Counts { imported: 6, dropped: 4, refused: 3 }, "{summary:?}");
     assert_eq!(
         refused(&summary),
-        [
-            ("Demand", "ensure-attention-pooled"),
-            ("Demand", "reclaim-refusal-gone"),
-            ("Demand", "surprise"),
-            ("Demand", "terminal-delivery-misaimed")
-        ],
+        [("Demand", "ensure-attention-pooled"), ("Demand", "surprise"), ("Demand", "terminal-delivery-misaimed")],
         "{summary:?}"
     );
-    assert_eq!(summary.tallies["Demand"].get("refused: names a convoy not in this host's replica"), Some(&1), "{summary:?}");
 
     let mut target = Import::in_memory(HERE, crate::runtime::decided_registry().expect("registry")).expect("target");
     let imported = import(&source, &mut target);
@@ -1236,6 +1315,12 @@ fn open_demands_import_as_the_attentions_their_writers_send() {
         assert_eq!(*message.state(), flotilla_state_machines::machines::message::MessageState::Pending, "{name}");
         assert_eq!(message.since(), Timestamp::from_datetime(&"2026-10-20T00:00:00Z".parse().expect("time")), "{name}");
     }
+    // One about a convoy the source no longer holds is about its tombstone, and the import
+    // settles it: nobody can act on a convoy gone before the import (#3108 ruling (a)).
+    let gone = load("fleet:lab/role:operator/message:reclaim-refusal-gone");
+    assert_eq!(gone.spec().subject().map(|reference| reference.address.as_str()), Some("project:flotilla/convoy:gone%231"));
+    assert!(matches!(gone.state(), MessageState::Dropped { reason: DropReason::Withdrawn { .. }, .. }), "{:?}", gone.state());
+    assert_eq!(imported.tallies["Demand"].get("withdrawn: its convoy was gone before import"), Some(&1), "{imported:?}");
     let credential = load("project:flotilla/role:operator/message:credential-refresh-demo-work");
     assert_eq!(
         credential.spec().body.value(),

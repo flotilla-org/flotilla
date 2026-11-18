@@ -833,6 +833,145 @@ pub fn retire_into(target: &flotilla_engine_store::Import, ended: &Resource<Conv
     Ok(held)
 }
 
+/// What a tombstone's end says: why it ended, and that when it ended is not known.
+pub const TOMBSTONE_REASON: &str = "its convoy was gone before import; when it ended is unknown";
+
+/// The provenance key a tombstone's admission carries, so a reader tells it from a convoy that
+/// was admitted: its value says its times stand in for ones not known.
+pub const TOMBSTONE_PROVENANCE: &str = "flotilla.work/import-tombstone";
+
+/// Writes `tombstone` into `target` and ends it (#3108 import ruling (a)): a convoy records name
+/// that the old store no longer holds, as an abandoned launch with no seat, promise or duty. Its
+/// creation and its end are both at its earliest dependent's time, because neither is known, and
+/// its admission says so. The convoy as ended, and its end's time.
+pub fn tombstone_into(
+    target: &mut flotilla_engine_store::Import,
+    tombstone: &flotilla_resources::convoy::engine::Tombstone,
+) -> Result<(Resource<Convoy>, Timestamp), String> {
+    use flotilla_engine_store::ImportTarget as _;
+    let launch = &tombstone.launch;
+    let at = timestamp(&tombstone.earliest_dependent);
+    let created = CreatedAt::from_datetime(&tombstone.earliest_dependent);
+    let refuse = |error: String| format!("tombstone `{}`: {error}", launch.name());
+    let document = flotilla_resources::convoy::admission::AdmissionDocument {
+        workflow_snapshot: flotilla_resources::WorkflowSnapshot {
+            cascade: None,
+            exit: None,
+            turn_delivery: Default::default(),
+            stall_nudges: Default::default(),
+            supervision: None,
+            vessels: Vec::new(),
+        },
+        placement_decision: None,
+        placement_policy: None,
+        role: launch.of.clone(),
+        ensure_admission: None,
+        naming: None,
+        dispatching_principal_ref: flotilla_protocol::PrincipalRef::implicit_for_namespace(launch.project.clone()),
+        continuation: None,
+        inputs: BTreeMap::new(),
+        repositories: Vec::new(),
+        r#ref: None,
+        adopted_checkout_refs: BTreeMap::new(),
+        subjects: Vec::new(),
+        instruction: None,
+        workflow_template: None,
+        placement_snapshot: None,
+        vessel_placements: BTreeMap::new(),
+        brief_artifacts: false,
+        adopted_checkout: None,
+        provenance: BTreeMap::from([(
+            TOMBSTONE_PROVENANCE.to_owned(),
+            "its creation and end times are its earliest dependent's: neither is known".to_owned(),
+        )]),
+    };
+    let bytes = document.encode().map_err(|error| refuse(error.to_string()))?;
+    let admission = flotilla_schema::Frozen::new(flotilla_state_machines::machines::convoy::AdmissionBytes::new(bytes))
+        .map_err(|error| refuse(error.to_string()))?;
+    let kinds =
+        Catalog::resolve(&stock(), &[]).and_then(|catalog| catalog.freeze(BTreeSet::new())).map_err(|error| refuse(error.to_string()))?;
+    let spec = ConvoySpec {
+        launch_of: launch.of.clone(),
+        launch: 0,
+        workflow_ref: String::new(),
+        admission,
+        project: Address::project(&launch.project).map_err(|error| refuse(error.to_string()))?,
+        priority: Priority(0),
+        kinds,
+        subjects: Records::new(),
+        duties: BTreeMap::new(),
+        seats: Records::new(),
+        promises: Records::new(),
+    };
+    let state = StoredState::<Convoy>::new(ConvoyState::Open { quota: BTreeMap::new(), retired_duties: BTreeSet::new() }, at);
+    let change = NewChange::new(flotilla_engine_store::IMPORT_WRITER, at).created_at(created);
+    let (_, written) = target.write_launch(&launch.home, &change, launch.n, |version| {
+        let resource = Resource::stored(launch.of.as_str(), stamped(&spec, version), state.clone(), Version(version)).numbered(launch.n);
+        (resource.name().to_owned(), resource)
+    })?;
+    let end = ImportedEnd {
+        edge: ConvoyEdge::Abandon(Abandon {
+            by: SeatName::new("operator", flotilla_engine_store::IMPORT_WRITER),
+            cause: AbandonCause::Operator,
+            reason: TOMBSTONE_REASON.to_owned(),
+            authority: import_grant(&launch.of),
+        }),
+        at,
+        phase: ConvoyPhase::Abandoned,
+    };
+    Ok((end_into(target, &written, &end).map_err(refuse)?, at))
+}
+
+/// Withdraws each of `messages` homed at `target`'s home and still pending, each pending to a
+/// seat under `launch`, a tombstone's address, or about it (#3108 import ruling (a)): its convoy
+/// was gone before the import, so nothing will take it or act on it. As [`withdraw_into`] does
+/// for an ended convoy's seats, by the launch's address on its authority: the machine expires
+/// only a message past its deadline. Written by the import at `at`, or at a message's own time
+/// when it came later. How many it settled.
+pub fn settle_into<'a>(
+    target: &flotilla_engine_store::Import,
+    launch: &Address,
+    messages: impl IntoIterator<Item = &'a MessageRef>,
+    at: Timestamp,
+) -> Result<usize, String> {
+    let home_name = target.store().home().to_owned();
+    let pending: Vec<Resource<Message>> = {
+        let mut store = target.store();
+        let mut read = store.read().map_err(|error| error.to_string())?;
+        let mut pending = Vec::new();
+        for message in messages.into_iter().filter(|message| message.home == home_name) {
+            let Some(id) = read
+                .resolve(<Resource<Message> as flotilla_schema::Kind>::CODE, &message.name, &home_name)
+                .map_err(|error| error.to_string())?
+            else {
+                continue;
+            };
+            let loaded = read.load::<Resource<Message>>(id).map_err(|error| error.to_string())?;
+            pending.extend(
+                loaded
+                    .map(|loaded| loaded.value)
+                    .filter(|message| message.label() == flotilla_state_machines::machines::message::MessageLabel::Pending),
+            );
+        }
+        pending
+    };
+    if pending.is_empty() {
+        return Ok(0);
+    }
+    let mut home = Home::<Message, flotilla_engine_store::StoreLog>::with_log(flotilla_engine_store::IMPORT_WRITER, target.log())
+        .map_err(|error| format!("{error:?}"))?;
+    let mut world = MemoryMessageWorld::default();
+    world.authority.put(&Ref::new(launch.as_str()), true);
+    let reason = DropReason::Withdrawn { by: launch.clone(), authority: launch.clone() };
+    for message in &pending {
+        home.restore(message.clone()).map_err(|error| format!("{error:?}"))?;
+        let when = Timestamp(at.0.max(message.since().0));
+        home.apply(message.name(), DropMessage { reason: reason.clone() }, &world, when)
+            .map_err(|error| format!("message `{}`: the machine refuses its withdrawal: {error:?}", message.name()))?;
+    }
+    Ok(pending.len())
+}
+
 /// A home writing as the import through `target`'s log, holding nothing yet.
 fn importing(target: &flotilla_engine_store::Import) -> Result<Home<Convoy, flotilla_engine_store::StoreLog>, String> {
     Home::with_log(flotilla_engine_store::IMPORT_WRITER, target.log()).map_err(|error| format!("{error:?}"))

@@ -436,6 +436,52 @@ async fn imported_ended_convoys_pass_the_convoy_reconciler_and_write_nothing() {
     }
 }
 
+// #3108 import ruling (a): an artifact and a pending message naming a convoy the old store's
+// garbage collection removed import against a tombstone the import retires, and the message is
+// settled by the import. The started daemon's controllers, and a convoy reconciler pass over the
+// tombstone, write nothing to either.
+#[tokio::test]
+async fn records_naming_a_lost_convoy_import_against_a_retired_tombstone_and_start_writes_nothing() {
+    use flotilla_state_machines::machines::{convoy::Convoy as EngineConvoy, message::Message as EngineMessage};
+    use flotilla_store::controller::Reconciler as _;
+
+    let host = Host::new("tombstone").await;
+    own::<FleetDesignation>(&host.backend, designation()).await;
+    host.own::<Artifact>("brief-gone", artifact("gone", "gone"), Value::Null).await;
+    let mut waiting = message("for-gone");
+    waiting["spec"]["receiver"] = json!("flotilla/gone/implement/coder");
+    own::<Message>(&host.backend, waiting).await;
+    let _runtime = host.start().await.expect("runtime");
+    let daemon = host.daemon();
+    let home = host.home();
+    let writer_of = |code, name: &str| {
+        daemon
+            .decided_store()
+            .expect("engine store")
+            .with_store(|store| {
+                let mut read = store.read()?;
+                let id = read.resolve(code, name, &home)?.unwrap_or_else(|| panic!("{name}"));
+                Ok(read.last_change(id)?.expect("its last change").writer)
+            })
+            .expect("read")
+    };
+    let convoy = <flotilla_state_machines::Resource<EngineConvoy> as Kind>::CODE;
+    let message = <flotilla_state_machines::Resource<EngineMessage> as Kind>::CODE;
+    let settled = "project:flotilla/convoy:gone%231/role:coder/message:for-gone";
+
+    let backend = daemon.resource_backend();
+    let tombstone = backend.using::<Convoy>(NS).get("gone#1").await.expect("the tombstone, read by its launch though retired");
+    assert!(backend.using::<Convoy>(NS).list().await.expect("list").items.is_empty(), "the tombstone retired at the import");
+    let reconciler = flotilla_crew::convoy::ConvoyReconciler::new(daemon.lifecycle_reads())
+        .with_engine(daemon.convoy_engine_path())
+        .with_messages(daemon.crew_message_path());
+    reconciler.prepare(&tombstone).await.expect("a pass over the tombstone");
+    assert_eq!(writer_of(convoy, "gone#1"), flotilla_engine_store::IMPORT_WRITER);
+    assert_eq!(writer_of(message, settled), flotilla_engine_store::IMPORT_WRITER);
+    let artifacts = backend.using::<Artifact>(NS).list().await.expect("artifacts").items;
+    assert_eq!(artifacts.iter().map(|artifact| artifact.spec.convoy.as_str()).collect::<Vec<_>>(), ["gone#1"]);
+}
+
 // #3108: an imported hold on a standing role is the one its ensure pass raises and clears. A role
 // held at its strike limit raises no second hold beside the imported one, and a role whose hold
 // is answered clears the imported one.

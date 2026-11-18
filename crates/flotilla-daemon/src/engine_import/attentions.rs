@@ -13,6 +13,7 @@ use flotilla_core::primitives::{
 use flotilla_engine_store::{Import, ImportTarget};
 use flotilla_provisioning::engine::import::{ImportRefusal, ImportReport, RowOutcome};
 use flotilla_resources::{Convoy, ConvoyEnsure, TerminalSession, Vessel};
+use flotilla_state_machines::machines::message::MessageRef;
 
 use super::{
     messages::{fleet_roles, old_store_records},
@@ -54,6 +55,13 @@ fn namespace_attentions(source: &Source, namespace: &str, target: &mut Import, c
         ensures: ensures.iter().map(|ensure| (ensure.object.metadata.name.clone(), &ensure.object)).collect(),
         vessels: vessels.iter().map(|vessel| &vessel.object).collect(),
         terminals: terminals.iter().map(|terminal| (terminal.object.metadata.name.clone(), &terminal.object)).collect(),
+        tombstones: carried
+            .convoy_launches
+            .tombstones()
+            .iter()
+            .filter(|((held_in, _), _)| held_in == namespace)
+            .map(|((_, record), tombstone)| (record.clone(), &tombstone.launch))
+            .collect(),
     };
     let old: Vec<_> = demands.iter().map(|(record, home)| OldDemand { record, home: home.clone() }).collect();
     let next = |home: &str| carried.admitted.get(home).copied().unwrap_or_default() + 1;
@@ -70,6 +78,9 @@ fn namespace_attentions(source: &Source, namespace: &str, target: &mut Import, c
     for message in imported.iter().filter(|message| failure(&message.record).is_none()) {
         let admitted = carried.admitted.entry(message.home.clone()).or_default();
         *admitted = (*admitted).max(message.resource.version().0);
+        if let Some(subject) = message.resource.spec().subject() {
+            carried.attentions.push((MessageRef::new(message.resource.name(), &message.home), subject.address.clone()));
+        }
     }
     let mut counted = MessageReport::default();
     for import in &results {

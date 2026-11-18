@@ -412,6 +412,15 @@ impl NoLaunch {
     pub fn class_in(reason: &str) -> Option<&'static str> {
         [Self::NeverBootstrapped, Self::NotHeld, Self::Unnamed(String::new())].iter().map(Self::class).find(|class| reason.contains(class))
     }
+
+    /// The convoy record a refusal's reason names when it is refused for naming a convoy this
+    /// host's replica does not hold: every such reason ends with the record, quoted, in brackets.
+    pub fn not_held_in(reason: &str) -> Option<&str> {
+        if !reason.contains(Self::NotHeld.class()) {
+            return None;
+        }
+        reason.strip_suffix("`)")?.rsplit_once("(`").map(|(_, record)| record)
+    }
 }
 
 impl std::fmt::Display for NoLaunch {
@@ -441,7 +450,21 @@ pub struct ImportedLaunches {
     unlaunched: BTreeMap<(String, String), NoLaunch>,
     /// The highest number each home's records take, launched or not.
     highest: BTreeMap<String, u64>,
+    /// Every launch name a record takes, every home's, launched or not.
+    numbered: BTreeSet<(String, u64)>,
     collisions: Vec<LaunchCollision>,
+    /// The convoys records name that the old store no longer holds, by namespace and name: each
+    /// imports as a retired tombstone launch (#3108 import ruling (a)), with its end time unknown.
+    tombstones: BTreeMap<(String, String), Tombstone>,
+}
+
+/// A convoy records name that the old store's garbage collection removed: the launch it imports
+/// as, and the earliest time a record naming it was made, which stands in for its creation and
+/// its end, neither of which is known.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Tombstone {
+    pub launch: ImportedLaunch,
+    pub earliest_dependent: chrono::DateTime<chrono::Utc>,
 }
 
 impl ImportedLaunches {
@@ -465,6 +488,7 @@ impl ImportedLaunches {
             *highest = (*highest).max(n);
             let launch = ImportedLaunch { home: home.to_owned(), project: convoy.spec.project_ref.clone(), of, n };
             named.entry((home.to_owned(), launch.name())).or_default().insert(convoy.metadata.name.clone());
+            this.numbered.insert((launch.of.clone(), n));
             if convoy.status.as_ref().is_some_and(|status| status.workflow_snapshot.is_some()) {
                 this.launches.insert(key, launch);
             } else {
@@ -483,8 +507,32 @@ impl ImportedLaunches {
     pub fn with(mut self, namespace: &str, record: &str, launch: ImportedLaunch) -> Self {
         let highest = self.highest.entry(launch.home.clone()).or_default();
         *highest = (*highest).max(launch.n);
+        self.numbered.insert((launch.of.clone(), launch.n));
         self.launches.insert((namespace.to_owned(), record.to_owned()), launch);
         self
+    }
+
+    /// These launches with a tombstone for convoy `record` in `namespace`, which records name and
+    /// the old store no longer holds (#3108 import ruling (a)): launch 1 of its name homed at
+    /// `home`, or the name's next free number when another record takes 1, in the namespace's
+    /// project, made at `earliest_dependent`. Every record naming it names that launch.
+    pub fn with_tombstone(self, namespace: &str, record: &str, home: &str, earliest_dependent: chrono::DateTime<chrono::Utc>) -> Self {
+        let taken: Vec<u64> = self.numbered.iter().filter(|(of, _)| of == record).map(|(_, n)| *n).collect();
+        let n = if taken.contains(&1) { taken.iter().max().copied().unwrap_or_default() + 1 } else { 1 };
+        let launch = ImportedLaunch { home: home.to_owned(), project: namespace.to_owned(), of: record.to_owned(), n };
+        let mut this = self.with(namespace, record, launch.clone());
+        this.tombstones.insert((namespace.to_owned(), record.to_owned()), Tombstone { launch, earliest_dependent });
+        this
+    }
+
+    /// The tombstones, by namespace and the record name they stand for.
+    pub fn tombstones(&self) -> &BTreeMap<(String, String), Tombstone> {
+        &self.tombstones
+    }
+
+    /// Whether record `record` in `namespace` imports as a tombstone.
+    pub fn is_tombstone(&self, namespace: &str, record: &str) -> bool {
+        self.tombstones.contains_key(&(namespace.to_owned(), record.to_owned()))
     }
 
     /// Why record `record` in `namespace` imports as no launch; nothing when it imports as one.

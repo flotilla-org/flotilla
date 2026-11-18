@@ -18,7 +18,7 @@ use std::collections::BTreeMap;
 use flotilla_address::{Address, Kind};
 use flotilla_protocol::ResourceRef;
 use flotilla_resources::{
-    convoy::engine::{convoy_reference_address, standing_name, NoLaunch},
+    convoy::engine::{convoy_reference_address, launch_address, standing_name, ImportedLaunch, NoLaunch},
     Convoy, ConvoyEnsure, MessageReference, ResourceObject, TerminalSession, Vessel, CONVOY_LABEL, ROLE_LABEL,
 };
 use flotilla_schema::Timestamp;
@@ -60,6 +60,8 @@ pub struct DemandRecords<'a> {
     pub ensures: BTreeMap<String, &'a ResourceObject<ConvoyEnsure>>,
     pub vessels: Vec<&'a ResourceObject<Vessel>>,
     pub terminals: BTreeMap<String, &'a ResourceObject<TerminalSession>>,
+    /// The tombstone each convoy the old store no longer holds imports as, by old name.
+    pub tombstones: BTreeMap<String, &'a ImportedLaunch>,
 }
 
 /// An attention a demand maps to: its id, and the person and project it is addressed by.
@@ -267,6 +269,14 @@ fn convoy_read(convoy: &ResourceObject<Convoy>, conversion: &Conversion<'_>) -> 
     Ok(Read { address, revision: convoy.metadata.resource_version.clone() })
 }
 
+/// What a demand's attention reads of a convoy the old store no longer holds: its tombstone's
+/// launch, which never changes, so its name is its revision, as a vessel's launch is.
+fn tombstone_read(tombstone: &ImportedLaunch) -> Result<Read, String> {
+    let project = Address::project(&tombstone.project).map_err(|error| format!("project `{}`: {error}", tombstone.project))?;
+    let name = tombstone.name();
+    Ok(Read { address: launch_address(&project, &name)?, revision: name })
+}
+
 /// What a standing role's attention reads of its generation `held`: the role's launch numbered by
 /// the generation (`<standing name>#<generation>`), as the ensure pass raises and clears the
 /// attention, whether or not the generation bootstrapped and so has a launch.
@@ -286,17 +296,22 @@ fn map(
     conversion: &Conversion<'_>,
     records: &DemandRecords<'_>,
 ) -> Result<Mapped, String> {
-    let attention = |cause, reason, convoy: &ResourceObject<Convoy>| {
+    let attention = |cause, reason, project: Option<String>| {
         Mapped::Attention(Box::new(Pending {
             id: record.metadata.name.clone(),
             attention: Attention { cause, reason },
             principal,
-            project: convoy.spec.project_ref.clone(),
+            project,
         }))
     };
-    let convoy = |name: &str| -> Result<Option<(&ResourceObject<Convoy>, Read)>, String> {
-        let Some(convoy) = records.convoys.get(name) else { return Ok(None) };
-        Ok(Some((*convoy, convoy_read(convoy, conversion)?)))
+    // A convoy the old store no longer holds is read as its tombstone (#3108 import ruling (a)).
+    // Its own project is unknown, so its attention goes where a convoy with none sends one.
+    let convoy = |name: &str| -> Result<Option<(Option<String>, Read)>, String> {
+        if let Some(convoy) = records.convoys.get(name) {
+            return Ok(Some((convoy.spec.project_ref.clone(), convoy_read(convoy, conversion)?)));
+        }
+        let Some(tombstone) = records.tombstones.get(name) else { return Ok(None) };
+        Ok(Some((None, tombstone_read(tombstone)?)))
     };
     match writer {
         Writer::Delivery { session } => {
@@ -313,7 +328,7 @@ fn map(
             let Some(ensure) = records.ensures.get(ensure) else { return Ok(Mapped::Dropped("its ConvoyEnsure is gone")) };
             let read = generation_read(held, ensure)?;
             let reason = reason(record, ENSURE_HOLD_REASON_ANNOTATION, || format!("Standing convoy `{target}` is held."));
-            Ok(attention(Cause::Hold { convoy: read }, reason, held))
+            Ok(attention(Cause::Hold { convoy: read }, reason, held.spec.project_ref.clone()))
         }
         Writer::Reclaim { convoy: target } => {
             let Some((held, read)) = convoy(target)? else { return Err(gone(target)) };
@@ -330,7 +345,7 @@ fn map(
                 Read { address: child(&project, Kind::Role, &ensure.spec.role)?, revision: ensure.metadata.resource_version.clone() };
             let reason =
                 reason(record, ENSURE_CONFIG_DRIFT_REASON_ANNOTATION, || format!("Standing role `{}` has drifted.", ensure.spec.role));
-            Ok(attention(Cause::Drift { role, convoy: read }, reason, held))
+            Ok(attention(Cause::Drift { role, convoy: read }, reason, held.spec.project_ref.clone()))
         }
     }
 }
