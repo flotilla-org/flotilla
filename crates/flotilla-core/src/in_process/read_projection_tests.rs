@@ -1299,6 +1299,10 @@ mod tests {
     #[tokio::test]
     async fn convoy_explanation_says_what_holds_it_from_retiring() {
         use flotilla_protocol::commands::ExplainedHolds;
+        use flotilla_resources::{
+            convoy::engine::Actor,
+            promises::{PromiseKind, PromiseOperation, PromiseSource, Submission},
+        };
 
         let now = Utc::now();
         let fixture = ProjectionFixture::new();
@@ -1309,42 +1313,22 @@ mod tests {
                 flotilla_engine_convoys_testkit::single_agent("coder"),
             )
             .await;
-        // Its crew's claim links the change request it produced.
-        let produced = Subject {
-            kind: SubjectKind::ChangeRequest,
-            source: IssueSource { service: "github.com".into(), scope: "owner/one".into() },
-            id: "42".into(),
-        };
+        // Its crew submits the change request it opened to its pr promise.
         let engine = fixture.convoy_engine.get().expect("the Convoy path");
         let convoy = fixture.home.convoy(&launch).await;
-        engine.link(&convoy, &produced, flotilla_resources::SubjectDiscoverySource::Claim, "coder").await.expect("link");
+        let submission =
+            Submission { reference: "cr/github.com/owner/one/42".into(), metadata: Default::default(), submitted_at: now, verdict: None };
+        let submit = PromiseOperation::Submit { id: "pr".into(), kind: PromiseKind::Pr, source: PromiseSource::Crew, submission };
+        engine.promise(&convoy, "work", "coder", &submit, Actor::Crew).await.expect("submitted");
         let (explained, name) = (&fixture, launch.as_str());
         let held_by = move || async move { explained.projections().explain_convoy("flotilla", name).await.expect("explain").held_by };
         let change_request = |holds: &[String]| matches!(holds, [hold] if hold.starts_with("change-request:") && hold.ends_with("/cr:42"));
         let open = held_by().await;
         assert!(matches!(&open, Some(ExplainedHolds::Open { holds }) if change_request(holds)), "{open:?}");
 
+        // Its merge keeps the promise and it lands; the change request has no record (the observer
+        // collected it), and none is read.
         flotilla_engine_convoys_testkit::land(&fixture.convoy_engine, &fixture.home.convoy(&launch).await).await;
-        // The change request it links has no record yet: absent is not closed.
-        let ended = held_by().await;
-        assert!(matches!(&ended, Some(ExplainedHolds::Ended { holds }) if change_request(holds)), "{ended:?}");
-
-        let requests = fixture.backend.using::<ChangeRequest>("flotilla");
-        let record = requests
-            .create(
-                &InputMeta::builder().name(cr_name("github.com", "owner/one", 42)).build(),
-                &ChangeRequestSpec::builder()
-                    .service("github.com".into())
-                    .scope("owner/one".into())
-                    .number(42)
-                    .observing_authority("local".into())
-                    .build(),
-            )
-            .await
-            .expect("request");
-        let mut status = subject_status(now);
-        status.state.value = Some(ObservedChangeRequestState::Merged);
-        requests.update_status(&record.metadata.name, &record.metadata.resource_version, &status).await.expect("merged");
         assert_eq!(held_by().await, Some(ExplainedHolds::Ended { holds: Vec::new() }), "nothing holds it");
 
         let retired = fixture.home.convoys.convoys().retire(&launch, flotilla_schema::Timestamp::from_datetime(&now)).expect("retire");

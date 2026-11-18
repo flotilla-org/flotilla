@@ -52,8 +52,8 @@ use flotilla_state_machines::{
     machines::{
         awaiting_reply::{Awaited, AwaitingReplySpec},
         convoy::{
-            Abandon, AbandonCause, AdmissionBytes, AdmittedPromise, Convoy, ConvoyId, ConvoyLabel, ConvoyRequest, Link, LinkSource,
-            Priority, PromiseId, PromiseSource, Seat, SeatName, VesselClass,
+            Abandon, AbandonCause, AdmissionBytes, AdmittedPromise, Authority, Convoy, ConvoyId, ConvoyLabel, ConvoyRequest, Deliver, Keep,
+            Link, LinkSource, Priority, PromiseId, PromiseSource, Reject, Seat, SeatName, Submit, VesselClass,
         },
         message::MessageRef,
         vessel::{VesselKind, VesselSpec},
@@ -108,23 +108,25 @@ fn document() -> AdmissionDocument {
     }
 }
 
+/// The pr promises a convoy is admitted with, by id, beside its decision ledger (id 0).
+const PRS: [u32; 4] = [1, 2, 3, 4];
+
 fn request(document: AdmissionDocument) -> ConvoyRequest {
+    let promise = |label: String, kind: &str| AdmittedPromise {
+        label,
+        kind: kind.into(),
+        target: project(),
+        source: PromiseSource::Template,
+        owner: SeatName::new("coder", ""),
+    };
+    let ledger = (PromiseId(0), promise("template/coder/decision-ledger".into(), "decision-ledger"));
+    let prs = PRS.map(|id| (PromiseId(id), promise(format!("pr-{id}"), "pr")));
     ConvoyRequest {
         launch_of: "fix-it".into(),
         workflow_ref: "single".into(),
         admission: Frozen::new(AdmissionBytes::new(document.encode().expect("encode"))).expect("freeze"),
         project: project(),
-        promises: [(
-            PromiseId(0),
-            AdmittedPromise {
-                label: "template/coder/decision-ledger".into(),
-                kind: "decision-ledger".into(),
-                target: project(),
-                source: PromiseSource::Template,
-                owner: SeatName::new("coder", ""),
-            },
-        )]
-        .into(),
+        promises: [ledger].into_iter().chain(prs).collect(),
         duties: Default::default(),
         seats: vec![Seat {
             failed: None,
@@ -137,7 +139,7 @@ fn request(document: AdmissionDocument) -> ConvoyRequest {
         }],
         quota: [(VesselClass::new("standard"), 1)].into(),
         priority: Priority(1),
-        kinds: Catalog::resolve(&stock(), &[]).expect("stock").freeze(["decision-ledger"]).expect("freeze"),
+        kinds: Catalog::resolve(&stock(), &[]).expect("stock").freeze(["decision-ledger", "pr"]).expect("freeze"),
     }
 }
 
@@ -192,6 +194,22 @@ impl Fixture {
         let link =
             Link { subject: change.clone(), source: LinkSource::Claim, by: SeatName::new("coder", ""), authority: Ref::new("granted") };
         self.convoys.apply("fix-it", link, Timestamp(3_000_000)).expect("linked");
+        change
+    }
+
+    /// Submits change request `number` to pr promise `id`, as its owner does; returns its address.
+    fn submit(&self, id: u32, number: u64) -> Address {
+        let change = stored_change_request_address("github.com", "flotilla-org/flotilla", number, &[]).expect("change request");
+        let durable = format!("{change}@durable");
+        self.convoys.world(|world| world.durable.put(&Ref::new(durable.as_str()), true));
+        let submit = Submit {
+            promise: PromiseId(id),
+            by: SeatName::new("coder", ""),
+            address: change.clone(),
+            revision: "c1".into(),
+            durable: Ref::new(durable),
+        };
+        self.convoys.apply("fix-it", submit, Timestamp(3_000_000)).expect("submitted");
         change
     }
 
@@ -292,14 +310,18 @@ async fn each_unreleased_dependent_holds_the_convoy() {
     };
     assert!(awaiting.record(stall, Timestamp(2_000_000)).expect("stall recorded"));
 
-    // Linked change requests: open and unobserved hold; merged and closed do not.
-    let open = fixture.link(1);
-    fixture.observe(&open, ObservedChangeRequestState::Open).await;
-    let unobserved = fixture.link(2);
-    for (number, state) in [(3, ObservedChangeRequestState::Merged), (4, ObservedChangeRequestState::Closed)] {
-        let change = fixture.link(number);
-        fixture.observe(&change, state).await;
-    }
+    // Its pr promises: a Submitted one holds, as its change request is open; one never submitted,
+    // one whose change request closed (back to Pending) and one kept at its merge do not.
+    let [submitted, rejected, kept, _] = PRS;
+    let open = fixture.submit(submitted, 1);
+    fixture.submit(rejected, 2);
+    fixture.convoys.apply("fix-it", Reject { promise: PromiseId(rejected) }, Timestamp(3_100_000)).expect("rejected");
+    fixture.submit(kept, 3);
+    fixture.convoys.apply("fix-it", Keep::Observed { promise: PromiseId(kept), submission: 1 }, Timestamp(3_100_000)).expect("kept");
+    // A change request linked with no promise holds nothing, open or with no record.
+    let linked = fixture.link(5);
+    fixture.observe(&linked, ObservedChangeRequestState::Open).await;
+    fixture.link(6);
 
     // Checkouts it holds: a live one holds, a released one does not.
     let checkouts = LifecycleHome::new(HOME, Home::with_log(HOME, StoreLog::new(fixture.service.store())).expect("home"));
@@ -359,7 +381,6 @@ async fn each_unreleased_dependent_holds_the_convoy() {
         format!("message:{}/message:m-pending", fixture.seat()),
         format!("awaiting-reply:{}", fixture.service.with_store(first_awaiting).expect("stall")),
         format!("change-request:{open}"),
-        format!("change-request:{unobserved}"),
         format!("checkout:{live}"),
         format!("vessel:{}", vessel.name()),
         "access-delivery:access-1".to_owned(),
@@ -452,6 +473,48 @@ async fn the_home_retires_a_convoy_when_its_last_hold_releases() {
     let follower = retire::follow(Arc::clone(&fixture.convoys), Arc::new(SystemClock)).expect("follow");
     assert_eq!(fixture.label(), ConvoyLabel::Abandoned);
 
+    checkouts.step(&checkout, &Step::Released, Timestamp(6_000_000)).expect("released");
+    let retired = async {
+        while fixture.label() != ConvoyLabel::Retired {
+            convoy_writes.next(|_, _| Ok(())).await.expect("a convoy write");
+        }
+    };
+    tokio::time::timeout(std::time::Duration::from_secs(30), retired).await.expect("retired once its checkout released");
+    follower.abort();
+}
+
+// Behaviour (#3108 d8): a convoy that delivered at its change request's merge retires when its
+// checkout releases later, though the observer collected the change request's record in between:
+// the pr promise its merge kept holds nothing, and the record is not read.
+#[tokio::test]
+async fn a_convoy_retires_after_its_merge_once_its_change_request_record_is_collected() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let fixture = Fixture::new(&dir);
+    let checkouts = fixture.checkouts();
+    let checkout = fixture.checkout(&checkouts, "ck");
+    let change = fixture.submit(PRS[0], 7);
+    assert!(fixture.holds().contains(&format!("change-request:{change}")), "an open change request holds it");
+
+    fixture.observe(&change, ObservedChangeRequestState::Merged).await;
+    fixture.convoys.apply("fix-it", Keep::Observed { promise: PromiseId(PRS[0]), submission: 1 }, Timestamp(3_100_000)).expect("kept");
+    for id in [0, PRS[1], PRS[2], PRS[3]] {
+        let verdict = Keep::Verdict {
+            promise: PromiseId(id),
+            by: SeatName::new("operator", ""),
+            authority: Authority::Operator,
+            reason: "done".into(),
+        };
+        fixture.convoys.apply("fix-it", verdict, Timestamp(3_100_000)).expect("kept by verdict");
+    }
+    fixture.convoys.apply("fix-it", Deliver { disposition: "merged".into() }, Timestamp(3_200_000)).expect("delivered");
+    let observations = EngineObservations::open(Arc::clone(&fixture.service), Arc::new(SystemClock)).expect("observations");
+    let name = record_name(&change).expect("record name");
+    KindRecords::<ChangeRequest>::delete(&observations, &name).await.expect("collected");
+    assert_eq!(fixture.holds(), BTreeSet::from([format!("checkout:{checkout}")]));
+
+    let mut convoy_writes = EngineWatch::start(Arc::clone(&fixture.service), [<Resource<Convoy> as Kind>::CODE]).expect("watch");
+    let follower = retire::follow(Arc::clone(&fixture.convoys), Arc::new(SystemClock)).expect("follow");
+    assert_eq!(fixture.label(), ConvoyLabel::Delivered);
     checkouts.step(&checkout, &Step::Released, Timestamp(6_000_000)).expect("released");
     let retired = async {
         while fixture.label() != ConvoyLabel::Retired {

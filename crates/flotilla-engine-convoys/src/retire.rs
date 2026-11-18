@@ -8,12 +8,9 @@
 use std::{collections::BTreeSet, sync::Arc};
 
 use flotilla_engine_store::{follow::Followed, watch::EngineWatch};
-use flotilla_provisioning::stored::{
-    account::AccountBinding, checkout::Checkout, forge_observation::ChangeRequestRecord, standing_role::StandingRoleRecord,
-};
+use flotilla_provisioning::stored::{account::AccountBinding, checkout::Checkout, standing_role::StandingRoleRecord};
 use flotilla_resources::{
-    access_delivery::convoy_of_access, account_access::requester_parts, address::subject_for, convoy::engine::convoy_records,
-    AccessDeliverySpec, Clock,
+    access_delivery::convoy_of_access, account_access::requester_parts, convoy::engine::convoy_records, AccessDeliverySpec, Clock,
 };
 use flotilla_schema::{reads, Identity, Kind, KindCode, Timestamp};
 use flotilla_schema_sqlite::{Read, StoreError};
@@ -29,14 +26,14 @@ use flotilla_state_machines::{
 
 use super::convoys::{Convoys, Retirement};
 
-/// The kinds whose writes can retire a convoy: the convoy's own, which ends it, and each hold's.
-fn followed_kinds() -> [KindCode; 9] {
+/// The kinds whose writes can retire a convoy: the convoy's own, which ends it and keeps or
+/// returns its pr promise, and each other hold's.
+fn followed_kinds() -> [KindCode; 8] {
     [
         <StandingRoleRecord as Kind>::CODE,
         <Resource<Convoy> as Kind>::CODE,
         <Resource<Message> as Kind>::CODE,
         <Resource<AwaitingReply> as Kind>::CODE,
-        <ChangeRequestRecord as Kind>::CODE,
         <Resource<Checkout> as Kind>::CODE,
         <Resource<Vessel> as Kind>::CODE,
         <AccessDeliverySpec as Kind>::CODE,
@@ -64,7 +61,7 @@ pub fn follow(convoys: Arc<Convoys>, clock: Arc<dyn Clock>) -> Result<tokio::tas
             let (home, waiting) = (home.clone(), held.clone());
             match watch.next(move |read, followed| candidates(read, followed, &home, &waiting)).await {
                 Ok(found) => {
-                    let names = found.names(&held, &convoys);
+                    let names = found.names(&held);
                     try_retire(&convoys, &clock, names, &mut held).await
                 }
                 Err(error) => tracing::warn!(%error, "the convoys' holds could not be read from the log; retrying"),
@@ -81,34 +78,17 @@ const FOLLOWER: &str = "Convoy retirement";
 struct Found {
     /// Convoys homed here, by name.
     convoys: BTreeSet<String>,
-    /// Change requests written, by service, scope and number: they name no convoy.
-    change_requests: Vec<(String, String, u64)>,
     /// Every held convoy is to be tried.
     every: bool,
 }
 
 impl Found {
-    /// The convoys to try: those found, the held ones linking a change request found, or every
-    /// held one. The links are read from this home's records, outside the store's read.
-    fn names(self, held: &BTreeSet<String>, convoys: &Convoys) -> BTreeSet<String> {
+    /// The convoys to try: those found, or every held one.
+    fn names(self, held: &BTreeSet<String>) -> BTreeSet<String> {
         if self.every {
             return self.convoys.into_iter().chain(held.iter().cloned()).collect();
         }
-        let mut names = self.convoys;
-        if !self.change_requests.is_empty() {
-            for name in held {
-                let Some(convoy) = convoys.launch(name) else { continue };
-                let links = convoy.spec().linked().into_iter().filter_map(|subject| subject_for(subject).ok()).any(|subject| {
-                    self.change_requests.iter().any(|(service, scope, number)| {
-                        subject.source.service == *service && subject.source.scope == *scope && subject.id == number.to_string()
-                    })
-                });
-                if links {
-                    names.insert(name.clone());
-                }
-            }
-        }
-        names
+        self.convoys
     }
 }
 
@@ -196,25 +176,12 @@ fn candidates(read: &mut Read<'_>, followed: Vec<Followed>, home: &str, held: &B
             found.every |= identity.home == home;
             continue;
         }
-        if identity.kind == <ChangeRequestRecord as Kind>::CODE {
-            match change_request(read, &identity)? {
-                Some(key) => found.change_requests.push(key),
-                None => found.every = true,
-            }
-            continue;
-        }
         match named(read, &identity, home)? {
             Some(names) => found.convoys.extend(names.into_iter().filter(|name| held.contains(name))),
             None => found.every = true,
         }
     }
     Ok(found)
-}
-
-/// The service, scope and number of change request record `identity`; `None` when it is gone.
-fn change_request(read: &mut Read<'_>, identity: &Identity) -> Result<Option<(String, String, u64)>, StoreError> {
-    let Some(id) = read.resolve(identity.kind, &identity.name, &identity.home)? else { return Ok(None) };
-    Ok(read.load::<ChangeRequestRecord>(id)?.map(|loaded| (loaded.value.service, loaded.value.scope, loaded.value.number)))
 }
 
 /// The convoys dependent `identity` names; `None` when it is gone.

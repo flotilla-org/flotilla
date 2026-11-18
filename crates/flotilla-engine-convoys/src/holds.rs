@@ -6,14 +6,15 @@
 //! |---|---|---|
 //! | an unsettled Message to a seat | its inbox, the seat's address | Message `by_inbox`, Pending and Awaiting |
 //! | an open AwaitingReply or stall | its subject, the convoy's or a seat's address | AwaitingReply `open_by_subject` |
-//! | a change request it links, neither merged nor closed | the convoy's own link, the record's subject | ChangeRequest `by_subject` |
+//! | an open change request it promised | its own pr promise, Submitted until the merge keeps it or the close returns it to Pending | none: the convoy's own record |
 //! | a live Checkout it holds | its holder, `convoy:<name>` | Checkout `by_holder` |
 //! | a live Vessel of its work | its convoy and work | Vessel `by_launch` |
 //! | an AccessDelivery to its crew | its access, a crew member's role address | AccessDelivery `by_access` |
 //! | an open AccountBinding of its crew | its requester, a seat's role address | AccountBinding `by_requester` |
 //! | a standing generation's end its role has not counted | its ensure, from its admission | StandingRole by name at its home |
 //!
-//! A linked change request with no record yet holds: absent is not closed. The holds name each
+//! A change request linked with no pr promise holds nothing, and the change request's own record
+//! is never read: the forge observer collects it once nothing demands it. The holds name each
 //! dependent `kind:name`, the first a query finds, so a refusal says what it waits for.
 
 use std::collections::BTreeSet;
@@ -22,18 +23,17 @@ use flotilla_address::Kind as AddressKind;
 use flotilla_provisioning::stored::{
     account::{AccountBinding, BindingLabel, BindingSpec},
     checkout::{Checkout, CheckoutRequest},
-    forge_observation::{ChangeRequestRecord, ChangeRequestState},
     standing_role::StandingRoleRecord,
     Holder,
 };
 use flotilla_resources::{
     access_delivery::access_key,
     account_access::requester_address,
-    address::subject_for,
     convoy::{
         admission::AdmissionDocument,
         engine::{launch_address, seat_address, split_launch},
     },
+    promises::PromiseKind,
     vessel_resource_name, AccessDeliverySpec, ENSURED_FROM_ANNOTATION,
 };
 use flotilla_schema::{IndexQuery, Kind};
@@ -41,7 +41,7 @@ use flotilla_schema_sqlite::{Read, ResourceId, StoreError};
 use flotilla_state_machines::{
     machines::{
         awaiting_reply::AwaitingReplySpec,
-        convoy::{Convoy, ConvoyId},
+        convoy::{Convoy, ConvoyId, Progress},
         message::{MessageLabel, MessageSpec},
         vessel::{Vessel, VesselSpec},
     },
@@ -80,22 +80,13 @@ pub fn holds(read: &mut Read<'_>, convoy: &Resource<Convoy>, home: &str) -> Resu
         first(read, &AwaitingReplySpec::open_by_subject(subject), &mut holds, "awaiting-reply")?;
     }
 
-    for subject in spec.linked().into_iter().filter(|subject| subject.kind() == AddressKind::ChangeRequest) {
-        let Ok(linked) = subject_for(subject) else { continue };
-        let Ok(number) = linked.id.parse::<u64>() else { continue };
-        let query = ChangeRequestRecord::by_subject(&linked.source.service, &linked.source.scope, &number);
-        let mut observed = false;
-        let mut open = false;
-        each(read, &query, |read, id| {
-            if let Some(record) = read.load::<ChangeRequestRecord>(id)? {
-                observed = true;
-                open |= !matches!(record.value.state, Some(ChangeRequestState::Merged | ChangeRequestState::Closed));
-            }
-            Ok(())
-        })?;
-        if open || !observed {
-            holds.insert(format!("change-request:{subject}"));
-        }
+    let pr = PromiseKind::Pr.as_str();
+    for row in spec.promises.iter().filter(|row| row.record.kind == pr && row.record.progress.value == Progress::Submitted) {
+        let promise = &row.record;
+        match promise.submissions.iter().last() {
+            Some(submission) => holds.insert(format!("change-request:{}", submission.record.address)),
+            None => holds.insert(format!("promise:{}", promise.label)),
+        };
     }
 
     each(read, &CheckoutRequest::by_holder(&Holder::convoy(name)), |read, id| {
