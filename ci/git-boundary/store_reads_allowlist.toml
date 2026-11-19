@@ -43,3 +43,8 @@ reason = "Watch-view protocol: a lost or failed event invalidates the cache and 
 path = "crates/flotilla-store/src/view.rs"
 function = "recover_local_view"
 reason = "Local watch-view protocol: retry the snapshot/watch handoff with backoff after a watch expires."
+
+[[allow]]
+path = "crates/flotilla-daemon/src/runtime/credential_delivery.rs"
+function = "watch_fulfilment_kinds"
+reason = "List-then-watch subscription: the FulfilmentKind list runs once each time the watch (re)opens, to diff against the grants last seen; changes are then taken from the watch."
