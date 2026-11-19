@@ -18,8 +18,45 @@ use flotilla_transport::message::MessageSession;
 
 use super::{remote_commands::RemoteCommandRouter, request_dispatch::RequestDispatcher};
 
+/// How long a caller is waited on while its environment's crew session is being launched.
+const LAUNCH_WAIT: std::time::Duration = std::time::Duration::from_secs(5);
+
+/// The crews placed in `environment`. A launch starts its crew's process before its realise is
+/// committed, and the crew may call at once: while the environment has an agent session still
+/// starting and none placed, the crews are read again at each TerminalSession change, until one
+/// is placed, none is starting, or [`LAUNCH_WAIT`] has passed.
 pub(super) async fn environment_crews(daemon: &InProcessDaemon, environment: &EnvironmentId) -> Result<Vec<CallerCrew>, String> {
     let namespace = daemon.provisioning_namespace().await;
+    let deadline = tokio::time::Instant::now() + LAUNCH_WAIT;
+    let mut changes = None;
+    loop {
+        let (crews, starting) = placed_crews(daemon, &namespace, environment).await?;
+        if !crews.is_empty() || !starting || tokio::time::Instant::now() >= deadline {
+            return Ok(crews);
+        }
+        let Some(watch) = changes.as_mut() else {
+            // Watching before the next read: a change after it wakes the wait.
+            changes = Some(
+                daemon
+                    .resource_backend()
+                    .using::<TerminalSession>(&namespace)
+                    .watch(flotilla_resources::WatchStart::Now)
+                    .await
+                    .map_err(|error| error.to_string())?,
+            );
+            continue;
+        };
+        match tokio::time::timeout_at(deadline, futures::StreamExt::next(watch)).await {
+            Ok(Some(_)) => {}
+            // The watch ended, or the wait is over: read once more.
+            Ok(None) | Err(_) => return Ok(placed_crews(daemon, &namespace, environment).await?.0),
+        }
+    }
+}
+
+/// The crews placed in `environment`, and whether an agent session there is still starting.
+async fn placed_crews(daemon: &InProcessDaemon, namespace: &str, environment: &EnvironmentId) -> Result<(Vec<CallerCrew>, bool), String> {
+    let namespace = namespace.to_owned();
     let backend = daemon.resource_backend();
     let sessions = backend
         .query_declared::<TerminalSession>(
@@ -29,10 +66,15 @@ pub(super) async fn environment_crews(daemon: &InProcessDaemon, environment: &En
         .await
         .map_err(|error| error.to_string())?;
     let mut crews = Vec::new();
+    let mut starting = false;
     for session in sessions.items {
         let session = session.object;
         let TerminalSessionSource::Agent { context, .. } = &session.spec.source else { continue };
-        let Some(status) = session.status.as_ref() else { continue };
+        let Some(status) = session.status.as_ref() else {
+            starting = true;
+            continue;
+        };
+        starting |= status.phase == TerminalSessionPhase::Starting;
         // A launch that has ended places no crew.
         if matches!(status.phase, TerminalSessionPhase::Stopped | TerminalSessionPhase::Failed | TerminalSessionPhase::Lost) {
             continue;
@@ -53,7 +95,7 @@ pub(super) async fn environment_crews(daemon: &InProcessDaemon, environment: &En
                 .build(),
         );
     }
-    Ok(crews)
+    Ok((crews, starting))
 }
 
 fn authorize_context(context: &mut CrewCommandContext, crew: &CallerCrew) -> Result<(), String> {

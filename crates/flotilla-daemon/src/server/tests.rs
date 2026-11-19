@@ -5211,6 +5211,14 @@ pub(super) fn launch_of(daemon: &InProcessDaemon, session: &str) -> String {
 
 /// Places `placed`'s crew in `environment`, returning its convoy's launch.
 pub(super) async fn place_crew(daemon: &InProcessDaemon, environment: &str, placed: PlacedCrew<'_>) -> String {
+    let (convoy, spec) = crew_session(daemon, environment, placed.convoy).await;
+    run_session(daemon, placed.session, &spec, &codex_crew_facts());
+    convoy
+}
+
+/// An active single-agent convoy `convoy`'s launch, and its coder session placed in
+/// `environment`, not yet requested.
+pub(super) async fn crew_session(daemon: &InProcessDaemon, environment: &str, convoy: &str) -> (String, TerminalSessionSpec) {
     let mut vessels = flotilla_resources::single_agent_workflow_spec().vessels;
     // These identity scenarios have no PR deliverable.
     let coder = &mut vessels[0].crew[0];
@@ -5229,7 +5237,7 @@ pub(super) async fn place_crew(daemon: &InProcessDaemon, environment: &str, plac
         ..Default::default()
     };
     let spec = ConvoySpec::builder().workflow_ref("single-agent".into()).project_ref("flotilla".into()).build();
-    let convoy = admit_convoy(daemon, flotilla_engine_convoys_testkit::convoy("flotilla", placed.convoy, spec, status)).await;
+    let convoy = admit_convoy(daemon, flotilla_engine_convoys_testkit::convoy("flotilla", convoy, spec, status)).await;
     let vessel = install_engine(daemon).vessels.request(&convoy, "work", daemon.local_host_id().expect("local host").as_str());
     let spec = TerminalSessionSpec {
         env_ref: environment.into(),
@@ -5243,8 +5251,36 @@ pub(super) async fn place_crew(daemon: &InProcessDaemon, environment: &str, plac
             context: Box::new(TerminalCrewContext { namespace: "flotilla".into(), convoy: convoy.clone(), vessel_ref: vessel }),
         },
     };
-    run_session(daemon, placed.session, &spec, &codex_crew_facts());
-    convoy
+    (convoy, spec)
+}
+
+// Behaviour (d16 finding 1): a launch starts its crew's process before its realise commits, and
+// the crew may call at once. A caller in an environment whose crew session is still starting is
+// resolved once the session is realised, not refused; with nothing starting it is refused at once.
+#[tokio::test]
+async fn a_crew_calling_while_its_session_starts_is_placed_once_realised() {
+    let (_tmp, daemon) = empty_daemon().await;
+    let (_, spec) = crew_session(&daemon, "starting-environment", "own").await;
+    let launch = request_session(&daemon, "starting-session", &spec);
+
+    let calling = tokio::spawn({
+        let daemon = Arc::clone(&daemon);
+        async move { super::environment_connection::environment_crews(&daemon, &EnvironmentId::new("starting-environment")).await }
+    });
+    tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+    assert!(!calling.is_finished(), "a caller is not refused while its session starts");
+    install_engine(&daemon).terminals.ready(&launch, "starting-session", &codex_crew_facts());
+    let crews = tokio::time::timeout(std::time::Duration::from_secs(5), calling)
+        .await
+        .expect("placed once realised")
+        .expect("the call")
+        .expect("placement identity");
+    assert_eq!(crews.iter().map(|crew| crew.crew_id.as_str()).collect::<Vec<_>>(), vec![launch.as_str()]);
+
+    let started = std::time::Instant::now();
+    let none = super::environment_connection::environment_crews(&daemon, &EnvironmentId::new("empty-environment")).await.expect("read");
+    assert!(none.is_empty());
+    assert!(started.elapsed() < std::time::Duration::from_secs(1), "nothing starting: answered at once");
 }
 
 /// A release gate that sanctions every ended convoy's reclaim.
