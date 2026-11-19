@@ -420,7 +420,9 @@ async fn a_checks_passed_turn_after_submission_does_not_nudge_the_idle_seat() {
 }
 
 // Run 4: a checks-failed turn after submission asks the coder to fix its PR. Idle, it is nudged,
-// and the nudge names that turn rather than telling it to submit the PR it has submitted.
+// and the nudge names that turn rather than telling it to submit the PR it has submitted. Run 5
+// R5-2: it states what is known, the turn and the revision it was delivered for, and does not
+// claim the turn went unanswered, which the judge does not know.
 #[tokio::test]
 async fn a_checks_failed_turn_after_submission_nudges_the_idle_seat_naming_the_turn() {
     use flotilla_resources::StallRung;
@@ -444,7 +446,9 @@ async fn a_checks_failed_turn_after_submission_nudges_the_idle_seat_naming_the_t
         .map(|message| message.spec.body)
         .collect();
     assert_eq!(nudges.len(), 1, "{nudges:?}");
-    assert!(nudges[0].contains(&format!("you have not answered the `{CHECKS_RULE}` turn")), "{}", nudges[0]);
+    assert!(nudges[0].contains(&format!("the newest turn that asked you to act is `{CHECKS_RULE}`")), "{}", nudges[0]);
+    assert!(nudges[0].contains("for `head-1@fail`"), "{}", nudges[0]);
+    assert!(!nudges[0].contains("have not answered"), "{}", nudges[0]);
     assert!(nudges[0].contains(CHECKS_BRIEF.lines().next().expect("first line")), "{}", nudges[0]);
     assert!(!nudges[0].contains("submit your PR"), "{}", nudges[0]);
 }

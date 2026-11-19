@@ -13,8 +13,8 @@ use flotilla_resources::{
     address::{leaf_address, record_name},
     select_convoy_children, Convoy, ConvoyAttention, ConvoyPhase, ConvoyStatus, CrewWorkPhase, LeafMaker, NudgeObligation, ResourceObject,
     StallEvidenceSource, StallNudge, StallRung, StallSupervisor, StalledCondition, Stalls, SupervisionTarget, TerminalAttention,
-    TerminalAttentionSource, TerminalAttentionState, TerminalSession, TerminalSessionPhase, TerminalSessionSource, TurnDeliveryRule,
-    WorkPhase, CONVOY_LABEL, ROLE_LABEL, VESSEL_LABEL,
+    TerminalAttentionSource, TerminalAttentionState, TerminalSession, TerminalSessionPhase, TerminalSessionSource, TurnDeliveryOutcome,
+    TurnDeliveryRule, WorkPhase, CONVOY_LABEL, ROLE_LABEL, VESSEL_LABEL,
 };
 use flotilla_store::{load_metrics::carry, off_frame};
 
@@ -403,8 +403,19 @@ fn owed_now(status: &ConvoyStatus, vessel: &str, role: &str) -> Option<String> {
         .and_then(|snapshot| snapshot.turn_delivery.get(source))
         .and_then(|rule| rule.brief.lines().map(str::trim).find(|line| !line.is_empty()))
         .unwrap_or_default();
+    // The revision of its subject the turn was delivered for. Whether the seat has acted on it is
+    // not known here (no "head moved, so acted on" inference), so the nudge does not say (run 5 R5-2).
+    let revision = status
+        .turn_deliveries
+        .get(source)
+        .and_then(|delivery| {
+            delivery.episodes.iter().find(
+                |episode| matches!(episode.outcome, TurnDeliveryOutcome::MessageAccepted { accepted_at: at, .. } if at == accepted_at),
+            )
+        })
+        .map_or(String::new(), |episode| format!(" for `{}`", episode.subject_revision));
     Some(format!(
-        "You owe deliverables for {vessel}/{role}: you have not answered the `{source}` turn delivered at {}: {asked} Your submitted promises wait on it; act on it, and submit again where it changes them. {BLOCKED}",
+        "You owe deliverables for {vessel}/{role}: the newest turn that asked you to act is `{source}`, delivered at {}{revision}: {asked} Your submitted promises wait on it; act on it if you have not, and submit again where it changes them. {BLOCKED}",
         accepted_at.to_rfc3339()
     ))
 }
