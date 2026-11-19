@@ -293,6 +293,8 @@ async fn message_send_reads_ignore_unrelated_history() {
         )
         .await;
         super::test_engine(&daemon);
+        // Started as the runtime starts it: the Convoy views' first composition is startup work.
+        daemon.convoy_views().expect("convoy views").opened().await;
         designate_fleet(&backend).await;
         let primitives = install_engine_messages(&daemon);
         let mut receiver = String::new();
@@ -312,6 +314,9 @@ async fn message_send_reads_ignore_unrelated_history() {
                 primitives.admit(&format!("history-{index}"), &unrelated).await.expect("unrelated message");
             }
         }
+        // The send is measured from a settled daemon: the views have read in the setup's last
+        // writes, which their follower may not have reached yet and the next read would catch up.
+        daemon.convoy_views().expect("convoy views").held().await.expect("the views read in the setup");
         let document = serde_json::json!({
             "apiVersion": "flotilla.work/v1", "kind": "Message", "metadata": {"name": "send"},
             "spec": {"sender": "project:flotilla/role:checks", "inbox": coder_inbox(&receiver), "relation": "system", "body": "checks settled"}
