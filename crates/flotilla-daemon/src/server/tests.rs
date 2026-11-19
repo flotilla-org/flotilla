@@ -5255,32 +5255,27 @@ pub(super) async fn crew_session(daemon: &InProcessDaemon, environment: &str, co
 }
 
 // Behaviour (d16 finding 1): a launch starts its crew's process before its realise commits, and
-// the crew may call at once. A caller in an environment whose crew session is still starting is
-// resolved once the session is realised, not refused; with nothing starting it is refused at once.
+// the crew may call at once. Its identity is its launch's request, committed before the process
+// starts: a caller whose session is still starting is placed as that launch's crew, at once, and
+// as the same crew once realised. An environment with no crew session places none.
 #[tokio::test]
 async fn a_crew_calling_while_its_session_starts_is_placed_once_realised() {
     let (_tmp, daemon) = empty_daemon().await;
     let (_, spec) = crew_session(&daemon, "starting-environment", "own").await;
     let launch = request_session(&daemon, "starting-session", &spec);
+    let placed = || async {
+        let crews = super::environment_connection::environment_crews(&daemon, &EnvironmentId::new("starting-environment"))
+            .await
+            .expect("placement identity");
+        crews.into_iter().map(|crew| crew.crew_id).collect::<Vec<_>>()
+    };
 
-    let calling = tokio::spawn({
-        let daemon = Arc::clone(&daemon);
-        async move { super::environment_connection::environment_crews(&daemon, &EnvironmentId::new("starting-environment")).await }
-    });
-    tokio::time::sleep(std::time::Duration::from_millis(50)).await;
-    assert!(!calling.is_finished(), "a caller is not refused while its session starts");
+    assert_eq!(placed().await, vec![launch.clone()], "placed while its session starts");
     install_engine(&daemon).terminals.ready(&launch, "starting-session", &codex_crew_facts());
-    let crews = tokio::time::timeout(std::time::Duration::from_secs(5), calling)
-        .await
-        .expect("placed once realised")
-        .expect("the call")
-        .expect("placement identity");
-    assert_eq!(crews.iter().map(|crew| crew.crew_id.as_str()).collect::<Vec<_>>(), vec![launch.as_str()]);
+    assert_eq!(placed().await, vec![launch.clone()], "the same crew once realised");
 
-    let started = std::time::Instant::now();
     let none = super::environment_connection::environment_crews(&daemon, &EnvironmentId::new("empty-environment")).await.expect("read");
     assert!(none.is_empty());
-    assert!(started.elapsed() < std::time::Duration::from_secs(1), "nothing starting: answered at once");
 }
 
 /// A release gate that sanctions every ended convoy's reclaim.
