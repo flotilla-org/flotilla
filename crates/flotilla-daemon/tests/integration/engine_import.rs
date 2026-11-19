@@ -745,6 +745,133 @@ async fn a_daemon_server_started_over_an_old_store_leaves_it_byte_identical() {
     }
 }
 
+// Behaviour (#3108, r983 cut-over): a live crew the import carries keeps running in the checkout
+// and the session it had. The old store named a convoy's worktree for the old convoy and a crew's
+// session for the old vessel; the started daemon's vessel asks for them by the convoy's and its
+// own launch, and finds the imported ones under those names. At r983 it found no checkout, asked
+// for a second of the same branch, which gave up, and the vessel and its convoy failed with it,
+// tearing the crew's environment and checkouts down (feta and udder).
+#[tokio::test]
+async fn an_imported_live_crew_keeps_its_checkout_and_its_convoy() {
+    use flotilla_resources::{
+        checkout_path::{checkout_name, checkout_placement_scope},
+        host_direct_environment_name, Checkout, CheckoutPhase, FulfilmentKind, ResourceObject, Vessel, VesselPhase, CONVOY_LABEL,
+        PLACEMENT_SNAPSHOT_ANNOTATION, PREPARED_SNAPSHOT_LABEL,
+    };
+
+    const HOST: &str = "host-a";
+    let dir = tempfile::tempdir().expect("tempdir");
+    let worktree = dir.path().join("work").join("repo");
+    std::fs::create_dir_all(&worktree).expect("worktree");
+    let worktree = worktree.to_str().expect("utf-8 path").to_owned();
+    let store = dir.path().join(OLD_STORE);
+    let backend = SqliteBackend::open(&store).expect("old store");
+    let (key, repository) = repository();
+    own::<Repository>(&backend, document("Repository", &key, repository, json!({"default_branch": "main"}))).await;
+    own::<Project>(
+        &backend,
+        document(
+            "Project",
+            "flotilla",
+            json!({"default_workflow_ref": "w", "display_name": "flotilla", "issue_source_bindings": [], "repositories": [{"repo": key}]}),
+            Value::Null,
+        ),
+    )
+    .await;
+    own::<FulfilmentKind>(&backend, {
+        // The placement admission froze for the convoy, as the old store held it.
+        let mut snapshot = document(
+            "FulfilmentKind",
+            "placement-demo",
+            json!({"grants": ["platform:linux"], "host_ref": HOST, "pool": "dummy", "realisation": "host_direct"}),
+            Value::Null,
+        );
+        snapshot["metadata"]["labels"] = json!({ (PREPARED_SNAPSHOT_LABEL): "placement", (CONVOY_LABEL): "demo" });
+        snapshot
+    })
+    .await;
+    let decision = json!({"kind": "placement-demo", "target_host": {"ref": HOST, "display_name": HOST}});
+    let mut convoy = live_convoy("demo");
+    convoy["metadata"]["annotations"] = json!({ (PLACEMENT_SNAPSHOT_ANNOTATION): "placement-demo" });
+    convoy["spec"]["ref"] = json!("feature");
+    convoy["spec"]["repositories"] = json!([{"url": "https://github.com/org/repo", "repo_ref": key, "source_ref": "feature",
+        "target_ref": "main", "workspace_slug": "repo"}]);
+    convoy["status"]["placement_decision"] = decision.clone();
+    own::<Convoy>(&backend, convoy).await;
+    let convoy: ResourceObject<Convoy> =
+        ResourceBackend::new(backend.clone()).using::<Convoy>(NS).get("demo").await.expect("the old convoy");
+    own::<Vessel>(
+        &backend,
+        document(
+            "Vessel",
+            "demo-implement",
+            json!({"convoy_ref": "demo", "vessel_name": "implement", "fulfilment_kind_ref": "placement-demo"}),
+            json!({"phase": "Ready", "environment_ref": host_direct_environment_name(HOST), "placement_decision": decision}),
+        ),
+    )
+    .await;
+    // Named as the old vessel reconciler named it: for the old convoy.
+    let old_name = checkout_name("demo", "repo", false, checkout_placement_scope(&convoy, Some(HOST)).as_deref());
+    let mut checkout = document(
+        "Checkout",
+        &old_name,
+        json!({"kind": "worktree", "repo_ref": key, "env_ref": host_direct_environment_name(HOST), "ref": "feature",
+            "target_path": worktree, "clone_ref": "clone-a"}),
+        json!({"phase": "Ready", "path": worktree}),
+    );
+    checkout["metadata"]["labels"] = json!({ (CONVOY_LABEL): "demo" });
+    own::<Checkout>(&backend, checkout).await;
+    // The crew's agent, running in the checkout, named as the old vessel reconciler named it.
+    own::<TerminalSession>(
+        &backend,
+        document(
+            "TerminalSession",
+            "terminal-demo-implement-coder",
+            json!({"env_ref": host_direct_environment_name(HOST), "role": "coder", "cwd": worktree, "pool": "dummy",
+                "source": {"kind": "agent", "selector": {"capability": "code"}, "brief": {"path": "brief.md", "content": "work"},
+                    "context": {"namespace": NS, "convoy": "demo", "vessel_ref": "demo-implement"}}}),
+            json!({"phase": "Running", "session_id": "terminal-demo-implement-coder"}),
+        ),
+    )
+    .await;
+    drop(backend);
+
+    let daemon = TestDaemon::builder().import(OldStoreImport { store, host_id: Some(HOST.to_owned()) }).start().await;
+    let report = daemon.import_report().expect("the first start imported");
+    assert_eq!(report["refusals"], json!([]), "{report:#}");
+    let [vessel] =
+        daemon.list::<Vessel>().await.into_iter().map(|vessel| vessel.metadata.name).collect::<Vec<_>>().try_into().expect("one vessel");
+    let session = format!("terminal-{vessel}-coder");
+    // The vessel holds the checkout and the session it had, and seats its crew in them.
+    daemon
+        .wait::<Vessel>("the vessel holding its imported checkout and session", |held| {
+            held.status.as_ref().is_some_and(|status| status.terminal_session_refs == [session.clone()] && !status.checkout_refs.is_empty())
+        })
+        .within(Duration::from_secs(30))
+        .await;
+    // A few of the controllers' passes: nothing ends, and nothing is asked for beside what it had.
+    tokio::time::sleep(Duration::from_secs(3)).await;
+    let [launch] =
+        daemon.list::<Convoy>().await.into_iter().map(|convoy| convoy.metadata.name).collect::<Vec<_>>().try_into().expect("one convoy");
+    let checkouts: Vec<_> = daemon
+        .list::<Checkout>()
+        .await
+        .into_iter()
+        .map(|checkout| (checkout.metadata.name, checkout.status.map(|status| status.phase)))
+        .collect();
+    assert_eq!(
+        checkouts,
+        [(checkout_name(&launch, "repo", false, checkout_placement_scope(&convoy, Some(HOST)).as_deref()), Some(CheckoutPhase::Ready))],
+        "the imported checkout, named for {launch}, and no other"
+    );
+    let sessions: Vec<_> = daemon.list::<TerminalSession>().await.into_iter().map(|session| session.metadata.name).collect();
+    assert_eq!(sessions, [session], "the imported session, named for {vessel}, and no other");
+    let vessel = daemon.get::<Vessel>(&vessel).await.expect("the vessel");
+    assert!(vessel.status.as_ref().is_some_and(|status| status.phase == VesselPhase::Ready), "{:?}", vessel.status);
+    let convoy = daemon.get::<Convoy>(&launch).await.expect("the convoy");
+    assert!(convoy.status.as_ref().is_some_and(|status| !status.phase.is_terminal()), "{launch} still runs: {:?}", convoy.status);
+}
+
 // Rehearsal (#3108): the same over a copy of a real frozen-fleet store, named by
 // `FLOTILLA_IMPORT_REHEARSAL_STORE`. The copy stays where it is, and this prints counts by kind
 // and refusal reasons only.
