@@ -3250,11 +3250,25 @@ impl CrewService {
 
     /// Continue follow-ups only from receiver-owned Message evidence.
     pub async fn reconcile_pending_supervisor_turns_once(&self, namespace: &str) -> Result<(), String> {
-        self.reconcile_pending_supervisor_turns_selected(namespace, None).await
+        self.reconcile_pending_supervisor_turns_selected(namespace, None)
+            .instrument(tracing::info_span!("supervisor_turns.pass", namespace, pending = tracing::field::Empty))
+            .await
     }
     async fn reconcile_pending_supervisor_turns_selected(&self, namespace: &str, name: Option<&str>) -> Result<(), String> {
         let convoys = self.resource_backend.using::<ResourceConvoy>(namespace);
-        let candidates = convoys.query_declared(&convoy_names_query(name, false)).await.map_err(|error| error.to_string())?.items;
+        let mut candidates = convoys.query_declared(&convoy_names_query(name, false)).await.map_err(|error| error.to_string())?.items;
+        // Only a convoy listed with a follow-up pending has one to continue: one that gains one
+        // after this read is a notes change, which wakes the next pass.
+        candidates.retain(|source| {
+            source
+                .object
+                .status
+                .iter()
+                .flat_map(|status| status.crew_work.values())
+                .flat_map(|crew| crew.values())
+                .any(|state| state.pending_follow_up.is_some())
+        });
+        tracing::Span::current().record("pending", candidates.len());
         // Each follow-up is read in its seat's inbox: the crew member it was sent to.
         let mut references = BTreeMap::<String, Vec<(String, String)>>::new();
         for source in &candidates {
