@@ -5,7 +5,11 @@ mod retirement;
 
 use std::path::{Path, PathBuf};
 #[cfg(unix)]
-use std::{collections::BTreeMap, sync::Arc};
+use std::{
+    collections::BTreeMap,
+    sync::Arc,
+    time::{Duration, Instant},
+};
 
 use color_eyre::{eyre::eyre, Result};
 #[cfg(unix)]
@@ -45,35 +49,151 @@ const LOCAL_HOME: &str = "local";
 
 /// Candidate host configuration and optional probes for pre-roll validation.
 #[cfg(unix)]
-#[derive(Default)]
 pub(crate) struct ValidationOptions {
     pub require_import: bool,
     pub sources: Option<PathBuf>,
     pub credential_tokens: BTreeMap<String, PathBuf>,
+    /// How long a daemon request refused because the daemon's store is busy is retried.
+    pub busy_retry: Duration,
 }
 
 #[cfg(unix)]
-const READ_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
+impl Default for ValidationOptions {
+    fn default() -> Self {
+        Self { require_import: false, sources: None, credential_tokens: BTreeMap::new(), busy_retry: DEFAULT_BUSY_RETRY }
+    }
+}
+
+/// How long `--from-daemon` validation waits out a daemon whose store is busy, unless overridden.
+#[cfg(unix)]
+pub(crate) const DEFAULT_BUSY_RETRY: Duration = Duration::from_secs(60);
+
+#[cfg(unix)]
+const BUSY_RETRY_FIRST_DELAY: Duration = Duration::from_millis(250);
+
+#[cfg(unix)]
+const BUSY_RETRY_MAX_DELAY: Duration = Duration::from_secs(5);
+
+/// The command path's refusal when its interactive deadline passes
+/// (`crates/flotilla-daemon/src/server/request_dispatch.rs`), which has no shared constant.
+#[cfg(unix)]
+const STORE_BUSY_INTERACTIVE_MESSAGE: &str = "resource store busy: interactive request deadline exceeded";
+
+#[cfg(unix)]
+const READ_TIMEOUT: Duration = Duration::from_secs(10);
+
+/// The daemon's resource socket. Every request validation makes goes through [`Daemon::send`],
+/// which waits out a busy store's refusal for up to `busy_retry`.
+#[cfg(unix)]
+struct Daemon {
+    client: reqwest::Client,
+    busy_retry: Duration,
+}
+
+/// A daemon reply, read whole so that a busy refusal can be recognised before the caller sees it.
+#[cfg(unix)]
+struct DaemonReply {
+    url: String,
+    status: reqwest::StatusCode,
+    body: Vec<u8>,
+}
+
+#[cfg(unix)]
+impl Daemon {
+    async fn get(&self, url: String) -> Result<DaemonReply> {
+        self.send(self.client.get(url)).await
+    }
+
+    /// Send `request`, retrying with a doubling delay while the daemon refuses it because its store
+    /// is busy, until `busy_retry` has passed; the last refusal is then returned as the reply, so
+    /// the caller fails with the daemon's message. Every other reply and every transport error is
+    /// returned at once.
+    async fn send(&self, request: reqwest::RequestBuilder) -> Result<DaemonReply> {
+        let started = Instant::now();
+        let mut delay = BUSY_RETRY_FIRST_DELAY;
+        loop {
+            let attempt = request.try_clone().ok_or_else(|| eyre!("daemon request cannot be repeated"))?;
+            let response = attempt.send().await?;
+            let reply = DaemonReply { url: response.url().to_string(), status: response.status(), body: response.bytes().await?.to_vec() };
+            let Some(refusal) = reply.store_busy() else {
+                return Ok(reply);
+            };
+            let spent = started.elapsed();
+            if spent + delay > self.busy_retry {
+                return Ok(reply);
+            }
+            eprintln!(
+                "{}: daemon refused ({}: {refusal}); retrying in {delay:?} ({:.1}s of {}s spent)",
+                reply.url,
+                reply.status,
+                spent.as_secs_f64(),
+                self.busy_retry.as_secs()
+            );
+            tokio::time::sleep(delay).await;
+            delay = (delay * 2).min(BUSY_RETRY_MAX_DELAY);
+        }
+    }
+}
+
+#[cfg(unix)]
+impl DaemonReply {
+    fn status(&self) -> reqwest::StatusCode {
+        self.status
+    }
+
+    fn text(&self) -> String {
+        String::from_utf8_lossy(&self.body).into_owned()
+    }
+
+    fn json<T: serde::de::DeserializeOwned>(&self) -> Result<T> {
+        serde_json::from_slice(&self.body).map_err(|error| eyre!("decode {}: {error}", self.url))
+    }
+
+    fn error_for_status(self) -> Result<Self> {
+        if self.status.is_client_error() || self.status.is_server_error() {
+            return Err(eyre!("{}: {}: {}", self.url, self.status, self.text()));
+        }
+        Ok(self)
+    }
+
+    /// The daemon's message when this reply refuses the request because the store is busy. The
+    /// wire carries no typed category for it: the previous generation answers a server error whose
+    /// status body's `message` is the store's busy refusal, which `ResourceError::is_store_busy`
+    /// recognises, or the command path's interactive-deadline refusal.
+    fn store_busy(&self) -> Option<String> {
+        #[derive(Deserialize)]
+        struct StatusBody {
+            message: String,
+        }
+        if !self.status.is_server_error() {
+            return None;
+        }
+        let message = serde_json::from_slice::<StatusBody>(&self.body).ok()?.message;
+        (message == STORE_BUSY_INTERACTIVE_MESSAGE || ResourceError::other(message.as_str()).is_store_busy()).then_some(message)
+    }
+}
 
 /// The running daemon's own host id, as its host list names it; none when the daemon does not report one.
 #[cfg(unix)]
-async fn daemon_host_id(client: &reqwest::Client, base: &str) -> Option<String> {
+async fn daemon_host_id(daemon: &Daemon, base: &str) -> Option<String> {
     let command = flotilla_protocol::Command::builder().action(flotilla_protocol::CommandAction::QueryHostList {}).build();
-    let accepted: Value = client
-        .post(format!("{base}/v1/commands"))
-        .timeout(READ_TIMEOUT)
-        .json(&command)
-        .send()
+    let accepted: Value = daemon
+        .send(daemon.client.post(format!("{base}/v1/commands")).timeout(READ_TIMEOUT).json(&command))
         .await
         .ok()?
         .error_for_status()
         .ok()?
         .json()
-        .await
         .ok()?;
     let url = accepted.get("url")?.as_str()?;
-    let finished: Value =
-        client.get(format!("{base}{url}?wait=5")).timeout(READ_TIMEOUT).send().await.ok()?.error_for_status().ok()?.json().await.ok()?;
+    let finished: Value = daemon
+        .send(daemon.client.get(format!("{base}{url}?wait=5")).timeout(READ_TIMEOUT))
+        .await
+        .ok()?
+        .error_for_status()
+        .ok()?
+        .json()
+        .ok()?;
     let flotilla_protocol::CommandValue::HostList(hosts) = serde_json::from_value(finished.get("outcome")?.clone()).ok()? else {
         return None;
     };
@@ -119,13 +239,13 @@ async fn validate_daemon_with_preview(
 ) -> Result<usize> {
     let catalog = skill_catalog.map(load_catalog).transpose()?;
     let mut skill_documents = Vec::new();
-    let client = reqwest::Client::builder().unix_socket(socket).build()?;
+    let daemon = Daemon { client: reqwest::Client::builder().unix_socket(socket).build()?, busy_retry: probes.busy_retry };
     let base = "http://flotilla.local";
-    let discovery = client.get(format!("{base}/apis/flotilla.work/v1")).send().await?;
+    let discovery = daemon.get(format!("{base}/apis/flotilla.work/v1")).await?;
     let discovered = discovery.status().is_success();
     let mut additional_stores = Vec::new();
     let kind_namespaces = if discovered {
-        let document: Value = discovery.json().await?;
+        let document: Value = discovery.json()?;
         additional_stores = document
             .get("stores")
             .map(|stores| {
@@ -145,7 +265,7 @@ async fn validate_daemon_with_preview(
         REGISTERED_RESOURCE_KINDS.iter().map(|kind| (kind.plural.to_string(), vec!["flotilla".to_string()])).collect()
     } else {
         let status = discovery.status();
-        let body = discovery.text().await.unwrap_or_default();
+        let body = discovery.text();
         return Err(eyre!("daemon kind discovery failed: {status}: {body}"));
     };
 
@@ -159,7 +279,7 @@ async fn validate_daemon_with_preview(
             return Err(eyre!("unknown advertised resource store {prefix:?}"));
         }
         let store_base = format!("{base}{prefix}");
-        let document: Value = client.get(format!("{store_base}/apis/flotilla.work/v1")).send().await?.error_for_status()?.json().await?;
+        let document: Value = daemon.get(format!("{store_base}/apis/flotilla.work/v1")).await?.error_for_status()?.json()?;
         collections
             .extend(discovery_kind_namespaces(&document)?.into_iter().map(|(kind, namespaces)| (store_base.clone(), kind, namespaces)));
     }
@@ -193,9 +313,9 @@ async fn validate_daemon_with_preview(
             }
             let label = format!("{store_base}/{namespace}/{kind}");
             let url = format!("{store_base}/apis/flotilla.work/v1/namespaces/{namespace}/{kind}{query}");
-            let response = client.get(url).send().await.map_err(|error| eyre!("list {label}: {error}"))?;
+            let response = daemon.get(url).await.map_err(|error| eyre!("list {label}: {error}"))?;
             if response.status() == reqwest::StatusCode::BAD_REQUEST && !discovered {
-                let message = response.text().await?;
+                let message = response.text();
                 if message.contains("unknown resource kind") {
                     // A candidate may know a kind that the old daemon does not serve.
                     continue;
@@ -207,13 +327,13 @@ async fn validate_daemon_with_preview(
                 continue;
             }
             if !response.status().is_success() {
-                eprintln!("{label}: daemon list failed: {}", response.text().await?);
+                eprintln!("{label}: daemon list failed: {}", response.text());
                 retirement_inventory_failed |= retirement_collection;
                 frozen_inventory_failed = true;
                 failed = true;
                 continue;
             }
-            let document: Value = response.json().await.map_err(|error| eyre!("decode {label} list: {error}"))?;
+            let document: Value = response.json().map_err(|error| eyre!("decode {label} list: {error}"))?;
             let items = document.get("items").and_then(Value::as_array).ok_or_else(|| eyre!("{label}: daemon list has no items array"))?;
             for item in items {
                 count += 1;
@@ -260,13 +380,11 @@ async fn validate_daemon_with_preview(
                 // All semantic gates use one merged view, as startup and admission
                 // do. Raw provenance was independently decoded above.
                 let fetched = async {
-                    let merged: Value = client
+                    let merged: Value = daemon
                         .get(format!("{base}/apis/flotilla.work/v1/namespaces/{namespace}/{kind}?includeReplicas=true"))
-                        .send()
                         .await?
                         .error_for_status()?
-                        .json()
-                        .await?;
+                        .json()?;
                     merged.get("items").and_then(Value::as_array).cloned().ok_or_else(|| eyre!("merged list has no items"))
                 }
                 .await;
@@ -298,7 +416,7 @@ async fn validate_daemon_with_preview(
     }
     // Rehearse before every roll, as this host's first start with `[primitives]` imports; the
     // candidate host configuration controls enforcement.
-    let own_host = if import_rows.iter().any(|row| row.plural == "hosts") { daemon_host_id(&client, base).await } else { None };
+    let own_host = if import_rows.iter().any(|row| row.plural == "hosts") { daemon_host_id(&daemon, base).await } else { None };
     let summary = engine_import::rehearse(&engine_import::Source::new(import_rows).with_own_host(own_host), LOCAL_HOME);
     failed |= probes.require_import && summary.refused();
     print_import(&summary);
@@ -306,13 +424,13 @@ async fn validate_daemon_with_preview(
         (!retirement_inventory_failed).then_some((retirement_templates, retirement_projects, retirement_designations));
     failed |= semantic_gates(retirement_inventory, &frozen_inventory, frozen_inventory_failed, probes, &mut report).await?;
     for namespace in charter_namespaces {
-        let response = client.get(format!("{base}/apis/flotilla.work/v1/namespaces/{namespace}/charterinputs")).send().await?;
+        let response = daemon.get(format!("{base}/apis/flotilla.work/v1/namespaces/{namespace}/charterinputs")).await?;
         if !response.status().is_success() {
-            eprintln!("{namespace}: bound charter inventory refused: {}", response.text().await?);
+            eprintln!("{namespace}: bound charter inventory refused: {}", response.text());
             failed = true;
             continue;
         }
-        let inputs: Vec<OperationalEntryFile> = response.json().await?;
+        let inputs: Vec<OperationalEntryFile> = response.json()?;
         for input in inputs {
             let result = parse_documents(Path::new(&input.path), &input.contents).and_then(|documents| {
                 for document in documents {
@@ -329,10 +447,9 @@ async fn validate_daemon_with_preview(
     // Build the old-endpoint fallback lazily, once for all namespaces.
     let mut local_inventory = None;
     for (namespace, registered) in projects {
-        let response = client.get(format!("{base}/apis/flotilla.work/v1/namespaces/{namespace}/operationalentries")).send().await?;
+        let response = daemon.get(format!("{base}/apis/flotilla.work/v1/namespaces/{namespace}/operationalentries")).await?;
         let status = response.status();
-        let (success, body) =
-            if status.is_success() { (Some(response.json::<Value>().await?), None) } else { (None, Some(response.text().await?)) };
+        let (success, body) = if status.is_success() { (Some(response.json::<Value>()?), None) } else { (None, Some(response.text())) };
         let result = if let Some(document) = success {
             validate_ops_inventory(&serde_json::from_value(document)?)
         } else {
@@ -2260,5 +2377,143 @@ mod frozen_reference_regression {
         let result = super::validate_daemon(&socket, Some(&[]), None).await;
         server.abort();
         assert!(result.is_err(), "a schema-valid frozen skill pin without resolvable candidate supply must refuse");
+    }
+}
+
+#[cfg(all(test, unix))]
+mod busy_daemon_retry {
+    use std::{
+        sync::{Arc, Mutex},
+        time::Duration,
+    };
+
+    use flotilla_resources::ResourceError;
+    use flotilla_test_support::TestSocketDir;
+    use serde_json::{json, Value};
+    use tokio::{
+        io::{AsyncReadExt, AsyncWriteExt},
+        net::UnixListener,
+        task::JoinHandle,
+    };
+
+    const BUSY_INTERACTIVE: &str = "resource store busy: interactive request deadline exceeded";
+
+    fn busy_read() -> (&'static str, Value) {
+        ("500 Internal Server Error", json!({"message": ResourceError::STORE_BUSY_READ_DEADLINE_MESSAGE}))
+    }
+
+    fn discovery() -> (&'static str, Value) {
+        ("200 OK", json!({"kinds":["terminalsessions"],"namespaces":{"terminalsessions":["flotilla"]}}))
+    }
+
+    fn empty_list() -> (&'static str, Value) {
+        ("200 OK", json!({"items":[]}))
+    }
+
+    // Stand-in for the previous generation's resource HTTP boundary: it answers each
+    // request with the next scripted reply, checking the path, and keeps accepting
+    // afterwards so an unexpected extra request fails the assertion on the count.
+    fn serve(socket: &std::path::Path, script: Vec<(&'static str, (&'static str, Value))>) -> (JoinHandle<()>, Arc<Mutex<Vec<String>>>) {
+        let listener = UnixListener::bind(socket).expect("stand-in socket");
+        let requests = Arc::new(Mutex::new(Vec::new()));
+        let log = requests.clone();
+        let task = tokio::spawn(async move {
+            let mut script = script.into_iter();
+            loop {
+                let Ok((mut stream, _)) = listener.accept().await else { return };
+                let mut request = Vec::new();
+                while !request.windows(4).any(|window| window == b"\r\n\r\n") {
+                    let mut buffer = [0u8; 4096];
+                    let read = stream.read(&mut buffer).await.expect("request");
+                    if read == 0 {
+                        break;
+                    }
+                    request.extend_from_slice(&buffer[..read]);
+                }
+                let request = String::from_utf8_lossy(&request).to_string();
+                let path = request.split_whitespace().nth(1).unwrap_or_default().split('?').next().unwrap_or_default().to_string();
+                let served = {
+                    let mut log = log.lock().expect("request log");
+                    log.push(path.clone());
+                    log.len()
+                };
+                let (status, body) = match script.next() {
+                    Some((expected, reply)) => {
+                        assert_eq!(path, expected, "request {served} out of order");
+                        reply
+                    }
+                    None => ("599 Unscripted", json!({"message": format!("unscripted request {path}")})),
+                };
+                let body = body.to_string();
+                let _ = stream
+                    .write_all(
+                        format!(
+                            "HTTP/1.1 {status}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                            body.len()
+                        )
+                        .as_bytes(),
+                    )
+                    .await;
+            }
+        });
+        (task, requests)
+    }
+
+    // Pre-roll on kiwi (2026-11-19): a previous-generation daemon whose store is briefly
+    // busy refuses reads with "resource store busy". Validation waits that out on every
+    // request it makes, the first and the later ones, and then validates as usual.
+    #[tokio::test]
+    async fn a_briefly_busy_daemon_is_retried_until_it_answers() {
+        rigging_tls::install_default_provider();
+        let directory = TestSocketDir::new();
+        let socket = directory.socket_path("busy.sock");
+        let list = "/apis/flotilla.work/v1/namespaces/flotilla/terminalsessions";
+        let (server, requests) = serve(
+            &socket,
+            vec![
+                ("/apis/flotilla.work/v1", busy_read()),
+                ("/apis/flotilla.work/v1", busy_read()),
+                ("/apis/flotilla.work/v1", discovery()),
+                (list, ("500 Internal Server Error", json!({"code":"command_error","message":BUSY_INTERACTIVE}))),
+                (list, empty_list()),
+            ],
+        );
+        let result = super::validate_daemon(&socket, None, None).await;
+        server.abort();
+        assert_eq!(result.expect("validation waits out the busy refusals"), 0);
+        assert_eq!(requests.lock().unwrap().len(), 5);
+    }
+
+    // A store that stays busy past the retry budget fails with the daemon's own message.
+    #[tokio::test]
+    async fn a_daemon_busy_past_the_budget_fails_with_its_message() {
+        rigging_tls::install_default_provider();
+        let directory = TestSocketDir::new();
+        let socket = directory.socket_path("busy.sock");
+        let (server, requests) = serve(&socket, (0..20).map(|_| ("/apis/flotilla.work/v1", busy_read())).collect());
+        // Delays of 250 ms then 500 ms: the third attempt would pass the 600 ms budget.
+        let options = super::ValidationOptions { busy_retry: Duration::from_millis(600), ..Default::default() };
+        let result = super::validate_daemon_with_options(&socket, None, None, &options).await;
+        server.abort();
+        let error = format!("{:#}", result.expect_err("a persistently busy daemon fails validation"));
+        assert!(error.contains(ResourceError::STORE_BUSY_READ_DEADLINE_MESSAGE), "{error}");
+        assert_eq!(requests.lock().unwrap().len(), 2);
+    }
+
+    // Any other refusal fails at once, as before: one request, no retry.
+    #[tokio::test]
+    async fn any_other_daemon_refusal_is_not_retried() {
+        rigging_tls::install_default_provider();
+        let directory = TestSocketDir::new();
+        let socket = directory.socket_path("broken.sock");
+        let (server, requests) = serve(
+            &socket,
+            vec![("/apis/flotilla.work/v1", ("500 Internal Server Error", json!({"message":"database disk image is malformed"})))],
+        );
+        let result = super::validate_daemon(&socket, None, None).await;
+        server.abort();
+        let error = format!("{:#}", result.expect_err("the refusal fails validation"));
+        assert!(error.contains("database disk image is malformed"), "{error}");
+        assert_eq!(requests.lock().unwrap().len(), 1);
     }
 }

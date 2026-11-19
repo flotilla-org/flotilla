@@ -618,6 +618,9 @@ pub enum ResourceSubCommand {
         /// Read a peer's forwarded resource socket instead of the local daemon
         #[arg(long, requires = "from_daemon")]
         host: Option<String>,
+        /// Seconds to keep retrying a daemon request refused because the daemon's store is busy (default 60)
+        #[arg(long, requires = "from_daemon", value_name = "SECONDS")]
+        busy_retry_secs: Option<u64>,
     },
     /// Make the manifest overwrite a drifted live spec
     Sync(ResourceManifestResolutionArgs),

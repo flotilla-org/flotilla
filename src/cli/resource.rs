@@ -10,7 +10,16 @@ use std::path::Path;
 
 pub(crate) async fn run_resource_command(cli: &Cli, command: ResourceSubCommand, format: OutputFormat) -> Result<()> {
     match command {
-        ResourceSubCommand::Validate { path, from_daemon, from_store, host, skill_catalog, skill_sources, skill_probe_tokens } => {
+        ResourceSubCommand::Validate {
+            path,
+            from_daemon,
+            from_store,
+            host,
+            skill_catalog,
+            skill_sources,
+            skill_probe_tokens,
+            busy_retry_secs,
+        } => {
             if from_store {
                 #[cfg(unix)]
                 {
@@ -32,6 +41,7 @@ pub(crate) async fn run_resource_command(cli: &Cli, command: ResourceSubCommand,
                             require_import: true,
                             sources: skill_sources.or_else(|| skill_catalog.as_ref().and_then(|path| path.parent().map(Path::to_path_buf))),
                             credential_tokens: resource_validate::frozen::load_tokens(skill_probe_tokens.as_deref())?,
+                            ..Default::default()
                         },
                     )
                     .await
@@ -74,11 +84,13 @@ pub(crate) async fn run_resource_command(cli: &Cli, command: ResourceSubCommand,
                         require_import: true,
                         sources: skill_sources.or_else(|| skill_catalog.as_ref().and_then(|path| path.parent().map(Path::to_path_buf))),
                         credential_tokens: resource_validate::frozen::load_tokens(skill_probe_tokens.as_deref())?,
+                        busy_retry: busy_retry_secs.map(std::time::Duration::from_secs).unwrap_or(resource_validate::DEFAULT_BUSY_RETRY),
                     },
                 )
                 .await;
                 #[cfg(not(unix))]
                 let result = {
+                    let _ = busy_retry_secs;
                     if skill_sources.is_some() || skill_probe_tokens.is_some() {
                         return Err(color_eyre::eyre::eyre!("frozen-reference daemon validation requires Unix"));
                     }
