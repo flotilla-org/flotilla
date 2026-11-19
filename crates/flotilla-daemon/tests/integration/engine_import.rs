@@ -158,10 +158,11 @@ impl Host {
     }
 }
 
-/// An artifact by convoy `convoy`'s coder about `subject`.
+/// An artifact by convoy `convoy`'s coder about `subject`. It expires long after any run: a
+/// started daemon's artifact retention deletes an expired one.
 fn artifact(convoy: &str, subject: &str) -> Value {
     json!({"convoy": convoy, "producer": "coder", "kind": "brief", "subject": subject, "summary": {}, "digest": "ef37".repeat(16),
-        "size": 1, "media_type": "text/markdown", "expires_at": "2026-11-19T00:00:00Z"})
+        "size": 1, "media_type": "text/markdown", "expires_at": "2126-11-19T00:00:00Z"})
 }
 
 fn repository() -> (String, Value) {

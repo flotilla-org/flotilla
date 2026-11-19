@@ -45,12 +45,14 @@ pub fn message(name: &str) -> Value {
     )
 }
 
+/// An artifact by `demo`'s coder. It expires long after any run: a started daemon's artifact
+/// retention deletes an expired one.
 pub fn artifact(name: &str) -> Value {
     document(
         "Artifact",
         name,
         json!({"convoy": "demo", "producer": "coder", "kind": "brief", "subject": "demo", "summary": {"charter_commit": "abc"},
-            "digest": "ef37".repeat(16), "size": 1, "media_type": "text/markdown", "expires_at": "2026-11-19T00:00:00Z"}),
+            "digest": "ef37".repeat(16), "size": 1, "media_type": "text/markdown", "expires_at": "2126-11-19T00:00:00Z"}),
         Value::Null,
     )
 }
