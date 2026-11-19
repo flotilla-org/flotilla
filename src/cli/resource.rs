@@ -83,6 +83,7 @@ pub(crate) async fn run_resource_command(cli: &Cli, command: ResourceSubCommand,
                         sources: skill_sources.or_else(|| skill_catalog.as_ref().and_then(|path| path.parent().map(Path::to_path_buf))),
                         credential_tokens: resource_validate::frozen::load_tokens(skill_probe_tokens.as_deref())?,
                         busy_retry: busy_retry_secs.map(std::time::Duration::from_secs).unwrap_or(resource_validate::DEFAULT_BUSY_RETRY),
+                        ..Default::default()
                     },
                 )
                 .await;
