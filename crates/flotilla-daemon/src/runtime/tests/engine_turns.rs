@@ -461,6 +461,75 @@ async fn holders_follow_changes_to_the_sessions() {
     assert!(receiver.reading.ended.is_none(), "the next launch's AgentSession is live");
 }
 
+/// Whether launch `launch`'s AgentSession is Live, as the decided store holds it: None when it
+/// has no record.
+fn agent_session_live(daemon: &Arc<InProcessDaemon>, launch: &str) -> Option<bool> {
+    let reads = daemon.lifecycle_reads();
+    let agents = reads.agent_sessions().expect("agent sessions");
+    agents.read(launch, None).expect("read the AgentSession").map(|agent| agent.reading.ended.is_none())
+}
+
+/// Passes until launch `launch`'s AgentSession is no longer Live, at most 40: whether it ended.
+async fn passes_until_ended(daemon: &Arc<InProcessDaemon>, delivery: &mut MessageDelivery, launch: &str) -> bool {
+    for _ in 0..40 {
+        passes(delivery, 1).await;
+        if agent_session_live(daemon, launch) == Some(false) {
+            return true;
+        }
+    }
+    false
+}
+
+// Behaviour (d15 finding 3): a session whose harness's hook created its AgentSession, and whose
+// launch ended before any delivery pass looked at it, leaves no Live AgentSession, though
+// delivery never routed it.
+#[tokio::test(start_paused = true)]
+async fn a_session_that_starts_and_ends_between_two_passes_leaves_no_live_agent_session() {
+    let crew = engine_crew("claude-code", lossy_pool()).await;
+    let mut delivery = crew.delivery();
+    passes(&mut delivery, 5).await;
+
+    let (_, launch) = launch_crew(&crew.daemon, &crew.profile, "claude-code", "brief", "brief-agent").await;
+    crate::agent_attention::record_agent_activity(
+        crew.daemon.lifecycle_reads(),
+        &crew.primitives,
+        "brief-agent",
+        Activity::Working,
+        "UserPromptSubmit",
+    )
+    .await
+    .expect("the hook records the agent's activity");
+    assert_eq!(agent_session_live(&crew.daemon, &launch), Some(true), "the hook created the session's Live record");
+    engine(&crew.daemon).terminals.exited(&launch, "the agent exited");
+
+    assert!(passes_until_ended(&crew.daemon, &mut delivery, &launch).await, "the ended launch's AgentSession is ended");
+}
+
+// Behaviour (d15 finding 3): a session held before a restart, whose launch ends after it and
+// before the restarted daemon's delivery routes it, leaves no Live AgentSession: the restarted
+// daemon reads the Live records from its store, not from the stopped daemon's memory.
+#[tokio::test(start_paused = true)]
+async fn a_session_that_ends_after_a_restart_leaves_no_live_agent_session() {
+    let crew = engine_crew("claude-code", lossy_pool()).await;
+    let mut delivery = crew.delivery();
+    passes(&mut delivery, 5).await;
+    assert_eq!(agent_session_live(&crew.daemon, &crew.launch), Some(true), "delivery registered the crew's Live record");
+    drop(delivery);
+
+    // The restarted daemon opens the Message path over the same store.
+    let service = crew.daemon.decided_store().expect("the decided store");
+    let reopened = Arc::new(
+        MessagePrimitives::open(crew.daemon.node_id().as_str(), service, crew.daemon.resource_backend(), crew.daemon.clock_for_scenarios())
+            .expect("reopen the Message path"),
+    );
+    reopened.install_lifecycle_reads(crew.daemon.lifecycle_reads()).expect("lifecycle reads");
+    engine(&crew.daemon).terminals.exited(&crew.launch, "the agent exited");
+    let state = runtime_state(&crew.daemon, &crew.config, &crew.registry, &crew.profile);
+    let mut restarted = MessageDelivery::new(state, reopened, NAMESPACE.into(), RuntimeHealth::default());
+
+    assert!(passes_until_ended(&crew.daemon, &mut restarted, &crew.launch).await, "the ended launch's AgentSession is ended");
+}
+
 // Behaviour: turns to several crews start in one pass, and each crew's turn is typed once, its
 // messages in the order they were sent.
 #[tokio::test(start_paused = true)]
