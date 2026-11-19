@@ -275,6 +275,63 @@ async fn a_stalled_crew_resumes_on_supervision_and_lands() {
     fleet.wait("Landed", in_phase(&name, ConvoyPhase::Landed)).await;
 }
 
+// An access delivered to a convoy's crew is removed when the convoy ends, and one delivered into
+// an environment when that environment ends, though neither record changes then: the convoy it
+// held retires. Each record is applied while its convoy and place are live, so the reconcile its
+// creation wakes keeps it.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn access_deliveries_go_when_their_convoy_or_place_ends_and_the_convoy_retires() {
+    use flotilla_resources::{access_delivery::access_key, AccessDelivery, AccessDeliverySpec, Environment};
+
+    let fleet = TestDaemon::builder().agent("stall_rate = 1.0").start().await;
+    let name = fleet.dispatch(CrewMix::Coder, DUMMY_FULFILMENT_KIND).await;
+    fleet.wait("a supervisable stall", stalled(&name)).await;
+    let launch_of = flotilla_resources::convoy::launch_of(&name).to_owned();
+    let environment = fleet
+        .wait("the crew's environment", |environment: &ResourceObject<Environment>| {
+            environment.metadata.name.starts_with(&format!("env-{launch_of}-"))
+        })
+        .await
+        .metadata
+        .name;
+    let local = fleet.list::<Host>().await.into_iter().next().expect("local host").metadata.name;
+    let delivery = |access: String, place: String| AccessDeliverySpec {
+        access,
+        place,
+        harness: "claude-code".into(),
+        home: "/requesters/probe".into(),
+        needs: Default::default(),
+        retry: None,
+    };
+    // Its place is host-direct, which never ends: only the convoy's end removes it.
+    fleet
+        .apply::<AccessDelivery>(
+            "to-the-crew",
+            delivery(access_key("fleet", &name, "work", "probe"), flotilla_resources::host_direct_environment_name(&local)),
+        )
+        .await;
+    // It names no convoy: only its place's end removes it.
+    fleet.apply::<AccessDelivery>("into-the-environment", delivery("operator-probe".into(), environment.clone())).await;
+    // Their creations' reconciles run while the convoy and the place are live, and keep both.
+    tokio::time::sleep(Duration::from_secs(1)).await;
+    for record in ["to-the-crew", "into-the-environment"] {
+        assert!(fleet.get::<AccessDelivery>(record).await.is_some(), "{record} is kept while its convoy and place are live");
+    }
+
+    let abandoned = fleet
+        .execute(CommandAction::ConvoyAbandon { namespace: Some(NAMESPACE.into()), name: name.clone(), reason: "end its accesses".into() })
+        .await;
+    assert!(!matches!(abandoned, CommandValue::Error { .. }), "{abandoned:?}");
+    fleet.wait("Abandoned", in_phase(&name, ConvoyPhase::Abandoned)).await;
+    fleet.wait_gone::<AccessDelivery>("to-the-crew").await;
+    fleet.wait_gone::<AccessDelivery>("into-the-environment").await;
+    fleet
+        .wait_reached("Retired", "convoy", "Retired", |row| {
+            row.get("resource.name").and_then(serde_json::Value::as_str) == Some(name.as_str())
+        })
+        .await;
+}
+
 // A dummy crew reaches the daemon as a real crew in its vessel does: its commands over the
 // environment socket its vessel forwards, as the crew its Hello claims, and Claude Code's hooks
 // over the hook route, so its attention is the hooks'. Its ledger is an artifact it put. A
