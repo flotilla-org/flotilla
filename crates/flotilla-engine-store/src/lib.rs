@@ -72,6 +72,15 @@ pub fn convoy_registry() -> Result<KindRegistry, RegistryError> {
     Ok(kinds)
 }
 
+/// Drops the tables of fields the engine no longer stores, with their readable views, from a
+/// store the previous generation wrote (ADR 0047 N→N+1): the Convoy's quota (#3108), which
+/// admission always granted empty and nothing reads. Opening ignores a table no kind declares,
+/// so this only discards the retired rows. Run it before the store opens. Remove it one fleet
+/// roll after the quota's removal ships, once no store holds the table.
+pub fn drop_retired_tables(connection: &rusqlite::Connection) -> rusqlite::Result<()> {
+    connection.execute_batch("DROP VIEW IF EXISTS \"convoy_quota_view\";\nDROP TABLE IF EXISTS \"convoy_quota\";")
+}
+
 /// Registers the engine's crew kind the `[primitives]` switch moves (#3629 layer 6): Vessel, the
 /// placement lease, under its production code.
 pub fn register_crew(kinds: &mut KindRegistry) -> Result<(), RegistryError> {

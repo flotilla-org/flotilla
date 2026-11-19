@@ -1,6 +1,6 @@
 --- a/machines/vessel.qnt
 +++ b/machines/vessel.qnt
-@@ -25,7 +25,7 @@
+@@ -28,7 +28,7 @@
          | Place(_) => L::Refused(L::WrongState)
        }
        match result {

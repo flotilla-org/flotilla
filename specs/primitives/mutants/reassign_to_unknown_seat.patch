@@ -1,6 +1,6 @@
 --- a/machines/convoy.qnt
 +++ b/machines/convoy.qnt
-@@ -197,7 +197,6 @@
+@@ -193,7 +193,6 @@
      if (not(mayRetract(p, a.by, a.authority)) or a.reason == "") Refused(Unauthorised) else Accepted)
    def reassigned(id: int, a: { promise: PromiseId, to: Seat, by: Seat, authority: Authority }): Outcome = onOpen(id, a.promise, p =>
      if (not(mayReassign(p, a.by, a.authority))) Refused(Unauthorised)

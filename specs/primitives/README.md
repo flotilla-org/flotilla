@@ -31,7 +31,7 @@ Every gate reads typed local evidence on the event inside `step`. Admission
 validates a typed request before creating a slot. Named actions look up a slot,
 run the rule and guard a single store assignment; `unchanged` composes with other
 machines. Refused actions are disabled and write nothing. Convoy keeps each part
-of a convoy (phase, fixed fields, retired duties, quota, promises, seats and link
+of a convoy (phase, fixed fields, retired duties, promises, seats and link
 rows) in its own variable keyed by convoy, and each named action writes only the
 parts its edge changes; `outcome` reads an edge's acceptance or refusal code from
 the current parts, which the conformance harness and scenario properties probe.
@@ -44,7 +44,7 @@ Every variable still receives an assignment, and world variables stay separate.
 The step blocks contain no assignment lists or machine rules. Imported variants use bare names in
 `match` patterns (constructors in expressions remain qualified).
 
-Convoy admission accepts `{project, promises, duties, seats, quota, priority}`
+Convoy admission accepts `{project, promises, duties, seats, priority}`
 (#3587 spec ruling). Admission needs an obligation: at least one promise or one
 convoy-lifetime duty (`NoObligations`). Each admitted promise keeps its opaque
 kind/target data, its source (template, dispatch or crew) and its owner seat.
@@ -59,8 +59,7 @@ caller, as `Abandon` is. Authority classes are worked out by the caller from
 these relations.
 Admission fixes the project, the duties and the priority; promises are work
 state, since the crew's `Declare` adds one while the convoy is Open (refused
-for an id ever used, retracted ids included), and the quota in force is work
-state, which readmission raises, so no admitted copy of it can go stale.
+for an id ever used, retracted ids included).
 
 A promise is `Pending → Submitted → Kept | Retracted`. Only its owner seat may
 `Submit`, with a reference the caller recorded as durable for the kind (as it
@@ -93,8 +92,8 @@ the convoy, and no decision edge runs once it ended. Retired is the only end:
 `Retire` moves a delivered or abandoned convoy there once nothing holds it. Its
 holds are read from its dependents' own records, each named by kind and
 record; a non-empty set refuses (`Held`), and holds not read refuse too
-(`HoldsUnread`), since absent is not empty. A retired convoy keeps no quota and
-no retired duties, and refuses every edge. A demo promise delivers a running
+(`HoldsUnread`), since absent is not empty. A retired convoy keeps no retired
+duties, and refuses every edge. A demo promise delivers a running
 demo plus a recipe to reactivate it.
 
 AwaitingReply is the sender's half of a Reply or Outcome exchange (#3587
@@ -107,17 +106,18 @@ sender withdraws with a reason. A stall is an open record whose kind is
 flight when the deadline passes can lose to `Expire`, and still lands in the
 inbox as a message.
 
-Admission grants a per-class cap, never a host reservation. Increasing a cap is
-readmission of the same convoy; the model keeps the class domain fixed and refuses decreases. Vessel placement
-fits one whole multidimensional request on one host and holds its lease through
-Requested and Realised until Gone. Waiting placement requests are not leased
-vessels. A lower-priority request cannot pass any waiting higher-priority request
-that fits that host's available capacity, even if that higher-priority convoy
-is currently capped. No borrowing or spend accounting is modeled.
+Admission grants no capacity: neither a cap nor a host reservation. Limits on
+what a convoy uses and costs come from telemetry, outside the convoy. Vessel
+placement reads only fit and priority: it fits one whole
+multidimensional request on one host and holds its lease through Requested and
+Realised until Gone. Waiting placement requests are not leased vessels. A
+lower-priority request cannot pass any waiting higher-priority request that
+fits that host's available capacity. No borrowing or spend accounting is
+modeled.
 
 The Vessel module composes the shared lifecycle's pure rules and owns placement
 state; it does not duplicate a lifecycle store. Placement evidence carries the
-observed caps, live counts, available capacity and waiting requests. A lease
+host's available capacity and the waiting requests. A lease
 holds only its request and host. The scenario keeps what each placement's
 priority rule read (available capacity and waiting requests), so the priority
 invariant checks the evidence the rule used. A standing role has no machine: its
@@ -155,7 +155,7 @@ The scenarios encode these rulings:
 | Reply exchange | the record exists exactly when its message was sent; Answered names a reply to the awaited message in the sender's inbox; expiry follows the deadline and never beats a reply already in the inbox; ends are final | a reply that lands while the record is open is eventually its answer under fair answering |
 | Inbox / replacement / unbind | turn before receipt; per-session dedupe; drain observed receipts before bind; accept an old session's receipt; one receiver; no undeliverable drop with an observed receipt; unbound timeout starts at unbind | observed receipts make progress under fair home delivery; observed session ends and sustained silence trigger owner unbind reactions |
 | Message race | outcome may settle Pending; terminal edges refuse; expiry waits for the consumer prefix past the deadline and loses to visible evidence; supersede and withdrawn reasons | visible expected evidence eventually settles under fair settlement; ends remain final |
-| Admission / placement | two convoys, two hosts, three placement requests, two abstract classes and two capacity dimensions; convoy caps, host leases, Gone lease return, priority order | no availability fairness assumed |
+| Admission / placement | two convoys, two hosts, three placement requests, two abstract classes and two capacity dimensions; requests only for admitted convoys, host leases, Gone lease return, priority order | no availability fairness assumed |
 | Machine edges | all lifecycle and session edges (receipts too), matching/missing evidence, exhausted attempts, ended resources | finite gate/edge coverage in the fast tier |
 
 Safety is expressed over typed state wherever possible: delivery promises,

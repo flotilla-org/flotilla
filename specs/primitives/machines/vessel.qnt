@@ -1,21 +1,19 @@
-// Admission is a cap. A placement leases one whole request on one host until Gone.
+// A placement leases one whole request on one host until Gone. It reads only fit and priority.
 module vessel {
   import lifecycle(IDS = Set()) as L from "./lifecycle"
   pure val lostCause = L::Lost
   type Request = { convoy: int, class: int, shape: int -> int, priority: int }
   type Placement = { request: Request, host: int }
   type State = Waiting(Request) | Leased({ placement: Placement, lifecycle: L::State }) | Gone(Placement)
-  type Evidence = { host: int, available: int -> int, waiting: Set[Request], live: int, cap: int, admitted: bool }
+  type Evidence = { host: int, available: int -> int, waiting: Set[Request] }
   type Event = Place(Evidence) | Realise({ present: bool, matches: bool }) | Release({ complete: bool }) | Vanish({ absent: bool, cause: L::VanishCause })
     | Attempted(L::AttemptOutcome) | FailedEarly({ retryable: bool, cause: str }) | GiveUp({ cause: str })
-  type Refusal = WrongState | NotAdmitted | QuotaExceeded | DoesNotFit | HigherPriorityWaiting | MissingEvidence
+  type Refusal = WrongState | DoesNotFit | HigherPriorityWaiting | MissingEvidence
   type Next = Moved(State) | Refused(Refusal)
   pure def fits(r: Request, available: int -> int): bool = r.shape.keys().forall(d => available.keys().contains(d) and r.shape.get(d) <= available.get(d))
   pure def step(s: State, e: Event): Next = match s {
     | Waiting(r) => match e {
-        | Place(o) => if (not(o.admitted)) Refused(NotAdmitted)
-            else if (o.live >= o.cap) Refused(QuotaExceeded)
-            else if (not(fits(r, o.available))) Refused(DoesNotFit)
+        | Place(o) => if (not(fits(r, o.available))) Refused(DoesNotFit)
             else if (o.waiting.exists(w => w.priority > r.priority and fits(w, o.available))) Refused(HigherPriorityWaiting)
             else Moved(Leased({ placement: { request: r, host: o.host }, lifecycle: L::Requested([]) }))
         | _ => Refused(WrongState)

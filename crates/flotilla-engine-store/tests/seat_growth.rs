@@ -66,7 +66,6 @@ fn retired_seats_keep_their_names_and_replicas_follow_seat_edges() {
                         },
                     ),
                 ]),
-                quota: BTreeMap::new(),
             },
             &world,
             Timestamp(0),

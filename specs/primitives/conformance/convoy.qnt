@@ -12,8 +12,7 @@
 // other classes decide as "s", and an empty reason is probed for the operator
 // only. A crew promise takes two submissions, which reaches resubmission and
 // stale evidence, and others one; Submit leaves the domain at that bound. The
-// quota increase is probed while no promise is held. The seat edges that move
-// are probed in convoys admitted for them, marked by an extra seat: "y" for
+// seat edges that move are probed in convoys admitted for them, marked by an extra seat: "y" for
 // AddSeat ("c", then "d", which fills the cap of four), Resupervise and the
 // subject edges, and "f" for FailSeat, both with no Declare; "g" for
 // RetireSeat and ReplaceSeat (one per seat), where the promise settles by
@@ -33,9 +32,9 @@ module convoy_conformance {
   // The convoy's parts as one value: the state a probe starts from, and what
   // the Rust state value encodes to.
   type Convoy = { phase: C::Phase, project: str, priority: int, duties: C::DutyId -> C::Duty, retired: Set[C::DutyId],
-    quota: C::VesselClass -> int, promises: C::PromiseId -> C::PromiseRecord, seats: C::Seat -> C::SeatRecord, subjects: List[C::LinkRow] }
+    promises: C::PromiseId -> C::PromiseRecord, seats: C::Seat -> C::SeatRecord, subjects: List[C::LinkRow] }
   def current: Convoy = { phase: C::phase.get(id), project: C::project.get(id), priority: C::priority.get(id), duties: C::duties.get(id),
-    retired: C::retired.get(id), quota: C::quota.get(id), promises: C::promises.get(id), seats: C::seats.get(id), subjects: C::subjects.get(id) }
+    retired: C::retired.get(id), promises: C::promises.get(id), seats: C::seats.get(id), subjects: C::subjects.get(id) }
   type Probe = Unadmitted
     | Admitted({ request: C::ConvoyRequest, outcome: C::Outcome })
     | Stepped({ from: Convoy, event: C::Event, outcome: C::Outcome })
@@ -48,7 +47,7 @@ module convoy_conformance {
   pure def under(seat: C::Seat, by: str): C::SeatRequest = { parent: C::Under(seat), supervisedBy: by }
   pure val seats = Map("a" -> root("op"), "b" -> under("a", "a"))
   pure def request(promises: C::PromiseId -> C::AdmittedPromise, duties: C::DutyId -> C::Duty, known: bool): C::ConvoyRequest =
-    { project: "project", projectKnown: known, promises: promises, duties: duties, seats: seats, quota: Map(0 -> 1, 1 -> 1), priority: 1 }
+    { project: "project", projectKnown: known, promises: promises, duties: duties, seats: seats, priority: 1 }
   pure val requests = Set(
     request(Map(), Map(), true), request(Map(), whileOpen, true), request(Map(), lifetime, true), request(Map(), lifetime, false),
     request(admitted(C::Template), Map(), true), request(admitted(C::Template), Map(), false), request(admitted(C::Dispatch), Map(), true),
@@ -63,10 +62,6 @@ module convoy_conformance {
   def seatProbe: bool = C::known(id, "y")
   def growthProbe: bool = C::known(id, "g")
   def failProbe: bool = C::known(id, "f")
-  // An increase, a decrease and a changed class domain. No negative count: Rust
-  // quota counts are unsigned, so InvalidQuota is unrepresentable there.
-  pure val increase = Map(0 -> 2, 1 -> 1)
-  pure val quotas = Set(Map(0 -> 0, 1 -> 1), Map(0 -> 1))
   pure val authorities = Set(C::Operator, C::ConvoySupervisor, C::Dispatcher, C::Owner, C::OwnerSupervisor)
   pure def deciders(a: C::Authority): Set[C::Seat] = if (a == C::Owner) Set("a", "b") else Set("s")
   pure def reasons(a: C::Authority): Set[str] = if (a == C::Operator) Set("", "decision") else Set("decision")
@@ -121,8 +116,6 @@ module convoy_conformance {
     .union(Set(C::Deliver({ disposition: "merged" })))
     .union(Set(true, false).map(a => Set("", "decision").map(r => C::Abandon({ authorised: a, cause: C::OperatorDecision, reason: r }))).flatten())
     .union(if (failProbe) Set(C::Abandon({ authorised: true, cause: C::WorkFailed, reason: "decision" })) else Set())
-    .union((if (C::promises.get(id).keys().size() == 0) quotas.union(Set(increase)) else quotas).map(q =>
-      Set(true, false).map(a => C::Readmit({ quota: q, authorised: a }))).flatten())
     .union(holdings.map(h => C::Retire(h)))
   action init = all { C::init, probe' = Unadmitted }
   // Admission until a request is admitted, then one event per step: an
@@ -135,20 +128,5 @@ module convoy_conformance {
     nondet e = (if (linkOnly) Set(C::Unlink({ subject: "cr", authorised: true })) else events).oneOf()
     val o = C::outcome(id, e)
     all { if (o == C::Accepted) C::fire(id, e) else C::unchanged, probe' = Stepped({ from: current, event: e, outcome: o }) }
-  }
-  // The placement abstraction may observe only an unchanged quota, admission,
-  // an authorised readmission that raises counts over the same class keys, or
-  // retirement, which releases the whole quota.
-  val quotaRefinesPlacement = match probe {
-    | Stepped(s) => {
-        val before = s.from.quota
-        val after = C::quota.get(id)
-        after == before or match s.event {
-          | Readmit(_) => after.keys() == before.keys() and after.keys().forall(k => after.get(k) >= before.get(k))
-          | Retire(_) => after == Map()
-          | _ => false
-        }
-      }
-    | _ => true
   }
 }

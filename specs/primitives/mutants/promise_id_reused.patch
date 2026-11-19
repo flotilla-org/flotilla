@@ -1,6 +1,6 @@
 --- a/machines/convoy.qnt
 +++ b/machines/convoy.qnt
-@@ -181,7 +181,7 @@
+@@ -177,7 +177,7 @@
      else rule(promises.get(id).get(p))
    // One outcome per edge, over an open convoy.
    def declared(id: int, d: { promise: PromiseId, definition: Promise, owner: Seat }): Outcome =

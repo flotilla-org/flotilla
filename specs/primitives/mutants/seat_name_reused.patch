@@ -1,6 +1,6 @@
 --- a/machines/convoy.qnt
 +++ b/machines/convoy.qnt
-@@ -206,7 +206,6 @@
+@@ -202,7 +202,6 @@
      else Accepted
    def seatAdded(id: int, a: { seat: Seat, parent: Seat, supervisedBy: str, authorised: bool }): Outcome =
      if (not(a.authorised)) Refused(Unauthorised)

@@ -531,7 +531,7 @@ fn ended_across_a_snapshot(write: impl FnOnce(&CheckoutFixture)) -> bool {
 fn a_holder_ending_lost_to_a_snapshot_is_judged_from_the_snapshot() {
     assert!(ended_across_a_snapshot(|beta| beta.abandon_convoy("c1", "deleted")), "abandoned");
     assert!(ended_across_a_snapshot(|beta| beta.deliver_convoy("c1")), "delivered");
-    assert!(!ended_across_a_snapshot(|beta| beta.readmit_convoy("c1")), "readmitted, still open");
+    assert!(!ended_across_a_snapshot(|beta| beta.resupervise_convoy("c1")), "resupervised, still open");
     assert!(!ended_across_a_snapshot(|_| ()), "nothing written since");
 }
 

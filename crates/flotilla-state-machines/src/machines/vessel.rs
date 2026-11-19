@@ -86,7 +86,7 @@ pub struct VesselSpec {
     pub launch_of: String,
     /// The home sequence the launch's create took; 0 until its log numbers it.
     pub launch: u64,
-    /// The convoy whose quota the lease counts against, at its own home.
+    /// The convoy the lease serves, at its own home.
     pub convoy: ConvoyId,
     pub class: VesselClass,
     #[store(child)]

@@ -1,6 +1,6 @@
 --- a/machines/convoy.qnt
 +++ b/machines/convoy.qnt
-@@ -183,7 +183,6 @@
+@@ -179,7 +179,6 @@
    def declared(id: int, d: { promise: PromiseId, definition: Promise, owner: Seat }): Outcome =
      if (promises.get(id).keys().contains(d.promise)) Refused(PromiseExists)
      else if (not(known(id, d.owner))) Refused(UnknownSeat)

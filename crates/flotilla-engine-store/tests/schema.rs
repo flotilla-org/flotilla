@@ -156,7 +156,6 @@ fn a_store_whose_link_sources_predate_branch_is_widened_at_open() {
                 }],
                 promises: BTreeMap::new(),
                 duties: BTreeMap::from([(DutyId(0), Duty { owner: by.clone(), scope: DutyScope::Lifetime, terms: Terms::default() })]),
-                quota: BTreeMap::new(),
             },
             &world,
             Timestamp(0),

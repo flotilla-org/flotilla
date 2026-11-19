@@ -1,8 +1,8 @@
 --- a/machines/convoy.qnt
 +++ b/machines/convoy.qnt
-@@ -251,7 +251,7 @@
-   }
-   // An ended convoy takes only Retire, and a retired one nothing.
+@@ -244,7 +244,7 @@
+   // holding it is released when its PR closes or merges. No decision edge
+   // (verdict, retraction, submission, reassignment) runs once it ended.
    def ended(id: int, e: Event): Outcome = match e {
 -    | Retire(h) => if (phase.get(id) == Retired) Refused(NotOpen) else match h {
 +    | Retire(h) => if (false) Refused(NotOpen) else match h {

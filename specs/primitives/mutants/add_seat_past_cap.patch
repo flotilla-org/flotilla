@@ -1,6 +1,6 @@
 --- a/machines/convoy.qnt
 +++ b/machines/convoy.qnt
-@@ -209,7 +209,6 @@
+@@ -205,7 +205,6 @@
      else if (known(id, a.seat)) Refused(SeatExists)
      else if (not(known(id, a.parent))) Refused(UnknownSeat)
      else if (seatRetired(id, a.parent)) Refused(SeatRetired)

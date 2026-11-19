@@ -25,7 +25,7 @@ use flotilla_state_machines::{
     machines::{
         convoy::{
             Abandon, AbandonCause, Convoy, ConvoyRequest, Deliver, Duty, DutyId, DutyScope, MemoryConvoyWorld, Priority, PromiseKinds,
-            Readmit, RetireDuty, Seat, SeatName, Terms, VesselClass,
+            Resupervise, RetireDuty, Seat, SeatName, Terms,
         },
         lifecycle::{LifecycleState, VanishCause},
     },
@@ -183,7 +183,6 @@ impl CheckoutFixture {
             promises: Default::default(),
             duties: [(DUTY, Duty { owner: lead(), scope: DutyScope::Lifetime, terms: Terms::default() })].into_iter().collect(),
             seats: vec![seat],
-            quota: [(VesselClass::new("standard"), 1)].into_iter().collect(),
             priority: Priority(1),
             kinds: Frozen::new(PromiseKinds::default()).expect("freeze"),
         };
@@ -222,12 +221,12 @@ impl CheckoutFixture {
         held.unwrap_or_else(|| self.open_convoy(name))
     }
 
-    /// Readmits the newest launch of engine Convoy `name` with one more standard vessel: a write that ends nothing.
-    pub fn readmit_convoy(&self, name: &str) {
-        let readmit =
-            Readmit { quota: [(VesselClass::new("standard"), 2)].into_iter().collect(), by: lead(), authority: Ref::new(AUTHORITY) };
+    /// Re-points the lead seat's supervisor on the newest launch of engine Convoy `name`: a write that ends nothing.
+    pub fn resupervise_convoy(&self, name: &str) {
+        let supervised_by = Address::project("elsewhere").expect("project");
+        let resupervise = Resupervise { seat: lead(), supervised_by, by: lead(), authority: Ref::new(AUTHORITY) };
         let launch = self.launch(name);
-        self.convoys.lock().expect("convoys").apply(&launch, readmit, &convoy_world(), Self::now()).expect("convoy readmitted");
+        self.convoys.lock().expect("convoys").apply(&launch, resupervise, &convoy_world(), Self::now()).expect("convoy resupervised");
     }
 
     /// The newest launch of engine Convoy `name`: its version here, and its identity.

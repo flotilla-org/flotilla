@@ -57,7 +57,6 @@ fn request(of: &str) -> ConvoyRequest {
             parent: None,
             supervised_by: project(),
         }],
-        quota: Default::default(),
         priority: Priority(0),
         kinds: Catalog::resolve(&stock(), &[]).expect("stock").freeze(["pr"]).expect("freeze"),
     }

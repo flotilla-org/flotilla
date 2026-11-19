@@ -1,9 +1,9 @@
 --- a/machines/convoy.qnt
 +++ b/machines/convoy.qnt
-@@ -122,7 +122,6 @@
+@@ -118,7 +118,6 @@
+   pure def admission(r: ConvoyRequest): Outcome =
      if (r.promises.keys().size() == 0 and not(r.duties.keys().exists(d => lifetime(r.duties.get(d))))) Refused(NoObligations)
      else if (not(r.projectKnown)) Refused(UnknownProject)
-     else if (not(validQuota(r.quota))) Refused(InvalidQuota)
 -    else if (not(seatsClosed(r))) Refused(UnknownSeat)
      else if (not(acyclic(r.seats.keys().mapBy(s => r.seats.get(s).parent)))) Refused(SeatCycle)
      else if (overSeatLimit(r.seats.keys().size())) Refused(SeatsFull)

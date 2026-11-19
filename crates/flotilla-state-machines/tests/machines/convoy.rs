@@ -7,18 +7,14 @@ use flotilla_state_machines::{
     machines::convoy::{
         Abandon, AbandonCause, AddSeat, AdmittedPromise, Authority, Convoy, ConvoyEdgeKind, ConvoyLabel, ConvoyRefusal, ConvoyRequest,
         ConvoyState, Declare, Deliver, Duty, DutyId, DutyScope, FailSeat, Keep, Link, LinkSource, MemoryConvoyWorld, Priority, Progress,
-        PromiseId, PromiseKinds, PromiseSource, Quota, Readmit, Reassign, Reject, Resupervise, Retire, RetireDuty, Retract, Seat, SeatName,
-        Submit, Terms, Unlink, VesselClass,
+        PromiseId, PromiseKinds, PromiseSource, Reassign, Reject, Resupervise, Retire, RetireDuty, Retract, Seat, SeatName, Submit, Terms,
+        Unlink,
     },
     Coded, Diagram, Home, InputRead, Machine, Ref, StateValue, Version, WriteError,
 };
 
 const YES: &str = "yes";
 const NO: &str = "no";
-
-fn quota(counts: &[(&str, u32)]) -> Quota {
-    counts.iter().map(|(class, count)| (VesselClass::new(*class), *count)).collect()
-}
 
 fn project() -> Address {
     Address::project("p").expect("project")
@@ -62,7 +58,6 @@ fn request(promises: &[(u32, PromiseSource)]) -> ConvoyRequest {
         promises: promises.iter().map(|(id, source)| (PromiseId(*id), admitted(*id, *source, "coder"))).collect(),
         duties: BTreeMap::new(),
         seats: vec![seat_row("lead", None), seat_row("coder", Some("lead"))],
-        quota: quota(&[("standard", 1)]),
         priority: Priority(1),
         kinds: Frozen::new(PromiseKinds::default()).expect("freeze"),
     }
@@ -129,17 +124,16 @@ fn the_declaration_is_valid() {
 }
 
 // State and edge codes are stable: renames never change them. Every label
-// until Retired carries the quota in force and the retired duties; Delivered
-// also carries its disposition, and Abandoned its cause and reason. Retired
-// carries nothing. Codes kept from the earlier machine stay (`ke`, `rt`, `de`,
-// `ab`, `ra`).
+// until Retired carries the retired duties; Delivered also carries its
+// disposition, and Abandoned its cause and reason. Retired carries nothing.
+// Codes kept from the earlier machine stay (`ke`, `rt`, `de`, `ab`).
 #[test]
 fn codes_are_pinned() {
     let labels: Vec<_> = ConvoyLabel::ALL.iter().map(|s| (s.name(), s.code(), ConvoyState::fields(*s))).collect();
     let expected: [(&str, Code, &[&str]); 4] = [
-        ("Open", Code::new("op"), &["quota", "retired_duties"]),
-        ("Delivered", Code::new("de"), &["quota", "retired_duties", "disposition"]),
-        ("Abandoned", Code::new("ab"), &["quota", "retired_duties", "cause", "reason"]),
+        ("Open", Code::new("op"), &["retired_duties"]),
+        ("Delivered", Code::new("de"), &["retired_duties", "disposition"]),
+        ("Abandoned", Code::new("ab"), &["retired_duties", "cause", "reason"]),
         ("Retired", Code::new("re"), &[]),
     ];
     assert_eq!(labels, expected);
@@ -161,7 +155,6 @@ fn codes_are_pinned() {
         ("unlink", "ul"),
         ("deliver", "de"),
         ("abandon", "ab"),
-        ("readmit", "ra"),
         ("retire", "re"),
     ];
     assert_eq!(edges, expected.map(|(name, code)| (name, code.to_owned())));
@@ -183,7 +176,6 @@ fn the_diagram_is_pinned() {
         "  Open --> Open: unlink writes subjects\n",
         "  Open --> Delivered: deliver [disposition]\n",
         "  Open --> Abandoned: abandon [cause, reason]\n",
-        "  Open --> Open: readmit [quota]\n",
         "  Delivered --> Retired: retire\n",
         "  Abandoned --> Retired: retire\n",
         "  Abandoned --> Abandoned: reject writes promises\n",
@@ -208,7 +200,7 @@ fn admission_requires_an_obligation() {
     assert_eq!(home.create("b", empty.clone(), &world(), Timestamp(0)).err(), Some(WriteError::Refused(ConvoyRefusal::NoObligations)));
     empty.duties = [(DutyId(0), lifetime("coder"))].into();
     let created = home.create("c", empty, &world(), Timestamp(0)).expect("a lifetime duty is an obligation");
-    assert_eq!(created.resource.state(), &ConvoyState::Open { quota: quota(&[("standard", 1)]), retired_duties: BTreeSet::new() });
+    assert_eq!(created.resource.state(), &ConvoyState::Open { retired_duties: BTreeSet::new() });
 }
 
 // #3392 G1: the project is read by address at admission, and the create
@@ -413,8 +405,7 @@ fn deliver_waits_for_promises_then_duties() {
     assert_eq!(apply(&mut home, retire(0, YES)), refused(ConvoyRefusal::UnknownDuty), "already retired");
     apply(&mut home, merged()).expect("delivered");
     let state = home.newest_launch("c", None).expect("exists").state().clone();
-    let delivered =
-        ConvoyState::Delivered { quota: quota(&[("standard", 1)]), retired_duties: [DutyId(0)].into(), disposition: "merged".into() };
+    let delivered = ConvoyState::Delivered { retired_duties: [DutyId(0)].into(), disposition: "merged".into() };
     assert_eq!(state, delivered);
     assert_eq!(apply(&mut home, submit(0, "coder", YES)), refused(ConvoyRefusal::NotOpen));
 }
@@ -523,7 +514,7 @@ fn a_seat_fails_once_with_a_reason() {
     let convoy = home.newest_launch("c", None).expect("exists");
     let (_, coder) = convoy.spec().seat(&seat("coder")).expect("seat");
     assert_eq!(coder.failed.as_deref(), Some("crashed"));
-    assert_eq!(convoy.state(), &ConvoyState::Open { quota: quota(&[("standard", 1)]), retired_duties: BTreeSet::new() });
+    assert_eq!(convoy.state(), &ConvoyState::Open { retired_duties: BTreeSet::new() });
     assert_eq!(progress(&home, 0), Progress::Pending, "the verdict settles none of the seat's promises");
 }
 
@@ -550,19 +541,6 @@ fn subjects_link_unlink_and_relink() {
     assert_eq!(rows, [(LinkSource::Claim, true), (LinkSource::Operator, false)]);
 }
 
-// Readmission raises the quota over the same classes, never lowering a count.
-#[test]
-fn readmission_only_raises_the_quota() {
-    let mut home = convoy(request(&[(0, PromiseSource::Template)]));
-    let readmit =
-        |counts: &[(&str, u32)], authority: &str| Readmit { quota: quota(counts), by: seat("lead"), authority: Ref::new(authority) };
-    assert_eq!(apply(&mut home, readmit(&[("standard", 2)], NO)), refused(ConvoyRefusal::Unauthorised));
-    assert_eq!(apply(&mut home, readmit(&[("standard", 0)], YES)), refused(ConvoyRefusal::QuotaNotIncrease));
-    assert_eq!(apply(&mut home, readmit(&[("standard", 2), ("large", 1)], YES)), refused(ConvoyRefusal::QuotaNotIncrease));
-    apply(&mut home, readmit(&[("standard", 2)], YES)).expect("readmitted");
-    assert_eq!(home.newest_launch("c", None).expect("exists").state().quota(), &quota(&[("standard", 2)]));
-}
-
 #[test]
 fn admission_starts_fresh_seat_lifetimes() {
     let mut req = request(&[(0, PromiseSource::Template)]);
@@ -572,4 +550,24 @@ fn admission_starts_fresh_seat_lifetimes() {
     }
     let home = convoy(req);
     assert!(home.newest_launch("c", None).unwrap().spec().seats.iter().all(|r| !r.record.retired && r.record.replacements == 0));
+}
+
+// Behaviour (ADR 0047 N→N+1): a convoy request document the previous generation froze (a convoy
+// request message's body) still carries the retired `quota`, as pairs of class and count. It
+// decodes with the quota dropped, since typed decoding ignores an unknown key. Remove this test
+// one fleet roll after the quota's removal ships, when no stored request carries it.
+#[test]
+fn a_request_frozen_with_a_quota_decodes_without_it() {
+    #[derive(serde::Serialize)]
+    struct Previous<'a> {
+        #[serde(flatten)]
+        request: &'a ConvoyRequest,
+        quota: Vec<(&'a str, u32)>,
+    }
+    let request = request(&[(0, PromiseSource::Template)]);
+    let previous = Previous { request: &request, quota: vec![("standard", 2)] };
+    let bytes = flotilla_cbor::to_vec(&previous, &flotilla_cbor::DEFAULT_LIMITS).expect("the previous shape encodes");
+    assert_ne!(bytes.as_slice(), Frozen::new(request.clone()).expect("freeze").bytes(), "the previous document holds the quota");
+    let frozen = Frozen::<ConvoyRequest>::from_stored(flotilla_schema::Hash::of(&bytes), &bytes).expect("decodes");
+    assert_eq!(frozen.value(), &request);
 }

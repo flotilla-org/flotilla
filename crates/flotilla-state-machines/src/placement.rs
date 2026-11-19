@@ -1,11 +1,10 @@
-//! Placement: admission grants a cap, never a reservation (spec
-//! `machines/vessel.qnt`, scenario `admission_placement.qnt`, ADR 0064).
+//! Placement reads only fit and priority (spec `machines/vessel.qnt`, scenario
+//! `admission_placement.qnt`, ADR 0064).
 //!
-//! [`place`] is the spec's `Place` rule over one placement snapshot: the
-//! convoy holds a cap for the class, its live vessels are under it, the whole
+//! [`place`] is the spec's `Place` rule over one placement snapshot: the whole
 //! request fits the host's available capacity in every dimension, and no
-//! waiting request of higher priority fits there (even one whose own convoy is
-//! capped). A lease holds its shape on one host until the vessel is Gone.
+//! waiting request of higher priority fits there. A lease holds its shape on
+//! one host until the vessel is Gone.
 //! Nothing is pooled across hosts or shapes, and there is no borrowing.
 //!
 //! [`Ledger`] is a pure, in-memory host ledger that computes the snapshot and
@@ -20,7 +19,7 @@ use flotilla_schema::{Stored, Timestamp};
 
 use crate::{
     machines::{
-        convoy::{ConvoyId, Priority, Quota, VesselClass},
+        convoy::{ConvoyId, Priority, VesselClass},
         lifecycle::{LifecycleEdge, LifecycleWorld, MemoryLifecycleWorld},
         vessel::{live_leases, Vessel as VesselMachine, VesselSpec},
     },
@@ -76,12 +75,6 @@ pub struct Evidence {
     pub available: Units,
     /// The other requests waiting for placement.
     pub waiting: Vec<Request>,
-    /// Leased vessels of the request's convoy and class.
-    pub live: u32,
-    /// The convoy's cap for the class.
-    pub cap: u32,
-    /// Whether the convoy is admitted for the class.
-    pub admitted: bool,
 }
 
 /// A granted placement: the whole request, leased on one host.
@@ -91,13 +84,11 @@ pub struct Lease {
     pub host: Host,
 }
 
-/// The spec's vessel `Refusal`. [`place`] produces the middle four; the
+/// The spec's vessel `Refusal`. [`place`] produces the middle two; the
 /// lifecycle half of a vessel produces `WrongState` and `MissingEvidence`.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub enum PlacementRefusal {
     WrongState,
-    NotAdmitted,
-    QuotaExceeded,
     DoesNotFit,
     HigherPriorityWaiting,
     MissingEvidence,
@@ -111,12 +102,6 @@ pub fn fits(request: &Request, available: &Units) -> bool {
 
 /// The spec's `Place` rule, checked in its order.
 pub fn place(request: &Request, evidence: &Evidence) -> Result<Lease, PlacementRefusal> {
-    if !evidence.admitted {
-        return Err(PlacementRefusal::NotAdmitted);
-    }
-    if evidence.live >= evidence.cap {
-        return Err(PlacementRefusal::QuotaExceeded);
-    }
     if !fits(request, &evidence.available) {
         return Err(PlacementRefusal::DoesNotFit);
     }
@@ -155,11 +140,10 @@ pub enum LedgerError {
     Refused(PlacementRefusal),
 }
 
-/// A pure, in-memory placement ledger: host capacities, convoy caps and vessels.
+/// A pure, in-memory placement ledger: host capacities and vessels.
 #[derive(Clone, Debug, Default)]
 pub struct Ledger {
     hosts: BTreeMap<Host, Units>,
-    caps: BTreeMap<ConvoyId, Quota>,
     vessels: BTreeMap<VesselId, Vessel>,
 }
 
@@ -175,17 +159,6 @@ impl Ledger {
         }
         self.hosts.insert(host, capacity);
         Ok(())
-    }
-
-    /// Sets a convoy's quota, as admitted or readmitted. A class with no
-    /// positive cap is not admitted.
-    pub fn set_caps(&mut self, convoy: ConvoyId, quota: Quota) {
-        self.caps.insert(convoy, quota);
-    }
-
-    /// Sets one class's cap for a convoy, keeping its other classes' caps.
-    pub fn set_cap(&mut self, convoy: ConvoyId, class: VesselClass, cap: u32) {
-        self.caps.entry(convoy).or_default().insert(class, cap);
     }
 
     /// Queues a vessel's request.
@@ -224,21 +197,9 @@ impl Ledger {
         })
     }
 
-    /// The convoy's cap for a class; zero when it holds none.
-    pub fn cap(&self, convoy: &ConvoyId, class: &VesselClass) -> u32 {
-        self.caps.get(convoy).and_then(|quota| quota.get(class)).copied().unwrap_or(0)
-    }
-
-    /// Leased vessels of the convoy and class, on any host.
-    pub fn live(&self, convoy: &ConvoyId, class: &VesselClass) -> u32 {
-        let count = self.leases().filter(|(_, lease)| lease.request.convoy == *convoy && lease.request.class == *class).count();
-        u32::try_from(count).unwrap_or(u32::MAX)
-    }
-
     /// The snapshot a placement of waiting vessel `id` on `host` reads.
-    /// Admission is a positive cap for the class, as in `admission_placement`.
     pub fn evidence(&self, id: &VesselId, host: Host) -> Result<Evidence, LedgerError> {
-        let request = self.waiting(id)?;
+        self.waiting(id)?;
         let available = self.available(host.clone())?;
         let waiting = self
             .vessels
@@ -248,8 +209,7 @@ impl Ledger {
                 _ => None,
             })
             .collect();
-        let cap = self.cap(&request.convoy, &request.class);
-        Ok(Evidence { host, available, waiting, live: self.live(&request.convoy, &request.class), cap, admitted: cap > 0 })
+        Ok(Evidence { host, available, waiting })
     }
 
     /// Places waiting vessel `id` on `host` when [`place`] allows it.
@@ -385,16 +345,6 @@ impl<L: Log<VesselMachine>> Placements<L> {
         self.home.get(&id.0)
     }
 
-    /// Sets a convoy's quota, as admitted or readmitted.
-    pub fn set_caps(&mut self, convoy: ConvoyId, quota: Quota) {
-        self.ledger.set_caps(convoy, quota);
-    }
-
-    /// Sets one class's cap for a convoy, keeping its other classes' caps.
-    pub fn set_cap(&mut self, convoy: ConvoyId, class: VesselClass, cap: u32) {
-        self.ledger.set_cap(convoy, class, cap);
-    }
-
     /// Adds a host with its capacity by dimension, as it joins after the ledger was built.
     pub fn add_host(&mut self, host: Host, capacity: Units) -> Result<(), PlacementError> {
         self.ledger.add_host(host, capacity).map_err(PlacementError::Ledger)
@@ -469,9 +419,8 @@ mod placements_tests {
     }
 
     fn placements(home: Home<VesselMachine, MemoryLog<VesselMachine>>) -> Placements<MemoryLog<VesselMachine>> {
-        let (mut placements, unplaced) = Placements::new(home, [(host(), [(Dimension(0), 4)].into())]).expect("host");
+        let (placements, unplaced) = Placements::new(home, [(host(), [(Dimension(0), 4)].into())]).expect("host");
         assert!(unplaced.is_empty());
-        placements.set_caps(ConvoyId::new("c", "home"), [(VesselClass::new("crew"), 2)].into());
         placements
     }
 

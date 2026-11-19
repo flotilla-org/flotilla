@@ -14,8 +14,7 @@ module vessel_conformance {
   // Availability at each request's fit boundary, plus a missing dimension.
   pure val availability = Set(Map(0 -> 2, 1 -> 1), Map(0 -> 1, 1 -> 2), Map(0 -> 2))
   pure val placements = Set(1, 2).map(h => availability.map(a => Set(Set()).union(requests.map(r => Set(r))).map(w =>
-      Set((0, 1), (1, 1), (0, 0)).map(lc => bools.map(adm =>
-        V::Place({ host: h, available: a, waiting: w, live: lc._1, cap: lc._2, admitted: adm }))).flatten()).flatten()).flatten()).flatten()
+      V::Place({ host: h, available: a, waiting: w })))).flatten().flatten()
   pure val events = placements
     .union(bools.map(p => bools.map(m => V::Realise({ present: p, matches: m }))).flatten())
     .union(bools.map(c => V::Release({ complete: c })))

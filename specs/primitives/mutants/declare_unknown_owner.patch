@@ -1,6 +1,6 @@
 --- a/machines/convoy.qnt
 +++ b/machines/convoy.qnt
-@@ -182,7 +182,6 @@
+@@ -178,7 +178,6 @@
    // One outcome per edge, over an open convoy.
    def declared(id: int, d: { promise: PromiseId, definition: Promise, owner: Seat }): Outcome =
      if (promises.get(id).keys().contains(d.promise)) Refused(PromiseExists)

@@ -479,7 +479,7 @@ pub fn import_convoy(
         seats,
         promises,
     };
-    let state = StoredState::<Convoy>::new(ConvoyState::Open { quota: BTreeMap::new(), retired_duties: BTreeSet::new() }, since);
+    let state = StoredState::<Convoy>::new(ConvoyState::Open { retired_duties: BTreeSet::new() }, since);
     let resource = Resource::stored(launch_of, spec, state, Version(1));
     verify(&resource, end.as_ref(), pre_ledger).map_err(|failure| match failure {
         Unverified::Differs(reason) => refuse(reason),
@@ -638,7 +638,6 @@ fn replayed(resource: &Resource<Convoy>) -> Result<(Home<Convoy>, String, Memory
             .collect(),
         duties: spec.duties.clone(),
         seats: spec.seats.iter().map(|row| row.record.clone()).collect(),
-        quota: resource.state().quota().clone(),
         priority: spec.priority,
         kinds: spec.kinds.clone(),
     };
@@ -929,7 +928,7 @@ pub fn tombstone_into(
         seats: Records::new(),
         promises: Records::new(),
     };
-    let state = StoredState::<Convoy>::new(ConvoyState::Open { quota: BTreeMap::new(), retired_duties: BTreeSet::new() }, at);
+    let state = StoredState::<Convoy>::new(ConvoyState::Open { retired_duties: BTreeSet::new() }, at);
     let change = NewChange::new(flotilla_engine_store::IMPORT_WRITER, at).created_at(created);
     let (_, written) = target.write_launch(&launch.home, &change, launch.n, |version| {
         let resource = Resource::stored(launch.of.as_str(), stamped(&spec, version), state.clone(), Version(version)).numbered(launch.n);

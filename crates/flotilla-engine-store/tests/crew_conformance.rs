@@ -86,15 +86,8 @@ mod walk {
         json!({ "convoy": int(1), "class": int(1), "shape": map_of([(int(1), int(2))]), "priority": int(1) })
     }
 
-    fn evidence(cap: i64, available: i64) -> Value {
-        json!({
-            "host": int(3),
-            "available": map_of([(int(1), int(available))]),
-            "waiting": set_of(Vec::new()),
-            "live": int(0),
-            "cap": int(cap),
-            "admitted": cap > 0,
-        })
+    fn evidence(available: i64) -> Value {
+        json!({ "host": int(3), "available": map_of([(int(1), int(available))]), "waiting": set_of(Vec::new()) })
     }
 
     fn refused(step: Step) -> String {
@@ -105,18 +98,17 @@ mod walk {
         }
     }
 
-    // Behaviour (#3629 layer 6): through the store, a vessel waits, is refused for no cap and for
-    // no fit without a write, is leased and created Requested, is realised and released, and is
-    // then Gone with its lease freed.
+    // Behaviour (#3629 layer 6): through the store, a vessel waits, is refused for no fit without a
+    // write, is leased and created Requested, is realised and released, and is then Gone with its
+    // lease freed.
     #[test]
     fn a_vessel_waits_is_leased_realised_and_released_through_the_store() {
         type V = VesselConformance<StoreLogs>;
         let mut vessel = V::create(&variant("Waiting", request()));
         assert_eq!(V::encode(&vessel), variant("Waiting", request()));
-        assert_eq!(refused(V::apply(&mut vessel, &variant("Place", evidence(0, 4)))), "NotAdmitted");
-        assert_eq!(refused(V::apply(&mut vessel, &variant("Place", evidence(1, 1)))), "DoesNotFit");
+        assert_eq!(refused(V::apply(&mut vessel, &variant("Place", evidence(1)))), "DoesNotFit");
         assert_eq!(V::version(&vessel), 0, "a refusal writes nothing");
-        assert!(matches!(V::apply(&mut vessel, &variant("Place", evidence(1, 4))), Step::Accepted));
+        assert!(matches!(V::apply(&mut vessel, &variant("Place", evidence(4))), Step::Accepted));
         let placement = json!({ "request": request(), "host": int(3) });
         assert_eq!(
             V::encode(&vessel),
@@ -124,7 +116,7 @@ mod walk {
         );
         let realise = variant("Realise", json!({ "present": true, "matches": true }));
         assert!(matches!(V::apply(&mut vessel, &realise), Step::Accepted));
-        assert_eq!(refused(V::apply(&mut vessel, &variant("Place", evidence(1, 4)))), "MissingEvidence");
+        assert_eq!(refused(V::apply(&mut vessel, &variant("Place", evidence(4)))), "MissingEvidence");
         assert!(matches!(V::apply(&mut vessel, &variant("Release", json!({ "complete": true }))), Step::Accepted));
         assert_eq!(V::encode(&vessel), variant("Gone", placement));
         assert_eq!(refused(V::apply(&mut vessel, &realise)), "WrongState");

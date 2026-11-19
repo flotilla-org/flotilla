@@ -72,6 +72,12 @@ pub fn open(state_dir: &Path, identity: EngineIdentity) -> Result<ComposedEngine
     let registry = registry().map_err(|error| format!("decided store registry: {error:?}"))?;
     std::fs::create_dir_all(state_dir).map_err(|error| format!("create state directory {}: {error}", state_dir.display()))?;
     let path = state_dir.join(ENGINE_STORE);
+    if path.exists() {
+        // ADR 0047 N→N+1: the previous generation's retired tables go before the store opens.
+        rusqlite::Connection::open(&path)
+            .and_then(|connection| flotilla_engine_store::drop_retired_tables(&connection))
+            .map_err(|error| format!("drop retired tables from decided store {}: {error}", path.display()))?;
+    }
     let service = Arc::new(
         flotilla_schema_sqlite::stream::Service::open(&path, &home, registry)
             .map_err(|error| format!("open decided store {}: {error}{}", path.display(), remedy(&error)))?,

@@ -93,7 +93,6 @@ fn convoy_request() -> ConvoyRequest {
             parent: None,
             supervised_by: project(),
         }],
-        quota: [(VesselClass::new("standard"), 2)].into(),
         priority: Priority(4),
         kinds: Frozen::new(PromiseKinds::default()).expect("freeze"),
     }
@@ -208,8 +207,8 @@ fn lease_of(convoy: &str, units: u32) -> Lease {
 }
 
 // The host ledger is a view over the live vessels' leases (#3392 ruling D5): a ledger rebuilt from
-// stored vessels after a restart holds exactly the live leases, so capacity and quota counts come
-// back unchanged, and a Gone vessel's lease is not restored.
+// stored vessels after a restart holds exactly the live leases, so capacity comes back unchanged,
+// and a Gone vessel's lease is not restored.
 #[test]
 fn the_host_ledger_is_rebuilt_from_live_vessels() {
     let mut before = Ledger::new();
@@ -218,7 +217,6 @@ fn the_host_ledger_is_rebuilt_from_live_vessels() {
     let mut launches = Vec::new();
     for (name, units) in [("a", 4), ("b", 3), ("gone", 2)] {
         let lease = lease_of("c", units);
-        before.set_caps(lease.request.convoy.clone(), [(VesselClass::new("1"), 5)].into());
         before.request(VesselId::new(name), lease.request.clone()).expect("requested");
         let placed = before.place(&VesselId::new(name), Host::new("3")).expect("placed").clone();
         let created = vessels.create(name, VesselSpec::of(name, placed), &MemoryLifecycleWorld::default(), Timestamp(0));
@@ -256,8 +254,6 @@ fn the_host_ledger_is_rebuilt_from_live_vessels() {
     }
     assert_eq!(after.leases().collect::<Vec<_>>(), before.leases().collect::<Vec<_>>());
     assert_eq!(after.available(Host::new("3")), Ok([(Dimension(0), 3)].into()));
-    let convoy = lease_of("c", 0).request.convoy;
-    assert_eq!(after.live(&convoy, &VesselClass::new("1")), before.live(&convoy, &VesselClass::new("1")));
     assert_eq!(
         after.restore(VesselId::new(launches[0].as_str()), lease_of("c", 1)),
         Err(LedgerError::DuplicateRequest(VesselId::new(launches[0].as_str())))
@@ -356,7 +352,7 @@ fn live_leases_and_the_live_by_host_index_agree() {
 
 // Behaviour (#3587 layers 3 and 4): Convoy and AwaitingReply round-trip through their row codec
 // with every table filled (seats, promises with nested submissions, duties with a WhileOpen scope
-// and terms, the frozen kinds, quota and retired duties).
+// and terms, the frozen kinds and retired duties).
 #[test]
 fn convoy_and_awaiting_reply_round_trip() {
     use flotilla_schema::Records;
@@ -443,12 +439,7 @@ fn convoy_and_awaiting_reply_round_trip() {
         promises,
     };
     let state = State::new(
-        ConvoyState::Abandoned {
-            quota: [(VesselClass::new("standard"), 2)].into(),
-            retired_duties: BTreeSet::from([DutyId(0)]),
-            cause: AbandonCause::Operator,
-            reason: "decision".into(),
-        },
+        ConvoyState::Abandoned { retired_duties: BTreeSet::from([DutyId(0)]), cause: AbandonCause::Operator, reason: "decision".into() },
         Timestamp(5),
     );
     let convoy = Resource::<Convoy>::stored("", spec, state, Version(0));

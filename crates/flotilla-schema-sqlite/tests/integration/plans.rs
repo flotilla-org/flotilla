@@ -101,8 +101,6 @@ fn the_enumeration_covers_every_kind_and_index() {
         "convoy_promises set owner",
         "convoy_seats last position",
         "convoy_seats set supervised_by",
-        "convoy_quota insert",
-        "convoy_quota delete",
         "convoy label state",
         "awaiting_reply label state",
         "awaiting_reply scan",

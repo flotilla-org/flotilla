@@ -33,7 +33,7 @@ module convoy_deliver {
         duties: if (lifetimeDuty) Map(0 -> { owner: "a", scope: C::Lifetime, terms: "terms" }) else Map(),
         seats: if (crowded) Map("a" -> { parent: C::Root, supervisedBy: "op" }, "c" -> { parent: C::Under("a"), supervisedBy: "a" },
             "d" -> { parent: C::Under("a"), supervisedBy: "a" })
-          else Map("a" -> { parent: C::Root, supervisedBy: "op" }), quota: Map(0 -> 1, 1 -> 1), priority: 1 }),
+          else Map("a" -> { parent: C::Root, supervisedBy: "op" }), priority: 1 }),
       keepWorld,
     }
   }
@@ -61,7 +61,6 @@ module convoy_deliver {
       all { C::replaceSeat(1, "a"), now' = now, replacedA' = replacedA + 1 },
       all { C::deliver(1, "merged"), keepWorld },
       all { C::abandon(1, auth, C::OperatorDecision, reason), keepWorld },
-      all { C::readmit(1, Map(0 -> 2, 1 -> 1), auth), keepWorld },
       { nondet holds = Set(C::Unread, C::Read(Set()), C::Read(Set("message:m"))).oneOf() all { C::retire(1, holds), keepWorld } },
       all { C::unchanged, tick },
     }
@@ -91,10 +90,9 @@ module convoy_deliver {
     ).forall(e => not(C::accepts(id, e)))
   })
   val settledPromisesFinal = everyConvoy(id => settledFinal(id))
-  // A retired convoy holds no quota and no retired duties, and takes no edge,
-  // Retire included.
+  // A retired convoy holds no retired duties, and takes no edge, Retire included.
   val retiredFinal = everyConvoy(id => C::phase.get(id) != C::Retired or and {
-    C::quota.get(id) == Map(), C::retired.get(id) == Set(),
+    C::retired.get(id) == Set(),
     Set(C::Retire(C::Read(Set())), C::Deliver({ disposition: "merged" }), C::Abandon({ authorised: true, cause: C::OperatorDecision, reason: "decision" }))
       .forall(e => not(C::accepts(id, e))),
   })
@@ -142,7 +140,7 @@ module convoy_deliver {
   // No inductive invariant: a universe of every owned-promise shape is beyond
   // Apalache in a crew's memory, and the fast tier exhausts this scenario's
   // complete finite graph, which covers every depth at its bounds.
-  val view = (C::phase, C::project, C::priority, C::duties, C::retired, C::quota, C::promises, C::seats, C::subjects, now, replacedA)
+  val view = (C::phase, C::project, C::priority, C::duties, C::retired, C::promises, C::seats, C::subjects, now, replacedA)
   action deliverReady(id: int): bool = all { C::deliver(id, "merged"), keepWorld }
   // Once nothing is open and no lifetime duty holds, fair delivery ends the convoy.
   temporal liveness = Set(1).forall(id => weakFair(deliverReady(id), view) implies always(

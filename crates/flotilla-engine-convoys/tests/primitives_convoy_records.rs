@@ -28,7 +28,7 @@ use flotilla_state_machines::{
         awaiting_reply::{Awaited, AwaitingReplySpec, ProposedDisposition, StallReason},
         convoy::{
             Abandon, AbandonCause, AddSeat, AdmissionBytes, AdmittedPromise, Authority, Convoy, ConvoyRequest, FailSeat, Link, LinkSource,
-            Priority, PromiseId, PromiseSource, Reassign, Seat, SeatName, VesselClass,
+            Priority, PromiseId, PromiseSource, Reassign, Seat, SeatName,
         },
         message::MessageRef,
     },
@@ -106,7 +106,6 @@ fn request() -> ConvoyRequest {
             parent: None,
             supervised_by: project().child(flotilla_address::Kind::Role, "operator").expect("operator"),
         }],
-        quota: [(VesselClass::new("standard"), 1)].into(),
         priority: Priority(1),
         kinds: Catalog::resolve(&stock(), &[]).expect("stock").freeze(["decision-ledger"]).expect("freeze"),
     }

@@ -1,6 +1,6 @@
 --- a/machines/convoy.qnt
 +++ b/machines/convoy.qnt
-@@ -218,8 +218,6 @@
+@@ -214,8 +214,6 @@
      if (not(a.authorised)) Refused(Unauthorised)
      else if (not(known(id, a.seat))) Refused(UnknownSeat)
      else if (seatRetired(id, a.seat)) Refused(SeatRetired)

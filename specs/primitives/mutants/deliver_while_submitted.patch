@@ -1,6 +1,6 @@
 --- a/machines/convoy.qnt
 +++ b/machines/convoy.qnt
-@@ -237,7 +237,7 @@
+@@ -233,7 +233,7 @@
    def subjectUnlinked(id: int, a: { subject: str, authorised: bool }): Outcome =
      if (not(a.authorised)) Refused(Unauthorised) else if (not(linked(id).contains(a.subject))) Refused(UnknownSubject) else Accepted
    def delivered(id: int): Outcome =

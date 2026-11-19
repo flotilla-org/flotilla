@@ -100,7 +100,7 @@ use flotilla_state_machines::{
         },
         consumer::ConsumerKind,
         convoy::{
-            self, Convoy, ConvoyEdge, ConvoyId, ConvoyRequest, ConvoyState, MemoryConvoyWorld, Priority, PromiseId, PromiseSource, Quota,
+            self, Convoy, ConvoyEdge, ConvoyId, ConvoyRequest, ConvoyState, MemoryConvoyWorld, Priority, PromiseId, PromiseSource,
             SeatName, VesselClass,
         },
         lifecycle::{self, Lifecycle, LifecycleEdge, LifecycleKind, LifecycleState, MemoryLifecycleWorld, Observed},
@@ -598,7 +598,7 @@ fn refuse_without_evidence(
 // class is its number as text; a duty's terms are its note.
 
 /// The spec keeps each part of a convoy in its own variable, keyed by convoy.
-const CONVOY_PARTS: [&str; 9] = ["phase", "project", "priority", "duties", "retired", "quota", "promises", "seats", "subjects"];
+const CONVOY_PARTS: [&str; 8] = ["phase", "project", "priority", "duties", "retired", "promises", "seats", "subjects"];
 
 /// The convoys the model has admitted.
 fn convoy_ids(state: &Value) -> BTreeSet<i64> {
@@ -616,14 +616,6 @@ fn convoy_open(parts: &Value) -> bool {
 
 fn class(n: u32) -> VesselClass {
     VesselClass::new(n.to_string())
-}
-
-fn quota(v: &Value) -> Quota {
-    pairs(v).iter().map(|pair| (class(small(&pair[0])), small(&pair[1]))).collect()
-}
-
-fn quota_value(quota: &Quota) -> Value {
-    map_of(quota.iter().map(|(class, count)| (int(class.0.parse().expect("model class")), int((*count).into()))))
 }
 
 fn seat(v: &Value) -> SeatName {
@@ -664,7 +656,7 @@ fn authority_of(v: &Value) -> convoy::Authority {
 
 /// The request the model admitted as convoy `id`, a launch of the id's text,
 /// from the parts it admitted: its fixed fields, its promises as admitted,
-/// its seats, and the quota in force at admission.
+/// and its seats.
 fn convoy_request(id: i64, parts: &Value) -> ConvoyRequest {
     let promises = pairs(&parts["promises"])
         .iter()
@@ -714,7 +706,6 @@ fn convoy_request(id: i64, parts: &Value) -> ConvoyRequest {
         promises,
         duties,
         seats,
-        quota: quota(&parts["quota"]),
         priority: Priority(small(&parts["priority"])),
         kinds: flotilla_schema::Frozen::new(convoy::PromiseKinds::default()).expect("freeze"),
     }
@@ -731,7 +722,7 @@ fn progress_name(progress: convoy::Progress) -> &'static str {
 
 /// The spec's parts of a convoy ([`CONVOY_PARTS`]), field by field: its phase,
 /// the spec's fixed fields and records, every link row, and the state's
-/// retired duties and quota in force.
+/// retired duties.
 fn convoy_value(resource: &Resource<Convoy>) -> Value {
     let spec = resource.spec();
     let state = resource.state();
@@ -810,7 +801,6 @@ fn convoy_value(resource: &Resource<Convoy>) -> Value {
         "priority": int(spec.priority.0.into()),
         "duties": map_of(duties),
         "retired": set_of(state.retired().iter().map(|d| int(d.0.into()))),
-        "quota": quota_value(state.quota()),
         "promises": map_of(promises),
         "seats": seats,
         "subjects": subjects,
@@ -885,7 +875,6 @@ fn probe_convoys(home: &mut Home<Convoy>, state: &Value, now: Timestamp, step: &
     for id in convoy_ids(state) {
         let model = convoy_parts(state, id);
         let name = convoy_name(home, id);
-        let current = home.get(&name).expect("convoy").state().quota().clone();
         let retract =
             |promise| convoy::Retract { promise, by: operator.clone(), authority: convoy::Authority::Operator, reason: "decision".into() };
         let verdict = |promise| convoy::Keep::Verdict {
@@ -895,13 +884,8 @@ fn probe_convoys(home: &mut Home<Convoy>, state: &Value, now: Timestamp, step: &
             reason: "decision".into(),
         };
         if !convoy_open(&model) {
-            let mut probes: Vec<ConvoyEdge> = vec![
-                verdict(PromiseId(0)).into(),
-                retract(PromiseId(0)).into(),
-                delivered().into(),
-                abandon("decision").into(),
-                convoy::Readmit { quota: current, by: by(), authority: owner() }.into(),
-            ];
+            let mut probes: Vec<ConvoyEdge> =
+                vec![verdict(PromiseId(0)).into(), retract(PromiseId(0)).into(), delivered().into(), abandon("decision").into()];
             for pair in pairs(&model["promises"]) {
                 let (promise, owner_seat) = (PromiseId(small(&pair[0])), seat(&pair[1]["owner"]));
                 let submit = convoy::Submit {
@@ -941,14 +925,10 @@ fn probe_convoys(home: &mut Home<Convoy>, state: &Value, now: Timestamp, step: &
             }
             continue;
         }
-        // The negative picks: without authority nothing is abandoned or
-        // readmitted, and an empty reason abandons nothing.
+        // The negative picks: without authority nothing is abandoned, and an
+        // empty reason abandons nothing.
         let refused = convoy_world(false, true);
-        let decisions: [(ConvoyEdge, &MemoryConvoyWorld); 3] = [
-            (abandon("decision").into(), &refused),
-            (abandon("").into(), &world),
-            (convoy::Readmit { quota: current, by: by(), authority: owner() }.into(), &refused),
-        ];
+        let decisions: [(ConvoyEdge, &MemoryConvoyWorld); 2] = [(abandon("decision").into(), &refused), (abandon("").into(), &world)];
         for (edge, decision_world) in decisions {
             let kind = edge.kind();
             assert!(!would_accept(home, &name, edge, decision_world, now, tally), "{step}: convoy {id} {kind:?} unauthorised");
@@ -1073,11 +1053,6 @@ fn convoy_deliver(trace: &Trace, tally: &mut Tally) {
             "replaceSeat" => accept(&mut home, &name, convoy::ReplaceSeat(SeatName::new("a", "")), &world, now, &step, tally),
             "deliver" => accept(&mut home, &name, delivered(), &world, now, &step, tally),
             "abandon" => accept(&mut home, &name, abandon(&reason()), &world, now, &step, tally),
-            // The scenario readmits with a fixed quota, `Map(0 -> 2, 1 -> 1)`.
-            "readmit" => {
-                let quota = BTreeMap::from([(class(0), 2), (class(1), 1)]);
-                accept(&mut home, &name, convoy::Readmit { quota, by: by(), authority: owner() }, &world, now, &step, tally);
-            }
             // Unread holds are absent from the world.
             "retire" => {
                 let (mut world, holds, picked) = (world, Ref::new("holds"), step.pick("holds"));
@@ -1095,7 +1070,7 @@ fn convoy_deliver(trace: &Trace, tally: &mut Tally) {
 }
 
 // ---------------------------------------------------------------------------
-// admission_placement: convoy caps, the placement ledger and vessel lifecycles
+// admission_placement: admitted convoys, the placement ledger and vessel lifecycles
 
 fn units(v: &Value) -> Units {
     pairs(v).iter().map(|pair| (Dimension(small(&pair[0])), small(&pair[1]))).collect()
@@ -1135,11 +1110,11 @@ struct Placed {
     evidence: Evidence,
 }
 
-/// The scenario's world: admission quotas, the ledger, vessel lifecycles, and what
+/// The scenario's world: the admitted convoys, the ledger, vessel lifecycles, and what
 /// the harness keeps beyond them (each placement's evidence, and the leases
 /// the ledger returned and forgot).
 struct Fleet {
-    quotas: BTreeMap<i64, Quota>,
+    admitted: BTreeSet<i64>,
     ledger: Ledger,
     vessels: Home<Lifecycle<VesselKind>>,
     placed: BTreeMap<i64, Placed>,
@@ -1158,19 +1133,12 @@ impl Fleet {
         ledger.add_host(Host::new("1"), BTreeMap::from([(Dimension(0), 2), (Dimension(1), 1)])).expect("host 1");
         ledger.add_host(Host::new("2"), BTreeMap::from([(Dimension(0), 1), (Dimension(1), 2)])).expect("host 2");
         Fleet {
-            quotas: BTreeMap::new(),
+            admitted: BTreeSet::new(),
             ledger,
             vessels: Home::new("home").expect("declaration"),
             placed: BTreeMap::new(),
             returned: BTreeMap::new(),
         }
-    }
-
-    /// The ledger's caps follow the convoy's quota in force.
-    fn sync_caps(&mut self, convoy: i64) {
-        let name = convoy.to_string();
-        let quota = self.quotas.get(&convoy).expect("admitted quota").clone();
-        self.ledger.set_caps(ConvoyId::new(name, "home"), quota);
     }
 
     /// The spec's `Waiting(Request) | Leased({ placement, lifecycle }) | Gone(Placement)`,
@@ -1207,11 +1175,11 @@ impl Fleet {
         }))
     }
 
-    /// Quotas, vessels and the recorded placement evidence equal the model's,
-    /// and every live lease keeps `queuePriority` over the evidence it read.
+    /// The admitted convoys, vessels and the recorded placement evidence equal
+    /// the model's, and every live lease keeps `queuePriority` over the
+    /// evidence it read.
     fn check(&self, state: &Value, step: &Step) {
-        let observed = map_of(self.quotas.iter().map(|(id, quota)| (int(*id), quota_value(quota))));
-        same(&observed, &state["quotas"], step, "admission quotas");
+        same(&set_of(self.admitted.iter().map(|id| int(*id))), &state["admitted"], step, "admitted convoys");
         let model = store(state, "::vessels");
         same(&slots(model, |id| self.vessel_value(id, step)), model, step, "vessel");
         same(&self.placed_value(), &state["placedOn"], step, "placedOn");
@@ -1227,7 +1195,7 @@ impl Fleet {
     }
 
     /// From the reached state, every placement the ledger would grant keeps
-    /// `convoyCaps`, `hostCapacity` and `queuePriority`.
+    /// `hostCapacity` and `queuePriority`.
     fn probe(&self, state: &Value, step: &Step, tally: &mut Tally) {
         for (id, model) in entries(state, "::vessels") {
             if !model.is_some_and(|model| tag(model) == "Waiting") {
@@ -1239,13 +1207,6 @@ impl Fleet {
                 let mut trial = self.ledger.clone();
                 let evidence = trial.evidence(&vessel, host.clone()).expect("a waiting vessel's evidence");
                 let Ok(lease) = trial.place(&vessel, host.clone()).cloned() else { continue };
-                for convoy in [1, 2] {
-                    let convoy = ConvoyId::new(convoy.to_string(), "home");
-                    for class in [class(0), class(1)] {
-                        let (live, cap) = (trial.live(&convoy, &class), trial.cap(&convoy, &class));
-                        assert!(live <= cap, "{step}: placing vessel {id} on {host:?} leases {live} of {convoy:?} {class:?}, cap {cap}");
-                    }
-                }
                 for checked in hosts() {
                     assert!(trial.available(checked.clone()).is_ok(), "{step}: placing vessel {id} on {host:?} oversubscribes {checked:?}");
                 }
@@ -1286,20 +1247,8 @@ fn admission_placement(trace: &Trace, tally: &mut Tally) {
         };
         match step.action() {
             "admitRequest" => {
-                assert!(!fleet.quotas.contains_key(&convoy), "{step}: admission sets a previously absent quota");
-                fleet.quotas.insert(convoy, BTreeMap::from([(class(0), 1), (class(1), 1)]));
+                assert!(fleet.admitted.insert(convoy), "{step}: a convoy is admitted once");
                 tally.writes += 1;
-                fleet.sync_caps(convoy);
-            }
-            // The scenario readmits authorised, with `Map(0 -> count, 1 -> 1)`.
-            "readmit" => {
-                let quota = BTreeMap::from([(class(0), small(step.pick("count"))), (class(1), 1)]);
-                let before = fleet.quotas.get(&convoy).expect("admitted quota");
-                assert_eq!(before.keys().collect::<Vec<_>>(), quota.keys().collect::<Vec<_>>(), "{step}: same quota keys");
-                assert!(before.iter().all(|(key, count)| quota[key] >= *count), "{step}: quota only rises");
-                fleet.quotas.insert(convoy, quota);
-                tally.writes += 1;
-                fleet.sync_caps(convoy);
             }
             "request" => {
                 let request = placement_request(payload(slot_at(step.after, "::vessels", id).expect("requested vessel")));

@@ -147,7 +147,6 @@ impl Crew {
             shape: BTreeMap::from([(CORES, 4), (MEMORY, 8)]),
             priority: Priority(1),
         };
-        self.placements.set_caps(convoy(n, home), [(VesselClass::new("crew"), 1)].into());
         self.placements.request(id.clone(), request).expect("request");
         let vessel = self.placements.place(&id, Host::new(format!("host-{}", (n as u32) % HOSTS)), Timestamp(at)).expect("placed");
         let id = VesselId::new(vessel.name());
@@ -301,7 +300,6 @@ fn crew_load() {
     // A fresh vessel per local convoy: the lease's grant and the vessel's create, then its realise.
     let ids: Vec<VesselId> = locals.iter().map(|n| VesselId::new(format!("vessel-{n}-b"))).collect();
     for (n, id) in locals.iter().zip(&ids) {
-        crew.placements.set_caps(convoy(*n, "local"), [(VesselClass::new("crew"), 2)].into());
         let request = Request {
             convoy: convoy(*n, "local"),
             class: VesselClass::new("crew"),

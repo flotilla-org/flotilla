@@ -1,11 +1,11 @@
 --- a/machines/vessel.qnt
 +++ b/machines/vessel.qnt
 @@ -13,7 +13,7 @@
+   pure def fits(r: Request, available: int -> int): bool = r.shape.keys().forall(d => available.keys().contains(d) and r.shape.get(d) <= available.get(d))
+   pure def step(s: State, e: Event): Next = match s {
      | Waiting(r) => match e {
-         | Place(o) => if (not(o.admitted)) Refused(NotAdmitted)
-             else if (o.live >= o.cap) Refused(QuotaExceeded)
--            else if (not(fits(r, o.available))) Refused(DoesNotFit)
-+            else if (false) Refused(DoesNotFit)
+-        | Place(o) => if (not(fits(r, o.available))) Refused(DoesNotFit)
++        | Place(o) => if (false) Refused(DoesNotFit)
              else if (o.waiting.exists(w => w.priority > r.priority and fits(w, o.available))) Refused(HigherPriorityWaiting)
              else Moved(Leased({ placement: { request: r, host: o.host }, lifecycle: L::Requested([]) }))
          | _ => Refused(WrongState)

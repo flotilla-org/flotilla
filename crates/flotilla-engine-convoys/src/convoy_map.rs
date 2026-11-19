@@ -360,7 +360,6 @@ pub fn request(convoy: &ResourceObject<OldConvoy>) -> Result<ConvoyRequest, Stri
         promises,
         duties: standing_duties(convoy, &crews)?,
         seats,
-        quota: BTreeMap::new(),
         priority: Priority(0),
         kinds,
     })

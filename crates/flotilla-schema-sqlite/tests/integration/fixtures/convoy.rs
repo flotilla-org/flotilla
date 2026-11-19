@@ -8,8 +8,8 @@ use flotilla_state_machines::{
     machines::convoy::{
         Abandon, AbandonCause, AddSeat, AdmissionBytes, Authority, Convoy, ConvoySpec, ConvoyState, ConvoyWorld, Declare, Deliver, Duty,
         DutyId, DutyScope, FailSeat, Keep, Link, LinkSource, MemoryConvoyWorld, Priority, Progress, Promise, PromiseId, PromiseKind,
-        PromiseKinds, PromiseSource, Readmit, Reassign, Reject, ReplaceSeat, Resupervise, Retire, RetireDuty, RetireSeat, Retract, Seat,
-        SeatName, SubjectLink, Submission, Submit, Terms, Unlink, VesselClass,
+        PromiseKinds, PromiseSource, Reassign, Reject, ReplaceSeat, Resupervise, Retire, RetireDuty, RetireSeat, Retract, Seat, SeatName,
+        SubjectLink, Submission, Submit, Terms, Unlink,
     },
     Ref, Resource,
 };
@@ -122,23 +122,18 @@ pub fn spec(tc: &TestCase, pick: Pick) -> ConvoySpec {
     }
 }
 
-pub fn quota(tc: &TestCase, pick: Pick) -> BTreeMap<VesselClass, u32> {
-    map(tc, pick.nth(1), 2, |_, n| (VesselClass::new(format!("{}{n}", name(tc))), tc.draw(gs::integers::<u32>())))
-}
-
 fn retired(tc: &TestCase, pick: Pick) -> BTreeSet<DutyId> {
     map(tc, pick.nth(2), 2, |pick, n| (DutyId(small(tc, pick, n)), ())).into_keys().collect()
 }
 
 /// A state of every label in turn when covering, its collections of every size.
 pub fn state_value(tc: &TestCase, pick: Pick) -> ConvoyState {
-    let (quota, retired) = (quota(tc, pick), retired(tc, pick));
+    let retired = retired(tc, pick);
     match pick.digit(tc, 4, SHAPES) {
-        0 => ConvoyState::Open { quota, retired_duties: retired },
-        1 => ConvoyState::Delivered { quota, retired_duties: retired, disposition: text(tc) },
+        0 => ConvoyState::Open { retired_duties: retired },
+        1 => ConvoyState::Delivered { retired_duties: retired, disposition: text(tc) },
         3 => ConvoyState::Retired,
         _ => ConvoyState::Abandoned {
-            quota,
             retired_duties: retired,
             cause: code_enum(tc, pick.nth(3), &[AbandonCause::Failed, AbandonCause::Operator]),
             reason: text(tc),
@@ -150,8 +145,7 @@ pub fn generate(tc: &TestCase, pick: Pick) -> Resource<Convoy> {
     resource(spec(tc, pick), State::new(state_value(tc, pick), timestamp(tc)))
 }
 
-/// A fixed open convoy for example tests: one pending template promise owned by its one seat,
-/// under a quota of one.
+/// A fixed open convoy for example tests: one pending template promise owned by its one seat.
 pub fn sample() -> Resource<Convoy> {
     let owner = SeatName::new("coder", "");
     let mut seats = Records::new();
@@ -194,7 +188,7 @@ pub fn sample() -> Resource<Convoy> {
         seats,
         promises,
     };
-    let open = ConvoyState::Open { quota: [(VesselClass::new("standard"), 1)].into(), retired_duties: BTreeSet::new() };
+    let open = ConvoyState::Open { retired_duties: BTreeSet::new() };
     resource(spec, State::new(open, Timestamp(0)))
 }
 
@@ -210,8 +204,8 @@ fn yes(authority: &str) -> Box<dyn ConvoyWorld> {
 
 /// Every edge an open convoy may take: declaring a promise, each promise edge on an open
 /// promise (by its owner, or an operator's verdict), the seat edges, linking a subject and
-/// unlinking a linked one, retiring a holding duty, delivering, abandoning, and readmitting with
-/// every count raised or kept; and the edge an ended one takes, retiring.
+/// unlinking a linked one, retiring a holding duty, delivering and abandoning; and the edge an
+/// ended one takes, retiring.
 pub fn candidates(tc: &TestCase, pick: Pick, convoy: &Resource<Convoy>) -> Vec<Candidate<Convoy>> {
     // One draw of each value, shared by the candidates: draws are what generation spends.
     let now = timestamp(tc);
@@ -289,13 +283,6 @@ pub fn candidates(tc: &TestCase, pick: Pick, convoy: &Resource<Convoy>) -> Vec<C
     candidates.push((Deliver { disposition: word.clone() }.into(), yes(&authority), now));
     let abandon = Abandon { by: by.clone(), cause: AbandonCause::Operator, reason: prose, authority: Ref::new(authority.as_str()) };
     candidates.push((abandon.into(), yes(&authority), now));
-    let raised = convoy
-        .state()
-        .quota()
-        .iter()
-        .map(|(class, count)| (class.clone(), count.saturating_add(tc.draw(gs::integers::<u32>().max_value(2)))))
-        .collect();
-    candidates.push((Readmit { quota: raised, by, authority: Ref::new(authority.as_str()) }.into(), yes(&authority), now));
     candidates.push((Retire { holds: Ref::new(authority.as_str()) }.into(), yes(&authority), now));
     candidates
 }

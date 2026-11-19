@@ -242,7 +242,6 @@ fn a_table_missing_a_defaulted_column_and_a_code_is_widened() {
         seats: vec![seat],
         promises: BTreeMap::new(),
         duties: BTreeMap::from([(DutyId(0), Duty { owner, scope: DutyScope::Lifetime, terms: Terms::default() })]),
-        quota: BTreeMap::new(),
     };
     home.create("standing", request, &MemoryConvoyWorld::default().with_project(&project), Timestamp(0)).expect("convoy");
     drop(home);
@@ -261,6 +260,93 @@ fn a_table_missing_a_defaulted_column_and_a_code_is_widened() {
     assert_eq!(count(&conn, "convoy_duties"), duties);
     let stored: String = conn.query_row("SELECT sql FROM sqlite_schema WHERE name = 'convoy'", [], |row| row.get(0)).expect("table");
     assert!(schema_ddl(&current, DdlMode::Create).contains(&format!("{stored};\n")), "{stored}");
+}
+
+// Behaviour (ADR 0047 N→N+1, #3108): the previous generation stored each convoy's quota in
+// `convoy_quota` (with its view and the Readmit edge's code row). A store holding one, with a
+// quota row, opens under this build, which reads the convoy without it; dropping the retired
+// tables discards the rows, and the store reopens to this build's schema. Remove this test with
+// `drop_retired_tables`, one fleet roll after the quota's removal ships.
+#[test]
+fn a_store_holding_convoy_quotas_opens_and_drops_them() {
+    use flotilla_engine_store::{drop_retired_tables, StoreLog};
+    use flotilla_schema::{Frozen, Kind};
+    use flotilla_state_machines::{machines::convoy::*, Home};
+    use std::{collections::BTreeMap, sync::Arc};
+
+    let store = Arc::new(StoreHandle::new(
+        Store::open(Connection::open_in_memory().expect("SQLite"), HOME, registry().expect("registry")).expect("store"),
+    ));
+    let mut home = Home::<Convoy, _>::with_log(HOME, StoreLog::new(Arc::clone(&store))).expect("convoy home");
+    let project: Address = "project:fleet".parse().expect("project");
+    let owner = SeatName::new("governor", "");
+    let seat = Seat {
+        role: owner.role.clone(),
+        seat: owner.seat.clone(),
+        parent: None,
+        supervised_by: project.clone(),
+        failed: None,
+        retired: false,
+        replacements: 0,
+    };
+    let request = ConvoyRequest {
+        launch_of: "c".into(),
+        workflow_ref: "w".into(),
+        admission: Frozen::new(AdmissionBytes::new(Vec::new())).expect("freeze"),
+        project: project.clone(),
+        priority: Priority(0),
+        kinds: Frozen::new(PromiseKinds::default()).expect("kinds"),
+        seats: vec![seat],
+        promises: BTreeMap::new(),
+        duties: BTreeMap::from([(DutyId(0), Duty { owner, scope: DutyScope::Lifetime, terms: Terms::default() })]),
+    };
+    let created = home
+        .create("standing", request, &MemoryConvoyWorld::default().with_project(&project), Timestamp(0))
+        .expect("convoy")
+        .resource
+        .clone();
+    drop(home);
+    let conn = Arc::try_unwrap(store).unwrap_or_else(|_| panic!("store still held")).into_inner().into_connection();
+    // The previous generation's quota table, view and code row, as it rendered them, and a quota.
+    conn.execute_batch(
+        r#"CREATE TABLE "convoy_quota" (
+  "convoy" INTEGER NOT NULL,
+  "key" INTEGER NOT NULL REFERENCES "strings" ("id"),
+  "value" INTEGER NOT NULL,
+  PRIMARY KEY ("convoy", "key"),
+  FOREIGN KEY ("convoy") REFERENCES "convoy" ("id") ON DELETE CASCADE
+) STRICT, WITHOUT ROWID;
+CREATE VIEW "convoy_quota_view" AS SELECT
+  "convoy_quota"."convoy",
+  (SELECT "s" FROM "strings" WHERE "id" = "convoy_quota"."key") AS "key",
+  "convoy_quota"."value"
+FROM "convoy_quota";
+INSERT INTO "codes" ("kind", "field", "code", "name") VALUES ('cv', 'log:edge', 'ra', 'Readmit');
+INSERT INTO "strings" ("domain", "s") VALUES ('vc', 'standard');
+INSERT INTO "convoy_quota" SELECT "convoy"."id", "strings"."id", 2 FROM "convoy", "strings" WHERE "strings"."s" = 'standard';"#,
+    )
+    .expect("the previous generation's quota");
+    assert_eq!(count(&conn, "convoy_quota"), 1);
+    let schema = |conn: &Connection| -> i64 {
+        conn.query_row("SELECT count(*) FROM sqlite_schema WHERE name IN ('convoy_quota', 'convoy_quota_view')", [], |row| row.get(0))
+            .expect("schema")
+    };
+    let load = |store: &mut Store| {
+        let mut read = store.read().expect("read");
+        let id = read.resolve(Resource::<Convoy>::CODE, created.name(), HOME).expect("resolve").expect("stored");
+        let loaded = read.load::<Resource<Convoy>>(id).expect("load").expect("kept");
+        loaded.value.with_identity(&loaded.name, loaded.version)
+    };
+
+    let mut accepted = Store::open(conn, HOME, registry().expect("registry")).expect("opens with the quota table present");
+    assert_eq!(load(&mut accepted), created, "read without the quota");
+    let conn = accepted.into_connection();
+    assert_eq!(schema(&conn), 2, "opening leaves a table no kind declares");
+
+    drop_retired_tables(&conn).expect("dropped");
+    assert_eq!(schema(&conn), 0);
+    let mut store = Store::open(conn, HOME, registry().expect("registry")).expect("reopens");
+    assert_eq!(load(&mut store), created);
 }
 
 /// The store an older build left: one `message` written by this build, then `column` dropped

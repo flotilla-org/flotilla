@@ -5,7 +5,7 @@ use flotilla_schema::{Address, Edge, Frozen, State, Timestamp};
 use flotilla_state_machines::{
     machines::{
         consumer::ConsumerKind,
-        convoy::{AdmissionBytes, AdmittedPromise, ConvoyRequest, Priority, PromiseId, PromiseKinds, PromiseSource, SeatName, VesselClass},
+        convoy::{AdmissionBytes, AdmittedPromise, ConvoyRequest, Priority, PromiseId, PromiseKinds, PromiseSource, SeatName},
         message::{
             Deliver, DropMessage, DropReason, Expectation, MemoryMessageWorld, Message, MessageBody, MessageReference, MessageSpec,
             MessageState, MessageWorld, Receiver, Relation, RequestBody, Settle, Settlement, Supersedes,
@@ -58,7 +58,6 @@ pub fn body(tc: &TestCase, pick: Pick) -> Frozen<MessageBody> {
             .into(),
             duties: Default::default(),
             seats: Vec::new(),
-            quota: [(VesselClass::new(name(tc)), 2)].into(),
             priority: Priority(3),
             kinds: Frozen::new(PromiseKinds::default()).expect("freeze"),
         }))),

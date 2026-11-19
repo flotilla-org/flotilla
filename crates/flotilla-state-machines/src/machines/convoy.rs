@@ -10,8 +10,8 @@
 //! nothing open and no lifetime duty holding.
 //!
 //! The work record is stored as the spec's `records` (seats, and promises
-//! with their submissions nested under them) and the state's data (the quota
-//! in force and the retired duties), as the layer 3 look-over approved
+//! with their submissions nested under them) and the state's data (the
+//! retired duties), as the layer 3 look-over approved
 //! (#3627). Records change only through edges: an effect writes them as
 //! [`ConvoyWrite`]s, which the home applies once the log takes the edge and a
 //! store log writes as the edge's rows. Promise ids and seat names stay
@@ -29,15 +29,16 @@
 //! operator decided.
 //!
 //! No role name, vessel class or promise kind appears here: a seat's role, a
-//! quota's vessel class and a promise's kind are interned text, and the kinds'
+//! vessel's class and a promise's kind are interned text, and the kinds'
 //! rules are the frozen document admission used. The project and a promise's
 //! target are addresses (#3392 G1, ADR 0066). Admission reads the project
 //! through the recording admission handle and refuses one that does not
 //! exist; gates read authorisation and durability through the world, as
-//! recorded inputs.
+//! recorded inputs. A convoy holds no capacity: limits on what a convoy uses
+//! and costs come from telemetry, elsewhere.
 //!
 //! The identifiers placement shares with the convoy ([`ConvoyId`],
-//! [`VesselClass`], [`Priority`] and [`Quota`]) are defined here once.
+//! [`VesselClass`] and [`Priority`]) are defined here once.
 
 use std::collections::{BTreeMap, BTreeSet};
 
@@ -59,7 +60,7 @@ pub type ConvoyId = flotilla_schema::Ref<Resource<Convoy>>;
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize, Stored)]
 pub struct PromiseId(pub u32);
 
-/// A vessel class as a quota counts it: interned text in its own domain, as a
+/// A vessel class as placement counts it: interned text in its own domain, as a
 /// seat's role and discriminator are, so the store and its views name the
 /// class (#3627 look-over ruling 4).
 #[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize, Stored)]
@@ -76,9 +77,6 @@ impl VesselClass {
 /// places first.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize, Stored)]
 pub struct Priority(pub u32);
-
-/// Per-class caps on live vessels. Admission grants a cap, never a reservation.
-pub type Quota = BTreeMap<VesselClass, u32>;
 
 /// A duty's key within one convoy.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize, Stored)]
@@ -390,21 +388,18 @@ pub struct ConvoySpec {
 
 states! {
     /// The spec's `State`, with its work record's state data on every label
-    /// until it retires: the quota in force and the lifetime duties retired.
-    /// Retired carries nothing: nothing reads a retired convoy's quota,
-    /// duties or end facts, and its Deliver or Abandon event keeps the latter.
+    /// until it retires: the lifetime duties retired. Retired carries
+    /// nothing: nothing reads a retired convoy's duties or end facts, and its
+    /// Deliver or Abandon event keeps the latter.
     pub enum ConvoyState => ConvoyLabel {
         Open {
-            #[store(child)] quota: BTreeMap<VesselClass, u32>,
             #[store(child)] retired_duties: BTreeSet<DutyId>,
         } = "op",
         Delivered {
-            #[store(child)] quota: BTreeMap<VesselClass, u32>,
             #[store(child)] retired_duties: BTreeSet<DutyId>,
             disposition: String,
         } = "de",
         Abandoned {
-            #[store(child)] quota: BTreeMap<VesselClass, u32>,
             #[store(child)] retired_duties: BTreeSet<DutyId>,
             cause: AbandonCause,
             reason: String,
@@ -413,18 +408,9 @@ states! {
     }
 }
 
-static NO_QUOTA: Quota = BTreeMap::new();
 static NO_DUTIES: BTreeSet<DutyId> = BTreeSet::new();
 
 impl ConvoyState {
-    /// The quota in force: the admitted one, or the last readmission's; none once retired.
-    pub fn quota(&self) -> &Quota {
-        match self {
-            ConvoyState::Open { quota, .. } | ConvoyState::Delivered { quota, .. } | ConvoyState::Abandoned { quota, .. } => quota,
-            ConvoyState::Retired => &NO_QUOTA,
-        }
-    }
-
     /// The lifetime duties retired so far; none once the convoy retired.
     pub fn retired(&self) -> &BTreeSet<DutyId> {
         match self {
@@ -524,9 +510,6 @@ pub struct ConvoyRequest {
     pub duties: BTreeMap<DutyId, Duty>,
     /// The seats admission creates, parents before the seats under them.
     pub seats: Vec<Seat>,
-    /// The quota admitted; it becomes the state's quota in force.
-    #[serde(with = "pairs")]
-    pub quota: Quota,
     pub priority: Priority,
     /// The promise kinds in force at admission, frozen into the convoy.
     pub kinds: Frozen<PromiseKinds>,
@@ -700,15 +683,6 @@ pub struct Retire {
     pub holds: Ref<Holds>,
 }
 
-/// Readmission of the same convoy with a raised quota.
-#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
-pub struct Readmit {
-    #[serde(with = "pairs")]
-    pub quota: Quota,
-    pub by: SeatName,
-    pub authority: Ref<Authorisation>,
-}
-
 /// A map in a document as a list of `(key, value)` pairs: the stored CBOR
 /// profile (ADR 0063) takes text map keys only.
 mod pairs {
@@ -732,7 +706,7 @@ mod pairs {
 
 edges! {
     /// The spec's events. Codes keep the earlier machine's where the edge
-    /// survives (`ke`, `rt`, `de`, `ab`, `ra`).
+    /// survives (`ke`, `rt`, `de`, `ab`).
     pub enum ConvoyEdge => ConvoyEdgeKind {
         Declare(Declare) = "dc",
         Submit(Submit) = "su",
@@ -750,7 +724,6 @@ edges! {
         Unlink(Unlink) = "ul",
         Deliver(Deliver) = "de",
         Abandon(Abandon) = "ab",
-        Readmit(Readmit) = "ra",
         Retire(Retire) = "re",
     }
 }
@@ -872,16 +845,12 @@ pub enum ConvoyRefusal {
     /// Admission read the request's project and found none (#3392 G1); the
     /// spec's `projectKnown` is that read.
     UnknownProject,
-    /// The spec refuses negative quota counts. Counts here are unsigned, so
-    /// neither admission nor readmission produces this.
-    InvalidQuota,
     /// The convoy has ended (Delivered or Abandoned) or retired.
     NotOpen,
     UnknownPromise,
     PromiseSettled,
     PromisesOutstanding(BTreeSet<PromiseId>),
     Unauthorised,
-    QuotaNotIncrease,
     PromiseExists,
     NotOwner,
     NotDurable,
@@ -926,7 +895,7 @@ impl From<WrongState<ConvoyLabel, ConvoyEdgeKind>> for ConvoyRefusal {
 }
 
 /// A decision by an authorised party (retiring a duty, fan-out, a supervision
-/// change, a seat verdict, a subject link, abandoning, readmitting); reads `true` when it is authorised. The
+/// change, a seat verdict, a subject link, abandoning); reads `true` when it is authorised. The
 /// caller works it out from seat relations, as the spec's `authorised`.
 pub struct Authorisation;
 impl Kind for Authorisation {
@@ -1221,14 +1190,6 @@ impl Machine for Convoy {
                     .effect(abandon),
             )
             .edge(
-                EdgeDef::<Self, Readmit>::new()
-                    .from([Open])
-                    .to([Open])
-                    .changes(["quota"])
-                    .gate("an authorised quota over the same classes, no count lower", gate_readmit)
-                    .effect(readmit),
-            )
-            .edge(
                 EdgeDef::<Self, Retire>::new()
                     .from([Delivered, Abandoned])
                     .to([Retired])
@@ -1240,8 +1201,7 @@ impl Machine for Convoy {
 
     /// A convoy needs an obligation: a promise or a convoy-lifetime duty.
     /// Its project must exist, read by address, and every owner and parent
-    /// must be one of its seats. Promises start Pending under the admitted
-    /// quota.
+    /// must be one of its seats. Promises start Pending.
     fn admit(admission: &mut Admission<'_, Convoy>, request: ConvoyRequest) -> Result<(ConvoySpec, ConvoyState), ConvoyRefusal> {
         if request.promises.is_empty() && !request.duties.values().any(|duty| duty.scope == DutyScope::Lifetime) {
             return Err(ConvoyRefusal::NoObligations);
@@ -1298,7 +1258,7 @@ impl Machine for Convoy {
             };
             spec.promises.append(0, row).expect("a request holds fewer than 2^32 promises");
         }
-        Ok((spec, ConvoyState::Open { quota: request.quota, retired_duties: BTreeSet::new() }))
+        Ok((spec, ConvoyState::Open { retired_duties: BTreeSet::new() }))
     }
 }
 
@@ -1542,21 +1502,6 @@ fn gate_retire(h: &mut Handle<'_, Convoy>, retire: &Retire) -> Result<(), Convoy
     }
 }
 
-// Spec: the class domain is fixed and no count may fall below the quota in force.
-fn gate_readmit(h: &mut Handle<'_, Convoy>, readmit: &Readmit) -> Result<(), ConvoyRefusal> {
-    if !authorised(h, &readmit.authority) {
-        return Err(ConvoyRefusal::Unauthorised);
-    }
-    let current = h.state().quota();
-    let same_classes = readmit.quota.keys().eq(current.keys());
-    let no_lower = readmit.quota.iter().all(|(class, count)| current.get(class).is_some_and(|old| count >= old));
-    if same_classes && no_lower {
-        Ok(())
-    } else {
-        Err(ConvoyRefusal::QuotaNotIncrease)
-    }
-}
-
 // Record effects write rows and leave the state as it is. Every effect below
 // is declared from Open only, so the engine hands it an Open state; any other
 // state is returned as given, which the engine refuses as a fault (its label
@@ -1633,9 +1578,9 @@ fn resupervise(h: &mut Handle<'_, Convoy>, state: ConvoyState, change: &Resuperv
 
 fn retire_duty(_: &mut Handle<'_, Convoy>, state: ConvoyState, retire: &RetireDuty) -> ConvoyState {
     match state {
-        ConvoyState::Open { quota, mut retired_duties } => {
+        ConvoyState::Open { mut retired_duties } => {
             retired_duties.insert(retire.duty);
-            ConvoyState::Open { quota, retired_duties }
+            ConvoyState::Open { retired_duties }
         }
         other => other,
     }
@@ -1658,25 +1603,16 @@ fn unlink(h: &mut Handle<'_, Convoy>, state: ConvoyState, unlink: &Unlink) -> Co
 
 fn deliver(_: &mut Handle<'_, Convoy>, state: ConvoyState, deliver: &Deliver) -> ConvoyState {
     match state {
-        ConvoyState::Open { quota, retired_duties } => {
-            ConvoyState::Delivered { quota, retired_duties, disposition: deliver.disposition.clone() }
-        }
+        ConvoyState::Open { retired_duties } => ConvoyState::Delivered { retired_duties, disposition: deliver.disposition.clone() },
         other => other,
     }
 }
 
 fn abandon(_: &mut Handle<'_, Convoy>, state: ConvoyState, abandon: &Abandon) -> ConvoyState {
     match state {
-        ConvoyState::Open { quota, retired_duties } => {
-            ConvoyState::Abandoned { quota, retired_duties, cause: abandon.cause, reason: abandon.reason.clone() }
+        ConvoyState::Open { retired_duties } => {
+            ConvoyState::Abandoned { retired_duties, cause: abandon.cause, reason: abandon.reason.clone() }
         }
-        other => other,
-    }
-}
-
-fn readmit(_: &mut Handle<'_, Convoy>, state: ConvoyState, readmit: &Readmit) -> ConvoyState {
-    match state {
-        ConvoyState::Open { retired_duties, .. } => ConvoyState::Open { quota: readmit.quota.clone(), retired_duties },
         other => other,
     }
 }

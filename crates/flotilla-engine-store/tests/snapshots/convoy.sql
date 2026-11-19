@@ -238,13 +238,6 @@ CREATE TABLE "convoy_promises_submissions" (
   PRIMARY KEY ("convoy", "promises_pos", "pos"),
   FOREIGN KEY ("convoy", "promises_pos") REFERENCES "convoy_promises" ("convoy", "pos") ON DELETE CASCADE
 ) STRICT, WITHOUT ROWID;
-CREATE TABLE "convoy_quota" (
-  "convoy" INTEGER NOT NULL,
-  "key" INTEGER NOT NULL REFERENCES "strings" ("id"),
-  "value" INTEGER NOT NULL,
-  PRIMARY KEY ("convoy", "key"),
-  FOREIGN KEY ("convoy") REFERENCES "convoy" ("id") ON DELETE CASCADE
-) STRICT, WITHOUT ROWID;
 CREATE TABLE "convoy_retired_duties" (
   "convoy" INTEGER NOT NULL,
   "value" INTEGER NOT NULL,
@@ -282,7 +275,6 @@ INSERT INTO "codes" ("kind", "field", "code", "name") VALUES
   ('cv', 'log:edge', 'fs', 'FailSeat'),
   ('cv', 'log:edge', 'ke', 'Keep'),
   ('cv', 'log:edge', 'lk', 'Link'),
-  ('cv', 'log:edge', 'ra', 'Readmit'),
   ('cv', 'log:edge', 'rd', 'RetireDuty'),
   ('cv', 'log:edge', 're', 'Retire'),
   ('cv', 'log:edge', 'rj', 'Reject'),
@@ -371,11 +363,6 @@ CREATE VIEW "convoy_promises_submissions_view" AS SELECT
   (SELECT "s" FROM "strings" WHERE "id" = "convoy_promises_submissions"."by_role") AS "by_role",
   (SELECT "s" FROM "strings" WHERE "id" = "convoy_promises_submissions"."by_seat") AS "by_seat"
 FROM "convoy_promises_submissions";
-CREATE VIEW "convoy_quota_view" AS SELECT
-  "convoy_quota"."convoy",
-  (SELECT "s" FROM "strings" WHERE "id" = "convoy_quota"."key") AS "key",
-  "convoy_quota"."value"
-FROM "convoy_quota";
 CREATE VIEW "convoy_retired_duties_view" AS SELECT
   "convoy_retired_duties"."convoy",
   "convoy_retired_duties"."value"

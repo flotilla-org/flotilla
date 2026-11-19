@@ -10,7 +10,7 @@ use flotilla_state_machines::{
     kinds::{stock, Catalog},
     machines::convoy::{
         AdmittedPromise, Convoy, ConvoyRefusal, ConvoyRequest, Declare, Priority, Progress, PromiseId, PromiseSource, Seat, SeatName,
-        Submit, VesselClass,
+        Submit,
     },
     Ref, Version, WriteError,
 };
@@ -47,7 +47,6 @@ fn request() -> ConvoyRequest {
             parent: None,
             supervised_by: address("supervisor"),
         }],
-        quota: [(VesselClass::new("standard"), 1)].into(),
         priority: Priority(1),
         kinds: Catalog::resolve(&stock(), &[]).expect("stock").freeze(["pr"]).expect("freeze"),
     }

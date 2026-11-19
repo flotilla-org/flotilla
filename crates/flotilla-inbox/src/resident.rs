@@ -10,7 +10,7 @@ use std::{
 use flotilla_schema::{Address, Timestamp};
 use flotilla_state_machines::{
     machines::{
-        convoy::{AdmittedPromise, ConvoyRequest, Duty, DutyId, DutyScope, PromiseId, Seat, SeatName, VesselClass},
+        convoy::{AdmittedPromise, ConvoyRequest, Duty, DutyId, DutyScope, PromiseId, Seat, SeatName},
         message::*,
     },
     Resource, Transport,
@@ -101,7 +101,7 @@ pub(crate) fn resource(value: &Resource<Message>, receipts: Option<&BTreeMap<Rec
             MessageBody::Request(RequestBody::CheckoutInspection { remote: _ }) => 0,
             MessageBody::Request(RequestBody::ChangeRequestBranch { branch }) => branch.capacity(),
             MessageBody::Request(RequestBody::Convoy(request)) => {
-                let ConvoyRequest { launch_of, workflow_ref, admission, project, promises, duties, seats, quota, priority: _, kinds } =
+                let ConvoyRequest { launch_of, workflow_ref, admission, project, promises, duties, seats, priority: _, kinds } =
                     request.as_ref();
                 let nodes = |len: usize, slot: usize| if len == 0 { 0 } else { len.saturating_mul(2).max(11) * slot + (len / 5 + 1) * 96 };
                 let seat = |seat: &SeatName| seat.role.capacity() + seat.seat.capacity();
@@ -113,8 +113,6 @@ pub(crate) fn resource(value: &Resource<Message>, receipts: Option<&BTreeMap<Rec
                     + launch_of.capacity()
                     + workflow_ref.capacity()
                     + heap_address(project)
-                    + nodes(quota.len(), size_of::<(VesselClass, u32)>())
-                    + quota.keys().map(|class| class.0.capacity()).sum::<usize>()
                     + nodes(promises.len(), size_of::<(PromiseId, AdmittedPromise)>())
                     + promises.values().map(|p| p.kind.capacity() + heap_address(&p.target) + seat(&p.owner)).sum::<usize>()
                     + nodes(duties.len(), size_of::<(DutyId, Duty)>())

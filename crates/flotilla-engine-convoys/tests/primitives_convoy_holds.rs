@@ -144,7 +144,6 @@ fn request(document: AdmissionDocument) -> ConvoyRequest {
             parent: None,
             supervised_by: operator(),
         }],
-        quota: [(VesselClass::new("standard"), 1)].into(),
         priority: Priority(1),
         kinds: Catalog::resolve(&stock(), &[]).expect("stock").freeze(["decision-ledger", "pr"]).expect("freeze"),
     }

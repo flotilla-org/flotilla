@@ -7,7 +7,7 @@
 //! Two temp-file stores in WAL mode with `synchronous = NORMAL`: the local home and a remote one.
 //! 10,000 convoys, nine in ten homed remotely and replicated into the local store through its
 //! change stream, one in ten local. Each convoy is admitted with two seats, two template promises,
-//! a lifetime duty and two quota classes over one of 100 projects, and has one submission on
+//! and a lifetime duty over one of 100 projects, and has one submission on
 //! promise 0, a change request of its own.
 //!
 //! Per-event cost: each local convoy takes two engine edges through `Home::apply` over the store's
@@ -36,7 +36,7 @@ use flotilla_state_machines::{
     kinds::{stock, Catalog, KindDefinition, Observation, Observations, Rule, Template},
     machines::convoy::{
         AdmissionBytes, AdmittedPromise, Convoy, ConvoyRequest, ConvoySpec, Duty, DutyId, DutyScope, Keep, MemoryConvoyWorld, Priority,
-        PromiseId, PromiseKinds, PromiseSource, Seat, SeatName, Submit, Terms, VesselClass,
+        PromiseId, PromiseKinds, PromiseSource, Seat, SeatName, Submit, Terms,
     },
     Home, Ref,
 };
@@ -150,7 +150,6 @@ fn request(n: usize) -> ConvoyRequest {
                 supervised_by: address("lead"),
             },
         ],
-        quota: [(VesselClass::new("standard"), 2), (VesselClass::new("large"), 1)].into(),
         priority: Priority(1),
         kinds: frozen_kinds(),
     }

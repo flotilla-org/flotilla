@@ -1,6 +1,6 @@
 --- a/machines/convoy.qnt
 +++ b/machines/convoy.qnt
-@@ -230,7 +230,6 @@
+@@ -226,7 +226,6 @@
    def seatReplaced(id: int, seat: Seat): Outcome =
      if (not(known(id, seat))) Refused(UnknownSeat)
      else if (seatRetired(id, seat)) Refused(SeatRetired)

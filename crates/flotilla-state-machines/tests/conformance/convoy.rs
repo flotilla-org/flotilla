@@ -9,7 +9,7 @@
 //!   `Reassign`: those edges, field for field.
 //! - `Submit{durable}`: the `submit` edge, its durability reading `durable`.
 //! - `RetireDuty`, `AddSeat`, `Resupervise`, `RetireSeat`, `FailSeat`,
-//!   `Link`, `Unlink`, `Abandon` and `Readmit`: those edges, their authority
+//!   `Link`, `Unlink` and `Abandon`: those edges, their authority
 //!   reading `authorised`.
 //! - `Deliver`: the `deliver` edge, with its disposition.
 //! - `Retire(holds)`: the `retire` edge; `Read(set)` puts the set in the
@@ -20,7 +20,6 @@
 //!   discriminator is empty.
 //! - The project, a promise's target, a submission's reference and a
 //!   supervisor are addresses ([`address`]).
-//! - A vessel class is its number as text.
 //! - A subject is an address; the spec's link source `ByOperator` is
 //!   [`LinkSource::Operator`], and its abandon causes `WorkFailed` and
 //!   `OperatorDecision` are [`AbandonCause::Failed`] and
@@ -30,15 +29,14 @@
 //!
 //! State mapping: the spec keeps each part of a convoy in its own variable,
 //! keyed by convoy; the harness admits convoy 0. [`spec_nodes`] reads those
-//! parts into one record, `{phase, project, priority, duties, retired, quota,
+//! parts into one record, `{phase, project, priority, duties, retired,
 //! promises, seats, subjects}`, which [`ConvoyConformance::encode`] builds
 //! field by field from the Rust value:
 //! - `phase`: `Open { .. }` is `Open`, `Delivered { disposition, .. }` is
 //!   `Delivered(disposition)`, `Abandoned { cause, reason, .. }` is
 //!   `Abandoned({cause, reason})` and `Retired` is `Retired`;
 //! - `project`, `priority` and `duties`: the spec's;
-//! - `retired` and `quota`: the state's retired duties and quota in force,
-//!   both empty once retired;
+//! - `retired`: the state's retired duties, empty once retired;
 //! - `promises` and `seats`: the records keyed by id and seat name, a seat's
 //!   `retired` its flag;
 //! - `subjects`: every link row in order, with its source and whether it was
@@ -51,8 +49,8 @@ use flotilla_state_machines::{
     machines::convoy::{
         Abandon, AbandonCause, AddSeat, AdmittedPromise, Authority, Convoy, ConvoyRefusal, ConvoyRequest, ConvoySpec, ConvoyState, Declare,
         Deliver, Duty, DutyId, DutyScope, FailSeat, Keep, Link, LinkSource, MemoryConvoyWorld, Priority, Progress, PromiseId, PromiseKinds,
-        PromiseSource, Quota, Readmit, Reassign, Reject, ReplaceSeat, Resupervise, Retire, RetireDuty, RetireSeat, Retract, Seat, SeatName,
-        Submit, Terms, Unlink, VesselClass,
+        PromiseSource, Reassign, Reject, ReplaceSeat, Resupervise, Retire, RetireDuty, RetireSeat, Retract, Seat, SeatName, Submit, Terms,
+        Unlink,
     },
     Home, Ref, Resource, WriteError,
 };
@@ -89,18 +87,6 @@ fn named(v: &Value) -> Vec<(&str, &Value)> {
         Value::Array(items) if items.is_empty() => Vec::new(),
         _ => pairs(v).iter().map(|p| (text(&p[0]), &p[1])).collect(),
     }
-}
-
-fn class(n: i64) -> VesselClass {
-    VesselClass::new(n.to_string())
-}
-
-fn quota_of(v: &Value) -> Quota {
-    pairs(v).iter().map(|p| (class(number(&p[0])), id(&p[1]))).collect()
-}
-
-fn quota_value(quota: &Quota) -> Value {
-    map_of(quota.iter().map(|(class, count)| (int(class.0.parse().expect("model class")), int((*count).into()))))
 }
 
 fn source_of(v: &Value) -> PromiseSource {
@@ -246,7 +232,6 @@ fn request_of(request: &Value) -> ConvoyRequest {
         promises,
         duties,
         seats,
-        quota: quota_of(&request["quota"]),
         priority: Priority(id(&request["priority"])),
         kinds: kinds(),
     }
@@ -260,12 +245,10 @@ fn refusal_of(refusal: ConvoyRefusal) -> Value {
         ConvoyRefusal::DutyHolds(ids) => return variant("DutyHolds", set_of(ids.iter().map(|d| int(d.0.into())))),
         ConvoyRefusal::NoObligations => "NoObligations",
         ConvoyRefusal::UnknownProject => "UnknownProject",
-        ConvoyRefusal::InvalidQuota => "InvalidQuota",
         ConvoyRefusal::NotOpen => "NotOpen",
         ConvoyRefusal::UnknownPromise => "UnknownPromise",
         ConvoyRefusal::PromiseSettled => "PromiseSettled",
         ConvoyRefusal::Unauthorised => "Unauthorised",
-        ConvoyRefusal::QuotaNotIncrease => "QuotaNotIncrease",
         ConvoyRefusal::PromiseExists => "PromiseExists",
         ConvoyRefusal::NotOwner => "NotOwner",
         ConvoyRefusal::NotDurable => "NotDurable",
@@ -343,7 +326,6 @@ fn parts(spec: &ConvoySpec, state: &ConvoyState) -> Value {
         "priority": int(spec.priority.0.into()),
         "duties": map_of(duties),
         "retired": set_of(state.retired().iter().map(|d| int(d.0.into()))),
-        "quota": quota_value(state.quota()),
         "promises": map_of(promises),
         "seats": Value::Object(seats),
         "subjects": subjects,
@@ -351,8 +333,7 @@ fn parts(spec: &ConvoySpec, state: &ConvoyState) -> Value {
 }
 
 /// The request that admitted an initial open convoy: its fixed fields, its
-/// promises as admitted and its seats, with the quota in force as the
-/// admitted quota.
+/// promises as admitted and its seats.
 fn admitted_request(convoy: &Value) -> ConvoyRequest {
     let promises: Vec<Value> = pairs(&convoy["promises"])
         .iter()
@@ -370,7 +351,6 @@ fn admitted_request(convoy: &Value) -> ConvoyRequest {
         "promises": { "#map": promises },
         "duties": convoy["duties"],
         "seats": Value::Object(seats),
-        "quota": convoy["quota"],
         "priority": convoy["priority"],
     });
     request_of(&request)
@@ -434,8 +414,6 @@ struct ConvoyConformance;
 
 impl Conformance for ConvoyConformance {
     const MACHINE: &'static str = "convoy";
-    // Quota counts are unsigned, so an invalid quota is unrepresentable.
-    const NEVER_REFUSED: &'static [&'static str] = &["InvalidQuota"];
     type Subject = Home<Convoy>;
 
     fn create(state: &Value) -> Home<Convoy> {
@@ -536,7 +514,6 @@ impl Conformance for ConvoyConformance {
                 let abandon = Abandon { by, cause: cause_of(&o["cause"]), reason: text(&o["reason"]).into(), authority };
                 outcome(home.apply(&name, abandon, &world, at))
             }
-            "Readmit" => outcome(home.apply(&name, Readmit { quota: quota_of(&o["quota"]), by, authority }, &world, at)),
             "Retire" => {
                 // Unread holds are absent from the world.
                 let holds = Ref::new("holds");

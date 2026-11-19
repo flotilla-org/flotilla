@@ -46,7 +46,7 @@ module convoy {
   type AbandonCause = WorkFailed | OperatorDecision
   // projectKnown is admission's recorded read of the project address.
   type ConvoyRequest = { project: str, projectKnown: bool, promises: PromiseId -> AdmittedPromise,
-    duties: DutyId -> Duty, seats: Seat -> SeatRequest, quota: VesselClass -> int, priority: int }
+    duties: DutyId -> Duty, seats: Seat -> SeatRequest, priority: int }
   // Retired is the only end: an ended convoy retires once nothing holds it.
   type Phase = Open | Delivered(str) | Abandoned({ cause: AbandonCause, reason: str }) | Retired
   // What holds an ended convoy, read from its dependents' own records and named
@@ -73,10 +73,9 @@ module convoy {
     | Link({ subject: str, source: LinkSource, authorised: bool })
     | Unlink({ subject: str, authorised: bool })
     | Deliver({ disposition: str }) | Abandon({ authorised: bool, cause: AbandonCause, reason: str })
-    | Readmit({ quota: VesselClass -> int, authorised: bool })
     | Retire(Holds)
-  type Refusal = NoObligations | UnknownProject | InvalidQuota | NotOpen | UnknownPromise | PromiseSettled
-    | PromisesOutstanding(Set[PromiseId]) | Unauthorised | QuotaNotIncrease | PromiseExists | NotOwner | NotDurable
+  type Refusal = NoObligations | UnknownProject | NotOpen | UnknownPromise | PromiseSettled
+    | PromisesOutstanding(Set[PromiseId]) | Unauthorised | PromiseExists | NotOwner | NotDurable
     | NotSubmitted | StaleEvidence | UnknownDuty | DutyHolds(Set[DutyId]) | UnknownSeat | SeatExists | SeatCycle
     | SeatRetired | SeatsFull | ReplacementsExhausted | SeatFailed | SubjectLinked | UnknownSubject
     | NotEnded | Held(Set[str]) | HoldsUnread
@@ -93,14 +92,12 @@ module convoy {
   var project: int -> str
   var priority: int -> int
   var duties: int -> (DutyId -> Duty)
-  // The lifetime duties retired, and the quota in force: none once retired.
+  // The lifetime duties retired: none once retired.
   var retired: int -> Set[DutyId]
-  var quota: int -> (VesselClass -> int)
   var promises: int -> (PromiseId -> PromiseRecord)
   var seats: int -> (Seat -> SeatRecord)
   var subjects: int -> List[LinkRow]
 
-  pure def validQuota(q: VesselClass -> int): bool = q.keys().forall(c => q.get(c) >= 0)
   pure def overSeatLimit(count: int): bool = count > SEAT_LIMIT
   pure def lifetime(d: Duty): bool = match d.scope { | Lifetime => true | WhileOpen(_) => false }
   pure def open(p: PromiseRecord): bool = p.state == Pending or p.state == Submitted
@@ -121,7 +118,6 @@ module convoy {
   pure def admission(r: ConvoyRequest): Outcome =
     if (r.promises.keys().size() == 0 and not(r.duties.keys().exists(d => lifetime(r.duties.get(d))))) Refused(NoObligations)
     else if (not(r.projectKnown)) Refused(UnknownProject)
-    else if (not(validQuota(r.quota))) Refused(InvalidQuota)
     else if (not(seatsClosed(r))) Refused(UnknownSeat)
     else if (not(acyclic(r.seats.keys().mapBy(s => r.seats.get(s).parent)))) Refused(SeatCycle)
     else if (overSeatLimit(r.seats.keys().size())) Refused(SeatsFull)
@@ -242,13 +238,6 @@ module convoy {
     else Accepted
   def abandoned(a: { authorised: bool, cause: AbandonCause, reason: str }): Outcome =
     if (not(a.authorised) or a.reason == "") Refused(Unauthorised) else Accepted
-  def readmitted(id: int, a: { quota: VesselClass -> int, authorised: bool }): Outcome = {
-    val q = quota.get(id)
-    if (not(a.authorised)) Refused(Unauthorised)
-    else if (not(validQuota(a.quota))) Refused(InvalidQuota)
-    else if (a.quota.keys() != q.keys() or not(a.quota.keys().forall(c => a.quota.get(c) >= q.get(c)))) Refused(QuotaNotIncrease)
-    else Accepted
-  }
   // An ended convoy takes Retire, and a retired one nothing. An abandoned
   // convoy's submitted promise still resolves by the world (#3108 ruling 1): a
   // rejection or an observed keep, writing only the promise, so a submission
@@ -283,7 +272,6 @@ module convoy {
     | Unlink(a) => subjectUnlinked(id, a)
     | Deliver(_) => delivered(id)
     | Abandon(a) => abandoned(a)
-    | Readmit(a) => readmitted(id, a)
     | Retire(_) => Refused(NotEnded)
   }
   // Only an admitted convoy takes an edge.
@@ -291,9 +279,9 @@ module convoy {
 
   // The store. A refused edge disables its action and writes nothing.
   action keepFixed = all { project' = project, priority' = priority, duties' = duties }
-  action unchanged = all { keepFixed, phase' = phase, retired' = retired, quota' = quota, promises' = promises, seats' = seats,
+  action unchanged = all { keepFixed, phase' = phase, retired' = retired, promises' = promises, seats' = seats,
     subjects' = subjects }
-  action init = all { phase' = Map(), project' = Map(), priority' = Map(), duties' = Map(), retired' = Map(), quota' = Map(),
+  action init = all { phase' = Map(), project' = Map(), priority' = Map(), duties' = Map(), retired' = Map(),
     promises' = Map(), seats' = Map(), subjects' = Map() }
   action admitRequest(id: int, r: ConvoyRequest): bool = all {
     not(phase.keys().contains(id)),
@@ -303,7 +291,6 @@ module convoy {
     priority' = priority.put(id, r.priority),
     duties' = duties.put(id, r.duties),
     retired' = retired.put(id, Set()),
-    quota' = quota.put(id, r.quota),
     promises' = promises.put(id, r.promises.keys().mapBy(p => { promise: r.promises.get(p).promise, source: r.promises.get(p).source,
       owner: r.promises.get(p).owner, state: Pending, submissions: [] })),
     seats' = seats.put(id, r.seats.keys().mapBy(s => { parent: r.seats.get(s).parent, supervisedBy: r.seats.get(s).supervisedBy,
@@ -313,19 +300,19 @@ module convoy {
   // The writes, each to one part.
   action writePromise(id: int, p: PromiseId, r: PromiseRecord): bool = all {
     promises' = promises.setBy(id, ps => ps.put(p, r)),
-    keepFixed, phase' = phase, retired' = retired, quota' = quota, seats' = seats, subjects' = subjects,
+    keepFixed, phase' = phase, retired' = retired, seats' = seats, subjects' = subjects,
   }
   action writeSeat(id: int, seat: Seat, r: SeatRecord): bool = all {
     seats' = seats.setBy(id, ss => ss.put(seat, r)),
-    keepFixed, phase' = phase, retired' = retired, quota' = quota, promises' = promises, subjects' = subjects,
+    keepFixed, phase' = phase, retired' = retired, promises' = promises, subjects' = subjects,
   }
   action writeSubjects(id: int, links: List[LinkRow]): bool = all {
     subjects' = subjects.set(id, links),
-    keepFixed, phase' = phase, retired' = retired, quota' = quota, promises' = promises, seats' = seats,
+    keepFixed, phase' = phase, retired' = retired, promises' = promises, seats' = seats,
   }
   action writePhase(id: int, reached: Phase): bool = all {
     phase' = phase.set(id, reached),
-    keepFixed, retired' = retired, quota' = quota, promises' = promises, seats' = seats, subjects' = subjects,
+    keepFixed, retired' = retired, promises' = promises, seats' = seats, subjects' = subjects,
   }
   def promiseRecord(id: int, p: PromiseId): PromiseRecord = promises.get(id).get(p)
   def seatRecord(id: int, s: Seat): SeatRecord = seats.get(id).get(s)
@@ -361,7 +348,7 @@ module convoy {
   action retireDuty(id: int, d: DutyId, auth: bool): bool = all {
     accepts(id, RetireDuty({ duty: d, authorised: auth })),
     retired' = retired.setBy(id, done => done.union(Set(d))),
-    keepFixed, phase' = phase, quota' = quota, promises' = promises, seats' = seats, subjects' = subjects,
+    keepFixed, phase' = phase, promises' = promises, seats' = seats, subjects' = subjects,
   }
   action addSeat(id: int, s: Seat, parent: Seat, supervisedBy: str, auth: bool): bool = all {
     accepts(id, AddSeat({ seat: s, parent: parent, supervisedBy: supervisedBy, authorised: auth })),
@@ -400,16 +387,10 @@ module convoy {
     accepts(id, Abandon({ authorised: auth, cause: cause, reason: reason })),
     writePhase(id, Abandoned({ cause: cause, reason: reason })),
   }
-  action readmit(id: int, q: VesselClass -> int, auth: bool): bool = all {
-    accepts(id, Readmit({ quota: q, authorised: auth })),
-    quota' = quota.set(id, q),
-    keepFixed, phase' = phase, retired' = retired, promises' = promises, seats' = seats, subjects' = subjects,
-  }
-  // A retired convoy keeps no quota and no retired duties.
+  // A retired convoy keeps no retired duties.
   action retire(id: int, holds: Holds): bool = all {
     accepts(id, Retire(holds)),
     phase' = phase.set(id, Retired),
-    quota' = quota.set(id, Map()),
     retired' = retired.set(id, Set()),
     keepFixed, promises' = promises, seats' = seats, subjects' = subjects,
   }
@@ -434,7 +415,6 @@ module convoy {
     | Unlink(a) => unlink(id, a.subject, a.authorised)
     | Deliver(d) => deliver(id, d.disposition)
     | Abandon(a) => abandon(id, a.authorised, a.cause, a.reason)
-    | Readmit(a) => readmit(id, a.quota, a.authorised)
     | Retire(h) => retire(id, h)
   }
 }
