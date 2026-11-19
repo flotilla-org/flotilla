@@ -4500,6 +4500,63 @@ async fn run_message_role_waiting_home_case(remote: bool, admitted: bool) {
     }
 }
 
+// A producer in the daemon (a crew turn, a handoff) sends through the router: a receiver homed
+// here is admitted by a direct call, with no command round on this daemon's event stream, and
+// one homed elsewhere is admitted there, never here.
+#[tokio::test]
+async fn a_producers_send_is_admitted_at_its_home_without_a_local_command() {
+    use flotilla_resources::{ConvoyEnsure, ConvoyEnsureSpec, Message, MessagePhase};
+    for remote in [false, true] {
+        let topology =
+            spawn_in_memory_request_topology_stateful(empty_daemon_named("message-caller").await, empty_daemon_named("role-home").await)
+                .await
+                .expect("role Message topology");
+        let home = if remote { &topology.follower } else { &topology.leader };
+        home.resource_backend()
+            .using::<ConvoyEnsure>("flotilla")
+            .create(
+                &InputMeta::builder().name("waiting-governor".into()).build(),
+                &ConvoyEnsureSpec::builder().project_ref("flotilla".into()).role("governor".into()).repositories(Vec::new()).build(),
+            )
+            .await
+            .expect("declared standing role");
+        if remote {
+            let caller = topology.leader.resource_backend().definitions::<ConvoyEnsure>("flotilla");
+            tokio::time::timeout(Duration::from_secs(5), async {
+                while caller.get("waiting-governor").await.is_err() {
+                    tokio::time::sleep(Duration::from_millis(20)).await;
+                }
+            })
+            .await
+            .expect("the caller follows the declaration from its home");
+        }
+        let intent: flotilla_messaging::Intent = serde_json::from_value(serde_json::json!({
+            "sender": "fleet:lab/role:turn-rules", "inbox": "project:flotilla/role:governor", "relation": "system", "body": "settled checks"
+        }))
+        .expect("intent");
+        let mut events = topology.leader.subscribe();
+        let sent = topology.leader.publish_message("flotilla", "request", &intent).await.expect("producer send");
+        assert_eq!(sent.name, "request");
+        let record = home.resource_backend().using::<Message>("flotilla").get("request").await.expect("home-authored Message");
+        assert_eq!(record.status.expect("admitted status").phase, MessagePhase::Deliverable);
+        if remote {
+            assert!(topology.leader.resource_backend().using::<Message>("flotilla").get("request").await.is_err(), "authored at its home");
+        }
+        // A repeat is the message already admitted.
+        topology.leader.publish_message("flotilla", "request", &intent).await.expect("repeated send");
+        loop {
+            match events.try_recv() {
+                // A remote home's command reports its progress here, under that home's node.
+                Ok(DaemonEvent::CommandStarted { description, node_id, .. }) if node_id == *topology.leader.node_id() => {
+                    panic!("the send ran a command here (remote: {remote}): {description}")
+                }
+                Ok(_) | Err(tokio::sync::broadcast::error::TryRecvError::Lagged(_)) => {}
+                Err(_) => break,
+            }
+        }
+    }
+}
+
 #[tokio::test]
 async fn message_role_waiting_home_pinned_rows() {
     for remote in [false, true] {

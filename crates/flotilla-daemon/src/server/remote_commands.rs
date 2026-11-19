@@ -215,50 +215,53 @@ struct QueryRoute {
 #[async_trait]
 impl flotilla_crew::leaf_engine::ResourceIntentPublisher for RemoteCommandRouterInner {
     async fn publish(self: Arc<Self>, namespace: &str, document: serde_json::Value) -> Result<flotilla_protocol::ResourceRef, String> {
-        let router = RemoteCommandRouter { inner: self };
-        let command = Command::builder().action(CommandAction::ResourceApply { namespace: namespace.to_string(), document }).build();
-        match off_frame(|| router.dispatch_and_wait(command, uuid::Uuid::nil())).await? {
-            CommandValue::ResourceObject(object) => Ok(flotilla_protocol::ResourceRef::new(
-                object.value.get("apiVersion").and_then(serde_json::Value::as_str).unwrap_or("flotilla.work/v1"),
-                &object.kind,
-                &object.namespace,
-                object
-                    .value
-                    .pointer("/metadata/name")
-                    .and_then(serde_json::Value::as_str)
-                    .ok_or("resource admission response has no name")?,
-            )),
-            CommandValue::Error { message } => Err(message),
-            value => Err(format!("unexpected resource intent admission result: {value:?}")),
-        }
+        Ok(self.publish_admitted(namespace, document).await?.0)
     }
+    /// Admits a Message at its receiver's home. Routing names the home; at this home the
+    /// admission is called directly, and only another home is sent the command.
     async fn publish_admitted(
         self: Arc<Self>,
         namespace: &str,
         document: serde_json::Value,
     ) -> Result<(flotilla_protocol::ResourceRef, Option<String>), String> {
         let router = RemoteCommandRouter { inner: self };
-        let command = Command::builder().action(CommandAction::ResourceApply { namespace: namespace.to_string(), document }).build();
-        match off_frame(|| router.dispatch_and_wait(command, uuid::Uuid::nil())).await? {
-            CommandValue::ResourceObject(object) => {
-                let name = object
-                    .value
-                    .pointer("/metadata/name")
-                    .and_then(serde_json::Value::as_str)
-                    .ok_or("resource admission response has no name")?;
-                let home = object
-                    .value
-                    .pointer("/metadata/annotations")
-                    .and_then(|annotations| annotations.get(flotilla_store::replica::ORIGIN_ROOT_ANNOTATION))
-                    .and_then(serde_json::Value::as_str)
-                    .map(str::to_owned);
-                let api_version = object.value.get("apiVersion").and_then(serde_json::Value::as_str).unwrap_or("flotilla.work/v1");
-                Ok((flotilla_protocol::ResourceRef::new(api_version, &object.kind, &object.namespace, name), home))
-            }
+        let mut command = Command::builder().action(CommandAction::ResourceApply { namespace: namespace.to_string(), document }).build();
+        let route = off_frame(|| router.query_route(&mut command)).instrument(tracing::info_span!("message_publish.route")).await?;
+        if route.target_node_id == *router.daemon.node_id() {
+            let CommandAction::ResourceApply { namespace, document } = &command.action else {
+                unreachable!("the routed command is the Message apply")
+            };
+            let object = off_frame(|| router.daemon.admit_message_document(namespace, document))
+                .instrument(tracing::info_span!("message_publish.admit"))
+                .await
+                .map_err(|error| error.to_string())?;
+            return admitted_message(&object.kind, &object.namespace, &object.value);
+        }
+        let answer = off_frame(|| router.send_query_to_target(command, Some(uuid::Uuid::nil()), route))
+            .instrument(tracing::info_span!("message_publish.remote"))
+            .await?;
+        match answer {
+            CommandValue::ResourceObject(object) => admitted_message(&object.kind, &object.namespace, &object.value),
             CommandValue::Error { message } => Err(message),
             value => Err(format!("unexpected resource intent admission result: {value:?}")),
         }
     }
+}
+
+/// The admitted Message an admission answered with, and the home holding it.
+fn admitted_message(
+    kind: &str,
+    namespace: &str,
+    value: &serde_json::Value,
+) -> Result<(flotilla_protocol::ResourceRef, Option<String>), String> {
+    let name = value.pointer("/metadata/name").and_then(serde_json::Value::as_str).ok_or("resource admission response has no name")?;
+    let home = value
+        .pointer("/metadata/annotations")
+        .and_then(|annotations| annotations.get(flotilla_store::replica::ORIGIN_ROOT_ANNOTATION))
+        .and_then(serde_json::Value::as_str)
+        .map(str::to_owned);
+    let api_version = value.get("apiVersion").and_then(serde_json::Value::as_str).unwrap_or("flotilla.work/v1");
+    Ok((flotilla_protocol::ResourceRef::new(api_version, kind, namespace, name), home))
 }
 
 impl RemoteCommandRouter {
