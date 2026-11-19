@@ -11,6 +11,7 @@ use std::{
     time::Duration,
 };
 
+use flotilla_engine_convoys::holds::{crew_accesses, each};
 use flotilla_engine_store::{follow::Followed, watch::EngineWatch};
 use flotilla_provisioning::stored::environment::Environment;
 use flotilla_schema::Kind;
@@ -218,58 +219,64 @@ pub(in crate::runtime) fn status_controller(
     (vec![Box::new(wake)], AccessStatusReconciler { state, namespace, held: Default::default() })
 }
 
-/// What one pass over the decided log found ended: environments and convoys by name.
+/// What one pass over the decided log woke: the records whose place or convoy ended.
 #[derive(Default)]
-struct Ended {
-    places: BTreeSet<String>,
-    convoys: BTreeSet<String>,
+struct Woken {
+    records: BTreeSet<String>,
     /// A home's state moved without entries: which of its resources ended is unknown.
     rescanned: bool,
 }
 
 /// Wakes the records whose place's environment or whose convoy has ended, from the decided log:
-/// the records themselves do not change when either ends.
+/// the records themselves do not change when either ends. Each is found through its index: a
+/// place's by `by_place`, a convoy's crew's by `by_access` with each of its crew's access keys.
 #[derive(Clone)]
 struct EndingWake {
     service: Arc<Service>,
 }
 
 impl EndingWake {
-    fn ended(read: &mut Read<'_>, followed: Vec<Followed>) -> Result<Ended, StoreError> {
+    fn woken(read: &mut Read<'_>, followed: Vec<Followed>) -> Result<Woken, StoreError> {
         let environment = <EngineResource<Environment> as Kind>::CODE;
         let convoy = <EngineResource<EngineConvoy> as Kind>::CODE;
-        let mut ended = Ended::default();
+        let mut woken = Woken::default();
+        let mut wake = |read: &mut Read<'_>, id| {
+            if let Some((identity, _)) = read.identity(id)? {
+                woken.records.insert(identity.name);
+            }
+            Ok(())
+        };
         for followed in followed {
             let identity = match followed {
                 Followed::Changed(identity) => identity,
                 Followed::Rescan(_) => {
-                    ended.rescanned = true;
+                    woken.rescanned = true;
                     continue;
                 }
             };
             let id = read.resolve(identity.kind, &identity.name, &identity.home)?;
-            // One no longer held (deleted or expunged) has ended too.
             if identity.kind == environment {
+                // One no longer held (deleted or expunged) has ended too.
                 let live = match id {
                     Some(id) => read.load::<EngineResource<Environment>>(id)?.is_some_and(|loaded| loaded.value.state().live()),
                     None => false,
                 };
                 if !live {
-                    ended.places.insert(identity.name);
+                    each(read, &AccessDeliverySpec::by_place(&identity.name), &mut wake)?;
                 }
             } else if identity.kind == convoy {
-                let open = match id {
-                    Some(id) => read
-                        .load::<EngineResource<EngineConvoy>>(id)?
-                        .is_some_and(|loaded| loaded.value.state().label() == ConvoyLabel::Open),
-                    None => false,
+                // One no longer held names no crew: its records wait for their places to end.
+                let Some(loaded) = id.map(|id| read.load::<EngineResource<EngineConvoy>>(id)).transpose()?.flatten() else {
+                    continue;
                 };
-                if !open {
-                    ended.convoys.insert(identity.name);
+                if loaded.value.state().label() != ConvoyLabel::Open {
+                    for access in crew_accesses(&loaded.value)? {
+                        each(read, &AccessDeliverySpec::by_access(&access), &mut wake)?;
+                    }
                 }
             }
         }
-        Ok(ended)
+        Ok(woken)
     }
 }
 
@@ -282,35 +289,27 @@ impl SecondaryWatch for EndingWake {
 
     fn spawn(
         self: Box<Self>,
-        backend: ResourceBackend,
-        namespace: String,
+        _backend: ResourceBackend,
+        _namespace: String,
         sender: WorkQueueSender,
     ) -> Pin<Box<dyn Future<Output = Result<(), ResourceError>> + Send>> {
         Box::pin(async move {
             let codes = [<EngineResource<Environment> as Kind>::CODE, <EngineResource<EngineConvoy> as Kind>::CODE];
             let mut watch =
                 EngineWatch::start(Arc::clone(&self.service), codes).map_err(|error| ResourceError::other(error.to_string()))?;
-            let records = backend.using::<AccessDelivery>(&namespace);
             loop {
-                let ended = match watch.next(Self::ended).await {
-                    Ok(ended) => ended,
+                let woken = match watch.next(Self::woken).await {
+                    Ok(woken) => woken,
                     Err(error) => {
                         tracing::warn!(%error, "the access delivery wake could not read the log; retrying at the next commit");
                         continue;
                     }
                 };
-                if ended.rescanned {
+                if woken.rescanned {
                     sender.send_every();
                 }
-                if ended.places.is_empty() && ended.convoys.is_empty() {
-                    continue;
-                }
-                // Only an ending lists the records: they are few, and read from memory.
-                for record in records.list().await?.items {
-                    let convoy = record.metadata.labels.get(CONVOY_LABEL);
-                    if (ended.places.contains(&record.spec.place) || convoy.is_some_and(|convoy| ended.convoys.contains(convoy)))
-                        && sender.send(record.metadata.name).await.is_err()
-                    {
+                for record in woken.records {
+                    if sender.send(record).await.is_err() {
                         return Ok(());
                     }
                 }

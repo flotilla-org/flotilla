@@ -294,6 +294,12 @@ async fn access_deliveries_go_when_their_convoy_or_place_ends_and_the_convoy_ret
         .await
         .metadata
         .name;
+    // `env-<convoy>-<work>-<n>`: the coder's work, whose crew the access is delivered to.
+    let work = environment
+        .strip_prefix(&format!("env-{launch_of}-"))
+        .and_then(|rest| rest.rsplit_once('-'))
+        .map(|(work, _)| work.to_owned())
+        .expect("the environment names its work");
     let local = fleet.list::<Host>().await.into_iter().next().expect("local host").metadata.name;
     let delivery = |access: String, place: String| AccessDeliverySpec {
         access,
@@ -307,7 +313,7 @@ async fn access_deliveries_go_when_their_convoy_or_place_ends_and_the_convoy_ret
     fleet
         .apply::<AccessDelivery>(
             "to-the-crew",
-            delivery(access_key("fleet", &name, "work", "probe"), flotilla_resources::host_direct_environment_name(&local)),
+            delivery(access_key("fleet", &name, &work, "coder"), flotilla_resources::host_direct_environment_name(&local)),
         )
         .await;
     // It names no convoy: only its place's end removes it.

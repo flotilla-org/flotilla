@@ -102,10 +102,9 @@ pub fn holds(read: &mut Read<'_>, convoy: &Resource<Convoy>, home: &str) -> Resu
             }
             Ok(())
         })?;
-        for crew in &work.crew {
-            let access = access_key(project_name, name, &work.name, &crew.role);
-            first(read, &AccessDeliverySpec::by_access(&access), &mut holds, "access-delivery")?;
-        }
+    }
+    for access in crew_accesses(convoy)? {
+        first(read, &AccessDeliverySpec::by_access(&access), &mut holds, "access-delivery")?;
     }
 
     // A standing generation's end is its role's next strike or reset: it holds until the role's
@@ -174,8 +173,23 @@ fn first<Q>(read: &mut Read<'_>, query: &IndexQuery<Q>, holds: &mut BTreeSet<Str
     Ok(())
 }
 
-/// Calls `each` with every resource `query` finds.
-fn each<Q>(
+/// The access keys of `convoy`'s crew, one per role of each work in its admission: what an
+/// AccessDelivery to its crew is keyed by (`by_access`).
+pub fn crew_accesses(convoy: &Resource<Convoy>) -> Result<Vec<String>, StoreError> {
+    let name = convoy.name();
+    let project = convoy.spec().project.get(AddressKind::Project).unwrap_or_default();
+    let admission = AdmissionDocument::decode(name, convoy.spec().admission.value().bytes())
+        .map_err(|error| StoreError::Stream(format!("convoy {name}'s crew accesses: {error}")))?;
+    Ok(admission
+        .workflow_snapshot
+        .vessels
+        .iter()
+        .flat_map(|work| work.crew.iter().map(|crew| access_key(project, name, &work.name, &crew.role)))
+        .collect())
+}
+
+/// Calls `each` with every resource `query` finds, a page at a time.
+pub fn each<Q>(
     read: &mut Read<'_>,
     query: &IndexQuery<Q>,
     mut each: impl FnMut(&mut Read<'_>, ResourceId) -> Result<(), StoreError>,
