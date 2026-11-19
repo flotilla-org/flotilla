@@ -133,16 +133,62 @@ pub const HOOK_STANDS_FOR: std::time::Duration = std::time::Duration::from_secs(
 /// launch, named by the launch (`<session>#<n>`), holding the receipts.
 pub struct Sessions {
     home: Mutex<Home<AgentSession, StoreLog>>,
+    /// The names of the Live records at this home, kept by its one writer: taken from the store
+    /// when the home opens, then by each create and end. Who ends sessions reads this, not the
+    /// whole kind.
+    live: Mutex<LiveSessions>,
+}
+
+/// The Live records' names, and how many records this home has created since it opened.
+#[derive(Default)]
+struct LiveSessions {
+    names: BTreeSet<String>,
+    created: u64,
 }
 
 impl Sessions {
+    fn over(home: Home<AgentSession, StoreLog>) -> Self {
+        Self { home: Mutex::new(home), live: Mutex::default() }
+    }
+
+    /// Takes a stored record into the home, and into the Live names while it is Live.
+    fn restore(&self, session: Resource<AgentSession>) -> Result<(), String> {
+        let mut home = self.home.lock().expect("session home");
+        let restored = home.restore(session).map_err(|error| format!("{error:?}"))?;
+        if restored.state().end_reason().is_none() {
+            self.live.lock().expect("live sessions").names.insert(restored.name().to_owned());
+        }
+        Ok(())
+    }
+
+    /// Creates `name`'s record, Live and detached, under the home's lock.
+    fn create(&self, home: &mut Home<AgentSession, StoreLog>, name: &str, now: Timestamp) -> Result<(), String> {
+        home.create(name, (), &MemoryAgentSessionWorld::default(), now).map_err(|error| format!("AgentSession `{name}`: {error:?}"))?;
+        let mut live = self.live.lock().expect("live sessions");
+        live.names.insert(name.to_owned());
+        live.created += 1;
+        Ok(())
+    }
+
+    /// The Live records at this home, and how many records it had created when they were read:
+    /// a later create changes that count.
+    pub fn live(&self) -> (u64, BTreeSet<String>) {
+        let live = self.live.lock().expect("live sessions");
+        (live.created, live.names.clone())
+    }
+
+    /// How many records this home has created since it opened.
+    pub fn created(&self) -> u64 {
+        self.live.lock().expect("live sessions").created
+    }
+
     /// Creates the session's record, Live and detached, unless it exists.
     pub fn ensure(&self, name: &str, now: Timestamp) -> Result<bool, String> {
         let mut home = self.home.lock().expect("session home");
         if home.get(name).is_some() {
             return Ok(false);
         }
-        home.create(name, (), &MemoryAgentSessionWorld::default(), now).map_err(|error| format!("AgentSession `{name}`: {error:?}"))?;
+        self.create(&mut home, name, now)?;
         Ok(true)
     }
 
@@ -161,7 +207,9 @@ impl Sessions {
         let mut world = MemoryAgentSessionWorld::default();
         let observed = flotilla_state_machines::Ref::<SessionEnd>::new(name);
         world.ends.put(&observed, reason);
-        home.apply(name, End { reason, observed }, &world, now).map(|_| ()).map_err(|error| format!("AgentSession `{name}`: {error:?}"))
+        home.apply(name, End { reason, observed }, &world, now).map_err(|error| format!("AgentSession `{name}`: {error:?}"))?;
+        self.live.lock().expect("live sessions").names.remove(name);
+        Ok(())
     }
 
     /// A keyed, in-memory hint for avoiding duplicate hook I/O. Observe rechecks
@@ -194,7 +242,7 @@ impl Sessions {
         // Materialize the same minimal record here, named by the validated launch;
         // the terminal and delivery adapter still own its lifecycle, not the hook.
         if home.get(name).is_none() {
-            home.create(name, (), &MemoryAgentSessionWorld::default(), now).map_err(|error| format!("AgentSession `{name}`: {error:?}"))?;
+            self.create(&mut home, name, now)?;
         }
         match home.apply(name, Observe { activity, cause }, &MemoryAgentSessionWorld::default(), now) {
             Ok(_) => Ok(true),
@@ -471,9 +519,8 @@ impl MessagePrimitives {
         let dead_letters = Arc::new(DeadLetters::default());
         let inbox = SqliteInbox::open(home, log, world.clone(), Arc::clone(&dead_letters) as Arc<dyn Supervision>)
             .map_err(|error| error.to_string())?;
-        let sessions = Arc::new(Sessions {
-            home: Mutex::new(Home::with_log(home, receipts.clone()).map_err(|error| format!("AgentSession home: {error:?}"))?),
-        });
+        let sessions =
+            Arc::new(Sessions::over(Home::with_log(home, receipts.clone()).map_err(|error| format!("AgentSession home: {error:?}"))?));
         let people = Arc::new(People {
             home: Mutex::new(Home::with_log(home, receipts.clone()).map_err(|error| format!("Person home: {error:?}"))?),
         });
@@ -482,7 +529,7 @@ impl MessagePrimitives {
         });
         // Consumer records persist; reopen them so a restart keeps their receipts.
         for session in stored::<AgentSession>(&service, home)? {
-            sessions.home.lock().expect("session home").restore(session).map_err(|error| format!("{error:?}"))?;
+            sessions.restore(session)?;
         }
         for person in stored::<Person>(&service, home)? {
             people.home.lock().expect("person home").restore(person).map_err(|error| format!("{error:?}"))?;

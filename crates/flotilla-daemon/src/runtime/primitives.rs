@@ -109,7 +109,9 @@ pub(super) struct MessageDelivery {
     /// earlier delivery, or a session no longer holding waits on its turn to end.
     rebind_due: bool,
     bound: BTreeSet<(Address, Receiver)>,
-    sessions: BTreeSet<String>,
+    /// How many AgentSession records this home had created when the last rebind read the Live
+    /// ones: a record created since, by a hook or a screen read, is looked at by the next rebind.
+    sessions_seen: Option<u64>,
     inflight: BTreeMap<String, InFlight>,
     /// Messages typed without confirmation, held so a pass never retypes them
     /// before the delivery hold runs out.
@@ -182,7 +184,7 @@ impl MessageDelivery {
             consumers: BTreeSet::new(),
             rebind_due: true,
             bound: BTreeSet::new(),
-            sessions: BTreeSet::new(),
+            sessions_seen: None,
             inflight: BTreeMap::new(),
             held: TurnHolds::default(),
             held_turns: Vec::new(),
@@ -341,8 +343,10 @@ impl MessageDelivery {
             .collect();
         consumers.insert(self.inspector().instrument(info_span!("message_delivery.inspector")).await?);
         // Rebinding follows what changed: a holding, the person's or service's inboxes, a turn
-        // settled (its session may wait on it to end), or a bind or end left for a later pass.
-        if changed || collected || self.rebind_due || consumers != self.consumers {
+        // settled (its session may wait on it to end), a session record created since the last
+        // rebind (its terminal may already have ended), or a bind or end left for a later pass.
+        let created = Some(self.primitives.sessions().created());
+        if changed || collected || self.rebind_due || consumers != self.consumers || created != self.sessions_seen {
             let span = info_span!("message_delivery.rebind", holders = self.holders.len());
             self.rebind(consumers, now).instrument(span).await?;
         }
@@ -475,11 +479,14 @@ impl MessageDelivery {
                 }
             }
         }
-        // A session's record ends once it holds nothing: one whose launch still runs is looked at
-        // again when routing reroutes it, as its launch's end does; one whose turn is settling, when
-        // the turn is collected.
-        let live: BTreeSet<_> = self.holders.values().map(|holder| holder.consumer.id.clone()).collect();
-        for name in self.sessions.difference(&live).cloned().collect::<Vec<_>>() {
+        // A Live record ends once its session holds nothing and its launch has ended: one whose
+        // launch still runs is looked at again when routing reroutes it, as its launch's end does;
+        // one whose turn is settling, when the turn is collected. The Live records are the store's,
+        // as this home opened them and has written them since, so a session never held here, or
+        // held before a restart, ends as well as one held now.
+        let held: BTreeSet<_> = self.holders.values().map(|holder| holder.consumer.id.clone()).collect();
+        let (created, live) = self.primitives.sessions().live();
+        for name in live.difference(&held).cloned().collect::<Vec<_>>() {
             // A turn still settling ends its session only once its receipt is recorded.
             if self.inflight.values().any(|turn| turn.consumer.id == name) {
                 continue;
@@ -504,9 +511,9 @@ impl MessageDelivery {
             tokio::task::spawn_blocking(flotilla_schema::reads::carry(move || sessions.end(&ended, reason, now)))
                 .await
                 .map_err(|error| error.to_string())??;
-            self.sessions.remove(&name);
         }
-        self.sessions.extend(live);
+        // Only once every end is written: a pass that failed part way looks at them all again.
+        self.sessions_seen = Some(created);
         Ok(())
     }
 
