@@ -452,6 +452,45 @@ pub(super) enum BackingDisposition {
     Failed,
 }
 
+/// Asks the provider now whether this home's environment `env_ref` still has its backing, for a
+/// crew session about to start in it, or that could not start or disappeared there. One gone is
+/// judged lost now, as the next provisioned-environments pass would judge it: its vessel is lost
+/// and relaunched, and no session starts or ends in it meanwhile. The reason it is gone; none
+/// while it runs, for the host's own and SSH host environments, or where nothing can tell.
+pub(super) async fn backing_gone_now(state: &Arc<ControllerRuntimeState>, env_ref: &str) -> Option<String> {
+    use flotilla_environment::environment::ObservationState;
+    if env_ref == state.host_direct_environment_name || state.ssh_host.contains_key(env_ref) {
+        return None;
+    }
+    let id = EnvironmentId::new(env_ref);
+    let cached =
+        state.provisioned_environments.lock().await.values().find(|active| active.handle.id() == &id).map(|active| active.handle.clone());
+    let handle = match cached {
+        Some(handle) => Some(handle),
+        None => {
+            let provider = state.provider_for_environment(env_ref).await.ok()?;
+            provider.inspect(&id).await.ok()?
+        }
+    };
+    let reason = match handle {
+        None => format!("environment {env_ref} is gone from its provider's inventory"),
+        Some(handle) => {
+            let observed = handle.observe().await;
+            match (observed.runtime.as_ref().and_then(|runtime| runtime.termination.as_ref()), &observed.state) {
+                (Some(termination), _) => format!("environment {env_ref} {termination}"),
+                (None, state @ (ObservationState::Stopped { .. } | ObservationState::Gone { .. })) => {
+                    format!("environment {env_ref} is not running (observation: {state:?})")
+                }
+                (None, ObservationState::Running | ObservationState::Unknown { .. }) => return None,
+            }
+        }
+    };
+    if let Err(error) = mark_unavailable_environment(state, &id, BackingDisposition::Lost, &reason).await {
+        warn!(environment = %id, %error, "a crew session's environment is gone, but its loss is not recorded; the next pass judges it");
+    }
+    Some(reason)
+}
+
 pub(super) async fn mark_unavailable_environment(
     state: &Arc<ControllerRuntimeState>,
     env_id: &EnvironmentId,

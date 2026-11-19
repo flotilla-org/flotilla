@@ -37,6 +37,7 @@ use tracing::{debug, info, warn};
 use super::access_layer::{deliver_access, deliver_host_account, AccessDelivered, AccessLaunch};
 use super::account_access::AccountLaunch;
 use super::credentials::RuntimeSessionCapabilities;
+use super::environments::backing_gone_now;
 use super::ssh_host_vessels::{apply_reach_environment, compose_session_environment, vessel_base, VesselAccess};
 use super::state::ControllerRuntimeState;
 use crate::blob_store::BlobDigest;
@@ -1025,21 +1026,40 @@ impl TerminalProvider for TerminalControllerRuntime {
         Ok(self.unregistered(&spec.env_ref))
     }
 
+    /// A session never starts in an environment whose backing is gone, and one that cannot start
+    /// because it is gone does not fail: the environment is judged lost, which ends this launch
+    /// with it, and its vessel's next launch replaces both.
     async fn launch(&self, launch: &TerminalRecord) -> Result<TerminalLaunched, LaunchFailure> {
         let view = self.session_view(launch).await?;
         let spec: TerminalSessionTarget<'_> = (&view).into();
+        if let Some(gone) = backing_gone_now(&self.state, &spec.env_ref).await {
+            return Err(LaunchFailure::waits(gone));
+        }
         let started = async {
             let tags = self.launch_tags(&view, launch).await?;
             self.ensure_session(launch.session_name(), &launch.name, spec, &tags).await
         };
-        started
-            .await
-            .map_err(|message| self.unregistered(&spec.env_ref).map_or_else(|| LaunchFailure::refused(message), LaunchFailure::waits))
+        match started.await {
+            Ok(launched) => Ok(launched),
+            Err(message) => match backing_gone_now(&self.state, &spec.env_ref).await {
+                Some(gone) => Err(LaunchFailure::waits(gone)),
+                None => Err(self.unregistered(&spec.env_ref).map_or_else(|| LaunchFailure::refused(message), LaunchFailure::waits)),
+            },
+        }
     }
 
+    /// A session that stopped or disappeared with its environment's backing is not judged: the
+    /// environment is judged lost, which ends the session with it and relaunches its vessel.
     async fn liveness(&self, launch: &TerminalRecord, session_id: &str) -> Result<TerminalLiveness, String> {
         let view = self.session_view(launch).await?;
-        self.session_liveness(session_id, (&view).into()).await
+        let spec: TerminalSessionTarget<'_> = (&view).into();
+        let liveness = self.session_liveness(session_id, spec).await?;
+        if matches!(liveness, TerminalLiveness::Stopped | TerminalLiveness::Lost(_)) {
+            if let Some(gone) = backing_gone_now(&self.state, &spec.env_ref).await {
+                return Ok(TerminalLiveness::Unavailable(gone));
+            }
+        }
+        Ok(liveness)
     }
 
     async fn exit_code(&self, launch: &TerminalRecord) -> Result<Option<i32>, String> {
