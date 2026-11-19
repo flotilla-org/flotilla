@@ -850,6 +850,9 @@ pub async fn refresh_cards(
     }
     let mut errors = Vec::new();
     let mut failed = BTreeSet::new();
+    // Each convoy is read once for the cards of all its sessions (d15: a refresh after a restart
+    // read 208 convoys one session at a time).
+    let mut convoys = BTreeMap::new();
     for record in &sessions {
         if record.is_agent() && phase(record).is_none_or(|phase| phase == TerminalSessionPhase::Starting) {
             // A card to try again stays to try once its session runs.
@@ -861,7 +864,8 @@ pub async fn refresh_cards(
         if !record.is_agent() || phase(record) != Some(TerminalSessionPhase::Running) {
             continue;
         }
-        let refreshed = refresh_record_card(backend, namespace, source, tracker, Arc::clone(&reads), accounts, record, &mut vessels).await;
+        let held = Held { vessels: &mut vessels, convoys: &mut convoys };
+        let refreshed = refresh_record_card(backend, namespace, source, tracker, Arc::clone(&reads), accounts, record, held).await;
         if let Err(error) = refreshed {
             warn!(session = %record.session_name(), %error, "failed to refresh session capability card");
             errors.push(format!("{}: {error}", record.session_name()));
@@ -877,8 +881,15 @@ pub async fn refresh_cards(
     }
 }
 
-/// Refreshes the card of running crew launch `record`, reading its vessel from `vessels` when a
-/// convoy's reading found it, else by key, and its convoy by key.
+/// What one refresh of the cards has read, by name: the vessels and convoys its cards share.
+struct Held<'a> {
+    vessels: &'a mut BTreeMap<String, VesselRecord>,
+    convoys: &'a mut BTreeMap<String, flotilla_resources::ResourceObject<Convoy>>,
+}
+
+/// Refreshes the card of running crew launch `record`, reading its vessel from `held` when a
+/// convoy's reading found it, else by key, and its convoy from `held` when another card of the
+/// refresh read it, else by key.
 #[allow(clippy::too_many_arguments)]
 async fn refresh_record_card(
     backend: &ResourceBackend,
@@ -888,8 +899,9 @@ async fn refresh_record_card(
     reads: Arc<dyn LifecycleReads>,
     accounts: &dyn AccountRecords,
     record: &TerminalRecord,
-    vessels: &mut BTreeMap<String, VesselRecord>,
+    held: Held<'_>,
 ) -> Result<(), String> {
+    let Held { vessels, convoys } = held;
     let name = record.vessel.clone().unwrap_or_default();
     let vessel = match vessels.get(&name) {
         Some(vessel) => Ok(Some(vessel.clone())),
@@ -905,12 +917,19 @@ async fn refresh_record_card(
     };
     vessels.insert(name, vessel.clone());
     {
-        let convoy = backend
-            .including_replicas::<Convoy>(namespace)
-            .get(&vessel.convoy)
-            .await
-            .map_err(|error| format!("read convoy {}: {error}", vessel.convoy))?
-            .object;
+        let convoy = match convoys.get(&vessel.convoy) {
+            Some(convoy) => convoy.clone(),
+            None => {
+                let convoy = backend
+                    .including_replicas::<Convoy>(namespace)
+                    .get(&vessel.convoy)
+                    .await
+                    .map_err(|error| format!("read convoy {}: {error}", vessel.convoy))?
+                    .object;
+                convoys.insert(vessel.convoy.clone(), convoy.clone());
+                convoy
+            }
+        };
         // An ended convoy's crew is torn down: its teardown closes the bindings the card names, and
         // a card sent then waits at a seat no one will consume (#3108).
         if convoy.status.as_ref().is_some_and(|status| status.phase.is_terminal()) {
