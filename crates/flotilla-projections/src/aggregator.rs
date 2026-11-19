@@ -2904,10 +2904,18 @@ impl Aggregator {
         let drift = (convoy.metadata.annotations.contains_key(ENSURED_FROM_ANNOTATION) && !phase.is_terminal())
             .then(|| AttentionSubject::StandingRole { project: convoy.spec.project_ref.clone(), role: convoy.spec.role.clone() })
             .and_then(|role| self.attentions.iter().find(|open| open.sender == Sender::Standing && open.subject == role));
+        // A checkout held for this convoy whose removal teardown holds for a person (dirty work
+        // that landed) is about the checkout, not the convoy, so it is found by the convoy's
+        // held checkouts.
+        let held_for_a_person = checkouts.iter().flat_map(BTreeMap::values).filter_map(|launch| {
+            let subject = AttentionSubject::Checkout { host: launch.home.clone(), checkout: launch.checkout_name().to_owned() };
+            self.attentions.iter().find(|open| open.sender == Sender::Teardown && open.subject == subject)
+        });
         let attention_demand = attentions
             .iter()
             .copied()
             .filter(|open| open.sender != Sender::TurnRules)
+            .chain(held_for_a_person)
             .chain(drift)
             .min_by_key(|open| (open.sender != Sender::Teardown, open.sender, &open.subject));
         // Terminal records retain delivery history for explain, but delivery can no
