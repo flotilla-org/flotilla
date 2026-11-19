@@ -290,6 +290,16 @@ impl ConvoyViews {
         self.find(&record.name, Some(&record.home)).await
     }
 
+    /// Waits for the views' first composition, begun when they were installed, or composes them
+    /// where none has begun. Startup awaits it before serving, so no request pays it: the first
+    /// composition reads every launch, and a read waiting on it counts those reads.
+    /// A composition that fails is logged, and the first read composes them.
+    pub async fn opened(&self) {
+        if let Err(error) = self.with_held(|_| ()).await {
+            tracing::warn!(%error, "convoy views: composing them at open failed; the first read composes them");
+        }
+    }
+
     /// Reads the views held, filling them on first use and starting the follower that keeps them.
     /// Every change written before the read is read into them first: the commits counted before
     /// it waits for the views are read in by a pass, its own or one that began after them; while
@@ -800,15 +810,11 @@ fn view_record(held: HeldView, home: String) -> Record<Convoy> {
 
 impl crate::EnginePort for ConvoyViews {
     fn install(self: Arc<Self>, backend: &crate::ResourceBackend) {
-        // The views are composed when they open, as startup work: no read pays the first
-        // composition. Without a runtime the first read composes them.
+        // The views are composed when they open, as startup work, which startup awaits with
+        // `opened`. Without a runtime the first read composes them.
         if tokio::runtime::Handle::try_current().is_ok() {
             let views = Arc::clone(&self);
-            tokio::spawn(reads::inherit(async move {
-                if let Err(error) = views.with_held(|_| ()).await {
-                    tracing::warn!(%error, "convoy views: composing them at open failed; the first read composes them");
-                }
-            }));
+            tokio::spawn(reads::inherit(async move { views.opened().await }));
         }
         backend.install_engine_kind::<Convoy>(self);
     }
