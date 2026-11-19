@@ -1,9 +1,13 @@
-use std::sync::Arc;
+use std::{
+    collections::{BTreeMap, BTreeSet},
+    sync::Arc,
+};
 
 use crate::engine::{checkouts::CheckoutRepositoryWake, clones::CloneRepositoryWake};
 use async_trait::async_trait;
 use chrono::{DateTime, Utc};
 use flotilla_resources::checkout_records::latest_launches;
+use flotilla_resources::repository::{forge_service_url_key, FORGE_SERVICE_URL_FIELD};
 use flotilla_resources::{
     discovered_checkouts::DiscoveredCheckouts, lifecycle_reads::LifecycleReads, resolve_default_branch, CheckoutSpec, CredentialConsumer,
     CredentialSpec, DefaultBranchObservation, DefaultBranchProvenance, Forge, ForgeIdentity, ForgeSpec, LifecycleAuthority, ReadWatchEvent,
@@ -12,7 +16,7 @@ use flotilla_resources::{
 use flotilla_schema::reads::carry;
 use flotilla_store::{
     controller::{ReconcileOutcome, Reconciler, SecondaryWatch, WorkQueueSender},
-    ResourceBackend,
+    ResourceBackend, StoreQuery,
 };
 use futures::StreamExt;
 use tokio::sync::broadcast::error::RecvError;
@@ -121,7 +125,7 @@ impl SecondaryWatch for DiscoveredRepositoryWake {
 struct ForgeIdentityRepositoryWake;
 
 impl ForgeIdentityRepositoryWake {
-    /// The URL of the forge `event` changes the daemon's identity on: `None` when it may be any.
+    /// The URL of the forge `event` changes the daemon's identity on, if any.
     async fn forge_url(backend: &ResourceBackend, namespace: &str, event: ForgeIdentityEvent) -> Result<Option<String>, ResourceError> {
         match event {
             ForgeIdentityEvent::Forge(spec) => Ok(Some(spec.https_url)),
@@ -129,13 +133,12 @@ impl ForgeIdentityRepositoryWake {
                 match backend.including_replicas::<Forge>(namespace).get(&forge_ref).await {
                     Ok(forge) => Ok(Some(forge.object.spec.https_url)),
                     // An undeclared forge has no repositories to wake; its declaration wakes them.
-                    Err(ResourceError::NotFound { .. }) => Ok(Some(String::new())),
+                    Err(ResourceError::NotFound { .. }) => Ok(None),
                     Err(error) => Err(error),
                 }
             }
             // Other consumers are no forge's daemon identity.
-            ForgeIdentityEvent::Credential(_) => Ok(Some(String::new())),
-            ForgeIdentityEvent::Unknown => Ok(None),
+            ForgeIdentityEvent::Credential(_) => Ok(None),
         }
     }
 }
@@ -144,8 +147,6 @@ impl ForgeIdentityRepositoryWake {
 enum ForgeIdentityEvent {
     Forge(ForgeSpec),
     Credential(CredentialConsumer),
-    /// A deletion by name, which carries no spec.
-    Unknown,
 }
 
 impl SecondaryWatch for ForgeIdentityRepositoryWake {
@@ -161,36 +162,49 @@ impl SecondaryWatch for ForgeIdentityRepositoryWake {
         namespace: String,
         sender: WorkQueueSender,
     ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<(), ResourceError>> + Send>> {
+        // A deletion by name carries no spec, so no forge to resolve, and wakes nothing. These
+        // watches start now over the engine's Forge and CredentialSpec records, which hand every
+        // deletion over with the record deleted; a deletion by name comes only from resuming a
+        // watch at an earlier position, which these never do.
         Box::pin(async move {
-            let forges = backend.including_replicas::<Forge>(&namespace).watch().await?.map(|event| {
-                event.map(|event| match event {
-                    ReadWatchEvent::Added(forge) | ReadWatchEvent::Modified(forge) | ReadWatchEvent::Deleted(forge) => {
-                        ForgeIdentityEvent::Forge(forge.object.spec)
+            let forges = backend.including_replicas::<Forge>(&namespace).watch().await?.filter_map(|event| {
+                futures::future::ready(match event {
+                    Ok(ReadWatchEvent::Added(forge) | ReadWatchEvent::Modified(forge) | ReadWatchEvent::Deleted(forge)) => {
+                        Some(Ok(ForgeIdentityEvent::Forge(forge.object.spec)))
                     }
-                    ReadWatchEvent::DeletedByName { .. } => ForgeIdentityEvent::Unknown,
+                    Ok(ReadWatchEvent::DeletedByName { .. }) => None,
+                    Err(error) => Some(Err(error)),
                 })
             });
-            let credentials = backend.including_replicas::<CredentialSpec>(&namespace).watch().await?.map(|event| {
-                event.map(|event| match event {
-                    ReadWatchEvent::Added(spec) | ReadWatchEvent::Modified(spec) | ReadWatchEvent::Deleted(spec) => {
-                        ForgeIdentityEvent::Credential(spec.object.spec.consumer)
+            let credentials = backend.including_replicas::<CredentialSpec>(&namespace).watch().await?.filter_map(|event| {
+                futures::future::ready(match event {
+                    Ok(ReadWatchEvent::Added(spec) | ReadWatchEvent::Modified(spec) | ReadWatchEvent::Deleted(spec)) => {
+                        Some(Ok(ForgeIdentityEvent::Credential(spec.object.spec.consumer)))
                     }
-                    ReadWatchEvent::DeletedByName { .. } => ForgeIdentityEvent::Unknown,
+                    Ok(ReadWatchEvent::DeletedByName { .. }) => None,
+                    Err(error) => Some(Err(error)),
                 })
             });
-            let mut events = futures::stream::select(forges, credentials);
+            let mut events = std::pin::pin!(futures::stream::select(forges, credentials));
             while let Some(event) = events.next().await {
-                let Some(url) = Self::forge_url(&backend, &namespace, event?).await? else {
-                    sender.send_every();
-                    continue;
+                let Some(url) = Self::forge_url(&backend, &namespace, event?).await? else { continue };
+                // The Repositories on that forge, through the index of their forge's service URL;
+                // every home's copy, since each names the one Repository this controller reconciles.
+                let query = StoreQuery {
+                    fields: BTreeMap::from([(FORGE_SERVICE_URL_FIELD.to_owned(), forge_service_url_key(&url).to_owned())]),
+                    include_replicas: true,
+                    ..StoreQuery::default()
                 };
-                let url = url.trim_end_matches('/');
-                if url.is_empty() {
-                    continue;
-                }
-                for repository in backend.using::<Repository>(&namespace).list().await?.items {
-                    let on_forge = repository.spec.forge().is_some_and(|forge| forge.service_url.trim_end_matches('/') == url);
-                    if on_forge && sender.send(repository.metadata.name).await.is_err() {
+                let on_forge: BTreeSet<String> = backend
+                    .using::<Repository>(&namespace)
+                    .query_declared(&query)
+                    .await?
+                    .items
+                    .into_iter()
+                    .map(|repository| repository.object.metadata.name)
+                    .collect();
+                for name in on_forge {
+                    if sender.send(name).await.is_err() {
                         return Ok(());
                     }
                 }

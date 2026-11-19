@@ -1060,6 +1060,12 @@ pub(crate) fn select_reads<T: Resource>(
         .collect())
 }
 
+/// The index keys `record` is held under, as a reader's [`IndexCover`] names them.
+pub fn record_index_keys<T: Resource>(record: &Record<T>) -> Result<Vec<(String, String)>, ResourceError> {
+    // The keys name no namespace.
+    crate::object_index_keys(&record_object("", record.clone()))
+}
+
 /// An engine record as a resource in `namespace`: the labels and annotations its port rebuilds,
 /// its creation time, and no merge metadata, owner references or finalizers.
 pub(crate) fn record_object<T: Resource>(namespace: &str, record: Record<T>) -> ResourceObject<T> {

@@ -18,11 +18,12 @@ use flotilla_engine_store::{
 };
 use flotilla_resources::{
     definition_provenance::{SUPERSEDED_BY_ANNOTATION, VERIFICATION_PROJECT_ANNOTATION, VERIFICATION_PROVENANCE_ANNOTATION},
-    engine_records::{CommitMark, KindRecords, LogPosition, Record, Since, Ticks, WriteError},
+    engine_records::{CommitMark, IndexCover, KindRecords, LogPosition, Record, Since, Ticks, WriteError},
     Repository, RepositoryKey, RepositorySpec, RepositoryStatus,
 };
 use flotilla_schema::{Kind, KindCode, NewChange, Timestamp};
 use flotilla_schema_sqlite::{stream::Service, Read, StoreError};
+use flotilla_store::{record_index_keys, ViewIndex};
 use futures::stream::BoxStream;
 
 use super::reads::created_at;
@@ -47,9 +48,37 @@ type Held = Result<Record<Repository>, String>;
 /// Every home's records, by name and home.
 type Records = BTreeMap<(String, String), Held>;
 
+/// Every home's records, with the index keys each is held under.
+#[derive(Default)]
+struct Listing {
+    records: Records,
+    index: ViewIndex<(String, String)>,
+}
+
+impl Listing {
+    fn insert(&mut self, key: (String, String), held: Held) {
+        match &held {
+            Ok(record) => match record_index_keys(record) {
+                Ok(keys) => self.index.set(&key, keys),
+                Err(error) => {
+                    tracing::warn!(%error, name = %key.0, home = %key.1, "a repository record is not indexed");
+                    self.index.remove(&key);
+                }
+            },
+            Err(_) => self.index.remove(&key),
+        }
+        self.records.insert(key, held);
+    }
+
+    fn remove(&mut self, key: &(String, String)) {
+        self.index.remove(key);
+        self.records.remove(key);
+    }
+}
+
 struct Resident {
     follower: Follower,
-    records: Records,
+    listing: Listing,
 }
 
 fn locked<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
@@ -78,20 +107,23 @@ fn object(name: String, home: String, version: u64, created_at: DateTime<Utc>, r
     Ok(Record { spec: record.spec().clone(), status: Some(status), name, home, version, created_at, labels: BTreeMap::new(), annotations })
 }
 
-fn reload(read: &mut Read<'_>, records: &mut Records, name: &str, home: &str) -> Result<(), StoreError> {
+fn reload(read: &mut Read<'_>, listing: &mut Listing, name: &str, home: &str) -> Result<(), StoreError> {
     let key = (name.to_owned(), home.to_owned());
     match read.resolve(CODE, name, home)?.map(|id| read.load::<RepositoryRecord>(id)).transpose()?.flatten() {
         Some(loaded) => {
             let created_at = created_at(read, loaded.id)?;
-            records.insert(key, object(loaded.name, loaded.home, loaded.version, created_at, &loaded.value))
+            listing.insert(key, object(loaded.name, loaded.home, loaded.version, created_at, &loaded.value))
         }
-        None => records.remove(&key),
+        None => listing.remove(&key),
     };
     Ok(())
 }
 
-fn rescan(read: &mut Read<'_>, records: &mut Records, home: &str) -> Result<(), StoreError> {
-    records.retain(|(_, owner), _| owner != home);
+fn rescan(read: &mut Read<'_>, listing: &mut Listing, home: &str) -> Result<(), StoreError> {
+    let gone: Vec<_> = listing.records.keys().filter(|(_, owner)| owner == home).cloned().collect();
+    for key in &gone {
+        listing.remove(key);
+    }
     let mut after = None;
     loop {
         let page = read.scan::<RepositoryRecord>(home, after, 64)?;
@@ -99,7 +131,7 @@ fn rescan(read: &mut Read<'_>, records: &mut Records, home: &str) -> Result<(), 
             if let Some(loaded) = read.load::<RepositoryRecord>(id)? {
                 let key = (loaded.name.clone(), home.to_owned());
                 let created_at = created_at(read, id)?;
-                records.insert(key, object(loaded.name, loaded.home, loaded.version, created_at, &loaded.value));
+                listing.insert(key, object(loaded.name, loaded.home, loaded.version, created_at, &loaded.value));
             }
         }
         after = page.next;
@@ -147,20 +179,20 @@ impl EngineRepositories {
             service,
             home,
             log,
-            resident: Mutex::new(Resident { follower: Follower::new([CODE]), records: Records::new() }),
+            resident: Mutex::new(Resident { follower: Follower::new([CODE]), listing: Listing::default() }),
             clock,
         };
         let homes = opened.service.homes();
         {
             let mut resident = locked(&opened.resident);
-            let Resident { follower, records } = &mut *resident;
+            let Resident { follower, listing } = &mut *resident;
             opened
                 .service
                 .with_store(|store| {
                     let mut read = store.read()?;
                     follower.start(&mut read, &homes)?;
                     for home in &homes {
-                        rescan(&mut read, records, home)?;
+                        rescan(&mut read, listing, home)?;
                     }
                     Ok(())
                 })
@@ -177,17 +209,17 @@ impl EngineRepositories {
         }
         let homes = self.service.homes();
         {
-            let Resident { follower, records } = &mut *resident;
+            let Resident { follower, listing } = &mut *resident;
             self.service
                 .with_store(|store| {
                     let mut read = store.read()?;
                     for followed in follower.pass(&mut read, &homes)? {
                         match followed {
                             Followed::Changed(identity) if identity.kind == CODE => {
-                                reload(&mut read, records, &identity.name, &identity.home)?
+                                reload(&mut read, listing, &identity.name, &identity.home)?
                             }
                             Followed::Changed(_) => {}
-                            Followed::Rescan(home) => rescan(&mut read, records, &home)?,
+                            Followed::Rescan(home) => rescan(&mut read, listing, &home)?,
                         }
                     }
                     Ok(())
@@ -262,17 +294,17 @@ impl KindRecords<Repository> for EngineRepositories {
 
     async fn get(&self, name: &str) -> Result<Option<Record<Repository>>, String> {
         let resident = self.refresh()?;
-        resolve(&resident.records, &self.home, name).transpose()
+        resolve(&resident.listing.records, &self.home, name).transpose()
     }
 
     async fn list(&self) -> Result<Vec<Record<Repository>>, String> {
         let resident = self.refresh()?;
-        let mut names: Vec<&String> = resident.records.keys().map(|(name, _)| name).collect();
+        let mut names: Vec<&String> = resident.listing.records.keys().map(|(name, _)| name).collect();
         // The map orders by name, then home, so one name's homes are adjacent.
         names.dedup();
         Ok(names
             .into_iter()
-            .filter_map(|name| resolve(&resident.records, &self.home, name))
+            .filter_map(|name| resolve(&resident.listing.records, &self.home, name))
             .filter_map(|held| held.map_err(|error| tracing::warn!(%error, "skipping a repository record that does not encode")).ok())
             .collect())
     }
@@ -280,6 +312,7 @@ impl KindRecords<Repository> for EngineRepositories {
     async fn sources(&self) -> Result<Vec<Record<Repository>>, String> {
         let resident = self.refresh()?;
         Ok(resident
+            .listing
             .records
             .values()
             .filter_map(|held| {
@@ -291,6 +324,7 @@ impl KindRecords<Repository> for EngineRepositories {
     async fn positioned(&self) -> Result<(Vec<Record<Repository>>, LogPosition), String> {
         let resident = self.refresh()?;
         let records = resident
+            .listing
             .records
             .values()
             .filter_map(|held| {
@@ -312,6 +346,7 @@ impl KindRecords<Repository> for EngineRepositories {
     async fn copies(&self, name: &str) -> Result<Vec<Record<Repository>>, String> {
         let resident = self.refresh()?;
         Ok(resident
+            .listing
             .records
             .range((name.to_owned(), String::new())..)
             .take_while(|((held, _), _)| held == name)
@@ -319,6 +354,22 @@ impl KindRecords<Repository> for EngineRepositories {
                 held.clone().map_err(|error| tracing::warn!(%error, "skipping a repository record that does not encode")).ok()
             })
             .collect())
+    }
+
+    /// The records `cover` selects, from the resident map's index: this home's alone when `local`.
+    async fn covered(&self, cover: &IndexCover, local: bool) -> Option<Result<Vec<Record<Repository>>, String>> {
+        let resident = match self.refresh() {
+            Ok(resident) => resident,
+            Err(error) => return Some(Err(error)),
+        };
+        let listing = &resident.listing;
+        Some(Ok(listing
+            .index
+            .covered(cover)
+            .into_iter()
+            .filter(|(_, home)| !local || *home == self.home)
+            .filter_map(|key| listing.records.get(&key)?.clone().ok())
+            .collect()))
     }
 
     async fn apply(

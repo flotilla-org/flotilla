@@ -23,6 +23,7 @@ pub use definition::*;
 pub use engine_port::EnginePort;
 mod convoy_views;
 mod held_listing;
+pub use held_listing::ViewIndex;
 mod lifecycle_views;
 mod listed;
 pub use listed::Listed;

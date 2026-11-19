@@ -19,8 +19,10 @@ pub(crate) enum Joins {
 }
 
 /// The views a listing holds, by its own id for each, under each of their index keys as the
-/// store's query index names them: a selecting query reads only the views it may select.
-pub(crate) struct ViewIndex<Id> {
+/// store's query index names them: a selecting query reads only the views it may select. A
+/// port's [`flotilla_resources::engine_records::KindRecords::covered`] answers from one, with
+/// each record's keys from [`crate::record_index_keys`].
+pub struct ViewIndex<Id> {
     entries: BTreeMap<(String, String), BTreeSet<Id>>,
     keys: BTreeMap<Id, Vec<(String, String)>>,
 }
@@ -34,7 +36,7 @@ impl<Id> Default for ViewIndex<Id> {
 impl<Id: Ord + Clone> ViewIndex<Id> {
     /// Indexes view `id` under `keys` ([`crate::object_index_keys`]), in place of what it showed
     /// before.
-    pub(crate) fn set(&mut self, id: &Id, keys: Vec<(String, String)>) {
+    pub fn set(&mut self, id: &Id, keys: Vec<(String, String)>) {
         self.remove(id);
         for key in &keys {
             self.entries.entry(key.clone()).or_default().insert(id.clone());
@@ -42,7 +44,7 @@ impl<Id: Ord + Clone> ViewIndex<Id> {
         self.keys.insert(id.clone(), keys);
     }
 
-    pub(crate) fn remove(&mut self, id: &Id) {
+    pub fn remove(&mut self, id: &Id) {
         for key in self.keys.remove(id).into_iter().flatten() {
             if let Some(ids) = self.entries.get_mut(&key) {
                 ids.remove(id);
@@ -54,7 +56,7 @@ impl<Id: Ord + Clone> ViewIndex<Id> {
     }
 
     /// The views `cover` selects.
-    pub(crate) fn covered(&self, cover: &IndexCover) -> BTreeSet<Id> {
+    pub fn covered(&self, cover: &IndexCover) -> BTreeSet<Id> {
         cover.select(&self.entries)
     }
 
